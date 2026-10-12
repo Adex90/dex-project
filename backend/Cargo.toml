@@ -6,6 +6,10 @@ rust-version = "1.80"
 description = "Synthetic Capital — motor transaccional con reserva del 100% (IFPE) y crédito con calce de plazos (SOFOM)"
 publish = false
 
+[lib]
+name = "synthetic_capital"
+path = "src/lib.rs"
+
 [[bin]]
 name = "synthetic-capital"
 path = "src/main.rs"
@@ -37,6 +41,7 @@ sha2 = "0.10"
 hex = "0.4"
 jsonwebtoken = "9"
 argon2 = "0.5"
+rand = "0.8"
 
 # Serialización y utilidades
 serde = { version = "1", features = ["derive"] }
@@ -49,6 +54,17 @@ dotenvy = "0.15"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
+
 [profile.release]
 lto = "thin"
 codegen-units = 1
+
+# Argon2 es deliberadamente costoso; sin optimizar, las pruebas en debug tardan segundos por hash.
+[profile.dev.package.argon2]
+opt-level = 3
+
+[profile.dev.package.blake2]
+opt-level = 3
