@@ -1,0 +1,54 @@
+[package]
+name = "synthetic-capital-backend"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+description = "Synthetic Capital — motor transaccional con reserva del 100% (IFPE) y crédito con calce de plazos (SOFOM)"
+publish = false
+
+[[bin]]
+name = "synthetic-capital"
+path = "src/main.rs"
+
+[dependencies]
+# HTTP
+axum = { version = "0.8", features = ["macros"] }
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
+
+# Base de datos
+sqlx = { version = "0.8", default-features = false, features = [
+    "runtime-tokio",
+    "tls-rustls",
+    "postgres",
+    "macros",
+    "migrate",
+    "uuid",
+    "chrono",
+    "rust_decimal",
+    "json",
+] }
+
+# Dinero: decimal exacto (nunca f64) — se mapea a NUMERIC(18, 8)
+rust_decimal = { version = "1", features = ["serde-with-str"] }
+
+# Criptografía
+sha2 = "0.10"
+hex = "0.4"
+jsonwebtoken = "9"
+argon2 = "0.5"
+
+# Serialización y utilidades
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+thiserror = "2"
+anyhow = "1"
+dotenvy = "0.15"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
