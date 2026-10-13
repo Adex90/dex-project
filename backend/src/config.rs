@@ -21,7 +21,7 @@ pub struct Config {
     /// depósitos simulados por el propio cliente. Nunca en producción.
     pub modo_demo: bool,
     pub migrar_al_inicio: bool,
-    /// Banco (3) + plaza (3) para generar CLABEs.
+    /// Prefijo de las CLABEs propias: banco (3) + plaza (3) [+ hasta 4 dígitos].
     pub clabe_prefijo: String,
     pub pld: UmbralesPld,
     /// Periodicidad de cortes automáticos de Proof of Reserve (0 = desactivado).
@@ -38,6 +38,49 @@ pub struct Config {
     pub operador_email: Option<String>,
     pub operador_password: Option<String>,
     pub http: LimitesHttp,
+    pub spei: ConfigSpei,
+}
+
+/// Integración SPEI.
+#[derive(Debug, Clone)]
+pub struct ConfigSpei {
+    /// Secretos HMAC de los webhooks del proveedor (el vigente y, durante una
+    /// rotación, el anterior). Sin secreto, los webhooks responden 503.
+    pub webhook_secretos: Vec<String>,
+    /// Antigüedad máxima de la firma de un webhook.
+    pub tolerancia_firma_seg: u64,
+    /// Prefijo de nuestras claves de rastreo (1 a 8 letras/dígitos).
+    pub prefijo_rastreo: String,
+    /// Periodicidad del despachador de órdenes salientes (0 = desactivado).
+    pub despacho_intervalo_ms: u64,
+    /// Espera entre consultas de estado de una orden enviada.
+    pub consulta_intervalo_seg: u64,
+    /// Intentos sin resultado definitivo antes de pedir revisión manual.
+    pub max_intentos: i32,
+    /// Órdenes por ciclo del despachador.
+    pub lote: i64,
+    /// Espera mínima antes de volver a consultar una orden de resultado
+    /// desconocido (el proveedor puede tardar en mostrar una orden registrada).
+    pub espera_incierto_seg: u64,
+    /// Días después de liquidar durante los que se consulta si la orden fue
+    /// devuelta por el banco receptor.
+    pub ventana_devolucion_dias: i32,
+}
+
+impl Default for ConfigSpei {
+    fn default() -> Self {
+        Self {
+            webhook_secretos: Vec::new(),
+            tolerancia_firma_seg: 300,
+            prefijo_rastreo: "SC".into(),
+            despacho_intervalo_ms: 1_000,
+            consulta_intervalo_seg: 5,
+            max_intentos: 20,
+            lote: 50,
+            espera_incierto_seg: 60,
+            ventana_devolucion_dias: 3,
+        }
+    }
 }
 
 /// Límites del servidor HTTP. Sin ellos, conexiones ociosas o lentas agotan
@@ -122,9 +165,7 @@ impl Config {
         let jwt_secret = var("JWT_SECRET").context("JWT_SECRET es obligatoria")?;
         validar_secreto_jwt(&jwt_secret)?;
         let clabe_prefijo = var("CLABE_PREFIJO").unwrap_or_else(|| "999180".into());
-        if clabe_prefijo.len() != 6 || !clabe_prefijo.bytes().all(|b| b.is_ascii_digit()) {
-            bail!("CLABE_PREFIJO debe ser de 6 dígitos (banco + plaza)");
-        }
+        crate::spei::clabe::validar_prefijo(&clabe_prefijo).map_err(|e| anyhow::anyhow!("CLABE_PREFIJO: {e}"))?;
         let defecto = UmbralesPld::default();
         Ok(Self {
             database_url: var("DATABASE_URL").context("DATABASE_URL es obligatoria")?,
@@ -151,6 +192,35 @@ impl Config {
             caja_cuenta: var("CAJA_CUENTA").unwrap_or_else(|| "SC-SOFOM-CAJA-001".into()),
             operador_email: var("BOOTSTRAP_OPERADOR_EMAIL"),
             operador_password: var("BOOTSTRAP_OPERADOR_PASSWORD"),
+            spei: {
+                let d = ConfigSpei::default();
+                let mut webhook_secretos = Vec::new();
+                for nombre in ["SPEI_WEBHOOK_SECRETO", "SPEI_WEBHOOK_SECRETO_ANTERIOR"] {
+                    if let Some(s) = var(nombre) {
+                        validar_secreto_jwt(&s).map_err(|e| anyhow::anyhow!("{nombre}: {e}"))?;
+                        webhook_secretos.push(s);
+                    }
+                }
+                let prefijo_rastreo = var("SPEI_PREFIJO_RASTREO").unwrap_or(d.prefijo_rastreo).to_ascii_uppercase();
+                if prefijo_rastreo.is_empty()
+                    || prefijo_rastreo.len() > 8
+                    || !prefijo_rastreo.bytes().all(|b| b.is_ascii_alphanumeric())
+                {
+                    bail!("SPEI_PREFIJO_RASTREO debe tener de 1 a 8 letras o dígitos");
+                }
+                ConfigSpei {
+                    webhook_secretos,
+                    tolerancia_firma_seg: var_o("SPEI_TOLERANCIA_FIRMA_SEG", d.tolerancia_firma_seg)?,
+                    prefijo_rastreo,
+                    despacho_intervalo_ms: var_o("SPEI_DESPACHO_INTERVALO_MS", d.despacho_intervalo_ms)?,
+                    consulta_intervalo_seg: var_o("SPEI_CONSULTA_INTERVALO_SEG", d.consulta_intervalo_seg)?.max(1),
+                    max_intentos: var_o("SPEI_MAX_INTENTOS", d.max_intentos)?.max(1),
+                    lote: var_o("SPEI_LOTE", d.lote)?.clamp(1, 500),
+                    espera_incierto_seg: var_o("SPEI_ESPERA_INCIERTO_SEG", d.espera_incierto_seg)?,
+                    ventana_devolucion_dias: var_o("SPEI_VENTANA_DEVOLUCION_DIAS", d.ventana_devolucion_dias)?
+                        .clamp(0, 60),
+                }
+            },
             http: {
                 let d = LimitesHttp::default();
                 LimitesHttp {
@@ -188,6 +258,11 @@ impl Config {
             operador_email: None,
             operador_password: None,
             http: LimitesHttp::default(),
+            spei: ConfigSpei {
+                webhook_secretos: vec!["secreto-webhook-spei-de-pruebas-0123456789abcdef".into()],
+                despacho_intervalo_ms: 0,
+                ..ConfigSpei::default()
+            },
         }
     }
 }

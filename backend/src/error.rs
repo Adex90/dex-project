@@ -14,7 +14,7 @@
 //! código intentó cruzar el aislamiento IFPE/SOFOM, y se registra como tal.
 
 use axum::{
-    extract::rejection::{JsonRejection, PathRejection, QueryRejection},
+    extract::rejection::{BytesRejection, JsonRejection, PathRejection, QueryRejection},
     http::StatusCode,
     response::{IntoResponse, Response},
     Json,
@@ -151,6 +151,9 @@ fn es_invariante(codigo: &str) -> bool {
             | "CORTE_INVALIDO"
             | "FONDEO_INCOMPLETO"
             | "COBRO_INVALIDO"
+            | "SPEI_SIN_REGISTRO"
+            | "SPEI_DESCUADRE"
+            | "SPEI_TRANSICION"
     ) || codigo.ends_with("_INMUTABLE")
 }
 
@@ -243,6 +246,12 @@ fn rechazo(status: StatusCode, texto: String, causa: &(dyn std::error::Error + '
 
 impl From<JsonRejection> for AppError {
     fn from(r: JsonRejection) -> Self {
+        rechazo(r.status(), r.body_text(), &r)
+    }
+}
+
+impl From<BytesRejection> for AppError {
+    fn from(r: BytesRejection) -> Self {
         rechazo(r.status(), r.body_text(), &r)
     }
 }

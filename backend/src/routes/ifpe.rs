@@ -4,6 +4,7 @@ use axum::{
     routing::{get, post},
     Router,
 };
+use chrono::NaiveDate;
 use rust_decimal::Decimal;
 use serde::Deserialize;
 
@@ -14,6 +15,11 @@ use crate::{
     ledger::{self, Movimiento},
     models::ifpe::{CuentaIfpe, TransaccionIfpe},
     routes::extraccion::{Json, Query},
+    spei::{
+        inbound::{self, ResultadoAbono},
+        outbound::{self, ResultadoOrden, SolicitudSpei},
+        IdentidadSpei,
+    },
     state::AppState,
 };
 
@@ -86,21 +92,26 @@ struct SolicitudRetiro {
     clave_idempotencia: String,
 }
 
+/// Retiro a una cuenta propia en otro banco: es un SPEI saliente con el nombre
+/// del cliente como beneficiario (ver `spei::outbound`).
 async fn retirar(
     State(e): State<AppState>,
     u: Usuario,
     Json(s): Json<SolicitudRetiro>,
-) -> AppResult<(StatusCode, Json<Movimiento>)> {
+) -> AppResult<(StatusCode, Json<ResultadoOrden>)> {
     u.exigir_cliente()?;
-    let r = ledger::Retiro {
+    let solicitud = SolicitudSpei {
         cliente_id: u.cliente_id,
-        monto: s.monto,
         clabe_destino: s.clabe_destino,
-        concepto: s.concepto,
+        beneficiario_nombre: None,
+        beneficiario_rfc_curp: None,
+        monto: s.monto,
+        concepto: Some(s.concepto.unwrap_or_else(|| "RETIRO A CUENTA PROPIA".into())),
+        referencia_numerica: None,
         clave_idempotencia: u.clave(&s.clave_idempotencia)?,
     };
-    let m = ledger::retirar(&e.pool, &e.config.pld, &r).await?;
-    Ok((status_de(m.idempotente), Json(m)))
+    let r = outbound::solicitar(&e.pool, &e.config.pld, &e.config.spei, &solicitud).await?;
+    Ok((status_de(r.idempotente), Json(r)))
 }
 
 #[derive(Deserialize)]
@@ -112,12 +123,14 @@ struct SolicitudDepositoSimulado {
 }
 
 /// Solo en `MODO_DEMO`: simula un SPEI entrante a la cuenta del propio cliente.
-/// Mueve la reserva en custodia igual que un depósito real.
+/// Pasa por el mismo proceso que un SPEI real (registro en `spei_inbound` con
+/// origen DEMO, reserva en custodia 1:1). La identidad del pago se deriva de la
+/// clave de idempotencia, así que repetirla no abona dos veces.
 async fn deposito_simulado(
     State(e): State<AppState>,
     u: Usuario,
     Json(s): Json<SolicitudDepositoSimulado>,
-) -> AppResult<(StatusCode, Json<Movimiento>)> {
+) -> AppResult<(StatusCode, Json<ResultadoAbono>)> {
     u.exigir_cliente()?;
     if !e.config.modo_demo {
         return Err(AppError::no_encontrado("ruta no disponible"));
@@ -125,13 +138,32 @@ async fn deposito_simulado(
     let cuenta = ledger::cuenta_de_cliente(&e.pool, u.cliente_id)
         .await?
         .ok_or_else(|| AppError::no_encontrado("no tienes cuenta en la bóveda IFPE"))?;
-    let d = ledger::Deposito {
-        cuenta_id: cuenta.id,
+    let clave = u.clave(&s.clave_idempotencia)?;
+    let rastreo = format!("DEMO{}", &crate::ledger::hash::sha256_hex(clave.as_bytes())[..26]).to_ascii_uppercase();
+    let abono = inbound::Abono {
+        identidad: IdentidadSpei::nueva("99999", NaiveDate::from_ymd_opt(2000, 1, 1).expect("fecha"), &rastreo)?,
+        institucion_receptora: None,
+        receptor_clabe: cuenta.clabe.clone(),
         monto: s.monto,
-        referencia_externa: None,
-        concepto: Some("Depósito simulado (modo demo)".into()),
-        clave_idempotencia: u.clave(&s.clave_idempotencia)?,
+        nombre_ordenante: Some("DEPOSITO SIMULADO".into()),
+        cuenta_ordenante: None,
+        rfc_curp_ordenante: None,
+        referencia_numerica: None,
+        concepto: Some("modo demo".into()),
+        tipo_pago: None,
+        rastreo_devuelto: None,
+        causa_devolucion: None,
+        id_proveedor: None,
+        raw_payload: serde_json::json!({ "demo": true, "monto": s.monto.to_string() }),
     };
-    let m = ledger::depositar(&e.pool, &e.config.pld, &d).await?;
-    Ok((status_de(m.idempotente), Json(m)))
+    let r = inbound::abonar(
+        &e.pool,
+        &e.config.pld,
+        &e.config.spei,
+        &abono,
+        inbound::Origen::Demo,
+        inbound::SiNoAcreditable::Rechazar,
+    )
+    .await?;
+    Ok((status_de(r.idempotente), Json(r)))
 }

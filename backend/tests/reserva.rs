@@ -256,6 +256,14 @@ async fn truncar_el_ledger_lo_detectan_las_anclas(pool: PgPool) {
         "ifpe.transacciones",
         "trg_ifpe_tx_inmutable",
         &[
+            // El abono también tiene su registro SPEI (inmutable): el atacante lo borra.
+            ("ALTER TABLE ifpe.spei_inbound DISABLE TRIGGER trg_spei_inbound_inmutable", vec![]),
+            (
+                "DELETE FROM ifpe.spei_inbound WHERE transaccion_id = \
+                   (SELECT id FROM ifpe.transacciones ORDER BY secuencia DESC LIMIT 1)",
+                vec![],
+            ),
+            ("ALTER TABLE ifpe.spei_inbound ENABLE TRIGGER trg_spei_inbound_inmutable", vec![]),
             (
                 "DELETE FROM ifpe.transacciones WHERE secuencia = (SELECT max(secuencia) FROM ifpe.transacciones)",
                 vec![],

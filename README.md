@@ -41,6 +41,55 @@ Integrity checks (migration `0004` and the backend):
   the leaf is the customer's own account and that the cut matches the public,
   unauthenticated copy (`GET /reserva/cortes/{id}`).
 
+## SPEI (interbank transfers, migration `0005`)
+
+Real transfers through a settlement partner such as STP. SPEI moves only the
+IFPE vault and its custody reserve; the SOFOM never sees it.
+
+- **Receiving:** `POST /api/v1/spei/webhook/inbound`, signed with HMAC-SHA256
+  (`X-Spei-Firma: t=<unix>,v1=<hex>` over `<t>.<raw body>`, 5-minute window,
+  constant-time check, two secrets during rotation). In one transaction:
+  the client's balance and the custody reserve go up by the same amount, the
+  DEPOSITO enters the hash chain, and the payment is logged in
+  `ifpe.spei_inbound`. The reply follows STP: `confirmar`, or `devolver`
+  with the Banxico cause when the CLABE is unknown (1), the account is blocked
+  or has no KYC (2), or it is closed (3). Authenticated notifications that
+  cannot be used are quarantined and returned (14), never answered with a 4xx.
+- **No double credit:** a payment's identity is issuing participant + tracking
+  key + operation date (Banxico makes the tracking key unique per participant
+  per day). A unique index plus a per-identity advisory lock mean concurrent
+  or repeated webhooks credit once. A second check blocks the same payment
+  under another identity (an operator typing the calendar date or a wrong
+  issuer code, or credits from before 0005).
+- **Sending:** `POST /api/v1/spei/transfer`. The balance and the reserve go
+  down at once (the money is committed to the order and cannot be spent
+  twice), and the order is dispatched by a background worker. The worker
+  never refunds on a timeout or an ambiguous answer. A rejection counts as
+  final only on the first attempt; afterwards (for example "duplicate
+  tracking key" on a resend) the order goes to manual review. Refunds happen
+  only on a first-attempt rejection, a cancellation or a return, exactly once
+  (`spei-reverso:<order>`), even when the status webhook, the poller and an
+  incoming return all report it. Settled orders are polled for returns during
+  `SPEI_VENTANA_DEVOLUCION_DIAS`.
+- **Database guarantees:** every new DEPOSITO is a logged SPEI or an order
+  reversal, and every new RETIRO is an order or an operator correction, each
+  created in the same transaction as its record. A separate role (`sc_spei`)
+  is the only one that can log incoming payments, change order states or
+  refund. Client-facing code (`sc_ifpe`) can only create orders. Account
+  owners and CLABEs never change.
+- **CLABE:** official mod-10 check digit (weights 3-7-1) in Rust and in
+  PostgreSQL. CLABEs live in `ifpe.clabes_asignadas` (STP virtual CLABEs
+  `646...` included) and are never reassigned.
+- **Reconciliation:** `GET /api/v1/spei/conciliacion` reports, per custody
+  account, book reserve plus orders not yet confirmed as settled.
+- **Corrections:** `POST /api/v1/operaciones/spei/recibidos/{id}/correccion`
+  (operator) reverses a wrong credit, up to the credited amount.
+
+`backend/src/spei/pasarela.rs` defines the gateway interface. The simulated
+gateway reproduces STP's behaviour, including duplicate rejections on resend
+and delayed status queries. A production STP client (RSA-signed orders,
+participant catalog) plugs in there.
+
 ## Layout
 
 ```
@@ -82,7 +131,7 @@ the owner and serve as a login that can act only through the `sc_*` roles:
 
 ```sql
 CREATE ROLE sc_app LOGIN PASSWORD '...' NOINHERIT;
-GRANT sc_ifpe, sc_sofom, sc_puente, sc_auditor, sc_kyc TO sc_app;
+GRANT sc_ifpe, sc_sofom, sc_puente, sc_auditor, sc_kyc, sc_spei TO sc_app;
 ```
 
 ```bash
@@ -128,7 +177,8 @@ the password is hashed, so a parallel burst cannot test more than 5 passwords.
 | POST | `/api/v1/auth/registro`, `/api/v1/auth/login` | public |
 | GET | `/api/v1/tablero` | client: vault + investment + live reserve |
 | GET | `/api/v1/ifpe/cuenta`, `/api/v1/ifpe/movimientos` | client |
-| POST | `/api/v1/ifpe/transferencias`, `/api/v1/ifpe/retiros` | client |
+| POST | `/api/v1/ifpe/transferencias` | client: internal transfer |
+| POST | `/api/v1/ifpe/retiros` | client: withdrawal to own external CLABE (an outgoing SPEI) |
 | POST | `/api/v1/ifpe/depositos/simulados` | client, `MODO_DEMO` only |
 | GET | `/api/v1/sofom/tasas` | public: terms and rates |
 | GET | `/api/v1/sofom/posicion` | client |
@@ -139,9 +189,14 @@ the password is hashed, so a parallel burst cannot test more than 5 passwords.
 | GET | `/api/v1/reserva/prueba` | client: Merkle proof for their account |
 | POST | `/api/v1/reserva/verificar` | public: verify a proof against the published root |
 | GET | `/api/v1/auditoria/ledger/{ifpe,sofom}` | operator / auditor |
-| POST | `/api/v1/operaciones/depositos` | operator: incoming SPEI, identified by issuer bank + value date + tracking key (`banco_emisor`, `fecha_operacion`, `clave_rastreo`, case-insensitive), so the same transfer is never credited twice |
+| POST | `/api/v1/operaciones/depositos` | operator: manual entry of an incoming SPEI (5-digit `banco_emisor`, `fecha_operacion`, `clave_rastreo`); same path and same identity as the webhook, so a payment entered by hand and notified by the provider is credited once |
 | POST | `/api/v1/operaciones/creditos`, `.../{id}/pagos`, `.../{id}/castigo` | operator: loans, collections, write-offs (losses absorbed by SOFOM capital) |
 | POST | `/api/v1/operaciones/usuarios/{id}/revocar-sesiones` | operator: invalidate a user's JWTs immediately |
+| POST | `/api/v1/spei/webhook/inbound`, `/api/v1/spei/webhook/estado` | SPEI provider (HMAC signature) |
+| POST | `/api/v1/spei/transfer` | client: send an SPEI |
+| GET | `/api/v1/spei/transferencias`, `/api/v1/spei/recibidos` | client |
+| GET | `/api/v1/spei/conciliacion` | operator / auditor |
+| POST | `/api/v1/operaciones/spei/recibidos/{id}/correccion` | operator: reverse a wrong SPEI credit |
 | POST | `/api/v1/operaciones/...` | operator: holds, KYC, AML alerts, capital |
 
 Full table in `backend/src/routes/mod.rs`.

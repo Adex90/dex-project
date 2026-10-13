@@ -30,3 +30,14 @@ pub struct Query<T>(pub T);
 #[derive(FromRequestParts)]
 #[from_request(via(axum::extract::Path), rejection(AppError))]
 pub struct Path<T>(pub T);
+
+/// Cuerpo crudo (los webhooks se firman sobre los bytes exactos).
+pub struct Cuerpo(pub axum::body::Bytes);
+
+impl<S: Send + Sync> FromRequest<S> for Cuerpo {
+    type Rejection = AppError;
+
+    async fn from_request(req: axum::extract::Request, estado: &S) -> Result<Self, Self::Rejection> {
+        axum::body::Bytes::from_request(req, estado).await.map(Cuerpo).map_err(AppError::from)
+    }
+}

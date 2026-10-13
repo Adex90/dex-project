@@ -20,7 +20,6 @@ use uuid::Uuid;
 
 use super::{bloquear_caja, buscar_tx_por_clave, insertar_tx_sofom, NuevaTxSofom};
 use crate::{
-    clabe,
     config::UmbralesPld,
     db::{self, Rol},
     dinero,
@@ -30,6 +29,7 @@ use crate::{
         Entidad,
     },
     pld::{self, EventoPld},
+    spei::clabe,
 };
 
 #[derive(Debug, Clone)]

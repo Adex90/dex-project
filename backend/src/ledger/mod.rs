@@ -22,7 +22,6 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::{
-    clabe,
     config::UmbralesPld,
     db::{self, Rol, Tx},
     dinero,
@@ -32,6 +31,7 @@ use crate::{
         Entidad, EstadoCuenta,
     },
     pld::{self, EventoPld},
+    spei::clabe,
 };
 
 /// Resultado de una operación del ledger.
@@ -176,7 +176,89 @@ pub(crate) fn exigir_saldo(cuenta: &CuentaIfpe, monto: Decimal) -> AppResult<()>
     Ok(())
 }
 
-fn validar_texto(campo: &str, valor: Option<&str>, max: usize) -> AppResult<()> {
+/// Entra efectivo: el saldo disponible de la cuenta y la reserva en custodia
+/// suben juntos y se registra el DEPOSITO. La cuenta y la reserva deben estar
+/// bloqueadas por el llamador (orden cuentas -> reserva).
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn abonar_efectivo(
+    tx: &mut Tx,
+    cuenta_id: Uuid,
+    reserva_id: Uuid,
+    monto: Decimal,
+    concepto: Option<&str>,
+    referencia_externa: Option<&str>,
+    clave: &str,
+) -> AppResult<TransaccionIfpe> {
+    // Pasivo y reserva suben juntos: 1 peso depositado = 1 peso en custodia.
+    sqlx::query("UPDATE ifpe.cuentas SET saldo_disponible = saldo_disponible + $1 WHERE id = $2")
+        .bind(monto)
+        .bind(cuenta_id)
+        .execute(&mut **tx)
+        .await?;
+    sqlx::query("UPDATE ifpe.reserva_custodia SET saldo = saldo + $1 WHERE id = $2")
+        .bind(monto)
+        .bind(reserva_id)
+        .execute(&mut **tx)
+        .await?;
+    insertar_tx_ifpe(
+        tx,
+        NuevaTxIfpe {
+            id: Uuid::new_v4(),
+            tipo: TipoTxIfpe::Deposito,
+            origen: None,
+            destino: Some(cuenta_id),
+            reserva: Some(reserva_id),
+            monto,
+            concepto,
+            referencia_externa,
+            clave,
+            espejo: None,
+        },
+    )
+    .await
+}
+
+/// Sale efectivo: saldo disponible y reserva bajan juntos (RETIRO). Mismas
+/// condiciones de bloqueo que [`abonar_efectivo`]; el saldo ya se comprobó.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn cargar_efectivo(
+    tx: &mut Tx,
+    cuenta_id: Uuid,
+    reserva_id: Uuid,
+    monto: Decimal,
+    concepto: Option<&str>,
+    referencia_externa: Option<&str>,
+    clave: &str,
+) -> AppResult<TransaccionIfpe> {
+    sqlx::query("UPDATE ifpe.cuentas SET saldo_disponible = saldo_disponible - $1 WHERE id = $2")
+        .bind(monto)
+        .bind(cuenta_id)
+        .execute(&mut **tx)
+        .await?;
+    sqlx::query("UPDATE ifpe.reserva_custodia SET saldo = saldo - $1 WHERE id = $2")
+        .bind(monto)
+        .bind(reserva_id)
+        .execute(&mut **tx)
+        .await?;
+    insertar_tx_ifpe(
+        tx,
+        NuevaTxIfpe {
+            id: Uuid::new_v4(),
+            tipo: TipoTxIfpe::Retiro,
+            origen: Some(cuenta_id),
+            destino: None,
+            reserva: Some(reserva_id),
+            monto,
+            concepto,
+            referencia_externa,
+            clave,
+            espejo: None,
+        },
+    )
+    .await
+}
+
+pub(crate) fn validar_texto(campo: &str, valor: Option<&str>, max: usize) -> AppResult<()> {
     if let Some(v) = valor {
         if v.chars().count() > max {
             return Err(AppError::validacion(format!("{campo} admite como máximo {max} caracteres")));
@@ -188,219 +270,9 @@ fn validar_texto(campo: &str, valor: Option<&str>, max: usize) -> AppResult<()> 
     Ok(())
 }
 
-// -----------------------------------------------------------------------------
-// Depósito (entrada de efectivo: SPEI entrante, ventanilla)
-// -----------------------------------------------------------------------------
-
-#[derive(Debug, Clone)]
-pub struct Deposito {
-    pub cuenta_id: Uuid,
-    pub monto: Decimal,
-    pub referencia_externa: Option<String>,
-    pub concepto: Option<String>,
-    /// Clave ya acotada por quien la origina (p. ej. `op:...` o `cli:<id>:...`).
-    pub clave_idempotencia: String,
-}
-
-/// Identidad de un pago SPEI. Una clave de rastreo solo es única por
-/// participante emisor y día de operación (por eso el CEP de Banxico pide los
-/// tres), y es insensible a mayúsculas.
-#[derive(Debug, Clone)]
-pub struct IdentidadSpei {
-    /// Clave del participante emisor (3 a 5 dígitos).
-    pub banco_emisor: String,
-    pub fecha_operacion: chrono::NaiveDate,
-    pub clave_rastreo: String,
-}
-
-impl IdentidadSpei {
-    /// Forma canónica `<emisor>:<AAAAMMDD>:<RASTREO>`; se guarda en
-    /// `referencia_externa` (dentro del hash de la cadena).
-    pub fn canonica(&self) -> AppResult<String> {
-        let emisor = self.banco_emisor.trim();
-        if !(3..=5).contains(&emisor.len()) || !emisor.bytes().all(|b| b.is_ascii_digit()) {
-            return Err(AppError::validacion("banco_emisor debe ser la clave de participante SPEI (3 a 5 dígitos)"));
-        }
-        let rastreo = self.clave_rastreo.trim().to_ascii_uppercase();
-        if rastreo.is_empty() || rastreo.len() > 30 || !rastreo.bytes().all(|b| b.is_ascii_alphanumeric()) {
-            return Err(AppError::validacion("la clave de rastreo SPEI debe tener de 1 a 30 caracteres alfanuméricos"));
-        }
-        let manana = chrono::Utc::now().date_naive() + chrono::Days::new(1);
-        let minima = chrono::NaiveDate::from_ymd_opt(2000, 1, 1).expect("fecha válida");
-        if self.fecha_operacion > manana || self.fecha_operacion < minima {
-            return Err(AppError::validacion("fecha_operacion fuera de rango"));
-        }
-        Ok(format!("{emisor}:{}:{rastreo}", self.fecha_operacion.format("%Y%m%d")))
-    }
-}
-
-impl Deposito {
-    /// SPEI entrante. La idempotencia se deriva de la identidad del pago
-    /// (emisor + fecha + rastreo, en forma canónica), no de quién lo registra:
-    /// el mismo SPEI nunca se acredita dos veces aunque lo capturen dos
-    /// operadores, se reintente con otra clave o cambie el uso de mayúsculas
-    /// (lo respalda además el índice único `ux_ifpe_tx_deposito_spei`).
-    pub fn spei(cuenta_id: Uuid, monto: Decimal, spei: &IdentidadSpei, concepto: Option<String>) -> AppResult<Self> {
-        let referencia = spei.canonica()?;
-        Ok(Self {
-            cuenta_id,
-            monto,
-            clave_idempotencia: format!("spei:{referencia}"),
-            referencia_externa: Some(referencia),
-            concepto,
-        })
-    }
-}
-
-pub async fn depositar(pool: &PgPool, umbrales: &UmbralesPld, d: &Deposito) -> AppResult<Movimiento> {
-    let monto = dinero::validar_monto(d.monto)?;
-    validar_texto("concepto", d.concepto.as_deref(), 140)?;
-    validar_texto("referencia_externa", d.referencia_externa.as_deref(), 64)?;
-    db::con_reintentos(|| depositar_tx(pool, umbrales, d, monto)).await
-}
-
-async fn depositar_tx(pool: &PgPool, umbrales: &UmbralesPld, d: &Deposito, monto: Decimal) -> AppResult<Movimiento> {
-    let mut tx = db::begin(pool, Rol::Ifpe).await?;
-    let cuenta = bloquear_cuenta_ifpe(&mut tx, d.cuenta_id).await?;
-    if let Some(previa) = buscar_por_clave(&mut tx, &d.clave_idempotencia).await? {
-        exigir_misma_operacion(
-            &previa,
-            TipoTxIfpe::Deposito,
-            monto,
-            None,
-            Some(cuenta.id),
-            d.concepto.as_deref(),
-            d.referencia_externa.as_deref(),
-        )?;
-        return Ok(Movimiento { transaccion: previa, idempotente: true });
-    }
-    let perfil = pld::cargar_perfil(&mut tx, cuenta.cliente_id).await?;
-    perfil.exigir_operable()?;
-    exigir_acreditable(&cuenta)?;
-    let reserva = bloquear_reserva(&mut tx).await?;
-
-    // Pasivo y reserva suben juntos: 1 peso depositado = 1 peso en custodia.
-    sqlx::query("UPDATE ifpe.cuentas SET saldo_disponible = saldo_disponible + $1 WHERE id = $2")
-        .bind(monto)
-        .bind(cuenta.id)
-        .execute(&mut *tx)
-        .await?;
-    sqlx::query("UPDATE ifpe.reserva_custodia SET saldo = saldo + $1 WHERE id = $2")
-        .bind(monto)
-        .bind(reserva.id)
-        .execute(&mut *tx)
-        .await?;
-    let t = insertar_tx_ifpe(
-        &mut tx,
-        NuevaTxIfpe {
-            id: Uuid::new_v4(),
-            tipo: TipoTxIfpe::Deposito,
-            origen: None,
-            destino: Some(cuenta.id),
-            reserva: Some(reserva.id),
-            monto,
-            concepto: d.concepto.as_deref(),
-            referencia_externa: d.referencia_externa.as_deref(),
-            clave: &d.clave_idempotencia,
-            espejo: None,
-        },
-    )
-    .await?;
-    let evento = EventoPld {
-        entidad: Entidad::Ifpe,
-        cliente: &perfil,
-        transaccion_id: t.id,
-        operacion: "DEPOSITO",
-        monto,
-        cuenta_deposito: Some(cuenta.id),
-    };
-    pld::evaluar(&mut tx, &evento, umbrales).await?;
-    tx.commit().await?;
-    Ok(Movimiento { transaccion: t, idempotente: false })
-}
-
-// -----------------------------------------------------------------------------
-// Retiro (salida de efectivo: SPEI saliente a una CLABE externa)
-// -----------------------------------------------------------------------------
-
-#[derive(Debug, Clone)]
-pub struct Retiro {
-    pub cliente_id: Uuid,
-    pub monto: Decimal,
-    pub clabe_destino: String,
-    pub concepto: Option<String>,
-    pub clave_idempotencia: String,
-}
-
-pub async fn retirar(pool: &PgPool, umbrales: &UmbralesPld, r: &Retiro) -> AppResult<Movimiento> {
-    let monto = dinero::validar_monto(r.monto)?;
-    validar_texto("concepto", r.concepto.as_deref(), 140)?;
-    if !clabe::es_valida(&r.clabe_destino) {
-        return Err(AppError::validacion("CLABE destino inválida"));
-    }
-    db::con_reintentos(|| retirar_tx(pool, umbrales, r, monto)).await
-}
-
-async fn retirar_tx(pool: &PgPool, umbrales: &UmbralesPld, r: &Retiro, monto: Decimal) -> AppResult<Movimiento> {
-    let mut tx = db::begin(pool, Rol::Ifpe).await?;
-    let cuenta_id = id_cuenta_ifpe_de_cliente(&mut tx, r.cliente_id).await?;
-    let cuenta = bloquear_cuenta_ifpe(&mut tx, cuenta_id).await?;
-    if let Some(previa) = buscar_por_clave(&mut tx, &r.clave_idempotencia).await? {
-        exigir_misma_operacion(
-            &previa,
-            TipoTxIfpe::Retiro,
-            monto,
-            Some(cuenta.id),
-            None,
-            r.concepto.as_deref(),
-            Some(&r.clabe_destino),
-        )?;
-        return Ok(Movimiento { transaccion: previa, idempotente: true });
-    }
-    let perfil = pld::cargar_perfil(&mut tx, cuenta.cliente_id).await?;
-    perfil.exigir_operable()?;
-    exigir_debitable(&cuenta)?;
-    exigir_saldo(&cuenta, monto)?;
-    let reserva = bloquear_reserva(&mut tx).await?;
-
-    sqlx::query("UPDATE ifpe.cuentas SET saldo_disponible = saldo_disponible - $1 WHERE id = $2")
-        .bind(monto)
-        .bind(cuenta.id)
-        .execute(&mut *tx)
-        .await?;
-    sqlx::query("UPDATE ifpe.reserva_custodia SET saldo = saldo - $1 WHERE id = $2")
-        .bind(monto)
-        .bind(reserva.id)
-        .execute(&mut *tx)
-        .await?;
-    let t = insertar_tx_ifpe(
-        &mut tx,
-        NuevaTxIfpe {
-            id: Uuid::new_v4(),
-            tipo: TipoTxIfpe::Retiro,
-            origen: Some(cuenta.id),
-            destino: None,
-            reserva: Some(reserva.id),
-            monto,
-            concepto: r.concepto.as_deref(),
-            referencia_externa: Some(&r.clabe_destino),
-            clave: &r.clave_idempotencia,
-            espejo: None,
-        },
-    )
-    .await?;
-    let evento = EventoPld {
-        entidad: Entidad::Ifpe,
-        cliente: &perfil,
-        transaccion_id: t.id,
-        operacion: "RETIRO",
-        monto,
-        cuenta_deposito: None,
-    };
-    pld::evaluar(&mut tx, &evento, umbrales).await?;
-    tx.commit().await?;
-    Ok(Movimiento { transaccion: t, idempotente: false })
-}
+// Las entradas y salidas de efectivo (DEPOSITO / RETIRO) solo ocurren por SPEI:
+// `crate::spei::inbound` (abonos, reversos) y `crate::spei::outbound` (órdenes).
+// La base de datos rechaza cualquier otra (migración 0005).
 
 // -----------------------------------------------------------------------------
 // Transferencia entre clientes de la bóveda (la reserva no se mueve)
@@ -432,11 +304,15 @@ async fn transferir_tx(
 ) -> AppResult<Movimiento> {
     let mut tx = db::begin(pool, Rol::Ifpe).await?;
     let origen_id = id_cuenta_ifpe_de_cliente(&mut tx, t.cliente_origen_id).await?;
-    let destino_id: Uuid = sqlx::query_scalar("SELECT id FROM ifpe.cuentas WHERE clabe = $1")
-        .bind(&t.clabe_destino)
-        .fetch_optional(&mut *tx)
-        .await?
-        .ok_or_else(|| AppError::no_encontrado("la CLABE destino no corresponde a una cuenta de Synthetic Capital"))?;
+    // Cualquier CLABE activa de la cuenta (la principal o una de STP).
+    let destino_id: Uuid =
+        sqlx::query_scalar("SELECT cuenta_id FROM ifpe.clabes_asignadas WHERE clabe = $1 AND activa")
+            .bind(&t.clabe_destino)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or_else(|| {
+                AppError::no_encontrado("la CLABE destino no corresponde a una cuenta de Synthetic Capital")
+            })?;
     if origen_id == destino_id {
         return Err(AppError::validacion("no puedes transferir a tu propia cuenta"));
     }

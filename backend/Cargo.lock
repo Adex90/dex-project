@@ -1870,6 +1870,7 @@ dependencies = [
  "chrono",
  "dotenvy",
  "hex",
+ "hmac",
  "http-body-util",
  "hyper",
  "hyper-util",

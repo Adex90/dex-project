@@ -14,7 +14,6 @@
 
 pub mod auth;
 pub mod bootstrap;
-pub mod clabe;
 pub mod config;
 pub mod crypto;
 pub mod db;
@@ -28,6 +27,7 @@ pub mod reserva;
 pub mod routes;
 pub mod servidor;
 pub mod sofom;
+pub mod spei;
 pub mod state;
 pub mod tareas;
 

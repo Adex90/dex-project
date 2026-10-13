@@ -12,11 +12,11 @@ use uuid::Uuid;
 
 use crate::{
     auth::password,
-    clabe,
     db::{self, Rol},
     dinero,
     error::{AppError, AppResult},
     models::kyc::{AlertaPld, Cliente, EstatusKyc, NivelRiesgo, TipoPersona},
+    spei::clabe,
 };
 
 #[derive(Debug, Clone, Deserialize)]
@@ -191,7 +191,7 @@ pub async fn registrar(pool: &PgPool, clabe_prefijo: &str, modo_demo: bool, d: D
     // Apertura de la cuenta IFPE. Colisión de CLABE aleatoria: reintentar.
     let mut cuenta = None;
     for _ in 0..8 {
-        let candidata = clabe::generar(clabe_prefijo);
+        let candidata = clabe::generar(clabe_prefijo).to_string();
         cuenta = sqlx::query_as::<_, (Uuid, String)>(
             "INSERT INTO ifpe.cuentas (cliente_id, clabe) VALUES ($1, $2) \
              ON CONFLICT (clabe) DO NOTHING RETURNING id, clabe",

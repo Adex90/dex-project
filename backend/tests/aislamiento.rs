@@ -101,7 +101,9 @@ async fn usuario_sin_privilegios_opera_pero_no_altera(pool: PgPool) {
 
     let login = format!("sc_app_{}", &uuid::Uuid::new_v4().simple().to_string()[..12]);
     pool.execute(format!("CREATE ROLE {login} LOGIN PASSWORD 'clave-de-prueba' NOINHERIT").as_str()).await.unwrap();
-    pool.execute(format!("GRANT sc_ifpe, sc_sofom, sc_puente, sc_auditor, sc_kyc TO {login}").as_str()).await.unwrap();
+    pool.execute(format!("GRANT sc_ifpe, sc_sofom, sc_puente, sc_auditor, sc_kyc, sc_spei TO {login}").as_str())
+        .await
+        .unwrap();
     let opciones = pool.connect_options().as_ref().clone().username(&login).password("clave-de-prueba");
     let app = PgPoolOptions::new().max_connections(2).connect_with(opciones).await.unwrap();
 

@@ -74,12 +74,18 @@ INSERT INTO sofom.cuentas (id, cliente_id) VALUES
 -- -----------------------------------------------------------------------------
 -- REGLA 1 — IFPE reserva 100%
 -- -----------------------------------------------------------------------------
+-- Desde 0005 el efectivo solo entra como SPEI registrado (rol sc_spei).
 SELECT pg_temp.debe_pasar('IFPE: depósito de 1000 respaldado por reserva', ARRAY[
-  'SET LOCAL ROLE sc_ifpe',
+  'SET LOCAL ROLE sc_spei',
   $q$UPDATE ifpe.cuentas SET saldo_disponible = saldo_disponible + 1000 WHERE id = '1a000000-0000-0000-0000-00000000001a'$q$,
   $q$UPDATE ifpe.reserva_custodia SET saldo = saldo + 1000 WHERE id = 'e0000000-0000-0000-0000-00000000000e'$q$,
-  $q$INSERT INTO ifpe.transacciones (tipo, cuenta_destino_id, reserva_id, monto, clave_idempotencia, referencia_externa)
-     VALUES ('DEPOSITO', '1a000000-0000-0000-0000-00000000001a', 'e0000000-0000-0000-0000-00000000000e', 1000, 'dep-1', 'SPEI-0001')$q$,
+  $q$INSERT INTO ifpe.transacciones (id, tipo, cuenta_destino_id, reserva_id, monto, clave_idempotencia, referencia_externa)
+     VALUES ('7d000000-0000-0000-0000-000000000001', 'DEPOSITO', '1a000000-0000-0000-0000-00000000001a',
+             'e0000000-0000-0000-0000-00000000000e', 1000, 'spei:40012:20261001:SPEI0001', '40012:20261001:SPEI0001')$q$,
+  $q$INSERT INTO ifpe.spei_inbound (institucion_emisora, clave_rastreo, fecha_operacion, receptor_clabe, cuenta_id, monto,
+                                    estado, transaccion_id, origen, raw_payload)
+     VALUES ('40012', 'SPEI0001', '2026-10-01', '646180157000000017', '1a000000-0000-0000-0000-00000000001a', 1000,
+             'ABONADO', '7d000000-0000-0000-0000-000000000001', 'WEBHOOK', '{}')$q$,
   'RESET ROLE'
 ]);
 

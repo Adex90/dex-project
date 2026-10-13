@@ -31,6 +31,10 @@ pub enum Rol {
     Auditor,
     /// Identidad: alta, autenticación, KYC, bandeja PLD.
     Kyc,
+    /// SPEI: registra lo que informa el proveedor (abonos, estados de órdenes,
+    /// reembolsos) y las correcciones del operador. Solo lo usan los webhooks
+    /// firmados, el despachador y el operador; nunca una ruta del cliente.
+    Spei,
 }
 
 impl Rol {
@@ -41,6 +45,7 @@ impl Rol {
             Rol::Puente => "sc_puente",
             Rol::Auditor => "sc_auditor",
             Rol::Kyc => "sc_kyc",
+            Rol::Spei => "sc_spei",
         }
     }
 
@@ -53,6 +58,7 @@ impl Rol {
             Rol::Puente => "SET LOCAL ROLE sc_puente",
             Rol::Auditor => "SET LOCAL ROLE sc_auditor",
             Rol::Kyc => "SET LOCAL ROLE sc_kyc",
+            Rol::Spei => "SET LOCAL ROLE sc_spei",
         }
     }
 }
@@ -135,12 +141,12 @@ pub async fn verificar_usuario_de_aplicacion(pool: &PgPool) -> Result<(), sqlx::
                          AND pg_has_role(current_user, nspowner, 'USAGE')), \
                 pg_has_role(current_user, 'sc_ifpe', 'MEMBER') AND pg_has_role(current_user, 'sc_sofom', 'MEMBER') \
                 AND pg_has_role(current_user, 'sc_puente', 'MEMBER') AND pg_has_role(current_user, 'sc_auditor', 'MEMBER') \
-                AND pg_has_role(current_user, 'sc_kyc', 'MEMBER')",
+                AND pg_has_role(current_user, 'sc_kyc', 'MEMBER') AND pg_has_role(current_user, 'sc_spei', 'MEMBER')",
     )
     .fetch_one(pool)
     .await?;
     if !miembro {
-        tracing::error!(%usuario, "el usuario de la aplicación no es miembro de sc_ifpe, sc_sofom, sc_puente, sc_auditor y sc_kyc");
+        tracing::error!(%usuario, "el usuario de la aplicación no es miembro de sc_ifpe, sc_sofom, sc_puente, sc_auditor, sc_kyc y sc_spei");
     }
     if superusuario || dueno {
         tracing::warn!(

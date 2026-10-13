@@ -406,7 +406,7 @@ async fn errores_siempre_en_sobre_json(pool: PgPool) {
 async fn montos_como_numero_json_rechazados(pool: PgPool) {
     let api = api(&pool).await;
     let (token, _) = registrar(&api, "Ana").await;
-    for monto in [json!(1000000000.00000001_f64), json!(10), json!("10000000.000000001")] {
+    for monto in [json!(1000000000.00000001_f64), json!(10), json!("10000000.001")] {
         let cuerpo = json!({ "monto": monto, "clave_idempotencia": format!("deposito-{}", uuid::Uuid::new_v4()) });
         let (s, e) = api.llamar("POST", "/api/v1/ifpe/depositos/simulados", Some(&token), Some(cuerpo)).await;
         assert_eq!(s, StatusCode::BAD_REQUEST, "{monto}: {e}");
@@ -415,10 +415,11 @@ async fn montos_como_numero_json_rechazados(pool: PgPool) {
     let movimientos: i64 =
         sqlx::query_scalar("SELECT count(*) FROM ifpe.transacciones").fetch_one(&pool).await.unwrap();
     assert_eq!(movimientos, 0, "ningún monto redondeado llegó al ledger");
-    let cuerpo = json!({ "monto": "1000000000.00000001", "clave_idempotencia": "deposito-exacto" });
+    // Un depósito (simulado como SPEI) llega exacto, en centavos.
+    let cuerpo = json!({ "monto": "1000000000.01", "clave_idempotencia": "deposito-exacto" });
     let (s, r) = api.llamar("POST", "/api/v1/ifpe/depositos/simulados", Some(&token), Some(cuerpo)).await;
     assert_eq!(s, StatusCode::CREATED, "{r}");
-    assert_eq!(r["transaccion"]["monto"], "1000000000.00000001");
+    assert_eq!(r["transaccion"]["monto"], "1000000000.01000000");
 }
 
 /// Hallazgo #11: entradas que no caben en las columnas responden 400, no 500.

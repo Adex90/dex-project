@@ -13,7 +13,7 @@ use uuid::Uuid;
 use super::status_de;
 use crate::{
     auth::Usuario,
-    error::{AppError, AppResult},
+    error::AppResult,
     kyc::{self, DictamenKyc},
     ledger::{self, Movimiento},
     models::{
@@ -22,11 +22,16 @@ use crate::{
     },
     routes::extraccion::{Json, Path, Query},
     sofom::credito::{self, ResultadoCastigo, ResultadoCredito, ResultadoPago},
+    spei::{
+        inbound::{self, Origen, ResultadoAbono, ResultadoCorreccion, SiNoAcreditable, SolicitudCorreccion},
+        IdentidadSpei,
+    },
     state::AppState,
 };
 
 pub fn rutas() -> Router<AppState> {
     Router::new()
+        .route("/operaciones/spei/recibidos/{id}/correccion", post(corregir_spei))
         .route("/operaciones/depositos", post(deposito))
         .route("/operaciones/retenciones", post(retencion))
         .route("/operaciones/kyc/{cliente_id}", post(dictamen_kyc))
@@ -44,7 +49,7 @@ struct SolicitudDeposito {
     clabe: String,
     #[serde(with = "rust_decimal::serde::str")]
     monto: Decimal,
-    /// Clave del participante SPEI que envía el pago (3 a 5 dígitos).
+    /// Clave de participante SPEI del emisor (5 dígitos, p. ej. 40012).
     banco_emisor: String,
     /// Día de operación SPEI (AAAA-MM-DD).
     fecha_operacion: chrono::NaiveDate,
@@ -54,36 +59,51 @@ struct SolicitudDeposito {
     concepto: Option<String>,
 }
 
-/// SPEI entrante: acredita a la cuenta y sube la reserva en custodia 1:1.
+/// SPEI entrante capturado por el operador (conciliación manual). Pasa por el
+/// mismo proceso que el webhook del proveedor: misma identidad de pago, así
+/// que un pago capturado a mano y notificado por el proveedor se abona una
+/// sola vez. Si la cuenta no puede recibir, se rechaza la captura (el operador
+/// decide la devolución).
 async fn deposito(
     State(e): State<AppState>,
     u: Usuario,
     Json(s): Json<SolicitudDeposito>,
-) -> AppResult<(StatusCode, Json<Movimiento>)> {
+) -> AppResult<(StatusCode, Json<ResultadoAbono>)> {
     u.exigir_operador()?;
-    let cuenta_id = cuenta_por_clabe(&e, &s.clabe).await?;
-    let spei = ledger::IdentidadSpei {
-        banco_emisor: s.banco_emisor,
-        fecha_operacion: s.fecha_operacion,
-        clave_rastreo: s.clave_rastreo,
+    let raw_payload = serde_json::json!({
+        "clabe": s.clabe,
+        "monto": s.monto.to_string(),
+        "banco_emisor": s.banco_emisor,
+        "fecha_operacion": s.fecha_operacion,
+        "clave_rastreo": s.clave_rastreo,
+        "concepto": s.concepto,
+    });
+    let abono = inbound::Abono {
+        identidad: IdentidadSpei::nueva(&s.banco_emisor, s.fecha_operacion, &s.clave_rastreo)?,
+        institucion_receptora: None,
+        receptor_clabe: s.clabe.trim().to_owned(),
+        monto: s.monto,
+        nombre_ordenante: None,
+        cuenta_ordenante: None,
+        rfc_curp_ordenante: None,
+        referencia_numerica: None,
+        concepto: s.concepto,
+        tipo_pago: None,
+        rastreo_devuelto: None,
+        causa_devolucion: None,
+        id_proveedor: None,
+        raw_payload,
     };
-    let d = ledger::Deposito::spei(cuenta_id, s.monto, &spei, s.concepto)?;
-    let m = ledger::depositar(&e.pool, &e.config.pld, &d).await?;
-    Ok((status_de(m.idempotente), Json(m)))
-}
-
-async fn cuenta_por_clabe(e: &AppState, clabe: &str) -> AppResult<Uuid> {
-    if !crate::clabe::es_valida(clabe) {
-        return Err(AppError::validacion("CLABE inválida"));
-    }
-    let mut tx = crate::db::begin_lectura(&e.pool, crate::db::Rol::Ifpe).await?;
-    let id = sqlx::query_scalar("SELECT id FROM ifpe.cuentas WHERE clabe = $1")
-        .bind(clabe)
-        .fetch_optional(&mut *tx)
-        .await?
-        .ok_or_else(|| AppError::no_encontrado("CLABE no encontrada"))?;
-    tx.commit().await?;
-    Ok(id)
+    let r = inbound::abonar(
+        &e.pool,
+        &e.config.pld,
+        &e.config.spei,
+        &abono,
+        Origen::Operador(u.cliente_id),
+        SiNoAcreditable::Rechazar,
+    )
+    .await?;
+    Ok((status_de(r.idempotente), Json(r)))
 }
 
 #[derive(Deserialize)]
@@ -246,4 +266,35 @@ async fn revocar_sesiones(State(e): State<AppState>, u: Usuario, Path(id): Path<
     u.exigir_operador()?;
     crate::auth::revocar_sesiones(&e.pool, id).await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SolicitudCorreccionHttp {
+    #[serde(with = "rust_decimal::serde::str")]
+    monto: Decimal,
+    motivo: String,
+    clave_idempotencia: String,
+}
+
+/// Corrige (total o parcialmente) un SPEI recibido que se abonó por error:
+/// cargo al cliente y a la reserva ligado al abono original, nunca más que su
+/// monto. Requiere saldo disponible (si el cliente ya lo gastó, primero se
+/// gestiona la recuperación).
+async fn corregir_spei(
+    State(e): State<AppState>,
+    u: Usuario,
+    Path(id): Path<Uuid>,
+    Json(s): Json<SolicitudCorreccionHttp>,
+) -> AppResult<(StatusCode, Json<ResultadoCorreccion>)> {
+    u.exigir_operador()?;
+    let solicitud = SolicitudCorreccion {
+        spei_inbound_id: id,
+        monto: s.monto,
+        motivo: s.motivo,
+        operador_id: u.cliente_id,
+        clave_idempotencia: u.clave(&s.clave_idempotencia)?,
+    };
+    let r = inbound::corregir(&e.pool, &solicitud).await?;
+    Ok((status_de(r.idempotente), Json(r)))
 }

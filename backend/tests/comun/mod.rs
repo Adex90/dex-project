@@ -13,10 +13,16 @@ use sqlx::PgPool;
 use synthetic_capital::{
     bootstrap,
     config::Config,
+    db,
+    error::AppResult,
     kyc::{self, DatosRegistro, Registro},
-    ledger::{self, hash, Movimiento},
+    ledger::{hash, Movimiento},
     models::{kyc::TipoPersona, sofom::ContratoMutuo},
     sofom::puente,
+    spei::{
+        inbound::{self, Origen, SiNoAcreditable},
+        outbound, IdentidadSpei,
+    },
 };
 use uuid::Uuid;
 
@@ -54,14 +60,85 @@ pub async fn cliente(pool: &PgPool, cfg: &Config, nombre: &str) -> Registro {
     .unwrap()
 }
 
-/// SPEI entrante con una clave de rastreo única.
+/// SPEI entrante (como lo notificaría el proveedor) con una clave de rastreo única.
 pub async fn depositar(pool: &PgPool, cfg: &Config, cuenta_id: Uuid, monto: &str) -> Movimiento {
-    let spei = ledger::IdentidadSpei {
-        banco_emisor: "40012".into(),
-        fecha_operacion: chrono::Utc::now().date_naive(),
-        clave_rastreo: format!("PRUEBA{}", &Uuid::new_v4().simple().to_string()[..20]),
-    };
-    ledger::depositar(pool, &cfg.pld, &ledger::Deposito::spei(cuenta_id, d(monto), &spei, None).unwrap()).await.unwrap()
+    // Con un rol (la prueba de usuario sin privilegios usa este ayudante).
+    let mut tx = db::begin_lectura(pool, db::Rol::Ifpe).await.unwrap();
+    let clabe: String = sqlx::query_scalar("SELECT clabe FROM ifpe.cuentas WHERE id = $1")
+        .bind(cuenta_id)
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    let rastreo = format!("PRUEBA{}", &Uuid::new_v4().simple().to_string()[..20]);
+    let r = inbound::abonar(
+        pool,
+        &cfg.pld,
+        &cfg.spei,
+        &abono(&clabe, monto, &rastreo),
+        Origen::Webhook,
+        SiNoAcreditable::Rechazar,
+    )
+    .await
+    .unwrap();
+    Movimiento { transaccion: r.transaccion.expect("abonado"), idempotente: r.idempotente }
+}
+
+/// SPEI recibido de BBVA (40012) con fecha de hoy.
+pub fn abono(clabe: &str, monto: &str, rastreo: &str) -> inbound::Abono {
+    inbound::Abono {
+        identidad: IdentidadSpei::nueva("40012", chrono::Utc::now().date_naive(), rastreo).unwrap(),
+        institucion_receptora: Some("90646".into()),
+        receptor_clabe: clabe.into(),
+        monto: d(monto),
+        nombre_ordenante: Some("ORDENANTE DE PRUEBA".into()),
+        cuenta_ordenante: Some("012180001234567899".into()),
+        rfc_curp_ordenante: None,
+        referencia_numerica: Some(1),
+        concepto: Some("PRUEBA".into()),
+        tipo_pago: Some(1),
+        rastreo_devuelto: None,
+        causa_devolucion: None,
+        id_proveedor: None,
+        raw_payload: serde_json::json!({ "prueba": true }),
+    }
+}
+
+/// Hace vencer el arrendamiento y la espera de todas las órdenes (como dueño
+/// del esquema), para que el siguiente ciclo del despachador las procese.
+pub async fn vencer_ordenes(pool: &PgPool) {
+    sqlx::query("UPDATE ifpe.spei_outbound SET proximo_intento_en = now() - interval '1 second' WHERE estado IN ('PENDIENTE', 'ENVIADA', 'LIQUIDADA')")
+        .execute(pool)
+        .await
+        .unwrap();
+}
+
+/// Retiro (SPEI saliente a cuenta propia).
+pub async fn retirar(
+    pool: &PgPool,
+    cfg: &Config,
+    cliente_id: Uuid,
+    monto: &str,
+    clabe_destino: &str,
+    concepto: Option<&str>,
+    clave_idempotencia: &str,
+) -> AppResult<outbound::ResultadoOrden> {
+    outbound::solicitar(
+        pool,
+        &cfg.pld,
+        &cfg.spei,
+        &outbound::SolicitudSpei {
+            cliente_id,
+            clabe_destino: clabe_destino.into(),
+            beneficiario_nombre: None,
+            beneficiario_rfc_curp: None,
+            monto: d(monto),
+            concepto: concepto.map(Into::into),
+            referencia_numerica: None,
+            clave_idempotencia: clave_idempotencia.into(),
+        },
+    )
+    .await
 }
 
 /// Simula el paso del tiempo para un mutuo: recorre `fecha_inicio` hacia
@@ -201,7 +278,7 @@ pub async fn cuentas_vacias(pool: &PgPool, cfg: &Config, n: usize) {
         .unwrap();
         sqlx::query("INSERT INTO ifpe.cuentas (cliente_id, clabe) VALUES ($1, $2)")
             .bind(cliente)
-            .bind(synthetic_capital::clabe::generar(&cfg.clabe_prefijo))
+            .bind(synthetic_capital::spei::clabe::generar(&cfg.clabe_prefijo).to_string())
             .execute(pool)
             .await
             .unwrap();

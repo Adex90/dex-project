@@ -11,6 +11,10 @@ use sqlx::PgPool;
 use synthetic_capital::{
     ledger::{self, hash},
     models::ifpe::TipoTxIfpe,
+    spei::{
+        inbound::{self, Origen, SiNoAcreditable},
+        IdentidadSpei,
+    },
     AppError,
 };
 
@@ -40,19 +44,7 @@ async fn deposito_transferencia_y_retiro(pool: PgPool) {
     .unwrap();
     assert_eq!(t.transaccion.hash_anterior, dep.transaccion.tx_hash);
 
-    ledger::retirar(
-        &pool,
-        &cfg.pld,
-        &ledger::Retiro {
-            cliente_id: beto.cliente.id,
-            monto: d("50"),
-            clabe_destino: "646180157000000017".into(),
-            concepto: None,
-            clave_idempotencia: clave(),
-        },
-    )
-    .await
-    .unwrap();
+    retirar(&pool, &cfg, beto.cliente.id, "50", "646180157000000017", None, &clave()).await.unwrap();
 
     assert_eq!(saldo_ifpe(&pool, ana.cuenta_ifpe.id).await.0, d("749.5"));
     assert_eq!(saldo_ifpe(&pool, beto.cuenta_ifpe.id).await.0, d("200.5"));
@@ -80,19 +72,7 @@ async fn sobregiro_rechazado_sin_efectos(pool: PgPool) {
     .await
     .unwrap_err();
     assert_eq!(err.codigo(), "SALDO_INSUFICIENTE");
-    let err = ledger::retirar(
-        &pool,
-        &cfg.pld,
-        &ledger::Retiro {
-            cliente_id: ana.cliente.id,
-            monto: d("101"),
-            clabe_destino: "646180157000000017".into(),
-            concepto: None,
-            clave_idempotencia: clave(),
-        },
-    )
-    .await
-    .unwrap_err();
+    let err = retirar(&pool, &cfg, ana.cliente.id, "101", "646180157000000017", None, &clave()).await.unwrap_err();
     assert_eq!(err.codigo(), "SALDO_INSUFICIENTE");
     assert_eq!(saldo_ifpe(&pool, ana.cuenta_ifpe.id).await.0, d("100"));
     let movimientos: i64 =
@@ -213,16 +193,20 @@ async fn concurrencia_cruzada_sin_deadlocks(pool: PgPool) {
         let deposito_cuenta = destino.cuenta_ifpe.id;
         tareas.push(tokio::spawn(async move {
             ledger::transferir(&pool, &cfg.pld, &t).await?;
-            ledger::depositar(
+            let mut tx = synthetic_capital::db::begin_lectura(&pool, synthetic_capital::db::Rol::Ifpe).await?;
+            let clabe: String = sqlx::query_scalar("SELECT clabe FROM ifpe.cuentas WHERE id = $1")
+                .bind(deposito_cuenta)
+                .fetch_one(&mut *tx)
+                .await?;
+            tx.commit().await?;
+            let rastreo = format!("CONC{}", &uuid::Uuid::new_v4().simple().to_string()[..20]);
+            inbound::abonar(
                 &pool,
                 &cfg.pld,
-                &ledger::Deposito {
-                    cuenta_id: deposito_cuenta,
-                    monto: d("1"),
-                    referencia_externa: None,
-                    concepto: None,
-                    clave_idempotencia: clave(),
-                },
+                &cfg.spei,
+                &abono(&clabe, "1", &rastreo),
+                Origen::Webhook,
+                SiNoAcreditable::Rechazar,
             )
             .await
         }));
@@ -264,16 +248,13 @@ async fn kyc_pendiente_no_opera(pool: PgPool) {
         .execute(&pool)
         .await
         .unwrap();
-    let err = ledger::depositar(
+    let err = inbound::abonar(
         &pool,
         &cfg.pld,
-        &ledger::Deposito {
-            cuenta_id: ana.cuenta_ifpe.id,
-            monto: d("10"),
-            referencia_externa: None,
-            concepto: None,
-            clave_idempotencia: clave(),
-        },
+        &cfg.spei,
+        &abono(&ana.cuenta_ifpe.clabe, "10", "KYCPENDIENTE1"),
+        Origen::Webhook,
+        SiNoAcreditable::Rechazar,
     )
     .await
     .unwrap_err();
@@ -314,12 +295,8 @@ async fn verificador_detecta_manipulacion(pool: PgPool) {
     assert_eq!(r.falla.unwrap().secuencia, 1);
 }
 
-fn spei(banco: &str, fecha: &str, rastreo: &str) -> ledger::IdentidadSpei {
-    ledger::IdentidadSpei {
-        banco_emisor: banco.into(),
-        fecha_operacion: fecha.parse().unwrap(),
-        clave_rastreo: rastreo.into(),
-    }
+fn spei(banco: &str, fecha: &str, rastreo: &str) -> Result<IdentidadSpei, synthetic_capital::AppError> {
+    IdentidadSpei::nueva(banco, fecha.parse().unwrap(), rastreo)
 }
 
 /// Hallazgos (rondas 1 y 2): el mismo SPEI no puede acreditarse dos veces, lo
@@ -330,59 +307,68 @@ fn spei(banco: &str, fecha: &str, rastreo: &str) -> ledger::IdentidadSpei {
 async fn spei_identidad_canonica(pool: PgPool) {
     let cfg = preparar(&pool).await;
     let ana = cliente(&pool, &cfg, "Ana").await;
-    let deposito = |id: ledger::IdentidadSpei| {
+    let deposito = |id: IdentidadSpei, monto: &'static str| {
         let pool = pool.clone();
         let pld = cfg.pld.clone();
-        let cuenta = ana.cuenta_ifpe.id;
-        async move { ledger::depositar(&pool, &pld, &ledger::Deposito::spei(cuenta, d("5000"), &id, None)?).await }
+        let spei_cfg = cfg.spei.clone();
+        let mut a = abono(&ana.cuenta_ifpe.clabe, monto, "X");
+        a.identidad = id;
+        async move { inbound::abonar(&pool, &pld, &spei_cfg, &a, Origen::Webhook, SiNoAcreditable::Devolver).await }
     };
-    let primero = deposito(spei("40012", "2026-10-01", "MBAN01002610130000123")).await.unwrap();
-    assert_eq!(primero.transaccion.referencia_externa.as_deref(), Some("40012:20261001:MBAN01002610130000123"));
+    let primero = deposito(spei("40012", "2026-10-01", "MBAN01002610130000123").unwrap(), "5000").await.unwrap();
+    let tx_primero = primero.transaccion.clone().unwrap();
+    assert_eq!(tx_primero.referencia_externa.as_deref(), Some("40012:20261001:MBAN01002610130000123"));
+    assert_eq!(tx_primero.clave_idempotencia, "spei:40012:20261001:MBAN01002610130000123");
+    assert_eq!(primero.spei.transaccion_id, Some(tx_primero.id));
 
     // Mismo pago con otras mayúsculas o espacios: es una repetición, no un crédito nuevo.
     for variante in ["mban01002610130000123", "MBan01002610130000123", " MBAN01002610130000123 "] {
-        let r = deposito(spei("40012", "2026-10-01", variante)).await.unwrap();
+        let r = deposito(spei("40012", "2026-10-01", variante).unwrap(), "5000").await.unwrap();
         assert!(r.idempotente, "{variante}");
-        assert_eq!(r.transaccion.id, primero.transaccion.id);
+        assert_eq!(r.transaccion.unwrap().id, tx_primero.id);
     }
     // Misma clave de rastreo, otro emisor u otro día: pagos distintos.
-    assert!(!deposito(spei("40014", "2026-10-01", "MBAN01002610130000123")).await.unwrap().idempotente);
-    assert!(!deposito(spei("40012", "2026-09-01", "MBAN01002610130000123")).await.unwrap().idempotente);
+    assert!(
+        !deposito(spei("40014", "2026-10-01", "MBAN01002610130000123").unwrap(), "5000").await.unwrap().idempotente
+    );
+    assert!(
+        !deposito(spei("40012", "2026-09-01", "MBAN01002610130000123").unwrap(), "5000").await.unwrap().idempotente
+    );
     assert_eq!(saldo_ifpe(&pool, ana.cuenta_ifpe.id).await.0, d("15000"));
 
-    // El índice único respalda la regla aunque se use otra clave de idempotencia `spei:`.
-    let mut otra_via = ledger::Deposito::spei(
-        ana.cuenta_ifpe.id,
-        d("5000"),
-        &spei("40012", "2026-10-01", "MBAN01002610130000123"),
-        None,
-    )
-    .unwrap();
-    otra_via.clave_idempotencia = "spei:otra-forma-de-escribirla".into();
-    let e = ledger::depositar(&pool, &cfg.pld, &otra_via).await.unwrap_err();
-    assert_eq!(e.codigo(), "SPEI_DUPLICADO");
-
     // Misma identidad con otro monto: conflicto, no se descarta en silencio.
-    let e = ledger::depositar(
-        &pool,
-        &cfg.pld,
-        &ledger::Deposito::spei(
-            ana.cuenta_ifpe.id,
-            d("4999"),
-            &spei("40012", "2026-10-01", "MBAN01002610130000123"),
-            None,
-        )
-        .unwrap(),
-    )
-    .await
-    .unwrap_err();
-    assert_eq!(e.codigo(), "CLAVE_IDEMPOTENCIA_REUTILIZADA");
+    let e = deposito(spei("40012", "2026-10-01", "MBAN01002610130000123").unwrap(), "4999").await.unwrap_err();
+    assert_eq!(e.codigo(), "SPEI_IDENTIDAD_REUTILIZADA");
 
-    assert!(
-        ledger::Deposito::spei(ana.cuenta_ifpe.id, d("1"), &spei("40012", "2026-10-01", "con espacios"), None).is_err()
-    );
-    assert!(ledger::Deposito::spei(ana.cuenta_ifpe.id, d("1"), &spei("4X", "2026-10-01", "ABC"), None).is_err());
-    assert!(ledger::Deposito::spei(ana.cuenta_ifpe.id, d("1"), &spei("40012", "2999-01-01", "ABC"), None).is_err());
+    // Ningún efectivo entra al ledger sin su registro SPEI, aunque cuadre la reserva.
+    for clave in ["spei:40012:20261002:OTRAVIA", "ventanilla:1", "SPEI:40012:20261001:MBAN01002610130000123"] {
+        let mut tx = pool.begin().await.unwrap();
+        sqlx::query("UPDATE ifpe.cuentas SET saldo_disponible = saldo_disponible + 5000 WHERE id = $1")
+            .bind(ana.cuenta_ifpe.id)
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE ifpe.reserva_custodia SET saldo = saldo + 5000 WHERE activa")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO ifpe.transacciones (tipo, cuenta_destino_id, reserva_id, monto, clave_idempotencia) \
+             SELECT 'DEPOSITO', $1, id, 5000, $2 FROM ifpe.reserva_custodia WHERE activa",
+        )
+        .bind(ana.cuenta_ifpe.id)
+        .bind(clave)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        let e = tx.commit().await.unwrap_err().to_string();
+        assert!(e.contains("SC_SPEI_SIN_REGISTRO"), "{clave}: {e}");
+    }
+
+    assert!(spei("40012", "2026-10-01", "con espacios").is_err());
+    assert!(spei("4X", "2026-10-01", "ABC").is_err());
+    assert!(spei("012", "2026-10-01", "ABC").is_err(), "3 dígitos es el banco de la CLABE, no el participante");
+    assert!(spei("40012", "2999-01-01", "ABC").is_err());
     assert_eq!(saldo_ifpe(&pool, ana.cuenta_ifpe.id).await.0, d("15000"));
     verificar_invariantes(&pool).await;
 }
@@ -394,18 +380,16 @@ async fn repeticion_con_otros_datos_es_conflicto(pool: PgPool) {
     let cfg = preparar(&pool).await;
     let ana = cliente(&pool, &cfg, "Ana").await;
     depositar(&pool, &cfg, ana.cuenta_ifpe.id, "1000").await;
-    let retiro = |clabe: &str, concepto: Option<&str>| ledger::Retiro {
-        cliente_id: ana.cliente.id,
-        monto: d("100"),
-        clabe_destino: clabe.into(),
-        concepto: concepto.map(Into::into),
-        clave_idempotencia: "cli:ana:retiro-1".into(),
+    let retiro = |clabe: &'static str, concepto: Option<&'static str>| {
+        let (pool, cfg) = (pool.clone(), cfg.clone());
+        let cliente = ana.cliente.id;
+        async move { retirar(&pool, &cfg, cliente, "100", clabe, concepto, "cli:ana:retiro-1").await }
     };
-    ledger::retirar(&pool, &cfg.pld, &retiro("646180157000000017", None)).await.unwrap();
-    assert!(ledger::retirar(&pool, &cfg.pld, &retiro("646180157000000017", None)).await.unwrap().idempotente);
-    let e = ledger::retirar(&pool, &cfg.pld, &retiro("646180157000000020", None)).await.unwrap_err();
+    retiro("646180157000000017", None).await.unwrap();
+    assert!(retiro("646180157000000017", None).await.unwrap().idempotente);
+    let e = retiro("646180157000000020", None).await.unwrap_err();
     assert_eq!(e.codigo(), "CLAVE_IDEMPOTENCIA_REUTILIZADA", "otra CLABE destino");
-    let e = ledger::retirar(&pool, &cfg.pld, &retiro("646180157000000017", Some("otro concepto"))).await.unwrap_err();
+    let e = retiro("646180157000000017", Some("otro concepto")).await.unwrap_err();
     assert_eq!(e.codigo(), "CLAVE_IDEMPOTENCIA_REUTILIZADA", "otro concepto");
     assert_eq!(saldo_ifpe(&pool, ana.cuenta_ifpe.id).await.0, d("900"));
 }
