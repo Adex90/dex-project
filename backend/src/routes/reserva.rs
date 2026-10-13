@@ -1,8 +1,8 @@
 use axum::{
-    extract::{Path, Query, State},
+    extract::State,
     http::StatusCode,
     routing::{get, post},
-    Json, Router,
+    Router,
 };
 
 use chrono::{DateTime, Utc};
@@ -15,6 +15,7 @@ use crate::{
     ledger::hash::{self, ResultadoVerificacion},
     models::ifpe::CorteReserva,
     reserva::{self, EstadoReservaVista, PruebaReserva, ResultadoVerificacionPrueba, SolicitudVerificacion},
+    routes::extraccion::{Json, Path, Query},
     state::AppState,
 };
 

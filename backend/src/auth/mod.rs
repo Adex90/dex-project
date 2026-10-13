@@ -162,74 +162,79 @@ struct FilaLogin {
     cliente_id: Uuid,
     estatus_kyc: EstatusKyc,
     en_lista_bloqueadas: bool,
-    password_hash: String,
-    bloqueado_hasta: Option<DateTime<Utc>>,
 }
 
-/// Inicio de sesión en tres pasos para no retener una conexión del pool (ni
-/// un lock de fila) durante el cómputo de Argon2:
-/// 1. lectura corta de las credenciales;
-/// 2. verificación Argon2 sin conexión (con tope de concurrencia);
-/// 3. registro atómico del resultado (conteo de fallos / bloqueo temporal).
+/// Inicio de sesión sin retener una conexión del pool (ni un lock de fila)
+/// durante el cómputo de Argon2:
+///
+/// 1. **Reserva del intento** (una sentencia atómica): cuenta el intento como
+///    fallido *antes* de verificar y, al llegar a `MAX_INTENTOS`, bloquea la
+///    cuenta. Si ya está bloqueada no devuelve fila y no se calcula ningún
+///    hash. Así, una ráfaga de N contraseñas en paralelo solo verifica
+///    `MAX_INTENTOS`; las demás reciben `BLOQUEADO` sin importar si eran
+///    correctas, y la respuesta no revela nada.
+/// 2. Verificación Argon2 sin conexión (con tope de concurrencia).
+/// 3. Si la contraseña es correcta, se reinicia el contador (también si la
+///    propia reserva acababa de bloquear la cuenta: el intento estaba dentro
+///    del cupo).
 pub async fn iniciar_sesion(estado: &AppState, email: &str, password_plano: &str) -> AppResult<Sesion> {
     let invalidas = || AppError::CredencialesInvalidas("email o contraseña incorrectos".into());
     let bloqueada =
         || AppError::Bloqueado("demasiados intentos fallidos; la cuenta está bloqueada temporalmente".into());
     let pool: &PgPool = &estado.pool;
 
-    let mut tx = db::begin_lectura(pool, Rol::Kyc).await?;
-    let fila: Option<FilaLogin> = sqlx::query_as(
-        "SELECT c.id AS cliente_id, c.estatus_kyc, c.en_lista_bloqueadas, cr.password_hash, cr.bloqueado_hasta \
-         FROM kyc.clientes c JOIN kyc.credenciales cr ON cr.cliente_id = c.id \
-         WHERE lower(c.email) = lower($1)",
-    )
-    .bind(email.trim())
-    .fetch_optional(&mut *tx)
-    .await?;
-    tx.commit().await?;
-
-    let Some(fila) = fila else {
+    let mut tx = db::begin(pool, Rol::Kyc).await?;
+    let cliente: Option<Uuid> = sqlx::query_scalar("SELECT id FROM kyc.clientes WHERE lower(email) = lower($1)")
+        .bind(email.trim())
+        .fetch_optional(&mut *tx)
+        .await?;
+    let Some(cliente_id) = cliente else {
+        tx.commit().await?;
         // Mismo costo que una verificación real: no revela qué emails existen.
         password::verificar_simulado(password_plano.to_owned()).await;
         return Err(invalidas());
     };
-    if fila.bloqueado_hasta.is_some_and(|hasta| hasta > Utc::now()) {
-        return Err(bloqueada());
-    }
-
-    let correcta = password::verificar(password_plano.to_owned(), fila.password_hash.clone()).await?;
-
-    let mut tx = db::begin(pool, Rol::Kyc).await?;
-    if !correcta {
-        // Incremento atómico: intentos concurrentes no se pierden.
-        sqlx::query(
-            "UPDATE kyc.credenciales SET \
-               intentos_fallidos = CASE WHEN intentos_fallidos + 1 >= $2 THEN 0 ELSE intentos_fallidos + 1 END, \
-               bloqueado_hasta = CASE WHEN intentos_fallidos + 1 >= $2 \
-                                      THEN now() + make_interval(mins => $3) ELSE bloqueado_hasta END \
-             WHERE cliente_id = $1 AND (bloqueado_hasta IS NULL OR bloqueado_hasta <= now())",
-        )
-        .bind(fila.cliente_id)
-        .bind(MAX_INTENTOS)
-        .bind(MINUTOS_BLOQUEO as i32)
-        .execute(&mut *tx)
-        .await?;
-        tx.commit().await?;
-        return Err(invalidas());
-    }
-    if fila.en_lista_bloqueadas || fila.estatus_kyc == EstatusKyc::Rechazado {
-        return Err(AppError::Prohibido);
-    }
-    // Si otra petición bloqueó la cuenta mientras se verificaba, no se abre sesión.
-    let rol: Option<RolUsuario> = sqlx::query_scalar(
-        "UPDATE kyc.credenciales SET intentos_fallidos = 0, bloqueado_hasta = NULL, ultimo_acceso = now() \
-         WHERE cliente_id = $1 AND (bloqueado_hasta IS NULL OR bloqueado_hasta <= now()) RETURNING rol",
+    // Una ventana de bloqueo vencida empieza de nuevo en 1.
+    let reservado: Option<String> = sqlx::query_scalar(
+        "UPDATE kyc.credenciales SET \
+           intentos_fallidos = CASE WHEN bloqueado_hasta IS NULL THEN intentos_fallidos + 1 ELSE 1 END, \
+           bloqueado_hasta = CASE WHEN (CASE WHEN bloqueado_hasta IS NULL THEN intentos_fallidos + 1 ELSE 1 END) >= $2 \
+                                  THEN now() + make_interval(mins => $3) ELSE NULL END \
+         WHERE cliente_id = $1 AND (bloqueado_hasta IS NULL OR bloqueado_hasta <= now()) \
+         RETURNING password_hash",
     )
-    .bind(fila.cliente_id)
+    .bind(cliente_id)
+    .bind(MAX_INTENTOS)
+    .bind(MINUTOS_BLOQUEO as i32)
     .fetch_optional(&mut *tx)
     .await?;
     tx.commit().await?;
-    let rol = rol.ok_or_else(bloqueada)?;
+    let Some(password_hash) = reservado else { return Err(bloqueada()) };
+
+    if !password::verificar(password_plano.to_owned(), password_hash).await? {
+        // El intento ya quedó contado en la reserva.
+        return Err(invalidas());
+    }
+
+    let mut tx = db::begin(pool, Rol::Kyc).await?;
+    let fila: FilaLogin = sqlx::query_as(
+        "SELECT c.id AS cliente_id, c.estatus_kyc, c.en_lista_bloqueadas FROM kyc.clientes c WHERE c.id = $1",
+    )
+    .bind(cliente_id)
+    .fetch_one(&mut *tx)
+    .await?;
+    if fila.en_lista_bloqueadas || fila.estatus_kyc == EstatusKyc::Rechazado {
+        tx.commit().await?;
+        return Err(AppError::Prohibido);
+    }
+    let rol: RolUsuario = sqlx::query_scalar(
+        "UPDATE kyc.credenciales SET intentos_fallidos = 0, bloqueado_hasta = NULL, ultimo_acceso = now() \
+         WHERE cliente_id = $1 RETURNING rol",
+    )
+    .bind(fila.cliente_id)
+    .fetch_one(&mut *tx)
+    .await?;
+    tx.commit().await?;
     let (token, expira_en) = estado.jwt.emitir(fila.cliente_id, rol)?;
     Ok(Sesion { token, expira_en, cliente_id: fila.cliente_id, rol })
 }

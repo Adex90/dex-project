@@ -7,7 +7,11 @@ use rust_decimal::Decimal;
 
 #[derive(Debug, Clone)]
 pub struct Config {
+    /// Usuario con el que corre la aplicación. En producción, un login sin
+    /// privilegios propios, miembro de los roles `sc_*`.
     pub database_url: String,
+    /// Dueño del esquema: migraciones y arranque. Si falta, se usa `database_url`.
+    pub database_url_propietario: Option<String>,
     pub max_conexiones: u32,
     pub bind_addr: SocketAddr,
     pub jwt_secret: String,
@@ -33,6 +37,30 @@ pub struct Config {
     pub caja_cuenta: String,
     pub operador_email: Option<String>,
     pub operador_password: Option<String>,
+    pub http: LimitesHttp,
+}
+
+/// Límites del servidor HTTP. Sin ellos, conexiones ociosas o lentas agotan
+/// los descriptores de archivo y un cliente lento retiene el apagado.
+#[derive(Debug, Clone)]
+pub struct LimitesHttp {
+    /// Tiempo máximo para recibir las cabeceras de una petición (también entre
+    /// peticiones de una conexión keep-alive ociosa).
+    pub cabeceras_seg: u64,
+    /// Tiempo máximo para recibir el cuerpo de una petición (408).
+    pub cuerpo_seg: u64,
+    /// Tiempo máximo de una petición completa, incluido el handler.
+    pub peticion_seg: u64,
+    /// Conexiones TCP simultáneas; al llegar al tope se deja de aceptar.
+    pub max_conexiones: usize,
+    /// Plazo para terminar las peticiones en curso al apagar.
+    pub apagado_seg: u64,
+}
+
+impl Default for LimitesHttp {
+    fn default() -> Self {
+        Self { cabeceras_seg: 10, cuerpo_seg: 15, peticion_seg: 30, max_conexiones: 512, apagado_seg: 20 }
+    }
 }
 
 /// Umbrales del monitoreo transaccional PLD/FT (MXN).
@@ -100,6 +128,7 @@ impl Config {
         let defecto = UmbralesPld::default();
         Ok(Self {
             database_url: var("DATABASE_URL").context("DATABASE_URL es obligatoria")?,
+            database_url_propietario: var("DATABASE_URL_PROPIETARIO"),
             max_conexiones: var_o("DB_MAX_CONEXIONES", 20)?,
             bind_addr: var_o("BIND_ADDR", SocketAddr::from(([0, 0, 0, 0], 8080)))?,
             jwt_secret,
@@ -122,6 +151,16 @@ impl Config {
             caja_cuenta: var("CAJA_CUENTA").unwrap_or_else(|| "SC-SOFOM-CAJA-001".into()),
             operador_email: var("BOOTSTRAP_OPERADOR_EMAIL"),
             operador_password: var("BOOTSTRAP_OPERADOR_PASSWORD"),
+            http: {
+                let d = LimitesHttp::default();
+                LimitesHttp {
+                    cabeceras_seg: var_o("HTTP_CABECERAS_SEG", d.cabeceras_seg)?.max(1),
+                    cuerpo_seg: var_o("HTTP_CUERPO_SEG", d.cuerpo_seg)?.max(1),
+                    peticion_seg: var_o("HTTP_PETICION_SEG", d.peticion_seg)?.max(1),
+                    max_conexiones: var_o("HTTP_MAX_CONEXIONES", d.max_conexiones)?.max(1),
+                    apagado_seg: var_o("HTTP_APAGADO_SEG", d.apagado_seg)?,
+                }
+            },
         })
     }
 
@@ -129,6 +168,7 @@ impl Config {
     pub fn para_pruebas(database_url: impl Into<String>) -> Self {
         Self {
             database_url: database_url.into(),
+            database_url_propietario: None,
             max_conexiones: 10,
             bind_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
             jwt_secret: "secreto-de-pruebas-con-al-menos-32-caracteres".into(),
@@ -147,6 +187,7 @@ impl Config {
             caja_cuenta: "SC-SOFOM-CAJA-001".into(),
             operador_email: None,
             operador_password: None,
+            http: LimitesHttp::default(),
         }
     }
 }

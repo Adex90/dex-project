@@ -2,7 +2,7 @@ use axum::{
     extract::State,
     http::StatusCode,
     routing::{get, post},
-    Json, Router,
+    Router,
 };
 use serde::{Deserialize, Serialize};
 
@@ -13,6 +13,7 @@ use crate::{
     ledger,
     models::{ifpe::CuentaIfpe, kyc::Cliente},
     reserva::{self, EstadoReservaVista},
+    routes::extraccion::Json,
     sofom::{self, Posicion},
     state::AppState,
 };

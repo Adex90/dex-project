@@ -89,3 +89,36 @@ fn solo_db_abre_transacciones() {
     recorrer(&Path::new(env!("CARGO_MANIFEST_DIR")).join("src"), &mut hallazgos);
     assert!(hallazgos.is_empty(), "abren transacciones sin rol: {hallazgos:?}");
 }
+
+/// Con `DATABASE_URL_PROPIETARIO`, la aplicación corre con un login que no es
+/// dueño del esquema: opera normalmente a través de los roles sc_*, pero no
+/// puede desactivar triggers ni escribir saldos por fuera de ellos.
+#[sqlx::test(migrations = "../migrations")]
+async fn usuario_sin_privilegios_opera_pero_no_altera(pool: PgPool) {
+    use sqlx::{postgres::PgPoolOptions, Executor};
+    let cfg = preparar(&pool).await;
+    let ana = cliente(&pool, &cfg, "Ana").await;
+
+    let login = format!("sc_app_{}", &uuid::Uuid::new_v4().simple().to_string()[..12]);
+    pool.execute(format!("CREATE ROLE {login} LOGIN PASSWORD 'clave-de-prueba' NOINHERIT").as_str()).await.unwrap();
+    pool.execute(format!("GRANT sc_ifpe, sc_sofom, sc_puente, sc_auditor, sc_kyc TO {login}").as_str()).await.unwrap();
+    let opciones = pool.connect_options().as_ref().clone().username(&login).password("clave-de-prueba");
+    let app = PgPoolOptions::new().max_connections(2).connect_with(opciones).await.unwrap();
+
+    db::verificar_usuario_de_aplicacion(&app).await.unwrap();
+    depositar(&app, &cfg, ana.cuenta_ifpe.id, "100").await;
+    synthetic_capital::reserva::generar_corte(&app).await.unwrap();
+    assert!(synthetic_capital::ledger::hash::verificar_cadena_ifpe(&app).await.unwrap().valido);
+
+    for sql in [
+        "ALTER TABLE ifpe.transacciones DISABLE TRIGGER trg_ifpe_tx_inmutable",
+        "ALTER TABLE ifpe.cuentas DISABLE TRIGGER trg_ifpe_cuentas_saldo_ledger",
+        "UPDATE ifpe.cuentas SET saldo_disponible = saldo_disponible + 1",
+        "UPDATE ifpe.saldos_ledger SET disponible = disponible + 1",
+    ] {
+        let e = app.execute(sql).await.unwrap_err().to_string();
+        assert!(e.contains("must be owner") || e.contains("permission denied"), "{sql}: {e}");
+    }
+    app.close().await;
+    pool.execute(format!("DROP ROLE {login}").as_str()).await.unwrap();
+}

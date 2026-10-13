@@ -14,6 +14,7 @@ use crate::{
     auth::password,
     clabe,
     db::{self, Rol},
+    dinero,
     error::{AppError, AppResult},
     models::kyc::{AlertaPld, Cliente, EstatusKyc, NivelRiesgo, TipoPersona},
 };
@@ -58,6 +59,50 @@ fn exigir_longitud(campo: &str, v: Option<&str>, max: usize) -> AppResult<()> {
     Ok(())
 }
 
+/// Mismas reglas que los CHECK de `kyc.clientes`. Se validan antes de
+/// calcular Argon2: una entrada inválida responde 400 sin costo de CPU (antes
+/// llegaba a la base de datos y respondía 500).
+fn rfc_valido(rfc: &str) -> bool {
+    // ^[A-ZÑ&]{3,4}[0-9]{6}[A-Z0-9]{3}$
+    let c: Vec<char> = rfc.chars().collect();
+    let letras = match c.len() {
+        12 => 3,
+        13 => 4,
+        _ => return false,
+    };
+    let (prefijo, resto) = c.split_at(letras);
+    prefijo.iter().all(|ch| ch.is_ascii_uppercase() || *ch == 'Ñ' || *ch == '&')
+        && resto[..6].iter().all(char::is_ascii_digit)
+        && resto[6..].iter().all(|ch| ch.is_ascii_uppercase() || ch.is_ascii_digit())
+}
+
+fn curp_valida(curp: &str) -> bool {
+    // ^[A-Z]{4}[0-9]{6}[HMX][A-Z]{5}[A-Z0-9][0-9]$
+    let b = curp.as_bytes();
+    b.len() == 18
+        && b[..4].iter().all(u8::is_ascii_uppercase)
+        && b[4..10].iter().all(u8::is_ascii_digit)
+        && matches!(b[10], b'H' | b'M' | b'X')
+        && b[11..16].iter().all(u8::is_ascii_uppercase)
+        && (b[16].is_ascii_uppercase() || b[16].is_ascii_digit())
+        && b[17].is_ascii_digit()
+}
+
+fn email_valido(email: &str) -> bool {
+    // ^[^@\s]+@[^@\s]+\.[^@\s]+$
+    let Some((local, dominio)) = email.split_once('@') else { return false };
+    let sin_espacios = |s: &str| !s.is_empty() && !s.contains('@') && !s.chars().any(char::is_whitespace);
+    sin_espacios(local)
+        && sin_espacios(dominio)
+        && dominio.char_indices().any(|(i, ch)| ch == '.' && i > 0 && i + 1 < dominio.len())
+}
+
+fn telefono_valido(t: &str) -> bool {
+    // ^\+?[0-9]{10,15}$
+    let digitos = t.strip_prefix('+').unwrap_or(t);
+    (10..=15).contains(&digitos.len()) && digitos.bytes().all(|b| b.is_ascii_digit())
+}
+
 /// Alta de cliente + credenciales + cuenta IFPE. En modo demo el KYC queda
 /// verificado al instante (riesgo BAJO) para poder operar de inmediato.
 pub async fn registrar(pool: &PgPool, clabe_prefijo: &str, modo_demo: bool, d: DatosRegistro) -> AppResult<Registro> {
@@ -66,7 +111,7 @@ pub async fn registrar(pool: &PgPool, clabe_prefijo: &str, modo_demo: bool, d: D
         return Err(AppError::validacion("el nombre es obligatorio"));
     }
     let email = d.email.trim().to_lowercase();
-    if email.len() > 254 || !email.contains('@') || email.starts_with('@') || email.ends_with('@') {
+    if email.len() > 254 || !email_valido(&email) {
         return Err(AppError::validacion("email inválido"));
     }
     password::validar_politica(&d.password)?;
@@ -90,8 +135,22 @@ pub async fn registrar(pool: &PgPool, clabe_prefijo: &str, modo_demo: bool, d: D
     if d.tipo_persona == TipoPersona::Moral && curp.is_some() {
         return Err(AppError::validacion("una persona moral no tiene CURP"));
     }
-    if d.ingreso_mensual_estimado.is_some_and(|i| i < Decimal::ZERO) {
-        return Err(AppError::validacion("ingreso_mensual_estimado no puede ser negativo"));
+    if rfc.as_deref().is_some_and(|r| !rfc_valido(r)) {
+        return Err(AppError::validacion("RFC inválido (12 o 13 caracteres: letras, fecha AAMMDD y homoclave)"));
+    }
+    if curp.as_deref().is_some_and(|c| !curp_valida(c)) {
+        return Err(AppError::validacion("CURP inválida (18 caracteres)"));
+    }
+    if telefono.as_deref().is_some_and(|t| !telefono_valido(t)) {
+        return Err(AppError::validacion("teléfono inválido (10 a 15 dígitos, con + opcional)"));
+    }
+    if let Some(ingreso) = d.ingreso_mensual_estimado {
+        if ingreso < Decimal::ZERO {
+            return Err(AppError::validacion("ingreso_mensual_estimado no puede ser negativo"));
+        }
+        if ingreso > dinero::maximo() || ingreso.normalize().scale() > dinero::ESCALA {
+            return Err(AppError::validacion("ingreso_mensual_estimado fuera de rango"));
+        }
     }
     let hash = password::hashear(d.password).await?;
 
@@ -211,4 +270,26 @@ pub async fn alertas_abiertas(pool: &PgPool, limite: i64) -> AppResult<Vec<Alert
     .await?;
     tx.commit().await?;
     Ok(alertas)
+}
+
+#[cfg(test)]
+mod pruebas {
+    use super::*;
+
+    #[test]
+    fn identidades_como_los_check_de_la_base() {
+        assert!(rfc_valido("GODE561231GR8"));
+        assert!(rfc_valido("ÑAB0101019Z1"));
+        assert!(!rfc_valido("ABCDEFGHIJKLMNOPQ"));
+        assert!(!rfc_valido("GODE5612311GR8"));
+        assert!(curp_valida("GODE561231HDFRRN09"));
+        assert!(!curp_valida("GODE561231HDFRRN09XXXXX"));
+        assert!(!curp_valida("GODE561231ZDFRRN09"));
+        assert!(email_valido("ana@banco.mx"));
+        assert!(!email_valido("ana@banco"));
+        assert!(!email_valido("ana @banco.mx"));
+        assert!(!email_valido("ana@.mx"));
+        assert!(telefono_valido("+525512345678"));
+        assert!(!telefono_valido("12345"));
+    }
 }

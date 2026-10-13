@@ -32,21 +32,30 @@
 //! | POST | `/api/v1/operaciones/capital` | operador |
 
 mod auth;
+mod extraccion;
 mod ifpe;
 mod operaciones;
 mod reserva;
 mod sofom;
 
+use std::time::Duration;
+
 use axum::{
-    extract::State,
+    extract::{DefaultBodyLimit, Request, State},
     http::{header, HeaderValue, Method, StatusCode},
+    middleware::{self, Next},
+    response::{IntoResponse, Response},
     routing::get,
     Json, Router,
 };
 use serde_json::json;
-use tower_http::{cors::CorsLayer, trace::TraceLayer};
+use tower_http::{cors::CorsLayer, timeout::RequestBodyTimeoutLayer, trace::TraceLayer};
 
-use crate::state::AppState;
+use crate::{error::AppError, state::AppState};
+
+/// Ninguna petición legítima se acerca a esto (una prueba de inclusión con
+/// 64 niveles ocupa unos 10 KB).
+const MAX_CUERPO: usize = 64 * 1024;
 
 pub fn router(estado: AppState) -> Router {
     let cors = match estado.config.frontend_origin.parse::<HeaderValue>() {
@@ -64,12 +73,47 @@ pub fn router(estado: AppState) -> Router {
         .merge(reserva::rutas())
         .merge(operaciones::rutas());
 
+    let limites = &estado.config.http;
+    let peticion = Duration::from_secs(limites.peticion_seg);
+    let cuerpo = Duration::from_secs(limites.cuerpo_seg);
     Router::new()
         .route("/salud", get(salud))
         .nest("/api/v1", api)
+        .fallback(ruta_inexistente)
+        .method_not_allowed_fallback(metodo_no_permitido)
+        .layer(DefaultBodyLimit::max(MAX_CUERPO))
+        .layer(RequestBodyTimeoutLayer::new(cuerpo))
+        .layer(middleware::from_fn_with_state(peticion, tiempo_maximo))
         .layer(TraceLayer::new_for_http())
         .layer(cors)
         .with_state(estado)
+}
+
+async fn ruta_inexistente() -> AppError {
+    AppError::peticion(StatusCode::NOT_FOUND, "RUTA_INEXISTENTE", "la ruta no existe")
+}
+
+async fn metodo_no_permitido() -> AppError {
+    AppError::peticion(StatusCode::METHOD_NOT_ALLOWED, "METODO_NO_PERMITIDO", "método no permitido en esta ruta")
+}
+
+/// Tope de tiempo por petición completa (cuerpo + handler). Al vencer se
+/// abandona el handler: la transacción en curso se revierte al soltar la
+/// conexión.
+async fn tiempo_maximo(State(limite): State<Duration>, peticion: Request, siguiente: Next) -> Response {
+    let ruta = peticion.uri().path().to_owned();
+    match tokio::time::timeout(limite, siguiente.run(peticion)).await {
+        Ok(respuesta) => respuesta,
+        Err(_) => {
+            tracing::warn!(%ruta, segundos = limite.as_secs(), "petición abandonada por tiempo máximo");
+            AppError::peticion(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "TIEMPO_AGOTADO",
+                "la operación tardó demasiado; reintenta con la misma clave de idempotencia",
+            )
+            .into_response()
+        }
+    }
 }
 
 async fn salud(State(e): State<AppState>) -> (StatusCode, Json<serde_json::Value>) {

@@ -17,7 +17,7 @@ pub fn lanzar(estado: AppState) {
             loop {
                 intervalo.tick().await;
                 if let Err(err) = corte_si_hay_cambios(&e).await {
-                    tracing::error!(error = %err, "falló el corte automático de reserva");
+                    tracing::error!(codigo = err.codigo(), error = %err.detalle(), "falló el corte automático de reserva");
                 }
             }
         });
@@ -53,7 +53,7 @@ async fn liquidaciones(e: &AppState) {
     match sofom::credito::marcar_creditos_vencidos(&e.pool).await {
         Ok(n) if n > 0 => tracing::warn!(n, "créditos marcados como vencidos"),
         Ok(_) => {}
-        Err(err) => tracing::error!(error = %err, "no se pudieron marcar créditos vencidos"),
+        Err(err) => tracing::error!(error = %err.detalle(), "no se pudieron marcar créditos vencidos"),
     }
     match sofom::puente::contratos_bloqueados_por_cartera(&e.pool).await {
         Ok(bloqueados) => {
@@ -61,18 +61,18 @@ async fn liquidaciones(e: &AppState) {
                 tracing::warn!(folio, %comprometido, "mutuo vencido bloqueado por cartera vencida: requiere cobranza o castigo");
             }
         }
-        Err(err) => tracing::error!(error = %err, "no se pudieron listar mutuos bloqueados"),
+        Err(err) => tracing::error!(error = %err.detalle(), "no se pudieron listar mutuos bloqueados"),
     }
     let pendientes = match sofom::puente::contratos_por_liquidar(&e.pool, 500).await {
         Ok(ids) => ids,
         Err(err) => {
-            tracing::error!(error = %err, "no se pudieron listar mutuos vencidos");
+            tracing::error!(error = %err.detalle(), "no se pudieron listar mutuos vencidos");
             return;
         }
     };
     for id in pendientes {
         if let Err(err) = sofom::puente::liquidar(&e.pool, id, None).await {
-            tracing::error!(contrato = %id, codigo = err.codigo(), error = %err, "no se pudo liquidar el mutuo");
+            tracing::error!(contrato = %id, codigo = err.codigo(), error = %err.detalle(), "no se pudo liquidar el mutuo");
         }
     }
 }

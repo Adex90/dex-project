@@ -26,6 +26,7 @@ pub mod models;
 pub mod pld;
 pub mod reserva;
 pub mod routes;
+pub mod servidor;
 pub mod sofom;
 pub mod state;
 pub mod tareas;

@@ -1,8 +1,8 @@
 use axum::{
-    extract::{Path, State},
+    extract::State,
     http::StatusCode,
     routing::{get, post},
-    Json, Router,
+    Router,
 };
 use rust_decimal::Decimal;
 use serde::Deserialize;
@@ -13,6 +13,7 @@ use crate::{
     auth::Usuario,
     error::{AppError, AppResult},
     models::kyc::RolUsuario,
+    routes::extraccion::{Json, Path},
     sofom::{
         self,
         puente::{self, ResultadoLiquidacion, ResultadoMutuo, TerminosMutuo},

@@ -114,8 +114,49 @@ pub async fn begin_administrativa(pool: &PgPool) -> Result<Tx, sqlx::Error> {
 /// Pool con límites de seguridad por conexión: ninguna transacción puede
 /// quedarse esperando un lock o abierta indefinidamente.
 pub async fn crear_pool(cfg: &Config) -> Result<PgPool, sqlx::Error> {
+    crear_pool_con(&cfg.database_url, cfg.max_conexiones).await
+}
+
+/// Pool del dueño del esquema (`DATABASE_URL_PROPIETARIO`), solo para
+/// migraciones y arranque.
+pub async fn crear_pool_propietario(url: &str) -> Result<PgPool, sqlx::Error> {
+    crear_pool_con(url, 2).await
+}
+
+/// Comprueba con qué privilegios corre la aplicación. Si el usuario de
+/// `DATABASE_URL` es dueño del esquema (o superusuario) puede desactivar
+/// triggers y saltarse los permisos por rol: la integridad depende entonces
+/// solo de la detección (anclas, auditoría), no de la prevención.
+pub async fn verificar_usuario_de_aplicacion(pool: &PgPool) -> Result<(), sqlx::Error> {
+    let (usuario, superusuario, dueno, miembro): (String, bool, bool, bool) = sqlx::query_as(
+        "SELECT current_user::text, \
+                (SELECT rolsuper FROM pg_roles WHERE rolname = current_user), \
+                EXISTS (SELECT 1 FROM pg_namespace WHERE nspname IN ('ifpe', 'sofom', 'kyc', 'nucleo') \
+                         AND pg_has_role(current_user, nspowner, 'USAGE')), \
+                pg_has_role(current_user, 'sc_ifpe', 'MEMBER') AND pg_has_role(current_user, 'sc_sofom', 'MEMBER') \
+                AND pg_has_role(current_user, 'sc_puente', 'MEMBER') AND pg_has_role(current_user, 'sc_auditor', 'MEMBER') \
+                AND pg_has_role(current_user, 'sc_kyc', 'MEMBER')",
+    )
+    .fetch_one(pool)
+    .await?;
+    if !miembro {
+        tracing::error!(%usuario, "el usuario de la aplicación no es miembro de sc_ifpe, sc_sofom, sc_puente, sc_auditor y sc_kyc");
+    }
+    if superusuario || dueno {
+        tracing::warn!(
+            %usuario,
+            "la aplicación corre como dueño del esquema: puede desactivar triggers. En producción usa \
+             DATABASE_URL_PROPIETARIO para migrar y un usuario sin privilegios en DATABASE_URL (ver README)"
+        );
+    } else {
+        tracing::info!(%usuario, "la aplicación corre sin privilegios de dueño: solo puede actuar mediante los roles sc_*");
+    }
+    Ok(())
+}
+
+async fn crear_pool_con(url: &str, max_conexiones: u32) -> Result<PgPool, sqlx::Error> {
     PgPoolOptions::new()
-        .max_connections(cfg.max_conexiones)
+        .max_connections(max_conexiones)
         .acquire_timeout(Duration::from_secs(10))
         .after_connect(|conn, _meta| {
             Box::pin(async move {
@@ -130,7 +171,7 @@ pub async fn crear_pool(cfg: &Config) -> Result<PgPool, sqlx::Error> {
                 Ok(())
             })
         })
-        .connect(&cfg.database_url)
+        .connect(url)
         .await
 }
 

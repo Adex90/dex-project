@@ -1,10 +1,10 @@
 //! Rutas de operador: SPEI entrante, retenciones, KYC, PLD y crédito.
 
 use axum::{
-    extract::{Path, Query, State},
+    extract::State,
     http::StatusCode,
     routing::{get, post},
-    Json, Router,
+    Router,
 };
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
@@ -20,6 +20,7 @@ use crate::{
         kyc::{AlertaPld, Cliente},
         sofom::{Credito, TransaccionSofom},
     },
+    routes::extraccion::{Json, Path, Query},
     sofom::credito::{self, ResultadoCastigo, ResultadoCredito, ResultadoPago},
     state::AppState,
 };

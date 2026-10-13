@@ -17,7 +17,11 @@ path = "src/main.rs"
 [dependencies]
 # HTTP
 axum = { version = "0.8", features = ["macros"] }
-tower-http = { version = "0.6", features = ["cors", "trace"] }
+# Servidor HTTP/1.1 propio (en vez de axum::serve) para fijar tiempos máximos
+# de cabeceras, tope de conexiones y apagado con plazo.
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio", "service"] }
+tower-http = { version = "0.6", features = ["cors", "trace", "timeout"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync"] }
 
 # Base de datos

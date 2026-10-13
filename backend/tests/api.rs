@@ -43,6 +43,24 @@ impl Api {
         let valor = if bytes.is_empty() { Value::Null } else { serde_json::from_slice(&bytes).unwrap_or(Value::Null) };
         (status, valor)
     }
+
+    /// Petición con cuerpo y cabeceras arbitrarios. Exige que la respuesta sea
+    /// el sobre JSON de error de la API.
+    async fn crudo(&self, metodo: &str, ruta: &str, tipo: Option<&str>, cuerpo: Vec<u8>) -> (StatusCode, String) {
+        let mut req = Request::builder().method(metodo).uri(ruta);
+        if let Some(t) = tipo {
+            req = req.header("content-type", t);
+        }
+        let resp = self.app.clone().oneshot(req.body(Body::from(cuerpo)).unwrap()).await.unwrap();
+        let status = resp.status();
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let valor: Value = serde_json::from_slice(&bytes).unwrap_or_else(|_| {
+            panic!("{metodo} {ruta}: respuesta {status} sin JSON: {:?}", String::from_utf8_lossy(&bytes))
+        });
+        let codigo = valor["error"]["codigo"].as_str().unwrap_or_else(|| panic!("sin error.codigo: {valor}"));
+        assert!(valor["error"]["mensaje"].is_string(), "{valor}");
+        (status, codigo.to_string())
+    }
 }
 
 async fn api(pool: &PgPool) -> Api {
@@ -331,4 +349,151 @@ async fn sesiones_revocables_y_rol_verificado(pool: PgPool) {
         .unwrap();
     let (s, _) = api.llamar("GET", "/api/v1/operaciones/alertas", Some(&operador), None).await;
     assert_eq!(s, StatusCode::UNAUTHORIZED);
+}
+
+// -----------------------------------------------------------------------------
+// Ronda 2 de revisión: contrato de la API
+// -----------------------------------------------------------------------------
+
+/// Hallazgo #14: todo error, también los del framework (cuerpo ilegible, tipo
+/// de contenido, ruta o método inexistente), usa el sobre JSON de la API.
+#[sqlx::test(migrations = "../migrations")]
+async fn errores_siempre_en_sobre_json(pool: PgPool) {
+    let api = api(&pool).await;
+    let login = br#"{"email":"a@b.mx","password":"x"}"#.to_vec();
+    type Caso<'a> = (&'a str, &'a str, Option<&'a str>, Vec<u8>, StatusCode, &'a str);
+    let casos: Vec<Caso> = vec![
+        ("POST", "/api/v1/auth/login", None, login.clone(), StatusCode::UNSUPPORTED_MEDIA_TYPE, "TIPO_NO_SOPORTADO"),
+        (
+            "POST",
+            "/api/v1/auth/login",
+            Some("application/json"),
+            br#"{"email":"#.to_vec(),
+            StatusCode::BAD_REQUEST,
+            "VALIDACION",
+        ),
+        (
+            "POST",
+            "/api/v1/auth/registro",
+            Some("application/json"),
+            br#"{"tipo_persona":"FISICA","nombre":"A","email":"a@b.mx","password":"x","x":1}"#.to_vec(),
+            StatusCode::BAD_REQUEST,
+            "VALIDACION",
+        ),
+        ("GET", "/api/v1/nada", None, vec![], StatusCode::NOT_FOUND, "RUTA_INEXISTENTE"),
+        ("GET", "/nada", None, vec![], StatusCode::NOT_FOUND, "RUTA_INEXISTENTE"),
+        ("DELETE", "/api/v1/auth/login", None, vec![], StatusCode::METHOD_NOT_ALLOWED, "METODO_NO_PERMITIDO"),
+        ("GET", "/api/v1/reserva/cortes/no-es-uuid", None, vec![], StatusCode::BAD_REQUEST, "VALIDACION"),
+        ("GET", "/api/v1/reserva/cortes?limite=muchos", None, vec![], StatusCode::BAD_REQUEST, "VALIDACION"),
+        (
+            "POST",
+            "/api/v1/reserva/verificar",
+            Some("application/json"),
+            vec![b' '; 70 * 1024],
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "CUERPO_DEMASIADO_GRANDE",
+        ),
+    ];
+    for (metodo, ruta, tipo, cuerpo, status, codigo) in casos {
+        let (s, c) = api.crudo(metodo, ruta, tipo, cuerpo).await;
+        assert_eq!((s, c.as_str()), (status, codigo), "{metodo} {ruta}");
+    }
+}
+
+/// Hallazgo #12: un monto enviado como número JSON pasaba por f64 y se
+/// redondeaba en silencio. Ahora solo se aceptan cadenas.
+#[sqlx::test(migrations = "../migrations")]
+async fn montos_como_numero_json_rechazados(pool: PgPool) {
+    let api = api(&pool).await;
+    let (token, _) = registrar(&api, "Ana").await;
+    for monto in [json!(1000000000.00000001_f64), json!(10), json!("10000000.000000001")] {
+        let cuerpo = json!({ "monto": monto, "clave_idempotencia": format!("deposito-{}", uuid::Uuid::new_v4()) });
+        let (s, e) = api.llamar("POST", "/api/v1/ifpe/depositos/simulados", Some(&token), Some(cuerpo)).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{monto}: {e}");
+        assert_eq!(e["error"]["codigo"], "VALIDACION");
+    }
+    let movimientos: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM ifpe.transacciones").fetch_one(&pool).await.unwrap();
+    assert_eq!(movimientos, 0, "ningún monto redondeado llegó al ledger");
+    let cuerpo = json!({ "monto": "1000000000.00000001", "clave_idempotencia": "deposito-exacto" });
+    let (s, r) = api.llamar("POST", "/api/v1/ifpe/depositos/simulados", Some(&token), Some(cuerpo)).await;
+    assert_eq!(s, StatusCode::CREATED, "{r}");
+    assert_eq!(r["transaccion"]["monto"], "1000000000.00000001");
+}
+
+/// Hallazgo #11: entradas que no caben en las columnas responden 400, no 500.
+#[sqlx::test(migrations = "../migrations")]
+async fn entrada_invalida_es_400_no_500(pool: PgPool) {
+    let api = api(&pool).await;
+    let base = json!({
+        "tipo_persona": "FISICA",
+        "nombre": "Ana",
+        "apellido_paterno": "Prueba",
+        "email": "ana@example.mx",
+        "password": "contraseña-segura-123"
+    });
+    for (campo, valor) in [
+        ("rfc", json!("ABCDEFGHIJKLMNOPQ")),
+        ("curp", json!("GODE561231HDFRRN09XXXXX")),
+        ("ingreso_mensual_estimado", json!("100000000000")),
+        ("ingreso_mensual_estimado", json!(5000)),
+        ("telefono", json!("12")),
+        ("email", json!("ana@sin-dominio")),
+    ] {
+        let mut cuerpo = base.clone();
+        cuerpo[campo] = valor.clone();
+        let (s, e) = api.llamar("POST", "/api/v1/auth/registro", None, Some(cuerpo)).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{campo}={valor}: {e}");
+        assert_eq!(e["error"]["codigo"], "VALIDACION");
+    }
+}
+
+/// Hallazgo #15: una ráfaga de contraseñas en paralelo verifica como máximo
+/// `MAX_INTENTOS`; el resto recibe BLOQUEADO sin calcular el hash, también la
+/// contraseña correcta (así la respuesta no revela cuál era).
+#[sqlx::test(migrations = "../migrations")]
+async fn rafaga_de_login_no_supera_el_cupo(pool: PgPool) {
+    use synthetic_capital::auth;
+    let cfg = preparar(&pool).await;
+    let estado = AppState::nuevo(pool.clone(), cfg);
+    let api = Api { app: routes::router(estado.clone()) };
+    registrar(&api, "Ana").await;
+
+    let mut tareas = Vec::new();
+    for i in 0..40 {
+        let estado = estado.clone();
+        let password = if i == 30 { "contraseña-segura-123".to_string() } else { format!("intento-equivocado-{i}") };
+        tareas.push(tokio::spawn(async move {
+            auth::iniciar_sesion(&estado, "ana@example.mx", &password)
+                .await
+                .map(|_| ())
+                .map_err(|e| e.codigo().to_string())
+        }));
+    }
+    let mut verificados = 0;
+    for t in tareas {
+        match t.await.unwrap() {
+            Ok(()) => verificados += 1,
+            Err(c) if c == "CREDENCIALES_INVALIDAS" => verificados += 1,
+            Err(c) => assert_eq!(c, "BLOQUEADO"),
+        }
+    }
+    assert!(verificados <= 5, "{verificados} contraseñas verificadas en una ráfaga");
+
+    // Bloqueada: ni la contraseña correcta abre sesión hasta que venza la ventana.
+    let e = auth::iniciar_sesion(&estado, "ana@example.mx", "contraseña-segura-123").await.unwrap_err();
+    assert_eq!(e.codigo(), "BLOQUEADO");
+    sqlx::query("UPDATE kyc.credenciales SET bloqueado_hasta = now() - interval '1 second'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    // Ventana nueva: cuatro errores y luego la correcta abre sesión y reinicia el contador.
+    for i in 0..4 {
+        let e = auth::iniciar_sesion(&estado, "ana@example.mx", &format!("otra-{i}")).await.unwrap_err();
+        assert_eq!(e.codigo(), "CREDENCIALES_INVALIDAS");
+    }
+    auth::iniciar_sesion(&estado, "ana@example.mx", "contraseña-segura-123").await.unwrap();
+    let intentos: i32 =
+        sqlx::query_scalar("SELECT intentos_fallidos FROM kyc.credenciales").fetch_one(&pool).await.unwrap();
+    assert_eq!(intentos, 0);
 }

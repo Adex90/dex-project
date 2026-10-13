@@ -204,7 +204,7 @@ async fn generar_corte_tx(pool: &PgPool) -> AppResult<CorteReserva> {
     let (hojas, hashes, arbol) = bloqueante(move || {
         let mut con_hash: Vec<(merkle::Hash, Hoja)> = hojas.into_iter().map(|h| (h.hash(), h)).collect();
         // Orden barajado en cada corte (el hash depende de la sal aleatoria).
-        con_hash.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        con_hash.sort_unstable_by_key(|(hash, _)| *hash);
         let nodos = con_hash.iter().map(|(hash, h)| Nodo { hash: *hash, suma: h.saldo }).collect();
         let arbol = ArbolSuma::desde_nodos(nodos).map_err(|e| AppError::Integridad(e.to_string()))?;
         let (hashes, hojas) = con_hash.into_iter().unzip::<_, _, Vec<_>, Vec<_>>();
