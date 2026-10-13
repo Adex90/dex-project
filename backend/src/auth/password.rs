@@ -3,6 +3,8 @@
 
 use std::sync::OnceLock;
 
+use tokio::sync::Semaphore;
+
 use argon2::{
     password_hash::{rand_core::OsRng, PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
     Argon2,
@@ -31,11 +33,20 @@ fn hashear_sync(password: &str) -> AppResult<String> {
         .map_err(|e| AppError::Interno(anyhow::anyhow!("argon2: {e}")))
 }
 
+/// Tope de cómputos Argon2 simultáneos (uno por núcleo): una ráfaga de
+/// inicios de sesión no puede acaparar CPU ni hilos bloqueantes.
+fn cupo_argon2() -> &'static Semaphore {
+    static CUPO: OnceLock<Semaphore> = OnceLock::new();
+    CUPO.get_or_init(|| Semaphore::new(std::thread::available_parallelism().map_or(2, |n| n.get()).max(2)))
+}
+
 pub async fn hashear(password: String) -> AppResult<String> {
+    let _permiso = cupo_argon2().acquire().await.map_err(|e| AppError::Interno(e.into()))?;
     tokio::task::spawn_blocking(move || hashear_sync(&password)).await.map_err(|e| AppError::Interno(e.into()))?
 }
 
 pub async fn verificar(password: String, hash: String) -> AppResult<bool> {
+    let _permiso = cupo_argon2().acquire().await.map_err(|e| AppError::Interno(e.into()))?;
     tokio::task::spawn_blocking(move || {
         let parsed = PasswordHash::new(&hash).map_err(|e| AppError::Interno(anyhow::anyhow!("hash inválido: {e}")))?;
         Ok(Argon2::default().verify_password(password.as_bytes(), &parsed).is_ok())

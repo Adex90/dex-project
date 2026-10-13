@@ -124,7 +124,7 @@ async fn deposito_simulado(
     let d = ledger::Deposito {
         cuenta_id: cuenta.id,
         monto: s.monto,
-        referencia_externa: Some("DEMO-SPEI".into()),
+        referencia_externa: None,
         concepto: Some("Depósito simulado (modo demo)".into()),
         clave_idempotencia: u.clave(&s.clave_idempotencia)?,
     };

@@ -2,7 +2,7 @@
 //!
 //! Cada operación:
 //! 1. abre una transacción con el rol `sc_ifpe` ([`db::begin`]);
-//! 2. bloquea las filas involucradas con `SELECT ... FOR UPDATE` en un orden
+//! 2. bloquea las filas involucradas con `SELECT ... FOR NO KEY UPDATE` en un orden
 //!    global fijo (cuentas por id → reserva → [estado_reserva y cabeza del
 //!    ledger, que toman los triggers]) para evitar deadlocks;
 //! 3. comprueba la idempotencia *después* de bloquear, de modo que dos
@@ -92,7 +92,7 @@ pub(crate) async fn insertar_tx_ifpe(tx: &mut Tx, n: NuevaTxIfpe<'_>) -> AppResu
 }
 
 pub(crate) async fn bloquear_cuenta_ifpe(tx: &mut Tx, cuenta_id: Uuid) -> AppResult<CuentaIfpe> {
-    sqlx::query_as("SELECT * FROM ifpe.cuentas WHERE id = $1 FOR UPDATE")
+    sqlx::query_as("SELECT * FROM ifpe.cuentas WHERE id = $1 FOR NO KEY UPDATE")
         .bind(cuenta_id)
         .fetch_optional(&mut **tx)
         .await?
@@ -109,7 +109,7 @@ pub(crate) async fn id_cuenta_ifpe_de_cliente(tx: &mut Tx, cliente_id: Uuid) -> 
 
 /// Cuenta de reserva en custodia por defecto (la activa más antigua), bloqueada.
 pub(crate) async fn bloquear_reserva(tx: &mut Tx) -> AppResult<ReservaCustodia> {
-    sqlx::query_as("SELECT * FROM ifpe.reserva_custodia WHERE activa ORDER BY creado_en, id LIMIT 1 FOR UPDATE")
+    sqlx::query_as("SELECT * FROM ifpe.reserva_custodia WHERE activa ORDER BY creado_en, id LIMIT 1 FOR NO KEY UPDATE")
         .fetch_optional(&mut **tx)
         .await?
         .ok_or_else(|| AppError::Interno(anyhow::anyhow!("no hay cuenta de reserva en custodia activa")))
@@ -194,6 +194,26 @@ pub struct Deposito {
     pub clave_idempotencia: String,
 }
 
+impl Deposito {
+    /// SPEI entrante. La idempotencia se deriva de la **clave de rastreo** del
+    /// pago, no de quién lo registra: el mismo SPEI nunca se acredita dos
+    /// veces aunque lo capturen dos operadores o se reintente con otra clave
+    /// (lo respalda además el índice único `ux_ifpe_tx_deposito_referencia`).
+    pub fn spei(cuenta_id: Uuid, monto: Decimal, clave_rastreo: &str, concepto: Option<String>) -> AppResult<Self> {
+        let rastreo = clave_rastreo.trim();
+        if rastreo.is_empty() || rastreo.len() > 30 || !rastreo.bytes().all(|b| b.is_ascii_alphanumeric()) {
+            return Err(AppError::validacion("la clave de rastreo SPEI debe tener de 1 a 30 caracteres alfanuméricos"));
+        }
+        Ok(Self {
+            cuenta_id,
+            monto,
+            referencia_externa: Some(rastreo.to_string()),
+            concepto,
+            clave_idempotencia: format!("spei:{rastreo}"),
+        })
+    }
+}
+
 pub async fn depositar(pool: &PgPool, umbrales: &UmbralesPld, d: &Deposito) -> AppResult<Movimiento> {
     let monto = dinero::validar_monto(d.monto)?;
     validar_texto("concepto", d.concepto.as_deref(), 140)?;
@@ -206,6 +226,12 @@ async fn depositar_tx(pool: &PgPool, umbrales: &UmbralesPld, d: &Deposito, monto
     let cuenta = bloquear_cuenta_ifpe(&mut tx, d.cuenta_id).await?;
     if let Some(previa) = buscar_por_clave(&mut tx, &d.clave_idempotencia).await? {
         exigir_misma_operacion(&previa, TipoTxIfpe::Deposito, monto, None, Some(cuenta.id))?;
+        if previa.referencia_externa != d.referencia_externa {
+            return Err(AppError::conflicto(
+                "CLAVE_IDEMPOTENCIA_REUTILIZADA",
+                "la clave de idempotencia ya se usó para un depósito con otra referencia",
+            ));
+        }
         return Ok(Movimiento { transaccion: previa, idempotente: true });
     }
     let perfil = pld::cargar_perfil(&mut tx, cuenta.cliente_id).await?;

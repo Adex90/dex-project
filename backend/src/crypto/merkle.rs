@@ -24,9 +24,11 @@
 //! impar de nodos, el último sube sin cambios al siguiente nivel (no se
 //! duplica: duplicar contaría dos veces su saldo).
 //!
-//! La sal aleatoria de 32 bytes por hoja y corte impide que alguien que ve el
-//! hash de una hoja vecina en su prueba adivine el saldo de otro cliente por
-//! fuerza bruta.
+//! Privacidad: la prueba revela la suma de cada hermano (sin ella no se puede
+//! verificar el árbol), así que el primer paso puede mostrar el saldo de una
+//! hoja vecina. La sal aleatoria de 32 bytes por hoja y corte oculta *de quién*
+//! es ese saldo (el `cuenta_id` va dentro del hash), y `reserva` baraja el
+//! orden de las hojas en cada corte para que el vecino no pueda seguirse.
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};

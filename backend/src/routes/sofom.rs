@@ -4,7 +4,6 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use chrono::Utc;
 use rust_decimal::Decimal;
 use serde::Deserialize;
 use uuid::Uuid;
@@ -62,7 +61,6 @@ async fn invertir(
         monto: s.monto,
         plazo_dias: s.plazo_dias,
         clave_idempotencia: u.clave(&s.clave_idempotencia)?,
-        fecha_inicio: Utc::now().date_naive(),
     };
     let r = puente::invertir(&e.pool, &e.config.pld, &solicitud).await?;
     Ok((status_de(r.idempotente), Json(r)))
@@ -89,6 +87,6 @@ async fn liquidar(
         RolUsuario::Operador => None,
         RolUsuario::Auditor => return Err(AppError::Prohibido),
     };
-    let r = puente::liquidar(&e.pool, id, solicitante, Utc::now().date_naive()).await?;
+    let r = puente::liquidar(&e.pool, id, solicitante).await?;
     Ok((status_de(r.idempotente), Json(r)))
 }

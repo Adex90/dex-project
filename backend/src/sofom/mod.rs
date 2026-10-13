@@ -65,7 +65,7 @@ pub(crate) async fn insertar_tx_sofom(tx: &mut Tx, n: NuevaTxSofom<'_>) -> AppRe
 
 /// Caja por defecto de la SOFOM (la activa más antigua), bloqueada.
 pub(crate) async fn bloquear_caja(tx: &mut Tx) -> AppResult<Caja> {
-    sqlx::query_as("SELECT * FROM sofom.caja WHERE activa ORDER BY creado_en, id LIMIT 1 FOR UPDATE")
+    sqlx::query_as("SELECT * FROM sofom.caja WHERE activa ORDER BY creado_en, id LIMIT 1 FOR NO KEY UPDATE")
         .fetch_optional(&mut **tx)
         .await?
         .ok_or_else(|| AppError::Interno(anyhow::anyhow!("no hay caja SOFOM activa")))

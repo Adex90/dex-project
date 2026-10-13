@@ -44,7 +44,7 @@ async fn generar_corte(State(e): State<AppState>, u: Usuario) -> AppResult<(Stat
 /// Prueba de inclusión (MerkleProof) de la cuenta del cliente en el último corte.
 async fn prueba(State(e): State<AppState>, u: Usuario) -> AppResult<Json<PruebaReserva>> {
     u.exigir_cliente()?;
-    Ok(Json(reserva::prueba_de_cliente(&e.pool, u.cliente_id).await?))
+    Ok(Json(reserva::prueba_de_cliente(&e.pool, u.cliente_id, e.config.corte_min_intervalo_seg).await?))
 }
 
 async fn verificar(

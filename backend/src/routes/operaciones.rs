@@ -6,7 +6,6 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use chrono::Utc;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -21,7 +20,7 @@ use crate::{
         kyc::{AlertaPld, Cliente},
         sofom::{Credito, TransaccionSofom},
     },
-    sofom::credito::{self, ResultadoCredito, ResultadoPago},
+    sofom::credito::{self, ResultadoCastigo, ResultadoCredito, ResultadoPago},
     state::AppState,
 };
 
@@ -33,6 +32,8 @@ pub fn rutas() -> Router<AppState> {
         .route("/operaciones/alertas", get(alertas))
         .route("/operaciones/creditos", get(listar_creditos).post(originar_credito))
         .route("/operaciones/creditos/{id}/pagos", post(pagar_credito))
+        .route("/operaciones/creditos/{id}/castigo", post(castigar_credito))
+        .route("/operaciones/usuarios/{id}/revocar-sesiones", post(revocar_sesiones))
         .route("/operaciones/capital", post(aportar_capital))
 }
 
@@ -41,10 +42,9 @@ pub fn rutas() -> Router<AppState> {
 struct SolicitudDeposito {
     clabe: String,
     monto: Decimal,
-    /// Clave de rastreo SPEI.
-    referencia_externa: String,
+    /// Clave de rastreo SPEI: identifica el pago y hace la operación idempotente.
+    clave_rastreo: String,
     concepto: Option<String>,
-    clave_idempotencia: String,
 }
 
 /// SPEI entrante: acredita a la cuenta y sube la reserva en custodia 1:1.
@@ -55,13 +55,7 @@ async fn deposito(
 ) -> AppResult<(StatusCode, Json<Movimiento>)> {
     u.exigir_operador()?;
     let cuenta_id = cuenta_por_clabe(&e, &s.clabe).await?;
-    let d = ledger::Deposito {
-        cuenta_id,
-        monto: s.monto,
-        referencia_externa: Some(s.referencia_externa),
-        concepto: s.concepto,
-        clave_idempotencia: u.clave(&s.clave_idempotencia)?,
-    };
+    let d = ledger::Deposito::spei(cuenta_id, s.monto, &s.clave_rastreo, s.concepto)?;
     let m = ledger::depositar(&e.pool, &e.config.pld, &d).await?;
     Ok((status_de(m.idempotente), Json(m)))
 }
@@ -160,7 +154,6 @@ async fn originar_credito(
         principal: s.principal,
         tasa_anual: s.tasa_anual,
         plazo_dias: s.plazo_dias,
-        fecha_desembolso: Utc::now().date_naive(),
         destino: s.destino,
         clabe_destino: s.clabe_destino,
         clave_idempotencia: u.clave(&s.clave_idempotencia)?,
@@ -217,4 +210,22 @@ async fn aportar_capital(
     let (transaccion, idempotente) =
         credito::aportar_capital(&e.pool, s.monto, s.referencia, u.clave(&s.clave_idempotencia)?).await?;
     Ok((status_de(idempotente), Json(RespuestaCapital { transaccion, idempotente })))
+}
+
+/// Castigo de un crédito vencido: la pérdida la absorbe el capital de la SOFOM.
+async fn castigar_credito(
+    State(e): State<AppState>,
+    u: Usuario,
+    Path(id): Path<Uuid>,
+) -> AppResult<Json<ResultadoCastigo>> {
+    u.exigir_operador()?;
+    Ok(Json(credito::castigar(&e.pool, id).await?))
+}
+
+/// Invalida de inmediato todos los JWT de una persona (baja de un operador,
+/// credenciales comprometidas, etc.).
+async fn revocar_sesiones(State(e): State<AppState>, u: Usuario, Path(id): Path<Uuid>) -> AppResult<StatusCode> {
+    u.exigir_operador()?;
+    crate::auth::revocar_sesiones(&e.pool, id).await?;
+    Ok(StatusCode::NO_CONTENT)
 }

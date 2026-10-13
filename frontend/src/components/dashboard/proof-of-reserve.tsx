@@ -15,7 +15,7 @@ import {
 
 import { HashText, Money, formatDateTime } from "@/components/ui/data";
 import { Alert, Badge, Button, Card, CardHeader, cx } from "@/components/ui/primitives";
-import { describeError } from "@/lib/api/client";
+import { ApiError, describeError } from "@/lib/api/client";
 import { api } from "@/lib/api/endpoints";
 import type { PruebaReserva, ResultadoVerificacionPrueba } from "@/lib/api/types";
 import { compareAmounts } from "@/lib/decimal";
@@ -39,6 +39,7 @@ export function ProofOfReservePanel({ token }: { token: string }) {
   const [server, setServer] = useState<ResultadoVerificacionPrueba | null>(null);
   const [revealed, setRevealed] = useState(0);
   const [error, setError] = useState<string | null>(null);
+  const [pending, setPending] = useState<string | null>(null);
   const timer = useRef<ReturnType<typeof setInterval> | null>(null);
 
   useEffect(() => () => {
@@ -49,6 +50,7 @@ export function ProofOfReservePanel({ token }: { token: string }) {
     if (timer.current) clearInterval(timer.current);
     setPhase("fetching");
     setError(null);
+    setPending(null);
     setLocal(null);
     setServer(null);
     setRevealed(0);
@@ -78,7 +80,9 @@ export function ProofOfReservePanel({ token }: { token: string }) {
         });
       }, STEP_DELAY_MS);
     } catch (e) {
-      setError(describeError(e));
+      // A brand-new account is not in a snapshot yet: informational, not a failure.
+      if (e instanceof ApiError && e.code === "PRUEBA_PENDIENTE") setPending(describeError(e));
+      else setError(describeError(e));
       setPhase("error");
     }
   };
@@ -125,6 +129,11 @@ export function ProofOfReservePanel({ token }: { token: string }) {
         </Button>
 
         {error ? <Alert tone="error">{error}</Alert> : null}
+        {pending ? (
+          <Alert tone="info" title="Not in a snapshot yet">
+            {pending}
+          </Alert>
+        ) : null}
 
         {phase === "fetching" ? (
           <p className="flex items-center gap-2 text-sm text-muted">

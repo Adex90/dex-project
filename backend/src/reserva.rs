@@ -10,6 +10,19 @@
 //! y la raíz se ancla al último `tx_hash` del ledger (`hash_ledger`), de modo
 //! que el corte prueba el estado exacto tras ese movimiento. Las hojas (con su
 //! sal aleatoria) se guardan para emitir pruebas de inclusión después.
+//!
+//! **Privacidad.** Un árbol de sumas solo es verificable si la prueba incluye
+//! la suma de cada hermano; el primer hermano puede ser la hoja de otra cuenta,
+//! así que una prueba revela *un* saldo ajeno. Lo que se protege es el
+//! vínculo con la identidad: el `cuenta_id` va dentro del hash con una sal
+//! aleatoria de 32 bytes, y el orden de las hojas se baraja en cada corte
+//! (se ordenan por su hash salado), de modo que el vecino cambia de corte a
+//! corte y no puede seguirse en el tiempo. Partir saldos en varias hojas
+//! ocultaría también el monto exacto; queda como mejora futura.
+//!
+//! **Costo acotado.** Un corte recorre todas las cuentas. Solo puede haber uno
+//! en curso (advisory lock) y una petición de cliente solo dispara uno si el
+//! último tiene más de `CORTE_MIN_INTERVALO_SEG`.
 
 use chrono::{DateTime, Utc};
 use rand::RngCore;
@@ -94,12 +107,20 @@ fn monto(unidades: u128) -> AppResult<Decimal> {
 }
 
 /// Genera y publica un corte de Proof of Reserve.
+/// Clave del advisory lock que serializa la generación de cortes.
+const LOCK_CORTE: i64 = 0x5343_504f_5200_0001; // "SCPOR\0\0\1"
+
 pub async fn generar_corte(pool: &PgPool) -> AppResult<CorteReserva> {
     db::con_reintentos(|| generar_corte_tx(pool)).await
 }
 
 async fn generar_corte_tx(pool: &PgPool) -> AppResult<CorteReserva> {
     let mut tx = db::begin_instantanea(pool, Rol::Auditor).await?;
+    let libre: bool =
+        sqlx::query_scalar("SELECT pg_try_advisory_xact_lock($1)").bind(LOCK_CORTE).fetch_one(&mut *tx).await?;
+    if !libre {
+        return Err(AppError::conflicto("CORTE_EN_CURSO", "ya se está generando un corte de reserva"));
+    }
     let filas: Vec<FilaHoja> =
         sqlx::query_as("SELECT cuenta_id, saldo_total FROM ifpe.v_hojas_reserva ORDER BY cuenta_id")
             .fetch_all(&mut *tx)
@@ -114,10 +135,12 @@ async fn generar_corte_tx(pool: &PgPool) -> AppResult<CorteReserva> {
     let cabeza: LedgerCabeza =
         sqlx::query_as("SELECT ultima_secuencia, ultimo_hash FROM ifpe.ledger_cabeza").fetch_one(&mut *tx).await?;
 
-    let hojas: Vec<Hoja> = filas
+    let mut hojas: Vec<Hoja> = filas
         .iter()
         .map(|f| Ok(Hoja { cuenta_id: f.cuenta_id, saldo: unidades(f.saldo_total)?, sal: aleatorio_32() }))
         .collect::<AppResult<_>>()?;
+    // Orden barajado en cada corte (el hash depende de la sal aleatoria).
+    hojas.sort_by_cached_key(Hoja::hash);
     let arbol = ArbolSuma::construir(&hojas).map_err(|e| AppError::Integridad(e.to_string()))?;
     let raiz = arbol.raiz();
     let total_hojas = monto(raiz.suma)?;
@@ -253,17 +276,32 @@ fn ruta_desde_json(ruta: &[PasoJson]) -> AppResult<Vec<Paso>> {
 }
 
 /// Prueba de inclusión de la cuenta IFPE del cliente en el último corte.
-/// Si no hay corte, o la cuenta es posterior al último, se genera uno nuevo.
-pub async fn prueba_de_cliente(pool: &PgPool, cliente_id: Uuid) -> AppResult<PruebaReserva> {
-    match prueba_en_ultimo_corte(pool, cliente_id).await? {
-        Some(p) => Ok(p),
-        None => {
-            generar_corte(pool).await?;
-            prueba_en_ultimo_corte(pool, cliente_id)
-                .await?
-                .ok_or_else(|| AppError::no_encontrado("la cuenta no aparece en el corte de reserva"))
+///
+/// Si la cuenta aún no está en un corte (cuenta nueva), se genera uno solo si
+/// el último tiene al menos `min_intervalo_seg` de antigüedad y no hay otro en
+/// curso; si no, responde `PRUEBA_PENDIENTE` y el siguiente corte la incluirá.
+pub async fn prueba_de_cliente(pool: &PgPool, cliente_id: Uuid, min_intervalo_seg: u64) -> AppResult<PruebaReserva> {
+    if let Some(p) = prueba_en_ultimo_corte(pool, cliente_id).await? {
+        return Ok(p);
+    }
+    let pendiente = || {
+        AppError::negocio(
+            "PRUEBA_PENDIENTE",
+            "tu cuenta se incluirá en el próximo corte de reserva; inténtalo de nuevo en un momento",
+        )
+    };
+    if let Some(ultimo) = ultimo_corte(pool).await? {
+        let antiguedad = Utc::now().signed_duration_since(ultimo.creado_en).num_seconds();
+        if antiguedad < i64::try_from(min_intervalo_seg).unwrap_or(i64::MAX) {
+            return Err(pendiente());
         }
     }
+    match generar_corte(pool).await {
+        Ok(_) => {}
+        Err(AppError::Conflicto { codigo, .. }) if codigo == "CORTE_EN_CURSO" => return Err(pendiente()),
+        Err(e) => return Err(e),
+    }
+    prueba_en_ultimo_corte(pool, cliente_id).await?.ok_or_else(pendiente)
 }
 
 async fn prueba_en_ultimo_corte(pool: &PgPool, cliente_id: Uuid) -> AppResult<Option<PruebaReserva>> {

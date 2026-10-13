@@ -22,6 +22,9 @@ pub struct Config {
     pub pld: UmbralesPld,
     /// Periodicidad de cortes automáticos de Proof of Reserve (0 = desactivado).
     pub corte_intervalo_seg: u64,
+    /// Antigüedad mínima del último corte para que la petición de prueba de
+    /// un cliente nuevo pueda disparar uno (acota el costo a 1 corte por intervalo).
+    pub corte_min_intervalo_seg: u64,
     /// Periodicidad de liquidación automática de mutuos vencidos (0 = desactivado).
     pub liquidacion_intervalo_seg: u64,
     pub reserva_institucion: String,
@@ -67,13 +70,29 @@ where
     }
 }
 
+/// El JWT es HS256: conocer el secreto equivale a poder firmar tokens de
+/// operador. Se exige también en MODO_DEMO (un demo expuesto sigue siendo un
+/// banco expuesto) y se rechazan valores de ejemplo o de baja entropía.
+pub fn validar_secreto_jwt(secreto: &str) -> anyhow::Result<()> {
+    if secreto.len() < 32 {
+        bail!("JWT_SECRET debe tener al menos 32 caracteres (genera uno con: openssl rand -hex 64)");
+    }
+    let minusculas = secreto.to_lowercase();
+    if ["change-me", "changeme", "cambiame", "secret", "password", "example"].iter().any(|p| minusculas.contains(p)) {
+        bail!("JWT_SECRET parece un valor de ejemplo; genera uno aleatorio con: openssl rand -hex 64");
+    }
+    let distintos = secreto.chars().collect::<std::collections::HashSet<_>>().len();
+    if distintos < 10 {
+        bail!("JWT_SECRET tiene muy poca variedad de caracteres; genera uno aleatorio con: openssl rand -hex 64");
+    }
+    Ok(())
+}
+
 impl Config {
     pub fn desde_entorno() -> anyhow::Result<Self> {
         let modo_demo = var_o("MODO_DEMO", false)?;
         let jwt_secret = var("JWT_SECRET").context("JWT_SECRET es obligatoria")?;
-        if jwt_secret.len() < 32 && !modo_demo {
-            bail!("JWT_SECRET debe tener al menos 32 caracteres (genera una con: openssl rand -hex 64)");
-        }
+        validar_secreto_jwt(&jwt_secret)?;
         let clabe_prefijo = var("CLABE_PREFIJO").unwrap_or_else(|| "999180".into());
         if clabe_prefijo.len() != 6 || !clabe_prefijo.bytes().all(|b| b.is_ascii_digit()) {
             bail!("CLABE_PREFIJO debe ser de 6 dígitos (banco + plaza)");
@@ -95,6 +114,7 @@ impl Config {
                 multiplo_perfil: var_o("PLD_MULTIPLO_PERFIL", defecto.multiplo_perfil)?,
             },
             corte_intervalo_seg: var_o("CORTE_INTERVALO_SEG", 300)?,
+            corte_min_intervalo_seg: var_o("CORTE_MIN_INTERVALO_SEG", 60)?,
             liquidacion_intervalo_seg: var_o("LIQUIDACION_INTERVALO_SEG", 3600)?,
             reserva_institucion: var("RESERVA_INSTITUCION").unwrap_or_else(|| "Banco de México".into()),
             reserva_cuenta: var("RESERVA_CUENTA").unwrap_or_else(|| "SC-IFPE-RESERVA-001".into()),
@@ -119,6 +139,7 @@ impl Config {
             clabe_prefijo: "999180".into(),
             pld: UmbralesPld::default(),
             corte_intervalo_seg: 0,
+            corte_min_intervalo_seg: 0,
             liquidacion_intervalo_seg: 0,
             reserva_institucion: "Banco de México".into(),
             reserva_cuenta: "SC-IFPE-RESERVA-001".into(),
@@ -127,5 +148,19 @@ impl Config {
             operador_email: None,
             operador_password: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod pruebas {
+    use super::validar_secreto_jwt;
+
+    #[test]
+    fn rechaza_secretos_debiles() {
+        assert!(validar_secreto_jwt("corto").is_err());
+        assert!(validar_secreto_jwt("change-me-change-me-change-me-change-me").is_err());
+        assert!(validar_secreto_jwt(&"a".repeat(64)).is_err());
+        assert!(validar_secreto_jwt("my-jwt-secret-for-the-bank-0123456789").is_err());
+        assert!(validar_secreto_jwt("9f2c1e7ab04d5b6c8e3f1a2b7c9d0e4f6a8b1c3d5e7f9a0b").is_ok());
     }
 }

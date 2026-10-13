@@ -211,12 +211,32 @@ async fn operador_deposita_por_spei_y_origina_credito(pool: PgPool) {
             Some(json!({
                 "clabe": registro["cuenta_ifpe"]["clabe"],
                 "monto": "5000",
-                "referencia_externa": "SPEI123456",
-                "clave_idempotencia": "spei-123456"
+                "clave_rastreo": "SPEI123456"
             })),
         )
         .await;
     assert_eq!(s, StatusCode::CREATED, "{r}");
+
+    // Un segundo operador registra el mismo SPEI: no se acredita otra vez.
+    bootstrap::asegurar_operador(&pool, "operador2@synthetic.mx", "operador-de-pruebas-456").await.unwrap();
+    let (_, sesion2) = api
+        .llamar(
+            "POST",
+            "/api/v1/auth/login",
+            None,
+            Some(json!({ "email": "operador2@synthetic.mx", "password": "operador-de-pruebas-456" })),
+        )
+        .await;
+    let (s, r2) = api
+        .llamar(
+            "POST",
+            "/api/v1/operaciones/depositos",
+            Some(sesion2["token"].as_str().unwrap()),
+            Some(json!({ "clabe": registro["cuenta_ifpe"]["clabe"], "monto": "5000", "clave_rastreo": "SPEI123456" })),
+        )
+        .await;
+    assert_eq!(s, StatusCode::OK, "{r2}");
+    assert_eq!(r2["transaccion"]["id"], r["transaccion"]["id"]);
 
     let (s, _) = api
         .llamar(
@@ -254,4 +274,53 @@ async fn operador_deposita_por_spei_y_origina_credito(pool: PgPool) {
     assert_eq!(s, StatusCode::OK);
     assert!(alertas.as_array().unwrap().is_empty());
     verificar_invariantes(&pool).await;
+}
+
+/// Hallazgo de la revisión: el rol del JWT se confirma contra la base de
+/// datos en cada petición, y las sesiones pueden revocarse de inmediato.
+#[sqlx::test(migrations = "../migrations")]
+async fn sesiones_revocables_y_rol_verificado(pool: PgPool) {
+    let api = api(&pool).await;
+    let (cliente, registro) = registrar(&api, "Ana").await;
+    let (_, sesion) = api
+        .llamar(
+            "POST",
+            "/api/v1/auth/login",
+            None,
+            Some(json!({ "email": "operador@synthetic.mx", "password": "operador-de-pruebas-123" })),
+        )
+        .await;
+    let operador = sesion["token"].as_str().unwrap().to_string();
+    let operador_id = sesion["cliente_id"].as_str().unwrap().to_string();
+
+    // Revocar las sesiones de la clienta: su token deja de servir al instante.
+    let ruta = format!("/api/v1/operaciones/usuarios/{}/revocar-sesiones", registro["cliente"]["id"].as_str().unwrap());
+    // (Esperar al siguiente segundo: `iat` del JWT tiene resolución de segundos.)
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    let (s, _) = api.llamar("POST", &ruta, Some(&operador), None).await;
+    assert_eq!(s, StatusCode::NO_CONTENT);
+    let (s, _) = api.llamar("GET", "/api/v1/tablero", Some(&cliente), None).await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED);
+    // Un inicio de sesión nuevo sí funciona.
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    let (s, nueva) = api
+        .llamar(
+            "POST",
+            "/api/v1/auth/login",
+            None,
+            Some(json!({ "email": "ana@example.mx", "password": "contraseña-segura-123" })),
+        )
+        .await;
+    assert_eq!(s, StatusCode::OK);
+    let (s, _) = api.llamar("GET", "/api/v1/tablero", Some(nueva["token"].as_str().unwrap()), None).await;
+    assert_eq!(s, StatusCode::OK);
+
+    // Degradar al operador: su token (aún vigente) pierde el poder de inmediato.
+    sqlx::query("UPDATE kyc.credenciales SET rol = 'CLIENTE' WHERE cliente_id = $1::uuid")
+        .bind(&operador_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let (s, _) = api.llamar("GET", "/api/v1/operaciones/alertas", Some(&operador), None).await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED);
 }

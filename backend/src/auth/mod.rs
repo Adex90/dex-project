@@ -7,7 +7,7 @@ use axum::{
     extract::{FromRef, FromRequestParts},
     http::{header, request::Parts},
 };
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Utc};
 use serde::Serialize;
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -88,8 +88,58 @@ where
             .and_then(|v| v.strip_prefix("Bearer "))
             .ok_or(AppError::NoAutenticado)?;
         let claims = estado.jwt.validar(token)?;
-        Ok(Usuario { cliente_id: claims.sub, rol: claims.rol })
+        validar_contra_bd(&estado.pool, &claims).await
     }
+}
+
+#[derive(sqlx::FromRow)]
+struct FilaSesion {
+    rol: RolUsuario,
+    estatus_kyc: EstatusKyc,
+    en_lista_bloqueadas: bool,
+    revocado: bool,
+}
+
+/// La firma del JWT no basta: en cada petición se confirma contra la base de
+/// datos que la persona existe, que su rol **actual** coincide con el del
+/// token, que sus sesiones no fueron revocadas y que no está bloqueada. Así,
+/// degradar a un operador o revocar sus sesiones surte efecto de inmediato.
+async fn validar_contra_bd(pool: &PgPool, claims: &jwt::Claims) -> AppResult<Usuario> {
+    let mut tx = db::begin_lectura(pool, Rol::Kyc).await?;
+    let fila: Option<FilaSesion> = sqlx::query_as(
+        "SELECT cr.rol, c.estatus_kyc, c.en_lista_bloqueadas, \
+                coalesce(floor(extract(epoch FROM cr.tokens_validos_desde)) > $2, false) AS revocado \
+         FROM kyc.credenciales cr JOIN kyc.clientes c ON c.id = cr.cliente_id \
+         WHERE cr.cliente_id = $1",
+    )
+    .bind(claims.sub)
+    .bind(claims.iat)
+    .fetch_optional(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    let fila = fila.ok_or(AppError::NoAutenticado)?;
+    if fila.revocado || fila.rol != claims.rol {
+        return Err(AppError::NoAutenticado);
+    }
+    if fila.en_lista_bloqueadas || fila.estatus_kyc == EstatusKyc::Rechazado {
+        return Err(AppError::Prohibido);
+    }
+    Ok(Usuario { cliente_id: claims.sub, rol: fila.rol })
+}
+
+/// Invalida todos los JWT emitidos hasta ahora para una persona.
+pub async fn revocar_sesiones(pool: &PgPool, cliente_id: Uuid) -> AppResult<()> {
+    let mut tx = db::begin(pool, Rol::Kyc).await?;
+    let n = sqlx::query("UPDATE kyc.credenciales SET tokens_validos_desde = now() WHERE cliente_id = $1")
+        .bind(cliente_id)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+    if n == 0 {
+        return Err(AppError::no_encontrado("persona no encontrada"));
+    }
+    tx.commit().await?;
+    Ok(())
 }
 
 // -----------------------------------------------------------------------------
@@ -113,62 +163,73 @@ struct FilaLogin {
     estatus_kyc: EstatusKyc,
     en_lista_bloqueadas: bool,
     password_hash: String,
-    intentos_fallidos: i32,
     bloqueado_hasta: Option<DateTime<Utc>>,
-    rol: RolUsuario,
 }
 
+/// Inicio de sesión en tres pasos para no retener una conexión del pool (ni
+/// un lock de fila) durante el cómputo de Argon2:
+/// 1. lectura corta de las credenciales;
+/// 2. verificación Argon2 sin conexión (con tope de concurrencia);
+/// 3. registro atómico del resultado (conteo de fallos / bloqueo temporal).
 pub async fn iniciar_sesion(estado: &AppState, email: &str, password_plano: &str) -> AppResult<Sesion> {
     let invalidas = || AppError::CredencialesInvalidas("email o contraseña incorrectos".into());
+    let bloqueada =
+        || AppError::Bloqueado("demasiados intentos fallidos; la cuenta está bloqueada temporalmente".into());
     let pool: &PgPool = &estado.pool;
-    let mut tx = db::begin(pool, Rol::Kyc).await?;
+
+    let mut tx = db::begin_lectura(pool, Rol::Kyc).await?;
     let fila: Option<FilaLogin> = sqlx::query_as(
-        "SELECT c.id AS cliente_id, c.estatus_kyc, c.en_lista_bloqueadas, \
-                cr.password_hash, cr.intentos_fallidos, cr.bloqueado_hasta, cr.rol \
+        "SELECT c.id AS cliente_id, c.estatus_kyc, c.en_lista_bloqueadas, cr.password_hash, cr.bloqueado_hasta \
          FROM kyc.clientes c JOIN kyc.credenciales cr ON cr.cliente_id = c.id \
-         WHERE lower(c.email) = lower($1) FOR UPDATE OF cr",
+         WHERE lower(c.email) = lower($1)",
     )
     .bind(email.trim())
     .fetch_optional(&mut *tx)
     .await?;
+    tx.commit().await?;
 
     let Some(fila) = fila else {
         // Mismo costo que una verificación real: no revela qué emails existen.
         password::verificar_simulado(password_plano.to_owned()).await;
         return Err(invalidas());
     };
-    let ahora = Utc::now();
-    if fila.bloqueado_hasta.is_some_and(|hasta| hasta > ahora) {
-        return Err(AppError::Bloqueado("demasiados intentos fallidos; la cuenta está bloqueada temporalmente".into()));
+    if fila.bloqueado_hasta.is_some_and(|hasta| hasta > Utc::now()) {
+        return Err(bloqueada());
     }
+
     let correcta = password::verificar(password_plano.to_owned(), fila.password_hash.clone()).await?;
+
+    let mut tx = db::begin(pool, Rol::Kyc).await?;
     if !correcta {
-        let intentos = fila.intentos_fallidos + 1;
-        let (intentos, bloqueo) = if intentos >= MAX_INTENTOS {
-            (0, Some(ahora + Duration::minutes(MINUTOS_BLOQUEO)))
-        } else {
-            (intentos, None)
-        };
-        sqlx::query("UPDATE kyc.credenciales SET intentos_fallidos = $1, bloqueado_hasta = $2 WHERE cliente_id = $3")
-            .bind(intentos)
-            .bind(bloqueo)
-            .bind(fila.cliente_id)
-            .execute(&mut *tx)
-            .await?;
-        tx.commit().await?; // el conteo de fallos debe persistir
+        // Incremento atómico: intentos concurrentes no se pierden.
+        sqlx::query(
+            "UPDATE kyc.credenciales SET \
+               intentos_fallidos = CASE WHEN intentos_fallidos + 1 >= $2 THEN 0 ELSE intentos_fallidos + 1 END, \
+               bloqueado_hasta = CASE WHEN intentos_fallidos + 1 >= $2 \
+                                      THEN now() + make_interval(mins => $3) ELSE bloqueado_hasta END \
+             WHERE cliente_id = $1 AND (bloqueado_hasta IS NULL OR bloqueado_hasta <= now())",
+        )
+        .bind(fila.cliente_id)
+        .bind(MAX_INTENTOS)
+        .bind(MINUTOS_BLOQUEO as i32)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
         return Err(invalidas());
     }
     if fila.en_lista_bloqueadas || fila.estatus_kyc == EstatusKyc::Rechazado {
         return Err(AppError::Prohibido);
     }
-    sqlx::query(
+    // Si otra petición bloqueó la cuenta mientras se verificaba, no se abre sesión.
+    let rol: Option<RolUsuario> = sqlx::query_scalar(
         "UPDATE kyc.credenciales SET intentos_fallidos = 0, bloqueado_hasta = NULL, ultimo_acceso = now() \
-         WHERE cliente_id = $1",
+         WHERE cliente_id = $1 AND (bloqueado_hasta IS NULL OR bloqueado_hasta <= now()) RETURNING rol",
     )
     .bind(fila.cliente_id)
-    .execute(&mut *tx)
+    .fetch_optional(&mut *tx)
     .await?;
     tx.commit().await?;
-    let (token, expira_en) = estado.jwt.emitir(fila.cliente_id, fila.rol)?;
-    Ok(Sesion { token, expira_en, cliente_id: fila.cliente_id, rol: fila.rol })
+    let rol = rol.ok_or_else(bloqueada)?;
+    let (token, expira_en) = estado.jwt.emitir(fila.cliente_id, rol)?;
+    Ok(Sesion { token, expira_en, cliente_id: fila.cliente_id, rol })
 }

@@ -11,6 +11,18 @@ the Rust backend.
 | **SOFOM** (credit) | Fixed-term mutuum contracts and loans | A loan is disbursed only if 100% funded by mutuums maturing **on or after** the loan (`SC_CALCE_PLAZOS`, `SC_FONDEO_INCOMPLETO`). No early withdrawal. |
 | **Isolation** | | Separate `ifpe` / `sofom` schemas and roles; every transaction runs under `SET LOCAL ROLE`. The bridge role cannot touch loans. |
 
+Further rules enforced in the database (migration `0003`):
+
+- **SOFOM liquidity:** cash always covers the unlent principal of every active
+  mutuum. Interest and loan losses are paid from SOFOM capital, never from
+  another investor's money.
+- **Write-offs:** a defaulted loan can be written off only when capital
+  absorbs the loss. Its funding mutuums are then released and repaid in full.
+- **Value dates:** mutuums start and loans are disbursed *today*. No
+  back-dating is allowed, so no-early-withdrawal cannot be bypassed.
+- **Sessions:** every request rechecks the JWT's role and revocation state
+  against the database.
+
 ## Layout
 
 ```
@@ -63,6 +75,9 @@ key returns 200 with the original movement.
 | GET | `/api/v1/reserva/prueba` | client: Merkle proof for their account |
 | POST | `/api/v1/reserva/verificar` | public: verify a proof against the published root |
 | GET | `/api/v1/auditoria/ledger/{ifpe,sofom}` | operator / auditor |
-| POST | `/api/v1/operaciones/...` | operator: SPEI, holds, KYC, AML alerts, loans, capital |
+| POST | `/api/v1/operaciones/depositos` | operator: incoming SPEI, idempotent on `clave_rastreo` (the same transfer is never credited twice) |
+| POST | `/api/v1/operaciones/creditos`, `.../{id}/pagos`, `.../{id}/castigo` | operator: loans, collections, write-offs (losses absorbed by SOFOM capital) |
+| POST | `/api/v1/operaciones/usuarios/{id}/revocar-sesiones` | operator: invalidate a user's JWTs immediately |
+| POST | `/api/v1/operaciones/...` | operator: holds, KYC, AML alerts, capital |
 
 Full table in `backend/src/routes/mod.rs`.

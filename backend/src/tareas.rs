@@ -6,8 +6,6 @@
 
 use std::time::Duration;
 
-use chrono::Utc;
-
 use crate::{reserva, sofom, state::AppState};
 
 pub fn lanzar(estado: AppState) {
@@ -41,19 +39,31 @@ async fn corte_si_hay_cambios(e: &AppState) -> crate::AppResult<()> {
     let actual = reserva::estado_actual(&e.pool).await?;
     let hay_cambios = ultimo.map_or(true, |c| c.secuencia_ledger != actual.ledger.ultima_secuencia);
     if hay_cambios {
-        reserva::generar_corte(&e.pool).await?;
+        match reserva::generar_corte(&e.pool).await {
+            Err(crate::AppError::Conflicto { codigo, .. }) if codigo == "CORTE_EN_CURSO" => {}
+            otro => {
+                otro?;
+            }
+        }
     }
     Ok(())
 }
 
 async fn liquidaciones(e: &AppState) {
-    let hoy = Utc::now().date_naive();
-    match sofom::credito::marcar_creditos_vencidos(&e.pool, hoy).await {
+    match sofom::credito::marcar_creditos_vencidos(&e.pool).await {
         Ok(n) if n > 0 => tracing::warn!(n, "créditos marcados como vencidos"),
         Ok(_) => {}
         Err(err) => tracing::error!(error = %err, "no se pudieron marcar créditos vencidos"),
     }
-    let pendientes = match sofom::puente::contratos_por_liquidar(&e.pool, hoy, 500).await {
+    match sofom::puente::contratos_bloqueados_por_cartera(&e.pool).await {
+        Ok(bloqueados) => {
+            for (folio, comprometido) in bloqueados {
+                tracing::warn!(folio, %comprometido, "mutuo vencido bloqueado por cartera vencida: requiere cobranza o castigo");
+            }
+        }
+        Err(err) => tracing::error!(error = %err, "no se pudieron listar mutuos bloqueados"),
+    }
+    let pendientes = match sofom::puente::contratos_por_liquidar(&e.pool, 500).await {
         Ok(ids) => ids,
         Err(err) => {
             tracing::error!(error = %err, "no se pudieron listar mutuos vencidos");
@@ -61,7 +71,7 @@ async fn liquidaciones(e: &AppState) {
         }
     };
     for id in pendientes {
-        if let Err(err) = sofom::puente::liquidar(&e.pool, id, None, hoy).await {
+        if let Err(err) = sofom::puente::liquidar(&e.pool, id, None).await {
             tracing::error!(contrato = %id, codigo = err.codigo(), error = %err, "no se pudo liquidar el mutuo");
         }
     }

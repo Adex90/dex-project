@@ -53,20 +53,49 @@ pub async fn cliente(pool: &PgPool, cfg: &Config, nombre: &str) -> Registro {
     .unwrap()
 }
 
+/// SPEI entrante con una clave de rastreo única.
 pub async fn depositar(pool: &PgPool, cfg: &Config, cuenta_id: Uuid, monto: &str) -> Movimiento {
-    ledger::depositar(
-        pool,
-        &cfg.pld,
-        &ledger::Deposito {
-            cuenta_id,
-            monto: d(monto),
-            referencia_externa: Some("SPEI-PRUEBA".into()),
-            concepto: None,
-            clave_idempotencia: format!("prueba:{}", Uuid::new_v4()),
-        },
-    )
-    .await
-    .unwrap()
+    let rastreo = format!("PRUEBA{}", &Uuid::new_v4().simple().to_string()[..20]);
+    ledger::depositar(pool, &cfg.pld, &ledger::Deposito::spei(cuenta_id, d(monto), &rastreo, None).unwrap())
+        .await
+        .unwrap()
+}
+
+/// Simula el paso del tiempo para un mutuo: recorre `fecha_inicio` hacia
+/// atrás. Solo el dueño del esquema puede hacerlo, desactivando el trigger
+/// que protege los términos (la aplicación nunca puede).
+pub async fn envejecer_mutuo(pool: &PgPool, contrato_id: Uuid, dias: i32) {
+    let mut tx = pool.begin().await.unwrap();
+    sqlx::query("ALTER TABLE sofom.contratos_mutuo DISABLE TRIGGER trg_mutuo_proteger")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE sofom.contratos_mutuo SET fecha_inicio = fecha_inicio - $2 WHERE id = $1")
+        .bind(contrato_id)
+        .bind(dias)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    // Dispara ya los triggers diferidos: ALTER TABLE no admite eventos pendientes.
+    sqlx::query("SET CONSTRAINTS ALL IMMEDIATE").execute(&mut *tx).await.unwrap();
+    sqlx::query("ALTER TABLE sofom.contratos_mutuo ENABLE TRIGGER trg_mutuo_proteger").execute(&mut *tx).await.unwrap();
+    tx.commit().await.unwrap();
+}
+
+/// Igual que [`envejecer_mutuo`], para la fecha de desembolso de un crédito.
+pub async fn envejecer_credito(pool: &PgPool, credito_id: Uuid, dias: i32) {
+    let mut tx = pool.begin().await.unwrap();
+    sqlx::query("ALTER TABLE sofom.creditos DISABLE TRIGGER trg_credito_proteger").execute(&mut *tx).await.unwrap();
+    sqlx::query("UPDATE sofom.creditos SET fecha_desembolso = fecha_desembolso - $2 WHERE id = $1")
+        .bind(credito_id)
+        .bind(dias)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    // Dispara ya los triggers diferidos: ALTER TABLE no admite eventos pendientes.
+    sqlx::query("SET CONSTRAINTS ALL IMMEDIATE").execute(&mut *tx).await.unwrap();
+    sqlx::query("ALTER TABLE sofom.creditos ENABLE TRIGGER trg_credito_proteger").execute(&mut *tx).await.unwrap();
+    tx.commit().await.unwrap();
 }
 
 pub fn clave() -> String {
@@ -144,4 +173,25 @@ pub async fn verificar_invariantes(pool: &PgPool) {
     assert!(ifpe.valido, "cadena IFPE inválida: {ifpe:?}");
     let sofom = hash::verificar_cadena_sofom(pool).await.unwrap();
     assert!(sofom.valido, "cadena SOFOM inválida: {sofom:?}");
+}
+
+/// Crea `n` cuentas IFPE vacías directamente (como dueño del esquema), sin
+/// el costo de Argon2 del alta normal. Para pruebas de carga.
+pub async fn cuentas_vacias(pool: &PgPool, cfg: &Config, n: usize) {
+    for i in 0..n {
+        let cliente: Uuid = sqlx::query_scalar(
+            "INSERT INTO kyc.clientes (tipo_persona, nombre, apellido_paterno, email, estatus_kyc, kyc_verificado_en, nivel_riesgo_pld) \
+             VALUES ('FISICA', 'Carga', 'Prueba', $1, 'VERIFICADO', now(), 'BAJO') RETURNING id",
+        )
+        .bind(format!("carga-{i}-{}@example.mx", Uuid::new_v4()))
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO ifpe.cuentas (cliente_id, clabe) VALUES ($1, $2)")
+            .bind(cliente)
+            .bind(synthetic_capital::clabe::generar(&cfg.clabe_prefijo))
+            .execute(pool)
+            .await
+            .unwrap();
+    }
 }

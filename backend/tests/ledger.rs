@@ -313,3 +313,33 @@ async fn verificador_detecta_manipulacion(pool: PgPool) {
     assert!(!r.valido);
     assert_eq!(r.falla.unwrap().secuencia, 1);
 }
+
+/// Hallazgo de la revisión: el mismo SPEI (clave de rastreo) no puede
+/// acreditarse dos veces, lo registre quien lo registre. Un doble registro
+/// inflaría pasivo y reserva por igual sin que el efectivo exista.
+#[sqlx::test(migrations = "../migrations")]
+async fn spei_no_se_acredita_dos_veces(pool: PgPool) {
+    let cfg = preparar(&pool).await;
+    let ana = cliente(&pool, &cfg, "Ana").await;
+    let spei = ledger::Deposito::spei(ana.cuenta_ifpe.id, d("50000"), "ABC123", None).unwrap();
+    let primero = ledger::depositar(&pool, &cfg.pld, &spei).await.unwrap();
+    let repetido = ledger::depositar(&pool, &cfg.pld, &spei).await.unwrap();
+    assert!(repetido.idempotente);
+    assert_eq!(primero.transaccion.id, repetido.transaccion.id);
+
+    // Mismo SPEI por otra vía (otra clave de idempotencia): lo frena el índice único.
+    let mut otra_via = spei.clone();
+    otra_via.clave_idempotencia = "otra-clave-cualquiera".into();
+    let e = ledger::depositar(&pool, &cfg.pld, &otra_via).await.unwrap_err();
+    assert_eq!(e.codigo(), "SPEI_DUPLICADO");
+
+    // Misma clave con otro SPEI: conflicto, no se descarta en silencio.
+    let mut otro_spei = spei.clone();
+    otro_spei.referencia_externa = Some("XYZ999".into());
+    let e = ledger::depositar(&pool, &cfg.pld, &otro_spei).await.unwrap_err();
+    assert_eq!(e.codigo(), "CLAVE_IDEMPOTENCIA_REUTILIZADA");
+
+    assert!(ledger::Deposito::spei(ana.cuenta_ifpe.id, d("1"), "con espacios", None).is_err());
+    assert_eq!(saldo_ifpe(&pool, ana.cuenta_ifpe.id).await.0, d("50000"));
+    verificar_invariantes(&pool).await;
+}

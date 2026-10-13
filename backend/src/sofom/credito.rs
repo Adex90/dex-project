@@ -38,7 +38,6 @@ pub struct SolicitudCredito {
     pub principal: Decimal,
     pub tasa_anual: Decimal,
     pub plazo_dias: i32,
-    pub fecha_desembolso: NaiveDate,
     pub destino: Option<String>,
     pub clabe_destino: String,
     pub clave_idempotencia: String,
@@ -101,6 +100,8 @@ async fn originar_tx(
     let perfil = pld::cargar_perfil(&mut tx, s.acreditado_id).await?;
     perfil.exigir_operable()?;
 
+    // Fecha valor: hoy según la base de datos (trg_credito_fecha_valor la exige).
+    let hoy: NaiveDate = sqlx::query_scalar("SELECT current_date").fetch_one(&mut *tx).await?;
     let credito: Credito = sqlx::query_as(
         "INSERT INTO sofom.creditos (id, acreditado_id, principal, tasa_anual, plazo_dias, fecha_desembolso, destino) \
          VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *",
@@ -110,17 +111,19 @@ async fn originar_tx(
     .bind(principal)
     .bind(s.tasa_anual)
     .bind(s.plazo_dias)
-    .bind(s.fecha_desembolso)
+    .bind(hoy)
     .bind(&s.destino)
     .fetch_one(&mut *tx)
     .await?;
 
-    // Solo mutuos que vencen en o después del crédito y que ya existían al desembolso.
+    // Solo mutuos que vencen en o después del crédito y que ya existían al
+    // desembolso. Sin lock aquí: todas las operaciones SOFOM se serializan en
+    // la caja, y el trigger de asignación bloquea y revalida cada mutuo.
     let candidatos: Vec<ContratoMutuo> = sqlx::query_as(
         "SELECT * FROM sofom.contratos_mutuo \
          WHERE estado = 'VIGENTE' AND fecha_vencimiento >= $1 AND fecha_inicio <= $2 \
            AND principal_asignado < principal \
-         ORDER BY fecha_vencimiento, folio FOR UPDATE",
+         ORDER BY fecha_vencimiento, folio",
     )
     .bind(credito.fecha_vencimiento)
     .bind(credito.fecha_desembolso)
@@ -156,7 +159,15 @@ async fn originar_tx(
             ),
         ));
     }
-    if caja.saldo < principal {
+    // Tras desembolsar, la caja debe seguir cubriendo el principal no prestado
+    // de todos los mutuos vigentes (el efectivo de un inversionista no fondea
+    // créditos asignados a otro).
+    let no_prestado: Decimal = sqlx::query_scalar(
+        "SELECT coalesce(sum(principal - principal_asignado), 0) FROM sofom.contratos_mutuo WHERE estado = 'VIGENTE'",
+    )
+    .fetch_one(&mut *tx)
+    .await?;
+    if caja.saldo - principal < no_prestado {
         return Err(AppError::negocio("LIQUIDEZ_SOFOM_INSUFICIENTE", "la caja de la SOFOM no cubre el desembolso"));
     }
 
@@ -238,13 +249,21 @@ pub async fn pagar(pool: &PgPool, p: &PagoCredito) -> AppResult<ResultadoPago> {
 async fn pagar_tx(pool: &PgPool, p: &PagoCredito, principal: Decimal, total: Decimal) -> AppResult<ResultadoPago> {
     let mut tx = db::begin(pool, Rol::Sofom).await?;
     let caja = bloquear_caja(&mut tx).await?;
-    let credito: Credito = sqlx::query_as("SELECT * FROM sofom.creditos WHERE id = $1 FOR UPDATE")
+    let credito: Credito = sqlx::query_as("SELECT * FROM sofom.creditos WHERE id = $1 FOR NO KEY UPDATE")
         .bind(p.credito_id)
         .fetch_optional(&mut *tx)
         .await?
         .ok_or_else(|| AppError::no_encontrado("crédito no encontrado"))?;
     if let Some(previa) = buscar_tx_por_clave(&mut tx, &p.clave_idempotencia).await? {
-        if previa.tipo != TipoTxSofom::CobroCredito || previa.credito_id != Some(credito.id) || previa.monto != total {
+        let desglose: Option<(Decimal, Decimal)> =
+            sqlx::query_as("SELECT principal, interes FROM sofom.cobros WHERE transaccion_id = $1")
+                .bind(previa.id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        let mismo = previa.tipo == TipoTxSofom::CobroCredito
+            && previa.credito_id == Some(credito.id)
+            && desglose == Some((principal, total - principal));
+        if !mismo {
             return Err(AppError::conflicto(
                 "CLAVE_IDEMPOTENCIA_REUTILIZADA",
                 "la clave ya se usó para otra operación",
@@ -252,7 +271,8 @@ async fn pagar_tx(pool: &PgPool, p: &PagoCredito, principal: Decimal, total: Dec
         }
         return Ok(ResultadoPago { credito, cobro: previa, idempotente: true });
     }
-    if !matches!(credito.estado, EstadoCredito::Vigente | EstadoCredito::Vencido) {
+    // Un crédito castigado admite recuperaciones (ingreso para la SOFOM).
+    if !matches!(credito.estado, EstadoCredito::Vigente | EstadoCredito::Vencido | EstadoCredito::Castigado) {
         return Err(AppError::negocio("CREDITO_NO_COBRABLE", format!("el crédito está {:?}", credito.estado)));
     }
     if principal > credito.saldo_insoluto {
@@ -262,7 +282,11 @@ async fn pagar_tx(pool: &PgPool, p: &PagoCredito, principal: Decimal, total: Dec
         ));
     }
     let saldo = credito.saldo_insoluto - principal;
-    let estado = if saldo.is_zero() { EstadoCredito::Liquidado } else { credito.estado };
+    let estado = if saldo.is_zero() && credito.estado != EstadoCredito::Castigado {
+        EstadoCredito::Liquidado
+    } else {
+        credito.estado
+    };
 
     sqlx::query("UPDATE sofom.caja SET saldo = saldo + $1 WHERE id = $2")
         .bind(total)
@@ -294,8 +318,78 @@ async fn pagar_tx(pool: &PgPool, p: &PagoCredito, principal: Decimal, total: Dec
         },
     )
     .await?;
+    sqlx::query("INSERT INTO sofom.cobros (transaccion_id, credito_id, principal, interes) VALUES ($1, $2, $3, $4)")
+        .bind(cobro.id)
+        .bind(credito.id)
+        .bind(principal)
+        .bind(total - principal)
+        .execute(&mut *tx)
+        .await?;
     tx.commit().await?;
     Ok(ResultadoPago { credito, cobro, idempotente: false })
+}
+
+// -----------------------------------------------------------------------------
+// Castigo (write-off)
+// -----------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ResultadoCastigo {
+    pub credito: Credito,
+    /// Saldo insoluto que absorbe el capital de la SOFOM.
+    pub perdida: Decimal,
+}
+
+/// Castiga un crédito vencido. Su fondeo se libera (los mutuos que lo
+/// fondeaban pueden vencer y pagarse completos): la pérdida la absorbe el
+/// capital propio de la SOFOM, nunca el inversionista ni la bóveda. Si el
+/// capital no alcanza, la base de datos rechaza el castigo (SC_LIQUIDEZ_MUTUOS)
+/// hasta que se aporte capital.
+pub async fn castigar(pool: &PgPool, credito_id: Uuid) -> AppResult<ResultadoCastigo> {
+    db::con_reintentos(|| async {
+        let mut tx = db::begin(pool, Rol::Sofom).await?;
+        let caja = bloquear_caja(&mut tx).await?;
+        let credito: Credito = sqlx::query_as("SELECT * FROM sofom.creditos WHERE id = $1 FOR NO KEY UPDATE")
+            .bind(credito_id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or_else(|| AppError::no_encontrado("crédito no encontrado"))?;
+        if credito.estado != EstadoCredito::Vencido {
+            return Err(AppError::negocio(
+                "CREDITO_NO_CASTIGABLE",
+                format!("solo se castigan créditos vencidos (está {:?})", credito.estado),
+            ));
+        }
+        let no_prestado: Decimal = sqlx::query_scalar(
+            "SELECT coalesce(sum(principal - principal_asignado), 0) FROM sofom.contratos_mutuo WHERE estado = 'VIGENTE'",
+        )
+        .fetch_one(&mut *tx)
+        .await?;
+        let liberado: Decimal = sqlx::query_scalar(
+            "SELECT coalesce(sum(monto), 0) FROM sofom.asignaciones_fondeo WHERE credito_id = $1 AND NOT liberada",
+        )
+        .bind(credito.id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if caja.saldo < no_prestado + liberado {
+            return Err(AppError::negocio(
+                "CAPITAL_INSUFICIENTE_PARA_CASTIGO",
+                format!(
+                    "el castigo libera {liberado} MXN de fondeo que la caja debe respaldar; faltan {} MXN de capital",
+                    no_prestado + liberado - caja.saldo
+                ),
+            ));
+        }
+        let credito: Credito =
+            sqlx::query_as("UPDATE sofom.creditos SET estado = 'CASTIGADO' WHERE id = $1 RETURNING *")
+                .bind(credito.id)
+                .fetch_one(&mut *tx)
+                .await?;
+        tx.commit().await?;
+        tracing::warn!(credito = %credito.id, folio = credito.folio, perdida = %credito.saldo_insoluto, "crédito castigado");
+        Ok(ResultadoCastigo { perdida: credito.saldo_insoluto, credito })
+    })
+    .await
 }
 
 // -----------------------------------------------------------------------------
@@ -353,13 +447,12 @@ pub async fn aportar_capital(
 }
 
 /// Marca como VENCIDOS los créditos con saldo pasada su fecha de vencimiento.
-pub async fn marcar_creditos_vencidos(pool: &PgPool, hoy: NaiveDate) -> AppResult<u64> {
+pub async fn marcar_creditos_vencidos(pool: &PgPool) -> AppResult<u64> {
     let mut tx = db::begin(pool, Rol::Sofom).await?;
     let n = sqlx::query(
         "UPDATE sofom.creditos SET estado = 'VENCIDO' \
-         WHERE estado = 'VIGENTE' AND fecha_vencimiento < $1 AND saldo_insoluto > 0",
+         WHERE estado = 'VIGENTE' AND fecha_vencimiento < current_date AND saldo_insoluto > 0",
     )
-    .bind(hoy)
     .execute(&mut *tx)
     .await?
     .rows_affected();

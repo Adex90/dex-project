@@ -98,6 +98,11 @@ const MESSAGES: Record<string, string> = {
   REINTENTAR: "The system is busy. Please try again.",
   RESERVA_100: "The operation was rejected because it would break the 100% reserve rule.",
   INTEGRIDAD: "An integrity check failed and the operation was reverted. Please contact support.",
+  PRUEBA_PENDIENTE: "Your account will be included in the next reserve snapshot. Please try again in a minute.",
+  CORTE_EN_CURSO: "A reserve snapshot is being generated right now. Please try again in a moment.",
+  SPEI_DUPLICADO: "That SPEI transfer was already credited.",
+  LIQUIDEZ_MUTUOS: "The credit division cannot complete this right now without additional capital.",
+  FECHA_VALOR: "This operation must be dated today.",
 };
 
 export function describeError(error: unknown): string {

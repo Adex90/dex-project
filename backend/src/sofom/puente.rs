@@ -147,7 +147,6 @@ pub struct SolicitudMutuo {
     pub plazo_dias: i32,
     /// Clave ya acotada al cliente.
     pub clave_idempotencia: String,
-    pub fecha_inicio: NaiveDate,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -200,7 +199,7 @@ async fn invertir_tx(
         .execute(&mut *tx)
         .await?;
     let cuenta_sofom: CuentaSofom =
-        sqlx::query_as("SELECT * FROM sofom.cuentas WHERE cliente_id = $1 AND moneda = 'MXN' FOR UPDATE")
+        sqlx::query_as("SELECT * FROM sofom.cuentas WHERE cliente_id = $1 AND moneda = 'MXN' FOR NO KEY UPDATE")
             .bind(s.cliente_id)
             .fetch_one(&mut *tx)
             .await?;
@@ -209,6 +208,8 @@ async fn invertir_tx(
     }
     let caja = bloquear_caja(&mut tx).await?;
 
+    // Fecha valor: la de la base de datos (el trigger trg_mutuo_fecha_valor la exige).
+    let fecha_inicio: NaiveDate = sqlx::query_scalar("SELECT current_date").fetch_one(&mut *tx).await?;
     let tx_ifpe_id = Uuid::new_v4();
     let tx_sofom_id = Uuid::new_v4();
     let contrato_id = Uuid::new_v4();
@@ -254,7 +255,7 @@ async fn invertir_tx(
         .execute(&mut *tx)
         .await?;
     let terminos =
-        terminos(s.cliente_id, cuenta_sofom.id, cuenta_ifpe.id, tx_ifpe_id, monto, tasa, s.plazo_dias, s.fecha_inicio)?;
+        terminos(s.cliente_id, cuenta_sofom.id, cuenta_ifpe.id, tx_ifpe_id, monto, tasa, s.plazo_dias, fecha_inicio)?;
     let contrato: ContratoMutuo = sqlx::query_as(
         "INSERT INTO sofom.contratos_mutuo \
          (id, cliente_id, cuenta_sofom_id, cuenta_ifpe_origen_id, tx_aportacion_ifpe_id, principal, tasa_anual, \
@@ -269,7 +270,7 @@ async fn invertir_tx(
     .bind(monto)
     .bind(tasa)
     .bind(s.plazo_dias)
-    .bind(s.fecha_inicio)
+    .bind(fecha_inicio)
     .bind(&terminos.hash)
     .fetch_one(&mut *tx)
     .await?;
@@ -360,22 +361,13 @@ fn clave_liquidacion(contrato_id: Uuid, parte: &str) -> String {
 
 /// Liquida un mutuo vencido. `solicitante = Some(cliente)` exige que el
 /// contrato sea suyo; `None` lo ejecuta el sistema u operador.
-pub async fn liquidar(
-    pool: &PgPool,
-    contrato_id: Uuid,
-    solicitante: Option<Uuid>,
-    hoy: NaiveDate,
-) -> AppResult<ResultadoLiquidacion> {
-    db::con_reintentos(|| liquidar_tx(pool, contrato_id, solicitante, hoy)).await
+pub async fn liquidar(pool: &PgPool, contrato_id: Uuid, solicitante: Option<Uuid>) -> AppResult<ResultadoLiquidacion> {
+    db::con_reintentos(|| liquidar_tx(pool, contrato_id, solicitante)).await
 }
 
-async fn liquidar_tx(
-    pool: &PgPool,
-    contrato_id: Uuid,
-    solicitante: Option<Uuid>,
-    hoy: NaiveDate,
-) -> AppResult<ResultadoLiquidacion> {
+async fn liquidar_tx(pool: &PgPool, contrato_id: Uuid, solicitante: Option<Uuid>) -> AppResult<ResultadoLiquidacion> {
     let mut tx = db::begin(pool, Rol::Puente).await?;
+    let hoy: NaiveDate = sqlx::query_scalar("SELECT current_date").fetch_one(&mut *tx).await?;
     let previo: Option<ContratoMutuo> = sqlx::query_as("SELECT * FROM sofom.contratos_mutuo WHERE id = $1")
         .bind(contrato_id)
         .fetch_optional(&mut *tx)
@@ -390,12 +382,12 @@ async fn liquidar_tx(
         return reconstruir_liquidacion(&mut tx, contrato_id, previa).await;
     }
     let reserva = ledger::bloquear_reserva(&mut tx).await?;
-    let cuenta_sofom: CuentaSofom = sqlx::query_as("SELECT * FROM sofom.cuentas WHERE id = $1 FOR UPDATE")
+    let cuenta_sofom: CuentaSofom = sqlx::query_as("SELECT * FROM sofom.cuentas WHERE id = $1 FOR NO KEY UPDATE")
         .bind(previo.cuenta_sofom_id)
         .fetch_one(&mut *tx)
         .await?;
     let caja = bloquear_caja(&mut tx).await?;
-    let contrato: ContratoMutuo = sqlx::query_as("SELECT * FROM sofom.contratos_mutuo WHERE id = $1 FOR UPDATE")
+    let contrato: ContratoMutuo = sqlx::query_as("SELECT * FROM sofom.contratos_mutuo WHERE id = $1 FOR NO KEY UPDATE")
         .bind(contrato_id)
         .fetch_one(&mut *tx)
         .await?;
@@ -419,10 +411,22 @@ async fn liquidar_tx(
 
     let interes = tasas::interes(contrato.principal, contrato.tasa_anual, contrato.plazo_dias);
     let total = contrato.principal + interes;
-    if caja.saldo < total {
+    // El efectivo que respalda el principal no prestado de los DEMÁS mutuos no
+    // se toca: el interés sale del capital propio de la SOFOM. Usar el dinero
+    // de otro inversionista sería prestar corto para pagar largo. (La base de
+    // datos lo exige al COMMIT con trg_caja_liquidez / trg_mutuo_liquidez.)
+    let comprometido_otros: Decimal = sqlx::query_scalar(
+        "SELECT coalesce(sum(principal - principal_asignado), 0) FROM sofom.contratos_mutuo \
+         WHERE estado = 'VIGENTE' AND id <> $1",
+    )
+    .bind(contrato.id)
+    .fetch_one(&mut *tx)
+    .await?;
+    if caja.saldo - total < comprometido_otros {
         return Err(AppError::negocio(
             "LIQUIDEZ_SOFOM_INSUFICIENTE",
-            "la caja de la SOFOM no cubre principal más intereses; se requiere aportación de capital",
+            "la SOFOM no tiene capital propio suficiente para pagar el interés de este mutuo; \
+             se requiere una aportación de capital",
         ));
     }
     let tx_ifpe_id = Uuid::new_v4();
@@ -585,17 +589,32 @@ async fn reconstruir_liquidacion(
 }
 
 /// Contratos vigentes ya vencidos y sin cartera viva (candidatos a liquidación automática).
-pub async fn contratos_por_liquidar(pool: &PgPool, hoy: NaiveDate, limite: i64) -> AppResult<Vec<Uuid>> {
+pub async fn contratos_por_liquidar(pool: &PgPool, limite: i64) -> AppResult<Vec<Uuid>> {
     let mut tx = db::begin_lectura(pool, Rol::Puente).await?;
     let ids = sqlx::query_scalar(
         "SELECT id FROM sofom.contratos_mutuo \
-         WHERE estado = 'VIGENTE' AND fecha_vencimiento <= $1 AND principal_asignado = 0 \
-         ORDER BY fecha_vencimiento, folio LIMIT $2",
+         WHERE estado = 'VIGENTE' AND fecha_vencimiento <= current_date AND principal_asignado = 0 \
+         ORDER BY fecha_vencimiento, folio LIMIT $1",
     )
-    .bind(hoy)
     .bind(limite)
     .fetch_all(&mut *tx)
     .await?;
     tx.commit().await?;
     Ok(ids)
+}
+
+/// Mutuos vencidos que no pueden liquidarse porque aún fondean créditos
+/// vencidos sin castigar (folio, principal comprometido). Requieren gestión de
+/// cobranza o castigo; las tareas de fondo los reportan en cada ciclo.
+pub async fn contratos_bloqueados_por_cartera(pool: &PgPool) -> AppResult<Vec<(i64, Decimal)>> {
+    let mut tx = db::begin_lectura(pool, Rol::Puente).await?;
+    let filas = sqlx::query_as(
+        "SELECT folio, principal_asignado FROM sofom.contratos_mutuo \
+         WHERE estado = 'VIGENTE' AND fecha_vencimiento <= current_date AND principal_asignado > 0 \
+         ORDER BY fecha_vencimiento, folio",
+    )
+    .fetch_all(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(filas)
 }
