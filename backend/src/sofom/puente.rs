@@ -140,6 +140,10 @@ pub fn terminos_de(c: &ContratoMutuo) -> AppResult<TerminosMutuo> {
 // Inversión: IFPE -> contrato de mutuo
 // -----------------------------------------------------------------------------
 
+fn concepto_aportacion(plazo_dias: i32) -> String {
+    format!("Aportación a contrato de mutuo a {plazo_dias} días")
+}
+
 #[derive(Debug, Clone)]
 pub struct SolicitudMutuo {
     pub cliente_id: Uuid,
@@ -182,7 +186,16 @@ async fn invertir_tx(
 
     // 2. Idempotencia (después del lock: una petición repetida espera y ve la primera).
     if let Some(previa) = ledger::buscar_por_clave(&mut tx, &s.clave_idempotencia).await? {
-        ledger::exigir_misma_operacion(&previa, TipoTxIfpe::TraspasoASofom, monto, Some(cuenta_ifpe.id), None)?;
+        let concepto = concepto_aportacion(s.plazo_dias);
+        ledger::exigir_misma_operacion(
+            &previa,
+            TipoTxIfpe::TraspasoASofom,
+            monto,
+            Some(cuenta_ifpe.id),
+            None,
+            Some(&concepto),
+            None,
+        )?;
         return reconstruir_inversion(&mut tx, previa, s.plazo_dias).await;
     }
 
@@ -213,7 +226,7 @@ async fn invertir_tx(
     let tx_ifpe_id = Uuid::new_v4();
     let tx_sofom_id = Uuid::new_v4();
     let contrato_id = Uuid::new_v4();
-    let concepto = format!("Aportación a contrato de mutuo a {} días", s.plazo_dias);
+    let concepto = concepto_aportacion(s.plazo_dias);
 
     // 5. IFPE: el pasivo y la reserva bajan juntos; el efectivo sale a la SOFOM.
     sqlx::query("UPDATE ifpe.cuentas SET saldo_disponible = saldo_disponible - $1 WHERE id = $2")
@@ -411,18 +424,14 @@ async fn liquidar_tx(pool: &PgPool, contrato_id: Uuid, solicitante: Option<Uuid>
 
     let interes = tasas::interes(contrato.principal, contrato.tasa_anual, contrato.plazo_dias);
     let total = contrato.principal + interes;
-    // El efectivo que respalda el principal no prestado de los DEMÁS mutuos no
-    // se toca: el interés sale del capital propio de la SOFOM. Usar el dinero
-    // de otro inversionista sería prestar corto para pagar largo. (La base de
-    // datos lo exige al COMMIT con trg_caja_liquidez / trg_mutuo_liquidez.)
-    let comprometido_otros: Decimal = sqlx::query_scalar(
-        "SELECT coalesce(sum(principal - principal_asignado), 0) FROM sofom.contratos_mutuo \
-         WHERE estado = 'VIGENTE' AND id <> $1",
-    )
-    .bind(contrato.id)
-    .fetch_one(&mut *tx)
-    .await?;
-    if caja.saldo - total < comprometido_otros {
+    // El efectivo que respalda a los DEMÁS inversionistas (su principal que no
+    // está prestado, incluido el que los acreditados ya devolvieron) no se
+    // toca: el interés sale del capital propio de la SOFOM. Usar el dinero de
+    // otro inversionista sería prestar corto para pagar largo. La base de
+    // datos aplica la misma fórmula al COMMIT (sofom.requerido_liquidez).
+    let requerido_otros: Decimal =
+        sqlx::query_scalar("SELECT sofom.requerido_liquidez($1)").bind(contrato.id).fetch_one(&mut *tx).await?;
+    if caja.saldo - total < requerido_otros {
         return Err(AppError::negocio(
             "LIQUIDEZ_SOFOM_INSUFICIENTE",
             "la SOFOM no tiene capital propio suficiente para pagar el interés de este mutuo; \

@@ -88,6 +88,7 @@ pub struct Credito {
     pub saldo_insoluto: Decimal,
     pub estado: EstadoCredito,
     pub destino: Option<String>,
+    pub clabe_desembolso: Option<String>,
     pub creado_en: DateTime<Utc>,
     pub actualizado_en: DateTime<Utc>,
 }

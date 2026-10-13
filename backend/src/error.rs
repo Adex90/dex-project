@@ -134,7 +134,7 @@ fn traducir_error_bd(codigo_sql: &str, mensaje: &str, restriccion: &str) -> Opti
             AppError::negocio("RESTRICCION_VIOLADA", format!("la operación viola la restricción {restriccion}"))
         }),
         // unique_violation
-        "23505" => Some(if restriccion.contains("deposito_referencia") {
+        "23505" => Some(if restriccion.contains("deposito_spei") {
             AppError::conflicto("SPEI_DUPLICADO", "ese SPEI (clave de rastreo) ya fue acreditado")
         } else if restriccion.contains("clave_idempotencia") {
             AppError::conflicto("OPERACION_DUPLICADA", "ya existe una operación con esa clave de idempotencia")

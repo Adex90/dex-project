@@ -314,32 +314,149 @@ async fn verificador_detecta_manipulacion(pool: PgPool) {
     assert_eq!(r.falla.unwrap().secuencia, 1);
 }
 
-/// Hallazgo de la revisión: el mismo SPEI (clave de rastreo) no puede
-/// acreditarse dos veces, lo registre quien lo registre. Un doble registro
-/// inflaría pasivo y reserva por igual sin que el efectivo exista.
+fn spei(banco: &str, fecha: &str, rastreo: &str) -> ledger::IdentidadSpei {
+    ledger::IdentidadSpei {
+        banco_emisor: banco.into(),
+        fecha_operacion: fecha.parse().unwrap(),
+        clave_rastreo: rastreo.into(),
+    }
+}
+
+/// Hallazgos (rondas 1 y 2): el mismo SPEI no puede acreditarse dos veces, lo
+/// registre quien lo registre y con cualquier uso de mayúsculas; pero dos SPEI
+/// distintos con la misma clave de rastreo (otro emisor u otro día) son pagos
+/// distintos y ambos se acreditan.
 #[sqlx::test(migrations = "../migrations")]
-async fn spei_no_se_acredita_dos_veces(pool: PgPool) {
+async fn spei_identidad_canonica(pool: PgPool) {
     let cfg = preparar(&pool).await;
     let ana = cliente(&pool, &cfg, "Ana").await;
-    let spei = ledger::Deposito::spei(ana.cuenta_ifpe.id, d("50000"), "ABC123", None).unwrap();
-    let primero = ledger::depositar(&pool, &cfg.pld, &spei).await.unwrap();
-    let repetido = ledger::depositar(&pool, &cfg.pld, &spei).await.unwrap();
-    assert!(repetido.idempotente);
-    assert_eq!(primero.transaccion.id, repetido.transaccion.id);
+    let deposito = |id: ledger::IdentidadSpei| {
+        let pool = pool.clone();
+        let pld = cfg.pld.clone();
+        let cuenta = ana.cuenta_ifpe.id;
+        async move { ledger::depositar(&pool, &pld, &ledger::Deposito::spei(cuenta, d("5000"), &id, None)?).await }
+    };
+    let primero = deposito(spei("40012", "2026-10-01", "MBAN01002610130000123")).await.unwrap();
+    assert_eq!(primero.transaccion.referencia_externa.as_deref(), Some("40012:20261001:MBAN01002610130000123"));
 
-    // Mismo SPEI por otra vía (otra clave de idempotencia): lo frena el índice único.
-    let mut otra_via = spei.clone();
-    otra_via.clave_idempotencia = "otra-clave-cualquiera".into();
+    // Mismo pago con otras mayúsculas o espacios: es una repetición, no un crédito nuevo.
+    for variante in ["mban01002610130000123", "MBan01002610130000123", " MBAN01002610130000123 "] {
+        let r = deposito(spei("40012", "2026-10-01", variante)).await.unwrap();
+        assert!(r.idempotente, "{variante}");
+        assert_eq!(r.transaccion.id, primero.transaccion.id);
+    }
+    // Misma clave de rastreo, otro emisor u otro día: pagos distintos.
+    assert!(!deposito(spei("40014", "2026-10-01", "MBAN01002610130000123")).await.unwrap().idempotente);
+    assert!(!deposito(spei("40012", "2026-09-01", "MBAN01002610130000123")).await.unwrap().idempotente);
+    assert_eq!(saldo_ifpe(&pool, ana.cuenta_ifpe.id).await.0, d("15000"));
+
+    // El índice único respalda la regla aunque se use otra clave de idempotencia `spei:`.
+    let mut otra_via = ledger::Deposito::spei(
+        ana.cuenta_ifpe.id,
+        d("5000"),
+        &spei("40012", "2026-10-01", "MBAN01002610130000123"),
+        None,
+    )
+    .unwrap();
+    otra_via.clave_idempotencia = "spei:otra-forma-de-escribirla".into();
     let e = ledger::depositar(&pool, &cfg.pld, &otra_via).await.unwrap_err();
     assert_eq!(e.codigo(), "SPEI_DUPLICADO");
 
-    // Misma clave con otro SPEI: conflicto, no se descarta en silencio.
-    let mut otro_spei = spei.clone();
-    otro_spei.referencia_externa = Some("XYZ999".into());
-    let e = ledger::depositar(&pool, &cfg.pld, &otro_spei).await.unwrap_err();
+    // Misma identidad con otro monto: conflicto, no se descarta en silencio.
+    let e = ledger::depositar(
+        &pool,
+        &cfg.pld,
+        &ledger::Deposito::spei(
+            ana.cuenta_ifpe.id,
+            d("4999"),
+            &spei("40012", "2026-10-01", "MBAN01002610130000123"),
+            None,
+        )
+        .unwrap(),
+    )
+    .await
+    .unwrap_err();
     assert_eq!(e.codigo(), "CLAVE_IDEMPOTENCIA_REUTILIZADA");
 
-    assert!(ledger::Deposito::spei(ana.cuenta_ifpe.id, d("1"), "con espacios", None).is_err());
-    assert_eq!(saldo_ifpe(&pool, ana.cuenta_ifpe.id).await.0, d("50000"));
+    assert!(
+        ledger::Deposito::spei(ana.cuenta_ifpe.id, d("1"), &spei("40012", "2026-10-01", "con espacios"), None).is_err()
+    );
+    assert!(ledger::Deposito::spei(ana.cuenta_ifpe.id, d("1"), &spei("4X", "2026-10-01", "ABC"), None).is_err());
+    assert!(ledger::Deposito::spei(ana.cuenta_ifpe.id, d("1"), &spei("40012", "2999-01-01", "ABC"), None).is_err());
+    assert_eq!(saldo_ifpe(&pool, ana.cuenta_ifpe.id).await.0, d("15000"));
+    verificar_invariantes(&pool).await;
+}
+
+/// Hallazgo (ronda 2): repetir una clave con datos materiales distintos (otra
+/// CLABE destino, otro concepto) es otra operación: 409, nunca un "éxito".
+#[sqlx::test(migrations = "../migrations")]
+async fn repeticion_con_otros_datos_es_conflicto(pool: PgPool) {
+    let cfg = preparar(&pool).await;
+    let ana = cliente(&pool, &cfg, "Ana").await;
+    depositar(&pool, &cfg, ana.cuenta_ifpe.id, "1000").await;
+    let retiro = |clabe: &str, concepto: Option<&str>| ledger::Retiro {
+        cliente_id: ana.cliente.id,
+        monto: d("100"),
+        clabe_destino: clabe.into(),
+        concepto: concepto.map(Into::into),
+        clave_idempotencia: "cli:ana:retiro-1".into(),
+    };
+    ledger::retirar(&pool, &cfg.pld, &retiro("646180157000000017", None)).await.unwrap();
+    assert!(ledger::retirar(&pool, &cfg.pld, &retiro("646180157000000017", None)).await.unwrap().idempotente);
+    let e = ledger::retirar(&pool, &cfg.pld, &retiro("646180157000000020", None)).await.unwrap_err();
+    assert_eq!(e.codigo(), "CLAVE_IDEMPOTENCIA_REUTILIZADA", "otra CLABE destino");
+    let e = ledger::retirar(&pool, &cfg.pld, &retiro("646180157000000017", Some("otro concepto"))).await.unwrap_err();
+    assert_eq!(e.codigo(), "CLAVE_IDEMPOTENCIA_REUTILIZADA", "otro concepto");
+    assert_eq!(saldo_ifpe(&pool, ana.cuenta_ifpe.id).await.0, d("900"));
+}
+
+/// Hallazgo (ronda 2): un saldo no puede cambiar sin su movimiento en el
+/// ledger. Antes, +X a una cuenta y +X a la reserva (cuadrado para
+/// SC_RESERVA_100) se confirmaba sin dejar rastro y pasaba toda auditoría.
+#[sqlx::test(migrations = "../migrations")]
+async fn saldo_sin_movimiento_en_ledger_rechazado(pool: PgPool) {
+    use synthetic_capital::db::{self, Rol};
+    let cfg = preparar(&pool).await;
+    let ana = cliente(&pool, &cfg, "Ana").await;
+    depositar(&pool, &cfg, ana.cuenta_ifpe.id, "1000").await;
+
+    let acunar = |rol: Rol, sentencias: Vec<String>| {
+        let pool = pool.clone();
+        async move {
+            let mut tx = db::begin(&pool, rol).await.unwrap();
+            for s in &sentencias {
+                sqlx::query(s).execute(&mut *tx).await.unwrap();
+            }
+            tx.commit().await.map_err(|e| e.to_string())
+        }
+    };
+    let cuenta = ana.cuenta_ifpe.id;
+    let e = acunar(
+        Rol::Ifpe,
+        vec![
+            format!("UPDATE ifpe.cuentas SET saldo_disponible = saldo_disponible + 5000000 WHERE id = '{cuenta}'"),
+            "UPDATE ifpe.reserva_custodia SET saldo = saldo + 5000000".into(),
+        ],
+    )
+    .await
+    .unwrap_err();
+    assert!(e.contains("SC_SALDO_SIN_LEDGER"), "{e}");
+
+    // Retención fantasma (disponible -> bloqueado sin movimiento RETENCION).
+    let e = acunar(
+        Rol::Ifpe,
+        vec![format!(
+            "UPDATE ifpe.cuentas SET saldo_disponible = saldo_disponible - 10, saldo_bloqueado = saldo_bloqueado + 10 WHERE id = '{cuenta}'"
+        )],
+    )
+    .await
+    .unwrap_err();
+    assert!(e.contains("SC_SALDO_SIN_LEDGER"), "{e}");
+
+    // Lo mismo en la SOFOM: efectivo de caja sin movimiento.
+    let e = acunar(Rol::Puente, vec!["UPDATE sofom.caja SET saldo = saldo + 100".into()]).await.unwrap_err();
+    assert!(e.contains("SC_SALDO_SIN_LEDGER"), "{e}");
+
+    assert_eq!(saldo_ifpe(&pool, cuenta).await, (d("1000"), d("0")));
     verificar_invariantes(&pool).await;
 }

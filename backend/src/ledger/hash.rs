@@ -12,18 +12,22 @@
 //! (o `~` si es NULL) y se une con `|`. El prefijo de longitud hace la
 //! codificación inyectiva aunque un concepto contenga `|`.
 
+use std::collections::HashMap;
+
 use chrono::{DateTime, Utc};
+use rust_decimal::Decimal;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
+use uuid::Uuid;
 
 use crate::{
     db::{self, Rol},
     dinero,
     error::AppResult,
     models::{
-        ifpe::{LedgerCabeza, TransaccionIfpe},
-        sofom::TransaccionSofom,
+        ifpe::{LedgerCabeza, TipoTxIfpe, TransaccionIfpe},
+        sofom::{TipoTxSofom, TransaccionSofom},
     },
 };
 
@@ -149,7 +153,15 @@ pub struct ResultadoVerificacion {
     pub ultimo_hash: String,
     /// `ledger_cabeza` apunta exactamente al último movimiento verificado.
     pub cabeza_coincide: bool,
+    /// Primera ruptura de la cadena (continuidad, enlace o hash).
     pub falla: Option<FallaCadena>,
+    /// Anclas publicadas (cortes de Proof of Reserve) comprobadas contra la cadena.
+    pub anclas_verificadas: u64,
+    /// Saldos vivos y sombra conciliados con la reproducción independiente del ledger.
+    pub saldos_conciliados: u64,
+    /// Anclas que ya no existen en la cadena, saldos que el ledger no justifica,
+    /// movimientos espejo IFPE<->SOFOM rotos, conteos que no cuadran.
+    pub discrepancias: Vec<String>,
 }
 
 /// Verificador incremental: recibe movimientos en orden de secuencia.
@@ -208,20 +220,98 @@ impl VerificadorCadena {
             ultimo_hash: self.hash_previo,
             cabeza_coincide,
             falla,
+            anclas_verificadas: 0,
+            saldos_conciliados: 0,
+            discrepancias: Vec::new(),
         }
+    }
+}
+
+impl ResultadoVerificacion {
+    fn cerrar(mut self) -> Self {
+        self.valido = self.falla.is_none() && self.cabeza_coincide && self.discrepancias.is_empty();
+        self
     }
 }
 
 const LOTE: i64 = 1_000;
 
-/// Recorre todo el ledger IFPE (foto consistente) y verifica la cadena.
+/// Saldos reproducidos a partir del ledger (dos componentes: disponible y bloqueado).
+#[derive(Default)]
+struct Reproduccion(HashMap<Uuid, (Decimal, Decimal)>);
+
+impl Reproduccion {
+    fn mover(&mut self, id: Option<Uuid>, d1: Decimal, d2: Decimal) {
+        if let Some(id) = id {
+            let e = self.0.entry(id).or_default();
+            e.0 += d1;
+            e.1 += d2;
+        }
+    }
+
+    /// Compara con los saldos de una tabla (vivos o sombra) y anota discrepancias.
+    fn conciliar(&self, nombre: &str, saldos: &[(Uuid, Decimal, Decimal)], r: &mut ResultadoVerificacion) {
+        let cero = (Decimal::ZERO, Decimal::ZERO);
+        let mut vistos = std::collections::HashSet::new();
+        for (id, a, b) in saldos {
+            vistos.insert(*id);
+            let esperado = self.0.get(id).copied().unwrap_or(cero);
+            if (*a, *b) != esperado {
+                r.discrepancias.push(format!(
+                    "{nombre} {id}: saldo ({a}, {b}) pero el ledger justifica ({}, {})",
+                    esperado.0, esperado.1
+                ));
+            }
+            r.saldos_conciliados += 1;
+        }
+        for (id, v) in &self.0 {
+            if !vistos.contains(id) && *v != cero {
+                r.discrepancias.push(format!("{nombre} {id}: el ledger justifica ({}, {}) pero no existe", v.0, v.1));
+            }
+        }
+    }
+}
+
+async fn conteo_ledger(tx: &mut db::Tx, tabla: &str) -> AppResult<(i64, Option<i64>)> {
+    let sql = format!("SELECT count(*), min(secuencia) FROM {tabla}");
+    Ok(sqlx::query_as(&sql).fetch_one(&mut **tx).await?)
+}
+
+fn verificar_conteo(r: &mut ResultadoVerificacion, conteo: (i64, Option<i64>), cabeza: &LedgerCabeza) {
+    let (n, min) = conteo;
+    if n != cabeza.ultima_secuencia || (n > 0 && min != Some(1)) {
+        r.discrepancias.push(format!(
+            "el ledger tiene {n} filas (mínima secuencia {min:?}) pero la cabeza declara {}",
+            cabeza.ultima_secuencia
+        ));
+    }
+}
+
+/// Recorre todo el ledger IFPE (foto consistente): cadena de hashes, anclas de
+/// los cortes publicados y reproducción de todos los saldos.
 pub async fn verificar_cadena_ifpe(pool: &PgPool) -> AppResult<ResultadoVerificacion> {
     let mut tx = db::begin_lectura_instantanea(pool, Rol::Auditor).await?;
     let cabeza: LedgerCabeza =
         sqlx::query_as("SELECT ultima_secuencia, ultimo_hash FROM ifpe.ledger_cabeza").fetch_one(&mut *tx).await?;
+    // Anclas publicadas: (secuencia, hash, corte) en orden de publicación.
+    let anclas: Vec<(i64, String, Uuid)> =
+        sqlx::query_as("SELECT secuencia_ledger, hash_ledger, id FROM ifpe.cortes_reserva ORDER BY creado_en, id")
+            .fetch_all(&mut *tx)
+            .await?;
+    let mut por_secuencia: HashMap<i64, Vec<(String, Uuid)>> = HashMap::new();
+    for (sec, h, id) in &anclas {
+        por_secuencia.entry(*sec).or_default().push((h.clone(), *id));
+    }
+
     let mut v = VerificadorCadena::default();
-    let mut desde = 0_i64;
-    loop {
+    let mut cuentas = Reproduccion::default();
+    let mut reservas = Reproduccion::default();
+    let mut anclas_ok = 0_u64;
+    let mut discrepancias = Vec::new();
+    let mut falla = None;
+    // Desde i64::MIN: una fila con secuencia <= 0 rompe la continuidad.
+    let mut desde = i64::MIN;
+    'lotes: loop {
         let lote: Vec<TransaccionIfpe> =
             sqlx::query_as("SELECT * FROM ifpe.transacciones WHERE secuencia > $1 ORDER BY secuencia LIMIT $2")
                 .bind(desde)
@@ -232,22 +322,97 @@ pub async fn verificar_cadena_ifpe(pool: &PgPool) -> AppResult<ResultadoVerifica
         desde = ultima.secuencia;
         for t in &lote {
             if let Err(f) = v.verificar(t.secuencia, &t.hash_anterior, &t.tx_hash, &hash_ifpe(t)) {
-                return Ok(v.resultado("IFPE", &cabeza, Some(f)));
+                falla = Some(f);
+                break 'lotes;
+            }
+            for (h, corte) in por_secuencia.get(&t.secuencia).into_iter().flatten() {
+                if *h == t.tx_hash {
+                    anclas_ok += 1;
+                } else {
+                    discrepancias.push(format!("el corte {corte} ancla la secuencia {} con otro hash", t.secuencia));
+                }
+            }
+            let m = t.monto;
+            let cero = Decimal::ZERO;
+            match t.tipo {
+                TipoTxIfpe::Deposito | TipoTxIfpe::RetornoDeSofom => {
+                    cuentas.mover(t.cuenta_destino_id, m, cero);
+                    reservas.mover(t.reserva_id, m, cero);
+                }
+                TipoTxIfpe::Retiro | TipoTxIfpe::TraspasoASofom => {
+                    cuentas.mover(t.cuenta_origen_id, -m, cero);
+                    reservas.mover(t.reserva_id, -m, cero);
+                }
+                TipoTxIfpe::Transferencia => {
+                    cuentas.mover(t.cuenta_origen_id, -m, cero);
+                    cuentas.mover(t.cuenta_destino_id, m, cero);
+                }
+                TipoTxIfpe::Retencion => cuentas.mover(t.cuenta_origen_id, -m, m),
+                TipoTxIfpe::LiberacionRetencion => cuentas.mover(t.cuenta_origen_id, m, -m),
             }
         }
     }
+    let mut r = v.resultado("IFPE", &cabeza, falla);
+    r.discrepancias.append(&mut discrepancias);
+    if r.falla.is_none() {
+        r.anclas_verificadas = anclas_ok;
+        verificar_conteo(&mut r, conteo_ledger(&mut tx, "ifpe.transacciones").await?, &cabeza);
+        // Anclas que apuntan más allá de la cabeza: el ledger fue truncado.
+        let mut maxima = 0_i64;
+        for (sec, h, corte) in &anclas {
+            if *sec > r.ultima_secuencia {
+                r.discrepancias.push(format!(
+                    "el corte {corte} ancla la secuencia {sec}, que ya no existe (cabeza en {}): ledger truncado",
+                    r.ultima_secuencia
+                ));
+            } else if *sec == 0 {
+                if h != GENESIS {
+                    r.discrepancias
+                        .push(format!("el corte {corte} ancla la secuencia 0 con un hash distinto al génesis"));
+                } else {
+                    r.anclas_verificadas += 1;
+                }
+            }
+            if *sec < maxima {
+                r.discrepancias.push(format!("el corte {corte} ancla la secuencia {sec}, anterior a un corte previo"));
+            }
+            maxima = maxima.max(*sec);
+        }
+        let vivos: Vec<(Uuid, Decimal, Decimal)> =
+            sqlx::query_as("SELECT id, saldo_disponible, saldo_bloqueado FROM ifpe.cuentas")
+                .fetch_all(&mut *tx)
+                .await?;
+        cuentas.conciliar("cuenta IFPE", &vivos, &mut r);
+        let sombra: Vec<(Uuid, Decimal, Decimal)> =
+            sqlx::query_as("SELECT cuenta_id, disponible, bloqueado FROM ifpe.saldos_ledger")
+                .fetch_all(&mut *tx)
+                .await?;
+        cuentas.conciliar("sombra de cuenta IFPE", &sombra, &mut r);
+        let reserva: Vec<(Uuid, Decimal, Decimal)> =
+            sqlx::query_as("SELECT id, saldo, 0::numeric FROM ifpe.reserva_custodia").fetch_all(&mut *tx).await?;
+        reservas.conciliar("reserva en custodia", &reserva, &mut r);
+        let sombra: Vec<(Uuid, Decimal, Decimal)> =
+            sqlx::query_as("SELECT reserva_id, saldo, 0::numeric FROM ifpe.reserva_ledger").fetch_all(&mut *tx).await?;
+        reservas.conciliar("sombra de reserva", &sombra, &mut r);
+    }
     tx.commit().await?;
-    Ok(v.resultado("IFPE", &cabeza, None))
+    Ok(r.cerrar())
 }
 
-/// Recorre todo el ledger SOFOM (foto consistente) y verifica la cadena.
+/// Recorre todo el ledger SOFOM (foto consistente): cadena de hashes,
+/// reproducción de cuentas de inversión, caja y créditos, y movimientos espejo
+/// con la IFPE.
 pub async fn verificar_cadena_sofom(pool: &PgPool) -> AppResult<ResultadoVerificacion> {
     let mut tx = db::begin_lectura_instantanea(pool, Rol::Sofom).await?;
     let cabeza: LedgerCabeza =
         sqlx::query_as("SELECT ultima_secuencia, ultimo_hash FROM sofom.ledger_cabeza").fetch_one(&mut *tx).await?;
     let mut v = VerificadorCadena::default();
-    let mut desde = 0_i64;
-    loop {
+    let mut cuentas = Reproduccion::default();
+    let mut cajas = Reproduccion::default();
+    let mut creditos = Reproduccion::default();
+    let mut falla = None;
+    let mut desde = i64::MIN;
+    'lotes: loop {
         let lote: Vec<TransaccionSofom> =
             sqlx::query_as("SELECT * FROM sofom.transacciones WHERE secuencia > $1 ORDER BY secuencia LIMIT $2")
                 .bind(desde)
@@ -258,12 +423,86 @@ pub async fn verificar_cadena_sofom(pool: &PgPool) -> AppResult<ResultadoVerific
         desde = ultima.secuencia;
         for t in &lote {
             if let Err(f) = v.verificar(t.secuencia, &t.hash_anterior, &t.tx_hash, &hash_sofom(t)) {
-                return Ok(v.resultado("SOFOM", &cabeza, Some(f)));
+                falla = Some(f);
+                break 'lotes;
+            }
+            let (m, cero) = (t.monto, Decimal::ZERO);
+            match t.tipo {
+                TipoTxSofom::AportacionMutuo => {
+                    cuentas.mover(t.cuenta_id, cero, m);
+                    cajas.mover(t.caja_id, m, cero);
+                }
+                TipoTxSofom::VencimientoMutuo => cuentas.mover(t.cuenta_id, m, -m),
+                TipoTxSofom::PagoInteresMutuo => cuentas.mover(t.cuenta_id, m, cero),
+                TipoTxSofom::RetornoAIfpe => {
+                    cuentas.mover(t.cuenta_id, -m, cero);
+                    cajas.mover(t.caja_id, -m, cero);
+                }
+                TipoTxSofom::DesembolsoCredito => {
+                    cajas.mover(t.caja_id, -m, cero);
+                    creditos.mover(t.credito_id, m, cero);
+                }
+                TipoTxSofom::CobroCredito | TipoTxSofom::AportacionCapital => cajas.mover(t.caja_id, m, cero),
             }
         }
     }
+    let mut r = v.resultado("SOFOM", &cabeza, falla);
+    if r.falla.is_none() {
+        verificar_conteo(&mut r, conteo_ledger(&mut tx, "sofom.transacciones").await?, &cabeza);
+        // El principal de cada cobro reduce el saldo del crédito (el movimiento lleva principal + interés).
+        let cobros: Vec<(Uuid, Decimal)> =
+            sqlx::query_as("SELECT credito_id, principal FROM sofom.cobros").fetch_all(&mut *tx).await?;
+        for (credito, principal) in cobros {
+            creditos.mover(Some(credito), -principal, Decimal::ZERO);
+        }
+        let consultas: [(&str, &str, &Reproduccion); 6] = [
+            ("cuenta SOFOM", "SELECT id, saldo_disponible, saldo_bloqueado FROM sofom.cuentas", &cuentas),
+            ("sombra de cuenta SOFOM", "SELECT cuenta_id, disponible, bloqueado FROM sofom.saldos_ledger", &cuentas),
+            ("caja SOFOM", "SELECT id, saldo, 0::numeric FROM sofom.caja", &cajas),
+            ("sombra de caja", "SELECT caja_id, saldo, 0::numeric FROM sofom.caja_ledger", &cajas),
+            ("crédito", "SELECT id, saldo_insoluto, 0::numeric FROM sofom.creditos", &creditos),
+            (
+                "sombra de crédito",
+                "SELECT credito_id, saldo_insoluto, 0::numeric FROM sofom.creditos_ledger",
+                &creditos,
+            ),
+        ];
+        for (nombre, sql, rep) in consultas {
+            let saldos: Vec<(Uuid, Decimal, Decimal)> = sqlx::query_as(sql).fetch_all(&mut *tx).await?;
+            rep.conciliar(nombre, &saldos, &mut r);
+        }
+    }
     tx.commit().await?;
-    Ok(v.resultado("SOFOM", &cabeza, None))
+    let mut espejos = verificar_espejos(pool).await?;
+    r.discrepancias.append(&mut espejos);
+    Ok(r.cerrar())
+}
+
+/// Cada movimiento del puente existe en ambos ledgers, con referencias
+/// recíprocas, el mismo monto y el tipo correspondiente. Se lee con el rol del
+/// puente (el único que ve ambos ledgers) en una sola foto consistente.
+async fn verificar_espejos(pool: &PgPool) -> AppResult<Vec<String>> {
+    let mut tx = db::begin_lectura_instantanea(pool, Rol::Puente).await?;
+    let rotos: Vec<(String, i64, String)> = sqlx::query_as(
+        "SELECT 'IFPE', i.secuencia, i.tipo FROM ifpe.transacciones i \
+           LEFT JOIN sofom.transacciones s ON s.id = i.ref_movimiento_espejo \
+          WHERE i.tipo IN ('TRASPASO_A_SOFOM', 'RETORNO_DE_SOFOM') \
+            AND (s.id IS NULL OR s.ref_movimiento_espejo IS DISTINCT FROM i.id OR s.monto <> i.monto \
+                 OR s.tipo <> CASE i.tipo WHEN 'TRASPASO_A_SOFOM' THEN 'APORTACION_MUTUO' ELSE 'RETORNO_A_IFPE' END) \
+         UNION ALL \
+         SELECT 'SOFOM', s.secuencia, s.tipo FROM sofom.transacciones s \
+           LEFT JOIN ifpe.transacciones i ON i.id = s.ref_movimiento_espejo \
+          WHERE s.tipo IN ('APORTACION_MUTUO', 'RETORNO_A_IFPE') \
+            AND (i.id IS NULL OR i.ref_movimiento_espejo IS DISTINCT FROM s.id OR i.monto <> s.monto \
+                 OR i.tipo <> CASE s.tipo WHEN 'APORTACION_MUTUO' THEN 'TRASPASO_A_SOFOM' ELSE 'RETORNO_DE_SOFOM' END)",
+    )
+    .fetch_all(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(rotos
+        .into_iter()
+        .map(|(ledger, sec, tipo)| format!("{ledger} secuencia {sec} ({tipo}) sin movimiento espejo válido"))
+        .collect())
 }
 
 #[cfg(test)]

@@ -400,3 +400,69 @@ async fn mutuos_protegidos_en_la_base_de_datos(pool: PgPool) {
     assert!(e.unwrap_err().contains("SC_MUTUO_INTERES"));
     verificar_invariantes(&pool).await;
 }
+
+/// Hallazgo (ronda 2): la regla de liquidez trataba como capital el principal
+/// que un acreditado ya devolvió; con eso se pagaba interés ajeno y el último
+/// pago del acreditado era rechazado. Ahora el último pago siempre procede y
+/// el interés de otro mutuo exige capital propio.
+#[sqlx::test(migrations = "../migrations")]
+async fn ultimo_pago_del_acreditado_nunca_se_rechaza(pool: PgPool) {
+    let cfg = preparar(&pool).await;
+    let ana = cliente(&pool, &cfg, "Ana").await;
+    let beto = cliente(&pool, &cfg, "Beto").await;
+    let taller = cliente(&pool, &cfg, "Taller").await;
+    depositar(&pool, &cfg, ana.cuenta_ifpe.id, "1000").await;
+    depositar(&pool, &cfg, beto.cuenta_ifpe.id, "500").await;
+    invertir(&pool, &cfg, &ana, "1000", 364).await;
+    let m_beto = invertir(&pool, &cfg, &beto, "500", 28).await;
+    let c = credito::originar(&pool, &cfg.pld, &solicitud_credito(&taller, "1000", 182)).await.unwrap();
+    let pago = |principal: &str| credito::PagoCredito {
+        credito_id: c.credito.id,
+        principal: d(principal),
+        interes: d("0"),
+        clave_idempotencia: clave(),
+    };
+    credito::pagar(&pool, &pago("900")).await.unwrap();
+
+    // Beto vence: su interés NO puede salir de los 900 que devolvió el acreditado (son de Ana).
+    envejecer_mutuo(&pool, m_beto.contrato.id, 30).await;
+    let e = puente::liquidar(&pool, m_beto.contrato.id, None).await.unwrap_err();
+    assert_eq!(e.codigo(), "LIQUIDEZ_SOFOM_INSUFICIENTE");
+    let interes = tasas::interes(d("500"), tasas::tasa_para(28).unwrap(), 28);
+    credito::aportar_capital(&pool, interes, None, clave()).await.unwrap();
+    puente::liquidar(&pool, m_beto.contrato.id, None).await.unwrap();
+
+    // El último pago del acreditado procede y libera el fondeo de Ana.
+    let fin = credito::pagar(&pool, &pago("100")).await.unwrap();
+    assert_eq!(fin.credito.estado, EstadoCredito::Liquidado);
+    assert_eq!(caja(&pool).await, d("1000"), "la caja respalda exactamente el mutuo de Ana");
+    verificar_invariantes(&pool).await;
+}
+
+/// Hallazgo (ronda 2): repetir la originación con otra tasa o CLABE de
+/// desembolso es otra operación (409), no la confirmación de la primera.
+#[sqlx::test(migrations = "../migrations")]
+async fn originacion_repetida_con_otros_terminos_es_conflicto(pool: PgPool) {
+    let cfg = preparar(&pool).await;
+    let ana = cliente(&pool, &cfg, "Ana").await;
+    let taller = cliente(&pool, &cfg, "Taller").await;
+    depositar(&pool, &cfg, ana.cuenta_ifpe.id, "1000").await;
+    invertir(&pool, &cfg, &ana, "1000", 364).await;
+    let s = solicitud_credito(&taller, "300", 180);
+    let a = credito::originar(&pool, &cfg.pld, &s).await.unwrap();
+    assert_eq!(a.credito.clabe_desembolso.as_deref(), Some("646180157000000017"));
+    assert!(credito::originar(&pool, &cfg.pld, &s).await.unwrap().idempotente);
+    let mut otra_tasa = s.clone();
+    otra_tasa.tasa_anual = d("0.05");
+    assert_eq!(
+        credito::originar(&pool, &cfg.pld, &otra_tasa).await.unwrap_err().codigo(),
+        "CLAVE_IDEMPOTENCIA_REUTILIZADA"
+    );
+    let mut otra_clabe = s.clone();
+    otra_clabe.clabe_destino = "646180157000000020".into();
+    assert_eq!(
+        credito::originar(&pool, &cfg.pld, &otra_clabe).await.unwrap_err().codigo(),
+        "CLAVE_IDEMPOTENCIA_REUTILIZADA"
+    );
+    verificar_invariantes(&pool).await;
+}

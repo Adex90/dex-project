@@ -123,17 +123,25 @@ pub(crate) async fn buscar_por_clave(tx: &mut Tx, clave: &str) -> AppResult<Opti
 }
 
 /// Una clave reutilizada debe describir exactamente la misma operación.
+/// Compara **todos** los campos materiales (incluidos concepto y referencia
+/// externa, p. ej. la CLABE destino de un retiro): una repetición con datos
+/// distintos es otra operación y se rechaza con 409, nunca se "confirma".
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn exigir_misma_operacion(
     previa: &TransaccionIfpe,
     tipo: TipoTxIfpe,
     monto: Decimal,
     origen: Option<Uuid>,
     destino: Option<Uuid>,
+    concepto: Option<&str>,
+    referencia_externa: Option<&str>,
 ) -> AppResult<()> {
     if previa.tipo != tipo
         || previa.monto != monto
         || previa.cuenta_origen_id != origen
         || previa.cuenta_destino_id != destino
+        || previa.concepto.as_deref() != concepto
+        || previa.referencia_externa.as_deref() != referencia_externa
     {
         return Err(AppError::conflicto(
             "CLAVE_IDEMPOTENCIA_REUTILIZADA",
@@ -194,22 +202,52 @@ pub struct Deposito {
     pub clave_idempotencia: String,
 }
 
-impl Deposito {
-    /// SPEI entrante. La idempotencia se deriva de la **clave de rastreo** del
-    /// pago, no de quién lo registra: el mismo SPEI nunca se acredita dos
-    /// veces aunque lo capturen dos operadores o se reintente con otra clave
-    /// (lo respalda además el índice único `ux_ifpe_tx_deposito_referencia`).
-    pub fn spei(cuenta_id: Uuid, monto: Decimal, clave_rastreo: &str, concepto: Option<String>) -> AppResult<Self> {
-        let rastreo = clave_rastreo.trim();
+/// Identidad de un pago SPEI. Una clave de rastreo solo es única por
+/// participante emisor y día de operación (por eso el CEP de Banxico pide los
+/// tres), y es insensible a mayúsculas.
+#[derive(Debug, Clone)]
+pub struct IdentidadSpei {
+    /// Clave del participante emisor (3 a 5 dígitos).
+    pub banco_emisor: String,
+    pub fecha_operacion: chrono::NaiveDate,
+    pub clave_rastreo: String,
+}
+
+impl IdentidadSpei {
+    /// Forma canónica `<emisor>:<AAAAMMDD>:<RASTREO>`; se guarda en
+    /// `referencia_externa` (dentro del hash de la cadena).
+    pub fn canonica(&self) -> AppResult<String> {
+        let emisor = self.banco_emisor.trim();
+        if !(3..=5).contains(&emisor.len()) || !emisor.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(AppError::validacion("banco_emisor debe ser la clave de participante SPEI (3 a 5 dígitos)"));
+        }
+        let rastreo = self.clave_rastreo.trim().to_ascii_uppercase();
         if rastreo.is_empty() || rastreo.len() > 30 || !rastreo.bytes().all(|b| b.is_ascii_alphanumeric()) {
             return Err(AppError::validacion("la clave de rastreo SPEI debe tener de 1 a 30 caracteres alfanuméricos"));
         }
+        let manana = chrono::Utc::now().date_naive() + chrono::Days::new(1);
+        let minima = chrono::NaiveDate::from_ymd_opt(2000, 1, 1).expect("fecha válida");
+        if self.fecha_operacion > manana || self.fecha_operacion < minima {
+            return Err(AppError::validacion("fecha_operacion fuera de rango"));
+        }
+        Ok(format!("{emisor}:{}:{rastreo}", self.fecha_operacion.format("%Y%m%d")))
+    }
+}
+
+impl Deposito {
+    /// SPEI entrante. La idempotencia se deriva de la identidad del pago
+    /// (emisor + fecha + rastreo, en forma canónica), no de quién lo registra:
+    /// el mismo SPEI nunca se acredita dos veces aunque lo capturen dos
+    /// operadores, se reintente con otra clave o cambie el uso de mayúsculas
+    /// (lo respalda además el índice único `ux_ifpe_tx_deposito_spei`).
+    pub fn spei(cuenta_id: Uuid, monto: Decimal, spei: &IdentidadSpei, concepto: Option<String>) -> AppResult<Self> {
+        let referencia = spei.canonica()?;
         Ok(Self {
             cuenta_id,
             monto,
-            referencia_externa: Some(rastreo.to_string()),
+            clave_idempotencia: format!("spei:{referencia}"),
+            referencia_externa: Some(referencia),
             concepto,
-            clave_idempotencia: format!("spei:{rastreo}"),
         })
     }
 }
@@ -225,13 +263,15 @@ async fn depositar_tx(pool: &PgPool, umbrales: &UmbralesPld, d: &Deposito, monto
     let mut tx = db::begin(pool, Rol::Ifpe).await?;
     let cuenta = bloquear_cuenta_ifpe(&mut tx, d.cuenta_id).await?;
     if let Some(previa) = buscar_por_clave(&mut tx, &d.clave_idempotencia).await? {
-        exigir_misma_operacion(&previa, TipoTxIfpe::Deposito, monto, None, Some(cuenta.id))?;
-        if previa.referencia_externa != d.referencia_externa {
-            return Err(AppError::conflicto(
-                "CLAVE_IDEMPOTENCIA_REUTILIZADA",
-                "la clave de idempotencia ya se usó para un depósito con otra referencia",
-            ));
-        }
+        exigir_misma_operacion(
+            &previa,
+            TipoTxIfpe::Deposito,
+            monto,
+            None,
+            Some(cuenta.id),
+            d.concepto.as_deref(),
+            d.referencia_externa.as_deref(),
+        )?;
         return Ok(Movimiento { transaccion: previa, idempotente: true });
     }
     let perfil = pld::cargar_perfil(&mut tx, cuenta.cliente_id).await?;
@@ -306,7 +346,15 @@ async fn retirar_tx(pool: &PgPool, umbrales: &UmbralesPld, r: &Retiro, monto: De
     let cuenta_id = id_cuenta_ifpe_de_cliente(&mut tx, r.cliente_id).await?;
     let cuenta = bloquear_cuenta_ifpe(&mut tx, cuenta_id).await?;
     if let Some(previa) = buscar_por_clave(&mut tx, &r.clave_idempotencia).await? {
-        exigir_misma_operacion(&previa, TipoTxIfpe::Retiro, monto, Some(cuenta.id), None)?;
+        exigir_misma_operacion(
+            &previa,
+            TipoTxIfpe::Retiro,
+            monto,
+            Some(cuenta.id),
+            None,
+            r.concepto.as_deref(),
+            Some(&r.clabe_destino),
+        )?;
         return Ok(Movimiento { transaccion: previa, idempotente: true });
     }
     let perfil = pld::cargar_perfil(&mut tx, cuenta.cliente_id).await?;
@@ -400,7 +448,15 @@ async fn transferir_tx(
     let (origen, destino) = if a.id == origen_id { (a, b) } else { (b, a) };
 
     if let Some(previa) = buscar_por_clave(&mut tx, &t.clave_idempotencia).await? {
-        exigir_misma_operacion(&previa, TipoTxIfpe::Transferencia, monto, Some(origen.id), Some(destino.id))?;
+        exigir_misma_operacion(
+            &previa,
+            TipoTxIfpe::Transferencia,
+            monto,
+            Some(origen.id),
+            Some(destino.id),
+            t.concepto.as_deref(),
+            None,
+        )?;
         return Ok(Movimiento { transaccion: previa, idempotente: true });
     }
     let perfil = pld::cargar_perfil(&mut tx, origen.cliente_id).await?;
@@ -483,7 +539,7 @@ async fn retener_tx(pool: &PgPool, r: &Retencion, monto: Decimal) -> AppResult<M
     let mut tx = db::begin(pool, Rol::Ifpe).await?;
     let cuenta = bloquear_cuenta_ifpe(&mut tx, r.cuenta_id).await?;
     if let Some(previa) = buscar_por_clave(&mut tx, &r.clave_idempotencia).await? {
-        exigir_misma_operacion(&previa, tipo, monto, Some(cuenta.id), Some(cuenta.id))?;
+        exigir_misma_operacion(&previa, tipo, monto, Some(cuenta.id), Some(cuenta.id), Some(&r.motivo), None)?;
         return Ok(Movimiento { transaccion: previa, idempotente: true });
     }
     exigir_acreditable(&cuenta)?;

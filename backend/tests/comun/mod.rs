@@ -55,10 +55,12 @@ pub async fn cliente(pool: &PgPool, cfg: &Config, nombre: &str) -> Registro {
 
 /// SPEI entrante con una clave de rastreo única.
 pub async fn depositar(pool: &PgPool, cfg: &Config, cuenta_id: Uuid, monto: &str) -> Movimiento {
-    let rastreo = format!("PRUEBA{}", &Uuid::new_v4().simple().to_string()[..20]);
-    ledger::depositar(pool, &cfg.pld, &ledger::Deposito::spei(cuenta_id, d(monto), &rastreo, None).unwrap())
-        .await
-        .unwrap()
+    let spei = ledger::IdentidadSpei {
+        banco_emisor: "40012".into(),
+        fecha_operacion: chrono::Utc::now().date_naive(),
+        clave_rastreo: format!("PRUEBA{}", &Uuid::new_v4().simple().to_string()[..20]),
+    };
+    ledger::depositar(pool, &cfg.pld, &ledger::Deposito::spei(cuenta_id, d(monto), &spei, None).unwrap()).await.unwrap()
 }
 
 /// Simula el paso del tiempo para un mutuo: recorre `fecha_inicio` hacia

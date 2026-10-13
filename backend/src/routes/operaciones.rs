@@ -42,7 +42,12 @@ pub fn rutas() -> Router<AppState> {
 struct SolicitudDeposito {
     clabe: String,
     monto: Decimal,
-    /// Clave de rastreo SPEI: identifica el pago y hace la operación idempotente.
+    /// Clave del participante SPEI que envía el pago (3 a 5 dígitos).
+    banco_emisor: String,
+    /// Día de operación SPEI (AAAA-MM-DD).
+    fecha_operacion: chrono::NaiveDate,
+    /// Clave de rastreo: junto con emisor y fecha identifica el pago y hace
+    /// la operación idempotente.
     clave_rastreo: String,
     concepto: Option<String>,
 }
@@ -55,7 +60,12 @@ async fn deposito(
 ) -> AppResult<(StatusCode, Json<Movimiento>)> {
     u.exigir_operador()?;
     let cuenta_id = cuenta_por_clabe(&e, &s.clabe).await?;
-    let d = ledger::Deposito::spei(cuenta_id, s.monto, &s.clave_rastreo, s.concepto)?;
+    let spei = ledger::IdentidadSpei {
+        banco_emisor: s.banco_emisor,
+        fecha_operacion: s.fecha_operacion,
+        clave_rastreo: s.clave_rastreo,
+    };
+    let d = ledger::Deposito::spei(cuenta_id, s.monto, &spei, s.concepto)?;
     let m = ledger::depositar(&e.pool, &e.config.pld, &d).await?;
     Ok((status_de(m.idempotente), Json(m)))
 }

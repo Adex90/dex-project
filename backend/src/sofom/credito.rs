@@ -85,7 +85,14 @@ async fn originar_tx(
             _ => None,
         };
         let credito = credito
-            .filter(|c| c.acreditado_id == s.acreditado_id && c.principal == principal && c.plazo_dias == s.plazo_dias)
+            .filter(|c| {
+                c.acreditado_id == s.acreditado_id
+                    && c.principal == principal
+                    && c.plazo_dias == s.plazo_dias
+                    && c.tasa_anual == s.tasa_anual
+                    && c.destino == s.destino
+                    && c.clabe_desembolso.as_deref() == Some(s.clabe_destino.as_str())
+            })
             .ok_or_else(|| {
                 AppError::conflicto("CLAVE_IDEMPOTENCIA_REUTILIZADA", "la clave ya se usó para otra operación")
             })?;
@@ -103,8 +110,9 @@ async fn originar_tx(
     // Fecha valor: hoy según la base de datos (trg_credito_fecha_valor la exige).
     let hoy: NaiveDate = sqlx::query_scalar("SELECT current_date").fetch_one(&mut *tx).await?;
     let credito: Credito = sqlx::query_as(
-        "INSERT INTO sofom.creditos (id, acreditado_id, principal, tasa_anual, plazo_dias, fecha_desembolso, destino) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *",
+        "INSERT INTO sofom.creditos \
+         (id, acreditado_id, principal, tasa_anual, plazo_dias, fecha_desembolso, destino, clabe_desembolso) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *",
     )
     .bind(Uuid::new_v4())
     .bind(s.acreditado_id)
@@ -113,6 +121,7 @@ async fn originar_tx(
     .bind(s.plazo_dias)
     .bind(hoy)
     .bind(&s.destino)
+    .bind(&s.clabe_destino)
     .fetch_one(&mut *tx)
     .await?;
 
@@ -159,15 +168,11 @@ async fn originar_tx(
             ),
         ));
     }
-    // Tras desembolsar, la caja debe seguir cubriendo el principal no prestado
-    // de todos los mutuos vigentes (el efectivo de un inversionista no fondea
-    // créditos asignados a otro).
-    let no_prestado: Decimal = sqlx::query_scalar(
-        "SELECT coalesce(sum(principal - principal_asignado), 0) FROM sofom.contratos_mutuo WHERE estado = 'VIGENTE'",
-    )
-    .fetch_one(&mut *tx)
-    .await?;
-    if caja.saldo - principal < no_prestado {
+    // Desembolsar convierte efectivo en cartera peso por peso: la regla de
+    // liquidez (caja >= principal vigente - cartera viva) se conserva si ya se
+    // cumplía. Se exige además que la caja tenga el efectivo.
+    let requerido: Decimal = sqlx::query_scalar("SELECT sofom.requerido_liquidez(NULL)").fetch_one(&mut *tx).await?;
+    if caja.saldo < principal || caja.saldo < requerido {
         return Err(AppError::negocio("LIQUIDEZ_SOFOM_INSUFICIENTE", "la caja de la SOFOM no cubre el desembolso"));
     }
 
@@ -360,23 +365,18 @@ pub async fn castigar(pool: &PgPool, credito_id: Uuid) -> AppResult<ResultadoCas
                 format!("solo se castigan créditos vencidos (está {:?})", credito.estado),
             ));
         }
-        let no_prestado: Decimal = sqlx::query_scalar(
-            "SELECT coalesce(sum(principal - principal_asignado), 0) FROM sofom.contratos_mutuo WHERE estado = 'VIGENTE'",
-        )
-        .fetch_one(&mut *tx)
-        .await?;
-        let liberado: Decimal = sqlx::query_scalar(
-            "SELECT coalesce(sum(monto), 0) FROM sofom.asignaciones_fondeo WHERE credito_id = $1 AND NOT liberada",
-        )
-        .bind(credito.id)
-        .fetch_one(&mut *tx)
-        .await?;
-        if caja.saldo < no_prestado + liberado {
+        // Al castigar, el saldo insoluto deja de contar como cartera que
+        // respalda a los mutuos: el capital propio debe cubrirlo.
+        let requerido: Decimal =
+            sqlx::query_scalar("SELECT sofom.requerido_liquidez(NULL)").fetch_one(&mut *tx).await?;
+        let requerido_tras_castigo = requerido + credito.saldo_insoluto;
+        if caja.saldo < requerido_tras_castigo {
             return Err(AppError::negocio(
                 "CAPITAL_INSUFICIENTE_PARA_CASTIGO",
                 format!(
-                    "el castigo libera {liberado} MXN de fondeo que la caja debe respaldar; faltan {} MXN de capital",
-                    no_prestado + liberado - caja.saldo
+                    "la pérdida de {} MXN debe cubrirse con capital propio; faltan {} MXN de capital",
+                    credito.saldo_insoluto,
+                    requerido_tras_castigo - caja.saldo
                 ),
             ));
         }
@@ -411,7 +411,10 @@ pub async fn aportar_capital(
         let mut tx = db::begin(pool, Rol::Sofom).await?;
         let caja = bloquear_caja(&mut tx).await?;
         if let Some(previa) = buscar_tx_por_clave(&mut tx, &clave_idempotencia).await? {
-            if previa.tipo != TipoTxSofom::AportacionCapital || previa.monto != monto {
+            if previa.tipo != TipoTxSofom::AportacionCapital
+                || previa.monto != monto
+                || previa.concepto.as_deref() != referencia.as_deref()
+            {
                 return Err(AppError::conflicto(
                     "CLAVE_IDEMPOTENCIA_REUTILIZADA",
                     "la clave ya se usó para otra operación",

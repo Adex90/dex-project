@@ -211,6 +211,8 @@ async fn operador_deposita_por_spei_y_origina_credito(pool: PgPool) {
             Some(json!({
                 "clabe": registro["cuenta_ifpe"]["clabe"],
                 "monto": "5000",
+                "banco_emisor": "40012",
+                "fecha_operacion": "2026-10-01",
                 "clave_rastreo": "SPEI123456"
             })),
         )
@@ -232,7 +234,13 @@ async fn operador_deposita_por_spei_y_origina_credito(pool: PgPool) {
             "POST",
             "/api/v1/operaciones/depositos",
             Some(sesion2["token"].as_str().unwrap()),
-            Some(json!({ "clabe": registro["cuenta_ifpe"]["clabe"], "monto": "5000", "clave_rastreo": "SPEI123456" })),
+            Some(json!({
+                "clabe": registro["cuenta_ifpe"]["clabe"],
+                "monto": "5000",
+                "banco_emisor": "40012",
+                "fecha_operacion": "2026-10-01",
+                "clave_rastreo": "spei123456"
+            })),
         )
         .await;
     assert_eq!(s, StatusCode::OK, "{r2}");

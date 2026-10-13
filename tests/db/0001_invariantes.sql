@@ -86,12 +86,25 @@ SELECT pg_temp.debe_pasar('IFPE: depósito de 1000 respaldado por reserva', ARRA
 SELECT pg_temp.debe_fallar('IFPE: crear saldo sin reserva (reserva fraccionaria)', ARRAY[
   'SET LOCAL ROLE sc_ifpe',
   $q$UPDATE ifpe.cuentas SET saldo_disponible = saldo_disponible + 500 WHERE id = '1b000000-0000-0000-0000-00000000001b'$q$
+], 'SC_SALDO_SIN_LEDGER');
+
+-- Segunda línea de defensa: aun sin la liga saldo-ledger (desactivada solo
+-- aquí, como dueño), el agregado SC_RESERVA_100 rechaza la reserva fraccionaria.
+SELECT pg_temp.debe_fallar('IFPE: reserva fraccionaria con la liga saldo-ledger desactivada', ARRAY[
+  'ALTER TABLE ifpe.cuentas DISABLE TRIGGER trg_ifpe_cuentas_saldo_ledger',
+  $q$UPDATE ifpe.cuentas SET saldo_disponible = saldo_disponible + 500 WHERE id = '1b000000-0000-0000-0000-00000000001b'$q$
 ], 'SC_RESERVA_100');
 
 SELECT pg_temp.debe_fallar('IFPE: retirar reserva dejando depósitos sin respaldo', ARRAY[
   'SET LOCAL ROLE sc_ifpe',
   $q$UPDATE ifpe.reserva_custodia SET saldo = saldo - 1 WHERE id = 'e0000000-0000-0000-0000-00000000000e'$q$
-], 'SC_RESERVA_100');
+], 'SC_SALDO_SIN_LEDGER');
+
+SELECT pg_temp.debe_fallar('IFPE: acuñar saldo y reserva cuadrados sin movimiento en el ledger', ARRAY[
+  'SET LOCAL ROLE sc_ifpe',
+  $q$UPDATE ifpe.cuentas SET saldo_disponible = saldo_disponible + 5000000 WHERE id = '1a000000-0000-0000-0000-00000000001a'$q$,
+  $q$UPDATE ifpe.reserva_custodia SET saldo = saldo + 5000000 WHERE id = 'e0000000-0000-0000-0000-00000000000e'$q$
+], 'SC_SALDO_SIN_LEDGER');
 
 SELECT pg_temp.debe_fallar('IFPE: sobregiro (saldo_disponible negativo)', ARRAY[
   'SET LOCAL ROLE sc_ifpe',
@@ -321,8 +334,11 @@ SELECT pg_temp.debe_fallar('Asignación: no se puede quitar fondeo a un crédito
 SELECT pg_temp.debe_pasar('SOFOM: cobro total y liquidación libera el fondeo del mutuo', ARRAY[
   'SET LOCAL ROLE sc_sofom',
   $q$UPDATE sofom.caja SET saldo = saldo + 500 WHERE id = 'f0000000-0000-0000-0000-00000000000f'$q$,
-  $q$INSERT INTO sofom.transacciones (tipo, credito_id, caja_id, monto, clave_idempotencia)
-     VALUES ('COBRO_CREDITO', '4c000000-0000-0000-0000-000000000001', 'f0000000-0000-0000-0000-00000000000f', 500, 'cobro-1')$q$,
+  $q$INSERT INTO sofom.transacciones (id, tipo, credito_id, caja_id, monto, clave_idempotencia)
+     VALUES ('9c000000-0000-0000-0000-000000000001', 'COBRO_CREDITO', '4c000000-0000-0000-0000-000000000001',
+             'f0000000-0000-0000-0000-00000000000f', 500, 'cobro-1')$q$,
+  $q$INSERT INTO sofom.cobros (transaccion_id, credito_id, principal, interes)
+     VALUES ('9c000000-0000-0000-0000-000000000001', '4c000000-0000-0000-0000-000000000001', 500, 0)$q$,
   $q$UPDATE sofom.creditos SET saldo_insoluto = 0, estado = 'LIQUIDADO' WHERE id = '4c000000-0000-0000-0000-000000000001'$q$,
   'RESET ROLE'
 ]);
