@@ -1,0 +1,113 @@
+@import "tailwindcss";
+
+/*
+ * Design tokens. Ink and parchment with a gold accent (sound money) and an
+ * emerald "verified" signal. Light and dark palettes share token names.
+ */
+:root {
+  --bg: #f6f4ef;
+  --surface: #ffffff;
+  --surface-2: #f1eee6;
+  --border: #e2ddd1;
+  --border-strong: #cfc8b8;
+  --ink: #16181d;
+  --ink-2: #3b3f48;
+  --muted: #6b6f78;
+  --accent: #9a6b14;
+  --accent-ink: #ffffff;
+  --accent-soft: #f5ead2;
+  --verified: #0f7a52;
+  --verified-soft: #dff3ea;
+  --danger: #b42318;
+  --danger-soft: #fde7e4;
+  --warning: #a15c07;
+  --warning-soft: #fdf0d8;
+  --info: #1d4f91;
+  --info-soft: #e3ecf8;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #0d0f13;
+    --surface: #14171d;
+    --surface-2: #1a1e25;
+    --border: #262b34;
+    --border-strong: #353b47;
+    --ink: #eef0f3;
+    --ink-2: #c7cbd3;
+    --muted: #8b919c;
+    --accent: #d9a84a;
+    --accent-ink: #14110a;
+    --accent-soft: #2a2213;
+    --verified: #34c48b;
+    --verified-soft: #0f2a20;
+    --danger: #f2705f;
+    --danger-soft: #34160f;
+    --warning: #f0b453;
+    --warning-soft: #2e2210;
+    --info: #7fb0f0;
+    --info-soft: #132034;
+  }
+}
+
+@theme inline {
+  --color-bg: var(--bg);
+  --color-surface: var(--surface);
+  --color-surface-2: var(--surface-2);
+  --color-border: var(--border);
+  --color-border-strong: var(--border-strong);
+  --color-ink: var(--ink);
+  --color-ink-2: var(--ink-2);
+  --color-muted: var(--muted);
+  --color-accent: var(--accent);
+  --color-accent-ink: var(--accent-ink);
+  --color-accent-soft: var(--accent-soft);
+  --color-verified: var(--verified);
+  --color-verified-soft: var(--verified-soft);
+  --color-danger: var(--danger);
+  --color-danger-soft: var(--danger-soft);
+  --color-warning: var(--warning);
+  --color-warning-soft: var(--warning-soft);
+  --color-info: var(--info);
+  --color-info-soft: var(--info-soft);
+  --font-sans: var(--font-geist-sans), ui-sans-serif, system-ui, sans-serif;
+  --font-mono: var(--font-geist-mono), ui-monospace, "SFMono-Regular", monospace;
+}
+
+html {
+  color-scheme: light dark;
+}
+
+body {
+  background: var(--bg);
+  color: var(--ink);
+  font-feature-settings: "tnum" 1, "cv11" 1;
+  -webkit-font-smoothing: antialiased;
+}
+
+::selection {
+  background: var(--accent-soft);
+}
+
+@keyframes reveal {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+.animate-reveal {
+  animation: reveal 240ms ease-out both;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .animate-reveal,
+  .animate-pulse,
+  .animate-spin {
+    animation: none;
+  }
+}
