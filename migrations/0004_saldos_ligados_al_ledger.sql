@@ -406,10 +406,17 @@ CREATE CONSTRAINT TRIGGER trg_credito_liquidez
 -- -----------------------------------------------------------------------------
 -- 5. Índice SPEI canónico
 -- -----------------------------------------------------------------------------
+-- Un SPEI se identifica por banco emisor, fecha de operación y clave de
+-- rastreo: '<emisor>:<AAAAMMDD>:<RASTREO>', ya en mayúsculas (el backend la
+-- canoniza). El índice cubre solo identidades canónicas: los depósitos
+-- anteriores a esta migración guardaban la clave de rastreo tal cual y pueden
+-- incluir variantes de mayúsculas del mismo pago (el doble abono que esta
+-- migración corrige); quedan en el ledger como historia y no impiden migrar.
 DROP INDEX ifpe.ux_ifpe_tx_deposito_referencia;
 CREATE UNIQUE INDEX ux_ifpe_tx_deposito_spei
     ON ifpe.transacciones (upper(referencia_externa))
-    WHERE tipo = 'DEPOSITO' AND referencia_externa IS NOT NULL AND clave_idempotencia LIKE 'spei:%';
+    WHERE tipo = 'DEPOSITO' AND clave_idempotencia LIKE 'spei:%'
+      AND referencia_externa ~ '^[0-9]{3,5}:[0-9]{8}:[A-Za-z0-9]{1,30}$';
 
 -- -----------------------------------------------------------------------------
 -- 6. CLABE de desembolso

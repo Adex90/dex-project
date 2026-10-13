@@ -338,8 +338,8 @@ async fn sesiones_revocables_y_rol_verificado(pool: PgPool) {
         )
         .await;
     assert_eq!(s, StatusCode::OK);
-    let (s, _) = api.llamar("GET", "/api/v1/tablero", Some(nueva["token"].as_str().unwrap()), None).await;
-    assert_eq!(s, StatusCode::OK);
+    let (s, cuerpo) = api.llamar("GET", "/api/v1/tablero", Some(nueva["token"].as_str().unwrap()), None).await;
+    assert_eq!(s, StatusCode::OK, "{cuerpo}");
 
     // Degradar al operador: su token (aún vigente) pierde el poder de inmediato.
     sqlx::query("UPDATE kyc.credenciales SET rol = 'CLIENTE' WHERE cliente_id = $1::uuid")
@@ -449,8 +449,12 @@ async fn entrada_invalida_es_400_no_500(pool: PgPool) {
 }
 
 /// Hallazgo #15: una ráfaga de contraseñas en paralelo verifica como máximo
-/// `MAX_INTENTOS`; el resto recibe BLOQUEADO sin calcular el hash, también la
-/// contraseña correcta (así la respuesta no revela cuál era).
+/// `MAX_INTENTOS`; el resto recibe BLOQUEADO sin calcular el hash. Con la
+/// cuenta bloqueada, la contraseña correcta recibe la misma respuesta que una
+/// equivocada, así que la respuesta no revela cuál era.
+///
+/// (Una contraseña correcta *dentro* del cupo abre sesión y reinicia el
+/// contador; eso solo lo puede provocar quien ya conoce la contraseña.)
 #[sqlx::test(migrations = "../migrations")]
 async fn rafaga_de_login_no_supera_el_cupo(pool: PgPool) {
     use synthetic_capital::auth;
@@ -459,26 +463,40 @@ async fn rafaga_de_login_no_supera_el_cupo(pool: PgPool) {
     let api = Api { app: routes::router(estado.clone()) };
     registrar(&api, "Ana").await;
 
-    let mut tareas = Vec::new();
-    for i in 0..40 {
+    let rafaga = |passwords: Vec<String>| {
         let estado = estado.clone();
-        let password = if i == 30 { "contraseña-segura-123".to_string() } else { format!("intento-equivocado-{i}") };
-        tareas.push(tokio::spawn(async move {
-            auth::iniciar_sesion(&estado, "ana@example.mx", &password)
-                .await
-                .map(|_| ())
-                .map_err(|e| e.codigo().to_string())
-        }));
-    }
-    let mut verificados = 0;
-    for t in tareas {
-        match t.await.unwrap() {
-            Ok(()) => verificados += 1,
-            Err(c) if c == "CREDENCIALES_INVALIDAS" => verificados += 1,
-            Err(c) => assert_eq!(c, "BLOQUEADO"),
+        async move {
+            let tareas: Vec<_> = passwords
+                .into_iter()
+                .map(|p| {
+                    let estado = estado.clone();
+                    tokio::spawn(async move {
+                        match auth::iniciar_sesion(&estado, "ana@example.mx", &p).await {
+                            Ok(_) => "SESION".to_string(),
+                            Err(e) => e.codigo().to_string(),
+                        }
+                    })
+                })
+                .collect();
+            let mut codigos = Vec::new();
+            for t in tareas {
+                codigos.push(t.await.unwrap());
+            }
+            codigos
         }
-    }
-    assert!(verificados <= 5, "{verificados} contraseñas verificadas en una ráfaga");
+    };
+
+    // 40 contraseñas equivocadas en paralelo: como máximo 5 se verifican.
+    let codigos = rafaga((0..40).map(|i| format!("intento-equivocado-{i}")).collect()).await;
+    let verificados = codigos.iter().filter(|c| *c == "CREDENCIALES_INVALIDAS").count();
+    assert!((1..=5).contains(&verificados), "{verificados} contraseñas verificadas en una ráfaga: {codigos:?}");
+    assert!(codigos.iter().all(|c| c == "CREDENCIALES_INVALIDAS" || c == "BLOQUEADO"), "{codigos:?}");
+
+    // Bloqueada: la correcta, sola o mezclada con equivocadas, recibe BLOQUEADO como todas.
+    let mut mezcla: Vec<String> = (0..9).map(|i| format!("otra-equivocada-{i}")).collect();
+    mezcla.insert(4, "contraseña-segura-123".into());
+    let codigos = rafaga(mezcla).await;
+    assert!(codigos.iter().all(|c| c == "BLOQUEADO"), "{codigos:?}");
 
     // Bloqueada: ni la contraseña correcta abre sesión hasta que venza la ventana.
     let e = auth::iniciar_sesion(&estado, "ana@example.mx", "contraseña-segura-123").await.unwrap_err();
