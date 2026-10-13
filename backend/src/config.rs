@@ -145,16 +145,21 @@ where
 /// operador. Se exige también en MODO_DEMO (un demo expuesto sigue siendo un
 /// banco expuesto) y se rechazan valores de ejemplo o de baja entropía.
 pub fn validar_secreto_jwt(secreto: &str) -> anyhow::Result<()> {
+    validar_secreto("JWT_SECRET", secreto)
+}
+
+/// Mismas reglas para cualquier secreto HMAC (JWT, webhooks SPEI).
+pub fn validar_secreto(nombre: &str, secreto: &str) -> anyhow::Result<()> {
     if secreto.len() < 32 {
-        bail!("JWT_SECRET debe tener al menos 32 caracteres (genera uno con: openssl rand -hex 64)");
+        bail!("{nombre} debe tener al menos 32 caracteres (genera uno con: openssl rand -hex 64)");
     }
     let minusculas = secreto.to_lowercase();
     if ["change-me", "changeme", "cambiame", "secret", "password", "example"].iter().any(|p| minusculas.contains(p)) {
-        bail!("JWT_SECRET parece un valor de ejemplo; genera uno aleatorio con: openssl rand -hex 64");
+        bail!("{nombre} parece un valor de ejemplo; genera uno aleatorio con: openssl rand -hex 64");
     }
     let distintos = secreto.chars().collect::<std::collections::HashSet<_>>().len();
     if distintos < 10 {
-        bail!("JWT_SECRET tiene muy poca variedad de caracteres; genera uno aleatorio con: openssl rand -hex 64");
+        bail!("{nombre} tiene muy poca variedad de caracteres; genera uno aleatorio con: openssl rand -hex 64");
     }
     Ok(())
 }
@@ -197,7 +202,7 @@ impl Config {
                 let mut webhook_secretos = Vec::new();
                 for nombre in ["SPEI_WEBHOOK_SECRETO", "SPEI_WEBHOOK_SECRETO_ANTERIOR"] {
                     if let Some(s) = var(nombre) {
-                        validar_secreto_jwt(&s).map_err(|e| anyhow::anyhow!("{nombre}: {e}"))?;
+                        validar_secreto(nombre, &s)?;
                         webhook_secretos.push(s);
                     }
                 }
