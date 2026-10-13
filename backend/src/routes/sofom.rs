@@ -43,6 +43,7 @@ async fn posicion(State(e): State<AppState>, u: Usuario) -> AppResult<Json<Posic
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SolicitudInversion {
+    #[serde(with = "rust_decimal::serde::str")]
     monto: Decimal,
     plazo_dias: i32,
     clave_idempotencia: String,
@@ -74,7 +75,7 @@ async fn terminos(State(e): State<AppState>, u: Usuario, Path(id): Path<Uuid>) -
         .iter()
         .find(|c| c.id == id)
         .ok_or_else(|| AppError::no_encontrado("contrato de mutuo no encontrado"))?;
-    Ok(Json(puente::terminos_de(contrato)?))
+    Ok(Json(puente::verificar_terminos(contrato)?))
 }
 
 async fn liquidar(

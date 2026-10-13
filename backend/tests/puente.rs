@@ -466,3 +466,42 @@ async fn originacion_repetida_con_otros_terminos_es_conflicto(pool: PgPool) {
     );
     verificar_invariantes(&pool).await;
 }
+
+/// Hallazgo #6: `hash_terminos` se comprueba, no solo se escribe. Si alguien
+/// altera la tasa de un mutuo en la base de datos, ni los términos ni la
+/// liquidación usan el valor alterado, y la auditoría lo reporta.
+#[sqlx::test(migrations = "../migrations")]
+async fn terminos_alterados_se_detectan(pool: PgPool) {
+    let cfg = preparar(&pool).await;
+    let ana = cliente(&pool, &cfg, "Ana").await;
+    depositar(&pool, &cfg, ana.cuenta_ifpe.id, "1000").await;
+    credito::aportar_capital(&pool, d("1000"), None, clave()).await.unwrap();
+    let m = invertir_vencido(&pool, &cfg, &ana, "600", 182).await;
+
+    let mut tx = pool.begin().await.unwrap();
+    sqlx::query("ALTER TABLE sofom.contratos_mutuo DISABLE TRIGGER trg_mutuo_proteger")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE sofom.contratos_mutuo SET tasa_anual = 0.99 WHERE id = $1")
+        .bind(m.contrato.id)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    sqlx::query("SET CONSTRAINTS ALL IMMEDIATE").execute(&mut *tx).await.unwrap();
+    sqlx::query("ALTER TABLE sofom.contratos_mutuo ENABLE TRIGGER trg_mutuo_proteger").execute(&mut *tx).await.unwrap();
+    tx.commit().await.unwrap();
+
+    let alterado: synthetic_capital::models::sofom::ContratoMutuo =
+        sqlx::query_as("SELECT * FROM sofom.contratos_mutuo WHERE id = $1")
+            .bind(m.contrato.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(puente::verificar_terminos(&alterado).unwrap_err().codigo(), "INTEGRIDAD");
+    let e = puente::liquidar(&pool, m.contrato.id, Some(ana.cliente.id)).await.unwrap_err();
+    assert_eq!(e.codigo(), "INTEGRIDAD", "no se paga interés con una tasa alterada");
+    let auditoria = synthetic_capital::ledger::hash::verificar_cadena_sofom(&pool).await.unwrap();
+    assert!(!auditoria.valido);
+    assert!(auditoria.discrepancias.iter().any(|d| d.contains("hash_terminos")), "{auditoria:?}");
+}

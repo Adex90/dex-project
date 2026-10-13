@@ -31,6 +31,7 @@ pub struct DatosRegistro {
     pub rfc: Option<String>,
     pub telefono: Option<String>,
     pub actividad_economica: Option<String>,
+    #[serde(default, with = "rust_decimal::serde::str_option")]
     pub ingreso_mensual_estimado: Option<Decimal>,
 }
 

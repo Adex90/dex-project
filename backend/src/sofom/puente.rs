@@ -136,6 +136,21 @@ pub fn terminos_de(c: &ContratoMutuo) -> AppResult<TerminosMutuo> {
     )
 }
 
+/// Recalcula los términos desde las columnas del contrato y exige que su hash
+/// sea el que el cliente aceptó (`hash_terminos`). Si alguien cambió la tasa,
+/// el plazo o las fechas en la base de datos, se detiene la operación en vez de
+/// pagar o mostrar términos distintos a los contratados.
+pub fn verificar_terminos(c: &ContratoMutuo) -> AppResult<TerminosMutuo> {
+    let t = terminos_de(c)?;
+    if t.hash != c.hash_terminos || t.fecha_vencimiento != c.fecha_vencimiento {
+        return Err(AppError::Integridad(format!(
+            "los términos del contrato {} no coinciden con el hash aceptado ({} != {})",
+            c.id, t.hash, c.hash_terminos
+        )));
+    }
+    Ok(t)
+}
+
 // -----------------------------------------------------------------------------
 // Inversión: IFPE -> contrato de mutuo
 // -----------------------------------------------------------------------------
@@ -287,7 +302,7 @@ async fn invertir_tx(
     .bind(&terminos.hash)
     .fetch_one(&mut *tx)
     .await?;
-    if contrato.fecha_vencimiento != terminos.fecha_vencimiento || terminos_de(&contrato)?.hash != terminos.hash {
+    if verificar_terminos(&contrato)?.hash != terminos.hash {
         return Err(AppError::Integridad("los términos almacenados no coinciden con los aceptados".into()));
     }
     let tx_sofom = insertar_tx_sofom(
@@ -345,7 +360,7 @@ async fn reconstruir_inversion(tx: &mut Tx, previa: TransaccionIfpe, plazo_dias:
         .fetch_one(&mut **tx)
         .await?;
     Ok(ResultadoMutuo {
-        terminos: terminos_de(&contrato)?,
+        terminos: verificar_terminos(&contrato)?,
         interes_al_vencimiento: tasas::interes(contrato.principal, contrato.tasa_anual, contrato.plazo_dias),
         contrato,
         tx_ifpe: previa,
@@ -421,6 +436,8 @@ async fn liquidar_tx(pool: &PgPool, contrato_id: Uuid, solicitante: Option<Uuid>
         ));
     }
     ledger::exigir_acreditable(&cuenta_ifpe)?;
+    // El interés se calcula con los términos aceptados, nunca con columnas alteradas.
+    verificar_terminos(&contrato)?;
 
     let interes = tasas::interes(contrato.principal, contrato.tasa_anual, contrato.plazo_dias);
     let total = contrato.principal + interes;

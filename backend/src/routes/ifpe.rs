@@ -52,6 +52,7 @@ async fn movimientos(
 #[serde(deny_unknown_fields)]
 struct SolicitudTransferencia {
     clabe_destino: String,
+    #[serde(with = "rust_decimal::serde::str")]
     monto: Decimal,
     concepto: Option<String>,
     clave_idempotencia: String,
@@ -77,6 +78,7 @@ async fn transferir(
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SolicitudRetiro {
+    #[serde(with = "rust_decimal::serde::str")]
     monto: Decimal,
     clabe_destino: String,
     concepto: Option<String>,
@@ -103,6 +105,7 @@ async fn retirar(
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SolicitudDepositoSimulado {
+    #[serde(with = "rust_decimal::serde::str")]
     monto: Decimal,
     clave_idempotencia: String,
 }

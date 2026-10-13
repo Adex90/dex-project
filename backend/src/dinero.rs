@@ -51,6 +51,19 @@ pub fn a_unidades(monto: Decimal) -> Option<u128> {
     u128::try_from(m.mantissa()).ok()
 }
 
+/// Como [`a_unidades`], para montos que llegan de fuera (una prueba de
+/// inclusión que envía un tercero): rechaza en vez de redondear. Un valor con
+/// más de 8 decimales o negativo no es un saldo comprometido en el árbol.
+pub fn a_unidades_estricto(monto: Decimal) -> Option<u128> {
+    if monto.is_sign_negative() && !monto.is_zero() {
+        return None;
+    }
+    if monto.normalize().scale() > ESCALA {
+        return None;
+    }
+    a_unidades(monto)
+}
+
 /// Inverso de [`a_unidades`]. `None` si excede la mantisa de 96 bits de `Decimal`.
 pub fn desde_unidades(unidades: u128) -> Option<Decimal> {
     let mantisa = i128::try_from(unidades).ok()?;
@@ -89,5 +102,17 @@ mod pruebas {
         assert_eq!(a_unidades(d("-1")), None);
         assert_eq!(a_unidades(Decimal::ZERO), Some(0));
         assert_eq!(desde_unidades(150_000_000).unwrap(), d("1.5"));
+    }
+
+    #[test]
+    fn unidades_estrictas_no_redondean() {
+        assert_eq!(a_unidades_estricto(d("10000202.10000000")), Some(1_000_020_210_000_000));
+        assert_eq!(a_unidades_estricto(d("1.500000000000")), Some(150_000_000));
+        assert_eq!(a_unidades_estricto(d("10000202.100000004")), None);
+        assert_eq!(a_unidades_estricto(d("-0.000000001")), None);
+        assert_eq!(a_unidades_estricto(d("-1")), None);
+        assert_eq!(a_unidades_estricto(Decimal::ZERO), Some(0));
+        // El redondeo sigue disponible solo para valores ya tipados por la base de datos.
+        assert_eq!(a_unidades(d("-0.000000001")), Some(0));
     }
 }

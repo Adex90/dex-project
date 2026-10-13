@@ -41,6 +41,7 @@ pub fn rutas() -> Router<AppState> {
 #[serde(deny_unknown_fields)]
 struct SolicitudDeposito {
     clabe: String,
+    #[serde(with = "rust_decimal::serde::str")]
     monto: Decimal,
     /// Clave del participante SPEI que envía el pago (3 a 5 dígitos).
     banco_emisor: String,
@@ -88,6 +89,7 @@ async fn cuenta_por_clabe(e: &AppState, clabe: &str) -> AppResult<Uuid> {
 #[serde(deny_unknown_fields)]
 struct SolicitudRetencion {
     cuenta_id: Uuid,
+    #[serde(with = "rust_decimal::serde::str")]
     monto: Decimal,
     motivo: String,
     #[serde(default)]
@@ -145,7 +147,9 @@ async fn listar_creditos(
 #[serde(deny_unknown_fields)]
 struct SolicitudCreditoHttp {
     acreditado_id: Uuid,
+    #[serde(with = "rust_decimal::serde::str")]
     principal: Decimal,
+    #[serde(with = "rust_decimal::serde::str")]
     tasa_anual: Decimal,
     plazo_dias: i32,
     destino: Option<String>,
@@ -175,7 +179,9 @@ async fn originar_credito(
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SolicitudPago {
+    #[serde(with = "rust_decimal::serde::str")]
     principal: Decimal,
+    #[serde(with = "rust_decimal::serde::str")]
     interes: Decimal,
     clave_idempotencia: String,
 }
@@ -200,6 +206,7 @@ async fn pagar_credito(
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SolicitudCapital {
+    #[serde(with = "rust_decimal::serde::str")]
     monto: Decimal,
     referencia: Option<String>,
     clave_idempotencia: String,

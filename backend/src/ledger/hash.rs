@@ -27,8 +27,9 @@ use crate::{
     error::AppResult,
     models::{
         ifpe::{LedgerCabeza, TipoTxIfpe, TransaccionIfpe},
-        sofom::{TipoTxSofom, TransaccionSofom},
+        sofom::{ContratoMutuo, TipoTxSofom, TransaccionSofom},
     },
+    sofom::puente,
 };
 
 /// Hash anterior del primer movimiento de cada ledger.
@@ -400,8 +401,8 @@ pub async fn verificar_cadena_ifpe(pool: &PgPool) -> AppResult<ResultadoVerifica
 }
 
 /// Recorre todo el ledger SOFOM (foto consistente): cadena de hashes,
-/// reproducción de cuentas de inversión, caja y créditos, y movimientos espejo
-/// con la IFPE.
+/// reproducción de cuentas de inversión, caja y créditos, hash de los términos
+/// de cada mutuo y movimientos espejo con la IFPE.
 pub async fn verificar_cadena_sofom(pool: &PgPool) -> AppResult<ResultadoVerificacion> {
     let mut tx = db::begin_lectura_instantanea(pool, Rol::Sofom).await?;
     let cabeza: LedgerCabeza =
@@ -470,6 +471,14 @@ pub async fn verificar_cadena_sofom(pool: &PgPool) -> AppResult<ResultadoVerific
         for (nombre, sql, rep) in consultas {
             let saldos: Vec<(Uuid, Decimal, Decimal)> = sqlx::query_as(sql).fetch_all(&mut *tx).await?;
             rep.conciliar(nombre, &saldos, &mut r);
+        }
+        // Los términos vigentes de cada mutuo deben ser los que el cliente aceptó.
+        let contratos: Vec<ContratoMutuo> =
+            sqlx::query_as("SELECT * FROM sofom.contratos_mutuo ORDER BY folio").fetch_all(&mut *tx).await?;
+        for c in &contratos {
+            if puente::verificar_terminos(c).is_err() {
+                r.discrepancias.push(format!("mutuo folio {}: los términos no coinciden con hash_terminos", c.folio));
+            }
         }
     }
     tx.commit().await?;

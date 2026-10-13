@@ -15,7 +15,8 @@ use synthetic_capital::{
     config::Config,
     kyc::{self, DatosRegistro, Registro},
     ledger::{self, hash, Movimiento},
-    models::kyc::TipoPersona,
+    models::{kyc::TipoPersona, sofom::ContratoMutuo},
+    sofom::puente,
 };
 use uuid::Uuid;
 
@@ -72,9 +73,18 @@ pub async fn envejecer_mutuo(pool: &PgPool, contrato_id: Uuid, dias: i32) {
         .execute(&mut *tx)
         .await
         .unwrap();
-    sqlx::query("UPDATE sofom.contratos_mutuo SET fecha_inicio = fecha_inicio - $2 WHERE id = $1")
+    let contrato: ContratoMutuo =
+        sqlx::query_as("UPDATE sofom.contratos_mutuo SET fecha_inicio = fecha_inicio - $2 WHERE id = $1 RETURNING *")
+            .bind(contrato_id)
+            .bind(dias)
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap();
+    // Los términos (y su hash) cambian con la fecha de inicio; sin esto la
+    // aplicación detectaría, con razón, un contrato alterado.
+    sqlx::query("UPDATE sofom.contratos_mutuo SET hash_terminos = $2 WHERE id = $1")
         .bind(contrato_id)
-        .bind(dias)
+        .bind(puente::terminos_de(&contrato).unwrap().hash)
         .execute(&mut *tx)
         .await
         .unwrap();

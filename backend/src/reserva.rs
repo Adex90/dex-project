@@ -22,13 +22,27 @@
 //!
 //! **Costo acotado.** Un corte recorre todas las cuentas. Solo puede haber uno
 //! en curso (advisory lock) y una petición de cliente solo dispara uno si el
-//! último tiene más de `CORTE_MIN_INTERVALO_SEG`.
+//! último tiene más de `CORTE_MIN_INTERVALO_SEG`. El árbol de cada corte se
+//! verifica y construye una sola vez, fuera del ejecutor async, y se comparte
+//! entre peticiones ([`CacheCortes`]): una prueba cuesta una consulta por
+//! índice y O(log N) en memoria.
+//!
+//! **Anclas.** Cada corte publica `(secuencia_ledger, hash_ledger)`. El
+//! historial completo de anclas es público (`GET /reserva/cortes`), de modo que
+//! terceros pueden guardar copias: un ledger truncado o reescrito ya no
+//! contiene esos hashes y el verificador de la cadena lo detecta.
+
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc,
+};
 
 use chrono::{DateTime, Utc};
 use rand::RngCore;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
+use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use crate::{
@@ -106,10 +120,39 @@ fn monto(unidades: u128) -> AppResult<Decimal> {
     dinero::desde_unidades(unidades).ok_or_else(|| AppError::Integridad("suma fuera de rango".into()))
 }
 
-/// Genera y publica un corte de Proof of Reserve.
+/// Ejecuta trabajo de CPU (hashes del árbol) en el pool bloqueante de tokio.
+async fn bloqueante<T: Send + 'static>(f: impl FnOnce() -> AppResult<T> + Send + 'static) -> AppResult<T> {
+    tokio::task::spawn_blocking(f)
+        .await
+        .map_err(|e| AppError::Integridad(format!("cálculo del árbol Merkle abortado: {e}")))?
+}
+
+/// Reproduce el ledger IFPE completo en SQL (agregado por cuenta y por reserva)
+/// y cuenta los saldos vivos que no coinciden. Se ejecuta en la misma foto que
+/// el corte, así que las hojas publicadas son saldos que el ledger justifica.
+const SQL_SALDOS_SIN_LEDGER: &str = "\
+    WITH mov AS ( \
+        SELECT cuenta_destino_id AS id, monto AS d, 0::numeric AS b FROM ifpe.transacciones \
+         WHERE tipo IN ('DEPOSITO', 'RETORNO_DE_SOFOM', 'TRANSFERENCIA') \
+        UNION ALL SELECT cuenta_origen_id, -monto, 0 FROM ifpe.transacciones \
+         WHERE tipo IN ('RETIRO', 'TRASPASO_A_SOFOM', 'TRANSFERENCIA') \
+        UNION ALL SELECT cuenta_origen_id, -monto, monto FROM ifpe.transacciones WHERE tipo = 'RETENCION' \
+        UNION ALL SELECT cuenta_origen_id, monto, -monto FROM ifpe.transacciones WHERE tipo = 'LIBERACION_RETENCION' \
+    ), cuentas AS (SELECT id, sum(d) AS d, sum(b) AS b FROM mov GROUP BY id), \
+    reservas AS ( \
+        SELECT reserva_id AS id, sum(CASE WHEN tipo IN ('DEPOSITO', 'RETORNO_DE_SOFOM') THEN monto ELSE -monto END) AS s \
+          FROM ifpe.transacciones WHERE reserva_id IS NOT NULL GROUP BY reserva_id \
+    ) \
+    SELECT (SELECT count(*) FROM ifpe.cuentas c FULL JOIN cuentas r ON r.id = c.id \
+             WHERE coalesce(c.saldo_disponible, 0) <> coalesce(r.d, 0) \
+                OR coalesce(c.saldo_bloqueado, 0) <> coalesce(r.b, 0)) \
+         + (SELECT count(*) FROM ifpe.reserva_custodia c FULL JOIN reservas r ON r.id = c.id \
+             WHERE coalesce(c.saldo, 0) <> coalesce(r.s, 0))";
+
 /// Clave del advisory lock que serializa la generación de cortes.
 const LOCK_CORTE: i64 = 0x5343_504f_5200_0001; // "SCPOR\0\0\1"
 
+/// Genera y publica un corte de Proof of Reserve.
 pub async fn generar_corte(pool: &PgPool) -> AppResult<CorteReserva> {
     db::con_reintentos(|| generar_corte_tx(pool)).await
 }
@@ -135,13 +178,39 @@ async fn generar_corte_tx(pool: &PgPool) -> AppResult<CorteReserva> {
     let cabeza: LedgerCabeza =
         sqlx::query_as("SELECT ultima_secuencia, ultimo_hash FROM ifpe.ledger_cabeza").fetch_one(&mut *tx).await?;
 
-    let mut hojas: Vec<Hoja> = filas
+    // El ledger nunca retrocede respecto de un ancla ya publicada.
+    let ancla_maxima: i64 = sqlx::query_scalar("SELECT coalesce(max(secuencia_ledger), 0) FROM ifpe.cortes_reserva")
+        .fetch_one(&mut *tx)
+        .await?;
+    if cabeza.ultima_secuencia < ancla_maxima {
+        return Err(AppError::Integridad(format!(
+            "la cabeza del ledger ({}) está detrás de un corte ya publicado ({ancla_maxima}): ledger truncado",
+            cabeza.ultima_secuencia
+        )));
+    }
+    // Cada saldo de la foto debe ser exactamente el que el ledger justifica.
+    let sin_ledger: i64 = sqlx::query_scalar(SQL_SALDOS_SIN_LEDGER).fetch_one(&mut *tx).await?;
+    if sin_ledger > 0 {
+        return Err(AppError::Integridad(format!(
+            "{sin_ledger} saldos (cuentas o reserva) no coinciden con la reproducción del ledger"
+        )));
+    }
+
+    let hojas: Vec<Hoja> = filas
         .iter()
         .map(|f| Ok(Hoja { cuenta_id: f.cuenta_id, saldo: unidades(f.saldo_total)?, sal: aleatorio_32() }))
         .collect::<AppResult<_>>()?;
-    // Orden barajado en cada corte (el hash depende de la sal aleatoria).
-    hojas.sort_by_cached_key(Hoja::hash);
-    let arbol = ArbolSuma::construir(&hojas).map_err(|e| AppError::Integridad(e.to_string()))?;
+    // Hash de cada hoja y árbol completo: CPU pura, fuera del ejecutor async.
+    let (hojas, hashes, arbol) = bloqueante(move || {
+        let mut con_hash: Vec<(merkle::Hash, Hoja)> = hojas.into_iter().map(|h| (h.hash(), h)).collect();
+        // Orden barajado en cada corte (el hash depende de la sal aleatoria).
+        con_hash.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        let nodos = con_hash.iter().map(|(hash, h)| Nodo { hash: *hash, suma: h.saldo }).collect();
+        let arbol = ArbolSuma::desde_nodos(nodos).map_err(|e| AppError::Integridad(e.to_string()))?;
+        let (hashes, hojas) = con_hash.into_iter().unzip::<_, _, Vec<_>, Vec<_>>();
+        Ok((hojas, hashes, arbol))
+    })
+    .await?;
     let raiz = arbol.raiz();
     let total_hojas = monto(raiz.suma)?;
 
@@ -178,7 +247,7 @@ async fn generar_corte_tx(pool: &PgPool) -> AppResult<CorteReserva> {
         let cuentas: Vec<Uuid> = lote.iter().map(|h| h.cuenta_id).collect();
         let saldos: Vec<Decimal> = lote.iter().map(|h| monto(h.saldo)).collect::<AppResult<_>>()?;
         let sales: Vec<String> = lote.iter().map(|h| hex::encode(h.sal)).collect();
-        let hashes: Vec<String> = lote.iter().map(|h| hex::encode(h.hash())).collect();
+        let hashes: Vec<String> = hashes[base..base + lote.len()].iter().map(hex::encode).collect();
         sqlx::query(
             "INSERT INTO ifpe.cortes_reserva_hojas (corte_id, indice, cuenta_id, saldo_total, sal, hoja_hash) \
              SELECT $1, * FROM UNNEST($2::int[], $3::uuid[], $4::numeric[], $5::text[], $6::text[])",
@@ -207,6 +276,124 @@ pub async fn ultimo_corte(pool: &PgPool) -> AppResult<Option<CorteReserva>> {
     Ok(corte)
 }
 
+/// Historial público de anclas, del más reciente al más antiguo. `antes`
+/// pagina por fecha de publicación.
+pub async fn listar_cortes(pool: &PgPool, antes: Option<DateTime<Utc>>, limite: i64) -> AppResult<Vec<CorteReserva>> {
+    let mut tx = db::begin_lectura(pool, Rol::Auditor).await?;
+    let cortes = sqlx::query_as(
+        "SELECT * FROM ifpe.cortes_reserva WHERE $1::timestamptz IS NULL OR creado_en < $1 \
+         ORDER BY creado_en DESC, id DESC LIMIT $2",
+    )
+    .bind(antes)
+    .bind(limite.clamp(1, 500))
+    .fetch_all(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(cortes)
+}
+
+pub async fn corte_por_id(pool: &PgPool, id: Uuid) -> AppResult<CorteReserva> {
+    let mut tx = db::begin_lectura(pool, Rol::Auditor).await?;
+    let corte =
+        sqlx::query_as("SELECT * FROM ifpe.cortes_reserva WHERE id = $1").bind(id).fetch_optional(&mut *tx).await?;
+    tx.commit().await?;
+    corte.ok_or_else(|| AppError::no_encontrado("corte no encontrado"))
+}
+
+// -----------------------------------------------------------------------------
+// Árbol de cada corte, construido una sola vez
+// -----------------------------------------------------------------------------
+
+/// Árbol verificado del corte más reciente que se ha pedido. Los cortes son
+/// inmutables, así que el árbol se reconstruye (y se comprueba contra la raíz
+/// publicada) una vez por corte en lugar de una vez por petición.
+///
+/// La construcción corre en una tarea propia que conserva el candado: si el
+/// cliente que la inició se desconecta, el trabajo no se pierde ni se repite.
+/// Memoria: unos 100 bytes por cuenta (todos los niveles del árbol).
+#[derive(Default)]
+pub struct CacheCortes {
+    ultimo: Arc<Mutex<Option<ArbolCorte>>>,
+    construcciones: AtomicU64,
+}
+
+#[derive(Clone)]
+struct ArbolCorte {
+    corte_id: Uuid,
+    creado_en: DateTime<Utc>,
+    arbol: Arc<ArbolSuma>,
+}
+
+impl CacheCortes {
+    /// Veces que se ha reconstruido un árbol (para pruebas y métricas).
+    pub fn construcciones(&self) -> u64 {
+        self.construcciones.load(Ordering::Relaxed)
+    }
+
+    async fn arbol(self: &Arc<Self>, pool: &PgPool, corte: &CorteReserva) -> AppResult<Arc<ArbolSuma>> {
+        let guardia = Arc::clone(&self.ultimo).lock_owned().await;
+        if let Some(c) = guardia.as_ref().filter(|c| c.corte_id == corte.id) {
+            return Ok(Arc::clone(&c.arbol));
+        }
+        let (cache, pool, corte) = (Arc::clone(self), pool.clone(), corte.clone());
+        tokio::spawn(async move {
+            let mut guardia = guardia;
+            let arbol = Arc::new(construir_verificado(&pool, &corte).await?);
+            cache.construcciones.fetch_add(1, Ordering::Relaxed);
+            // Nunca se reemplaza un corte más reciente por uno anterior.
+            if guardia.as_ref().map_or(true, |c| c.creado_en <= corte.creado_en) {
+                *guardia =
+                    Some(ArbolCorte { corte_id: corte.id, creado_en: corte.creado_en, arbol: Arc::clone(&arbol) });
+            }
+            Ok(arbol)
+        })
+        .await
+        .map_err(|e| AppError::Integridad(format!("construcción del árbol abortada: {e}")))?
+    }
+}
+
+/// Lee las hojas almacenadas de un corte, recalcula cada hash y el árbol, y
+/// exige que la raíz y la suma coincidan con las publicadas: una hoja alterada
+/// después de publicar se detecta aquí.
+async fn construir_verificado(pool: &PgPool, corte: &CorteReserva) -> AppResult<ArbolSuma> {
+    let mut tx = db::begin_lectura(pool, Rol::Auditor).await?;
+    let hojas: Vec<HojaCorte> =
+        sqlx::query_as("SELECT * FROM ifpe.cortes_reserva_hojas WHERE corte_id = $1 ORDER BY indice")
+            .bind(corte.id)
+            .fetch_all(&mut *tx)
+            .await?;
+    tx.commit().await?;
+    let corte = corte.clone();
+    bloqueante(move || {
+        if usize::try_from(corte.num_hojas).ok() != Some(hojas.len()) {
+            return Err(AppError::Integridad(format!("el corte {} declara {} hojas", corte.id, corte.num_hojas)));
+        }
+        let mut nodos = Vec::with_capacity(hojas.len());
+        for (i, h) in hojas.iter().enumerate() {
+            if usize::try_from(h.indice).ok() != Some(i) {
+                return Err(AppError::Integridad(format!("hojas del corte {} no contiguas", corte.id)));
+            }
+            let hoja = hoja_de_fila(h)?;
+            let hash = hoja.hash();
+            if hex::encode(hash) != h.hoja_hash {
+                return Err(AppError::Integridad(format!("hash de hoja alterado en corte {} índice {i}", corte.id)));
+            }
+            nodos.push(Nodo { hash, suma: hoja.saldo });
+        }
+        let arbol = ArbolSuma::desde_nodos(nodos).map_err(|e| AppError::Integridad(e.to_string()))?;
+        let raiz = arbol.raiz();
+        if hex::encode(raiz.hash) != corte.merkle_root || monto(raiz.suma)? != corte.total_pasivo {
+            return Err(AppError::Integridad(format!("la raíz recalculada del corte {} no coincide", corte.id)));
+        }
+        Ok(arbol)
+    })
+    .await
+}
+
+fn hoja_de_fila(h: &HojaCorte) -> AppResult<Hoja> {
+    Ok(Hoja { cuenta_id: h.cuenta_id, saldo: unidades(h.saldo_total)?, sal: hash_desde_hex(&h.sal)? })
+}
+
 // -----------------------------------------------------------------------------
 // Pruebas de inclusión (formato JSON, verificable fuera del banco)
 // -----------------------------------------------------------------------------
@@ -215,6 +402,7 @@ pub async fn ultimo_corte(pool: &PgPool) -> AppResult<Option<CorteReserva>> {
 pub struct HojaJson {
     pub cuenta_id: Uuid,
     /// Saldo con 8 decimales (las unidades del árbol son este valor × 10^8).
+    #[serde(with = "rust_decimal::serde::str")]
     pub saldo: Decimal,
     pub sal: String,
     #[serde(default)]
@@ -225,6 +413,7 @@ pub struct HojaJson {
 pub struct PasoJson {
     pub lado: Lado,
     pub hash: String,
+    #[serde(with = "rust_decimal::serde::str")]
     pub suma: Decimal,
 }
 
@@ -249,7 +438,8 @@ impl HojaJson {
     fn a_hoja(&self) -> AppResult<Hoja> {
         Ok(Hoja {
             cuenta_id: self.cuenta_id,
-            saldo: dinero::a_unidades(self.saldo).ok_or_else(|| AppError::validacion("saldo inválido"))?,
+            saldo: dinero::a_unidades_estricto(self.saldo)
+                .ok_or_else(|| AppError::validacion("saldo inválido: no negativo y con 8 decimales como máximo"))?,
             sal: hash_desde_hex(&self.sal)?,
         })
     }
@@ -268,7 +458,9 @@ fn ruta_desde_json(ruta: &[PasoJson]) -> AppResult<Vec<Paso>> {
                 lado: p.lado,
                 hermano: Nodo {
                     hash: hash_desde_hex(&p.hash)?,
-                    suma: dinero::a_unidades(p.suma).ok_or_else(|| AppError::validacion("suma inválida"))?,
+                    suma: dinero::a_unidades_estricto(p.suma).ok_or_else(|| {
+                        AppError::validacion("suma inválida: no negativa y con 8 decimales como máximo")
+                    })?,
                 },
             })
         })
@@ -280,8 +472,13 @@ fn ruta_desde_json(ruta: &[PasoJson]) -> AppResult<Vec<Paso>> {
 /// Si la cuenta aún no está en un corte (cuenta nueva), se genera uno solo si
 /// el último tiene al menos `min_intervalo_seg` de antigüedad y no hay otro en
 /// curso; si no, responde `PRUEBA_PENDIENTE` y el siguiente corte la incluirá.
-pub async fn prueba_de_cliente(pool: &PgPool, cliente_id: Uuid, min_intervalo_seg: u64) -> AppResult<PruebaReserva> {
-    if let Some(p) = prueba_en_ultimo_corte(pool, cliente_id).await? {
+pub async fn prueba_de_cliente(
+    pool: &PgPool,
+    cache: &Arc<CacheCortes>,
+    cliente_id: Uuid,
+    min_intervalo_seg: u64,
+) -> AppResult<PruebaReserva> {
+    if let Some(p) = prueba_en_ultimo_corte(pool, cache, cliente_id).await? {
         return Ok(p);
     }
     let pendiente = || {
@@ -301,10 +498,14 @@ pub async fn prueba_de_cliente(pool: &PgPool, cliente_id: Uuid, min_intervalo_se
         Err(AppError::Conflicto { codigo, .. }) if codigo == "CORTE_EN_CURSO" => return Err(pendiente()),
         Err(e) => return Err(e),
     }
-    prueba_en_ultimo_corte(pool, cliente_id).await?.ok_or_else(pendiente)
+    prueba_en_ultimo_corte(pool, cache, cliente_id).await?.ok_or_else(pendiente)
 }
 
-async fn prueba_en_ultimo_corte(pool: &PgPool, cliente_id: Uuid) -> AppResult<Option<PruebaReserva>> {
+async fn prueba_en_ultimo_corte(
+    pool: &PgPool,
+    cache: &Arc<CacheCortes>,
+    cliente_id: Uuid,
+) -> AppResult<Option<PruebaReserva>> {
     let mut tx = db::begin_lectura_instantanea(pool, Rol::Auditor).await?;
     let cuenta: Option<(Uuid, Decimal)> = sqlx::query_as(
         "SELECT id, saldo_disponible + saldo_bloqueado FROM ifpe.cuentas WHERE cliente_id = $1 AND moneda = 'MXN'",
@@ -320,45 +521,33 @@ async fn prueba_en_ultimo_corte(pool: &PgPool, cliente_id: Uuid) -> AppResult<Op
             .fetch_optional(&mut *tx)
             .await?;
     let Some(corte) = corte else { return Ok(None) };
-    let hojas: Vec<HojaCorte> =
-        sqlx::query_as("SELECT * FROM ifpe.cortes_reserva_hojas WHERE corte_id = $1 ORDER BY indice")
+    // Solo la hoja de esta cuenta (índice único por corte y cuenta).
+    let fila: Option<HojaCorte> =
+        sqlx::query_as("SELECT * FROM ifpe.cortes_reserva_hojas WHERE corte_id = $1 AND cuenta_id = $2")
             .bind(corte.id)
-            .fetch_all(&mut *tx)
+            .bind(cuenta_id)
+            .fetch_optional(&mut *tx)
             .await?;
     tx.commit().await?;
+    let Some(fila) = fila else { return Ok(None) };
 
-    let Some(posicion) = hojas.iter().position(|h| h.cuenta_id == cuenta_id) else { return Ok(None) };
-
-    // Reconstruye el árbol desde las hojas almacenadas y exige que la raíz
-    // coincida con la publicada: si alguien alteró una hoja, se detecta aquí.
-    let mut nodos = Vec::with_capacity(hojas.len());
-    for (i, h) in hojas.iter().enumerate() {
-        if h.indice as usize != i {
-            return Err(AppError::Integridad(format!("hojas del corte {} no contiguas", corte.id)));
-        }
-        let hoja = Hoja { cuenta_id: h.cuenta_id, saldo: unidades(h.saldo_total)?, sal: hash_desde_hex(&h.sal)? };
-        if hex::encode(hoja.hash()) != h.hoja_hash {
-            return Err(AppError::Integridad(format!("hash de hoja alterado en corte {} índice {i}", corte.id)));
-        }
-        nodos.push(hoja.nodo());
+    let arbol = cache.arbol(pool, &corte).await?;
+    let hoja = hoja_de_fila(&fila)?;
+    let indice = usize::try_from(fila.indice).map_err(|_| AppError::Integridad("índice de hoja inválido".into()))?;
+    let prueba = arbol.prueba(indice).ok_or_else(|| AppError::Integridad("índice fuera del árbol".into()))?;
+    // La fila leída ahora debe ser la misma hoja con la que se verificó el árbol.
+    if prueba.hoja != hoja.nodo() || hex::encode(prueba.hoja.hash) != fila.hoja_hash {
+        return Err(AppError::Integridad(format!("hoja alterada en corte {} índice {indice}", corte.id)));
     }
-    let arbol = ArbolSuma::desde_nodos(nodos).map_err(|e| AppError::Integridad(e.to_string()))?;
     let raiz = arbol.raiz();
-    if hex::encode(raiz.hash) != corte.merkle_root || monto(raiz.suma)? != corte.total_pasivo {
-        return Err(AppError::Integridad(format!("la raíz recalculada del corte {} no coincide", corte.id)));
-    }
-
-    let h = &hojas[posicion];
-    let prueba = arbol.prueba(posicion).ok_or_else(|| AppError::Integridad("índice fuera del árbol".into()))?;
-    let hoja = Hoja { cuenta_id: h.cuenta_id, saldo: unidades(h.saldo_total)?, sal: hash_desde_hex(&h.sal)? };
-    let valida = merkle::verificar(&hoja, &prueba.ruta, &raiz);
+    let valida = merkle::verificar(&hoja, &prueba.ruta, &raiz) && hex::encode(raiz.hash) == corte.merkle_root;
     Ok(Some(PruebaReserva {
-        indice: posicion,
+        indice,
         hoja: HojaJson {
-            cuenta_id: h.cuenta_id,
-            saldo: dinero::con_escala(h.saldo_total),
-            sal: h.sal.clone(),
-            hash: Some(h.hoja_hash.clone()),
+            cuenta_id: fila.cuenta_id,
+            saldo: dinero::con_escala(fila.saldo_total),
+            sal: fila.sal,
+            hash: Some(fila.hoja_hash),
         },
         ruta: ruta_a_json(&prueba.ruta)?,
         valida,
