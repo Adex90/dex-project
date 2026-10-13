@@ -17,9 +17,10 @@ import { HashText, Money, formatDateTime } from "@/components/ui/data";
 import { Alert, Badge, Button, Card, CardHeader, cx } from "@/components/ui/primitives";
 import { ApiError, describeError } from "@/lib/api/client";
 import { api } from "@/lib/api/endpoints";
-import type { PruebaReserva, ResultadoVerificacionPrueba } from "@/lib/api/types";
+import type { CorteReserva, PruebaReserva, ResultadoVerificacionPrueba } from "@/lib/api/types";
 import { compareAmounts } from "@/lib/decimal";
 import { verifyInclusion, type VerificationResult } from "@/lib/merkle";
+import { ISSUE_MESSAGES, proofVerdict, type Verdict as VerdictResult } from "@/lib/proof-verdict";
 
 type Phase = "idle" | "fetching" | "verifying" | "done" | "error";
 
@@ -28,14 +29,16 @@ const STEP_DELAY_MS = 140;
 /**
  * Proof of Reserve audit. The browser downloads the account's inclusion
  * proof, then recomputes every hash itself (WebCrypto SHA-256), from the
- * leaf up to the root, and compares the result with the root and total
- * liabilities the bank published. The server is not trusted for the
- * verdict; its own check is shown only as a second opinion.
+ * leaf up to the root. The verdict also requires that the leaf is this
+ * customer's own account and that the cut matches the bank's public copy
+ * (fetched separately, without credentials), so a private root or another
+ * customer's leaf is caught. The server's own check is only a second opinion.
  */
-export function ProofOfReservePanel({ token }: { token: string }) {
+export function ProofOfReservePanel({ token, accountId }: { token: string; accountId: string | null }) {
   const [phase, setPhase] = useState<Phase>("idle");
   const [proof, setProof] = useState<PruebaReserva | null>(null);
   const [local, setLocal] = useState<VerificationResult | null>(null);
+  const [publicCut, setPublicCut] = useState<CorteReserva | null>(null);
   const [server, setServer] = useState<ResultadoVerificacionPrueba | null>(null);
   const [revealed, setRevealed] = useState(0);
   const [error, setError] = useState<string | null>(null);
@@ -52,14 +55,21 @@ export function ProofOfReservePanel({ token }: { token: string }) {
     setError(null);
     setPending(null);
     setLocal(null);
+    setPublicCut(null);
     setServer(null);
     setRevealed(0);
     try {
       const p = await api.reserveProof(token);
       setProof(p);
       setPhase("verifying");
-      const result = await verifyInclusion(p.hoja, p.ruta, p.corte.merkle_root, p.corte.total_pasivo);
+      // The public copy of the cut comes from an unauthenticated request; a
+      // failure here leaves the verdict negative instead of trusting the proof.
+      const [result, cut] = await Promise.all([
+        verifyInclusion(p.hoja, p.ruta, p.corte.merkle_root, p.corte.total_pasivo),
+        api.publicCut(p.corte.id).catch(() => null),
+      ]);
       setLocal(result);
+      setPublicCut(cut);
       api.verifyProof(p).then(setServer).catch(() => setServer(null));
 
       // Reveal the path one level at a time (leaf, each step, root).
@@ -99,8 +109,7 @@ export function ProofOfReservePanel({ token }: { token: string }) {
   };
 
   const busy = phase === "fetching" || phase === "verifying";
-  const reserveCovers = proof ? compareAmounts(proof.corte.total_reserva, proof.corte.total_pasivo) >= 0 : false;
-  const verdict = local && phase === "done" ? local.valid && reserveCovers && local.leafHashMatches !== false : null;
+  const verdict = local && proof && phase === "done" ? proofVerdict({ local, proof, accountId, publicCut }) : null;
 
   return (
     <Card aria-labelledby="por-title">
@@ -143,7 +152,7 @@ export function ProofOfReservePanel({ token }: { token: string }) {
 
         {proof && local ? (
           <div className="space-y-5" aria-live="polite">
-            {verdict !== null ? <Verdict ok={verdict} local={local} proof={proof} /> : null}
+            {verdict !== null ? <Verdict verdict={verdict} local={local} proof={proof} /> : null}
 
             <dl className="grid grid-cols-2 gap-x-4 gap-y-3 rounded-lg bg-surface-2 p-3 text-xs sm:grid-cols-3">
               <Meta label="Snapshot" value={formatDateTime(proof.corte.creado_en)} />
@@ -171,7 +180,11 @@ export function ProofOfReservePanel({ token }: { token: string }) {
                 sum={proof.hoja.saldo}
                 detail={
                   <>
-                    account <span className="font-mono">{proof.hoja.cuenta_id.slice(0, 8)}…</span> · salt{" "}
+                    account <span className="font-mono">{proof.hoja.cuenta_id.slice(0, 8)}…</span>
+                    {accountId && proof.hoja.cuenta_id.toLowerCase() === accountId.toLowerCase() ? " (yours)" : (
+                      <span className="text-danger"> (not your account)</span>
+                    )}{" "}
+                    · salt{" "}
                     <HashText value={proof.hoja.sal} head={6} tail={4} label="salt" className="text-[11px]" />
                     {local.leafHashMatches === false ? (
                       <span className="text-danger"> · does not match the hash sent by the bank</span>
@@ -217,6 +230,12 @@ export function ProofOfReservePanel({ token }: { token: string }) {
                 {proof.corte.algoritmo}
               </Badge>
               <Badge tone="neutral">Hashed in your browser · {local.engine === "webcrypto" ? "WebCrypto" : "JS SHA-256"}</Badge>
+              {phase === "done" ? (
+                <Badge tone={verdict?.issues.some((i) => i.startsWith("PUBLIC_CUT")) ? "danger" : "verified"}>
+                  Public snapshot copy:{" "}
+                  {publicCut ? (verdict?.issues.includes("PUBLIC_CUT_MISMATCH") ? "differs" : "matches") : "unavailable"}
+                </Badge>
+              ) : null}
               {server ? (
                 <Badge tone={server.valida ? "verified" : "danger"} icon={<Server className="size-3" aria-hidden />}>
                   Server check: {server.valida ? "agrees" : "disagrees"}
@@ -230,7 +249,8 @@ export function ProofOfReservePanel({ token }: { token: string }) {
   );
 }
 
-function Verdict({ ok, local, proof }: { ok: boolean; local: VerificationResult; proof: PruebaReserva }) {
+function Verdict({ verdict, local, proof }: { verdict: VerdictResult; local: VerificationResult; proof: PruebaReserva }) {
+  const ok = verdict.ok;
   const changed = compareAmounts(proof.saldo_actual, proof.hoja.saldo) !== 0;
   return (
     <div
@@ -249,20 +269,22 @@ function Verdict({ ok, local, proof }: { ok: boolean; local: VerificationResult;
         <p className={cx("font-semibold", ok ? "text-verified" : "text-danger")}>
           {ok ? "Verified: your balance is included and fully backed" : "Verification failed"}
         </p>
-        <p className="text-ink-2">
-          {ok ? (
-            <>
-              Your balance of <Money value={proof.hoja.saldo} /> is part of the published root, and the sum of all
-              balances (<Money value={local.rootSum} />) equals the cash held in custody.
-            </>
-          ) : (
-            <>
-              {!local.rootMatches ? "The computed root does not match the published root. " : null}
-              {!local.totalMatches ? "The tree's total does not match the published liabilities. " : null}
-              Download the proof and contact the bank.
-            </>
-          )}
-        </p>
+        {ok ? (
+          <p className="text-ink-2">
+            Your balance of <Money value={proof.hoja.saldo} /> is part of the published root, the root matches the
+            bank&apos;s public copy of this snapshot, and the sum of all balances (<Money value={local.rootSum} />) equals
+            the cash held in custody.
+          </p>
+        ) : (
+          <>
+            <ul className="list-disc space-y-0.5 pl-4 text-ink-2" data-testid="proof-issues">
+              {verdict.issues.map((issue) => (
+                <li key={issue}>{ISSUE_MESSAGES[issue]}</li>
+              ))}
+            </ul>
+            <p className="text-ink-2">Download the proof and contact the bank.</p>
+          </>
+        )}
         {changed ? (
           <p className="text-xs text-muted">
             Your balance has changed since this snapshot (now <Money value={proof.saldo_actual} />). The next snapshot

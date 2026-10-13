@@ -107,6 +107,27 @@ try {
     check(true, "ledger row expands to show the hash chain");
     await page.screenshot({ path: `${OUT}/dashboard-light.png`, fullPage: true });
 
+    // A dishonest server: a private root (differs from the public copy of the
+    // cut) or a leaf for another account must both fail in the browser.
+    const tamper = async (pattern, edit) => {
+      await page.route(pattern, async (route) => {
+        const response = await route.fetch();
+        await route.fulfill({ response, json: edit(await response.json()) });
+      });
+      await page.getByRole("button", { name: "Verify again" }).click();
+      await page.getByTestId("proof-verdict").filter({ hasText: "Verification failed" }).waitFor({ timeout: 15_000 });
+      const issues = await page.getByTestId("proof-issues").innerText();
+      await page.unroute(pattern);
+      return issues;
+    };
+    let issues = await tamper("**/api/v1/reserva/cortes/*", (cut) => ({ ...cut, merkle_root: "00".repeat(32) }));
+    check(issues.includes("public copy"), "a root that differs from the public cut fails verification");
+    issues = await tamper("**/api/v1/reserva/prueba", (p) => ({
+      ...p,
+      hoja: { ...p.hoja, cuenta_id: "00000000-0000-4000-8000-000000000000" },
+    }));
+    check(issues.includes("different account"), "a proof for another account fails verification");
+
     // Overdraft attempt through the bridge is blocked client-side.
     await page.getByRole("button", { name: "Make another investment" }).click();
     await page.fill("#bridge-amount", "15000.01");

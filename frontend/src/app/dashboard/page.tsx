@@ -87,7 +87,7 @@ export default function DashboardPage() {
             />
           </div>
           <div className="lg:col-span-3">
-            <ProofOfReservePanel token={token} />
+            <ProofOfReservePanel token={token} accountId={summary?.boveda?.id ?? null} />
           </div>
         </div>
 

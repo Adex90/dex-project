@@ -19,6 +19,7 @@
 //! | POST | `/api/v1/sofom/mutuos/{id}/liquidar` | cliente dueño u operador |
 //! | GET  | `/api/v1/reserva/estado` | público |
 //! | GET  | `/api/v1/reserva/cortes/ultimo` | público |
+//! | GET  | `/api/v1/reserva/cortes`, `/api/v1/reserva/cortes/{id}` | público (historial de anclas) |
 //! | POST | `/api/v1/reserva/verificar` | público |
 //! | GET  | `/api/v1/reserva/prueba` | cliente |
 //! | POST | `/api/v1/reserva/cortes` | operador / auditor |

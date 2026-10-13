@@ -1,5 +1,6 @@
 import { request } from "./client";
 import type {
+  CorteReserva,
   EstadoReservaVista,
   Movimiento,
   PlazoTasa,
@@ -48,6 +49,9 @@ export const api = {
   reserveStatus: (signal?: AbortSignal) => request<EstadoReservaVista>("/api/v1/reserva/estado", { signal }),
 
   reserveProof: (token: string) => request<PruebaReserva>("/api/v1/reserva/prueba", { token }),
+
+  /** Public copy of a published cut, fetched without credentials. */
+  publicCut: (id: string) => request<CorteReserva>(`/api/v1/reserva/cortes/${encodeURIComponent(id)}`),
 
   verifyProof: (proof: PruebaReserva) =>
     request<ResultadoVerificacionPrueba>("/api/v1/reserva/verificar", {
