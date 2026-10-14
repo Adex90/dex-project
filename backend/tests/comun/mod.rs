@@ -6,7 +6,13 @@
 
 #![allow(dead_code)]
 
-use std::str::FromStr;
+use std::{
+    str::FromStr,
+    sync::atomic::{AtomicU32, Ordering},
+};
+
+use base64::Engine;
+use chrono::NaiveDate;
 
 use rust_decimal::Decimal;
 use sqlx::PgPool;
@@ -15,7 +21,13 @@ use synthetic_capital::{
     config::Config,
     db,
     error::AppResult,
-    kyc::{self, DatosRegistro, Registro},
+    kyc::{
+        self,
+        biometria::ProveedorSimulado,
+        curp::{self, Sexo},
+        expediente::{self, DatosIne, DatosPersonales, Domicilio, OrigenEnvio, Selfie, SolicitudVerificacion},
+        ine, rfc, DatosRegistro, EnvioVerificacion, Registro,
+    },
     ledger::{hash, Movimiento},
     models::{kyc::TipoPersona, sofom::ContratoMutuo},
     sofom::puente,
@@ -36,12 +48,22 @@ pub async fn preparar(pool: &PgPool) -> Config {
     cfg
 }
 
-/// Cliente persona física con KYC verificado (modo demo) y cuenta IFPE.
+/// Cliente persona física con cuenta IFPE y KYC VERIFICADO por el camino
+/// real: datos personales, INE y selfie evaluados por el proveedor simulado.
 pub async fn cliente(pool: &PgPool, cfg: &Config, nombre: &str) -> Registro {
+    let mut r = cliente_sin_kyc(pool, cfg, nombre).await;
+    let id = IdentidadPrueba::nueva(nombre);
+    let envio = onboarding(pool, cfg, r.cliente.id, &id, &proveedor(cfg)).await.unwrap();
+    assert_eq!(envio.estado_kyc, expediente::EstadoKyc::Verificado, "{envio:?}");
+    r.cliente = kyc::perfil(pool, r.cliente.id).await.unwrap();
+    r
+}
+
+/// Cliente recién registrado: expediente PENDIENTE, sin poder operar.
+pub async fn cliente_sin_kyc(pool: &PgPool, cfg: &Config, nombre: &str) -> Registro {
     kyc::registrar(
         pool,
         &cfg.clabe_prefijo,
-        true,
         DatosRegistro {
             tipo_persona: TipoPersona::Fisica,
             nombre: nombre.into(),
@@ -58,6 +80,133 @@ pub async fn cliente(pool: &PgPool, cfg: &Config, nombre: &str) -> Registro {
     )
     .await
     .unwrap()
+}
+
+/// Proveedor biométrico simulado que firma con el secreto de la configuración.
+pub fn proveedor(cfg: &Config) -> ProveedorSimulado {
+    ProveedorSimulado::nuevo(cfg.kyc.webhook_secretos[0].as_bytes())
+}
+
+/// Pasos 1 a 3 del onboarding con el proveedor indicado.
+pub async fn onboarding(
+    pool: &PgPool,
+    cfg: &Config,
+    cliente_id: Uuid,
+    id: &IdentidadPrueba,
+    proveedor: &ProveedorSimulado,
+) -> AppResult<EnvioVerificacion> {
+    expediente::guardar_datos(pool, cliente_id, &id.datos_personales(), chrono::Utc::now().date_naive()).await?;
+    kyc::verificar_identidad(pool, &cfg.kyc, proveedor, cliente_id, &id.solicitud(), &OrigenEnvio::default()).await
+}
+
+/// Revoca el KYC (como cumplimiento): el cliente deja de poder operar.
+pub async fn revocar_kyc(pool: &PgPool, cliente_id: Uuid) {
+    sqlx::query("UPDATE kyc.kyc_perfiles SET estado_kyc = 'PENDIENTE' WHERE cliente_id = $1")
+        .bind(cliente_id)
+        .execute(pool)
+        .await
+        .unwrap();
+}
+
+static SECUENCIA: AtomicU32 = AtomicU32::new(0);
+
+/// Identidad mexicana válida y única en el proceso (CURP, RFC y clave de
+/// elector con sus dígitos verificadores) para un nombre de pila.
+#[derive(Debug, Clone)]
+pub struct IdentidadPrueba {
+    pub nombres: String,
+    pub apellido_paterno: String,
+    pub apellido_materno: Option<String>,
+    pub curp: String,
+    pub rfc: String,
+    pub clave_elector: String,
+    pub cic: String,
+    pub semilla: u32,
+}
+
+impl IdentidadPrueba {
+    pub fn nueva(nombre: &str) -> Self {
+        let n = SECUENCIA.fetch_add(1, Ordering::Relaxed);
+        let fecha = NaiveDate::from_ymd_opt(1960, 1, 1).unwrap() + chrono::Days::new(u64::from(n % 14_000) + 1);
+        let (paterno, materno) = ("Prueba", Some("Sintética"));
+        let curp = curp::construir(nombre, paterno, materno, fecha, Sexo::M, "DF", (n % 10) as u8);
+        let rfc = rfc::construir_desde_curp(&curp, &format!("{:02}", n % 100));
+        let clave_elector = ine::construir_clave_elector(nombre, paterno, materno, fecha, 9, Sexo::M, (n % 1000) as u16);
+        Self {
+            nombres: nombre.to_owned(),
+            apellido_paterno: paterno.to_owned(),
+            apellido_materno: materno.map(str::to_owned),
+            curp,
+            rfc,
+            clave_elector,
+            cic: format!("{:09}", 100_000_000 + n),
+            semilla: n,
+        }
+    }
+
+    pub fn datos_personales(&self) -> DatosPersonales {
+        DatosPersonales {
+            nombres: self.nombres.clone(),
+            apellido_paterno: self.apellido_paterno.clone(),
+            apellido_materno: self.apellido_materno.clone(),
+            curp: self.curp.clone(),
+            rfc: self.rfc.clone(),
+            domicilio: Domicilio {
+                calle: "Av. Paseo de la Reforma".into(),
+                numero_exterior: "222".into(),
+                numero_interior: None,
+                colonia: "Juárez".into(),
+                municipio: "Cuauhtémoc".into(),
+                estado: "Ciudad de México".into(),
+                codigo_postal: "06600".into(),
+            },
+        }
+    }
+
+    pub fn solicitud(&self) -> SolicitudVerificacion {
+        SolicitudVerificacion {
+            ine: DatosIne {
+                clave_elector: self.clave_elector.clone(),
+                cic: self.cic.clone(),
+                identificador_ciudadano: None,
+                emision: 2023,
+                vigencia: 2033,
+                frente: imagen_jpeg(self.semilla, 1),
+                reverso: imagen_jpeg(self.semilla, 2),
+            },
+            selfie: Selfie { frames: (3..6).map(|i| imagen_jpeg(self.semilla, i)).collect(), reto: Some("PARPADEA".into()) },
+            consentimiento_biometrico: true,
+        }
+    }
+
+    pub fn datos_json(&self) -> serde_json::Value {
+        let d = self.datos_personales();
+        serde_json::json!({
+            "nombres": d.nombres, "apellido_paterno": d.apellido_paterno, "apellido_materno": d.apellido_materno,
+            "curp": d.curp, "rfc": d.rfc,
+            "domicilio": serde_json::to_value(&d.domicilio).unwrap(),
+        })
+    }
+
+    pub fn solicitud_json(&self) -> serde_json::Value {
+        let s = self.solicitud();
+        serde_json::json!({
+            "ine": {
+                "clave_elector": s.ine.clave_elector, "cic": s.ine.cic, "emision": s.ine.emision,
+                "vigencia": s.ine.vigencia, "frente": s.ine.frente, "reverso": s.ine.reverso,
+            },
+            "selfie": { "frames": s.selfie.frames, "reto": s.selfie.reto },
+            "consentimiento_biometrico": true,
+        })
+    }
+}
+
+/// "Imagen" JPEG (cabecera válida, contenido distinto por semilla e índice).
+pub fn imagen_jpeg(semilla: u32, indice: u32) -> String {
+    let mut bytes = vec![0xFF, 0xD8, 0xFF, 0xE0];
+    bytes.extend(format!("{semilla}:{indice}:").bytes());
+    bytes.resize(4096, (indice % 251) as u8);
+    format!("data:image/jpeg;base64,{}", base64::engine::general_purpose::STANDARD.encode(bytes))
 }
 
 /// SPEI entrante (como lo notificaría el proveedor) con una clave de rastreo única.

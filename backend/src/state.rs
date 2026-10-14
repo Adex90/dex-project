@@ -5,6 +5,7 @@ use sqlx::PgPool;
 use crate::{
     auth::jwt::ClavesJwt,
     config::Config,
+    kyc::biometria::{ProveedorBiometrico, ProveedorSimulado},
     reserva::CacheCortes,
     spei::pasarela::{Pasarela, PasarelaSimulada},
 };
@@ -19,6 +20,9 @@ pub struct AppState {
     pub cortes: Arc<CacheCortes>,
     /// Participante liquidador SPEI (STP). Por ahora, la pasarela simulada.
     pub pasarela: Arc<dyn Pasarela>,
+    /// Proveedor biométrico (prueba de vida, comparación facial, OCR de la
+    /// INE). Por ahora, el simulado.
+    pub biometria: Arc<dyn ProveedorBiometrico>,
 }
 
 impl AppState {
@@ -28,6 +32,13 @@ impl AppState {
 
     pub fn con_pasarela(pool: PgPool, config: Config, pasarela: Arc<dyn Pasarela>) -> Self {
         let jwt = ClavesJwt::nuevas(&config.jwt_secret, config.jwt_ttl_minutos);
-        Self { pool, config: Arc::new(config), jwt: Arc::new(jwt), cortes: Arc::default(), pasarela }
+        let biometria = Arc::new(ProveedorSimulado::nuevo(config.kyc.webhook_secretos[0].as_bytes()));
+        Self { pool, config: Arc::new(config), jwt: Arc::new(jwt), cortes: Arc::default(), pasarela, biometria }
+    }
+
+    /// Sustituye el proveedor biométrico (pruebas).
+    pub fn con_biometria(mut self, biometria: Arc<dyn ProveedorBiometrico>) -> Self {
+        self.biometria = biometria;
+        self
     }
 }

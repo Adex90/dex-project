@@ -90,6 +90,61 @@ gateway reproduces STP's behaviour, including duplicate rejections on resend
 and delayed status queries. A production STP client (RSA-signed orders,
 participant catalog) plugs in there.
 
+## Digital onboarding and biometric KYC (migration `0006`)
+
+Remote identification of individuals (CNBV / Ley Fintech, AML/CFT): personal
+data, INE (front and back) and a liveness selfie matched against the
+credential photograph.
+
+- **Strict gating, enforced by PostgreSQL row-level security.** A client
+  whose KYC is not `VERIFICADO` cannot receive deposits (SPEI or simulated),
+  transfer, withdraw or invest in a mutuum. Policies on `ifpe.transacciones`,
+  `sofom.contratos_mutuo` and `sofom.creditos` evaluate the client's current
+  state on every insert, so verifying or revoking a client changes what it can
+  do in the same transaction. This holds even if the backend skips its own
+  checks. The only exceptions are not client operations: the refund of the
+  client's own failed SPEI order, an operator correction, the maturity of a
+  signed mutuum, and compliance holds.
+- **One source of truth:** `kyc.kyc_perfiles.estado_kyc` (`PENDIENTE`,
+  `EN_REVISION`, `VERIFICADO`, `RECHAZADO`). `kyc.clientes.estatus_kyc` is a
+  mirror maintained by the database; no application role can write it.
+- **Who can decide.** `sc_kyc` (client routes) can only edit a `PENDIENTE`
+  file and send it to review; RLS makes every other file invisible to its
+  updates. Only `sc_kyc_verificador` (the provider's signed result and
+  operators) can verify, reject or reopen. Identity fields freeze once
+  submitted, and each submission gets a database-generated verification id.
+- **Evidence the database demands:** `VERIFICADO` requires a provider result
+  for the *current* submission with a passed liveness check, a valid document,
+  OCR whose CURP and voter key equal the file's, and a similarity score of at
+  least `kyc.parametros.umbral_score_minimo`. For an automatic approval the
+  result must come from the same transaction. For a manual approval it must
+  reach `umbral_revision`, and the operator is recorded and cannot be the
+  client. Thresholds and attempts live in `kyc.parametros`
+  (`KYC_SCORE_MINIMO`, `KYC_SCORE_REVISION`, `KYC_MAX_INTENTOS` set them at
+  startup).
+- **Validation:** CURP (structure, date, state, RENAPO check digit, and
+  letters vs the name as a warning), RFC (SAT check digit, same date as the
+  CURP), INE voter key (birth date and sex vs the CURP), CIC, credential
+  validity, and the ICAO 9303 TD1 MRZ check digits, cross-checked against the
+  file. Warnings send the case to human review instead of auto-approval.
+- **Audit:** `kyc.kyc_auditoria_biometrica` (immutable) keeps the score,
+  liveness, document and OCR checks, applied threshold, origin IP and user
+  agent, the signed raw result, and SHA-256 fingerprints of the images. The
+  images themselves are not stored. `kyc.kyc_historial` records every
+  transition with its role and operator. Express consent to biometric
+  processing (LFPDPPP sensitive data) is required and kept with the
+  submission.
+- **Provider:** `backend/src/kyc/biometria.rs` defines the interface. Results
+  are HMAC-signed JSON (`X-Kyc-Firma`, same scheme as SPEI) and always go
+  through the same path, whether the provider answers immediately or later on
+  `POST /api/v1/kyc/webhook`. Replays are idempotent, and a result for an
+  outdated submission is refused. The bundled `ProveedorSimulado` only checks
+  that the camera frames differ and returns a configurable score. A certified
+  provider (passive/active liveness, 1:1 face match, INE nominal-list and
+  RENAPO validation) plugs in behind the same trait.
+- **Identity squatting:** CURP, RFC and voter key are unique only among
+  submitted or verified files. A value merely typed at sign-up blocks no one.
+
 ## Layout
 
 ```
@@ -100,6 +155,8 @@ backend/      Rust: axum + sqlx + tokio
   src/crypto/merkle.rs   Merkle sum tree (Proof of Reserve)
   src/reserva.rs         reserve cuts and per-client inclusion proofs
   src/sofom/             IFPE -> mutuum bridge, maturity liquidation, loans
+  src/kyc/               onboarding: CURP/RFC/INE/MRZ validation, biometric provider, verdicts
+  src/spei/              CLABE, signed SPEI webhooks, outbound dispatcher, gateway
   src/routes/            HTTP API (/api/v1)
 frontend/     Next.js dashboard (Task 3)
 tests/db/     SQL invariant tests for the schema
@@ -119,6 +176,7 @@ Tests (need a user with `CREATEDB` and `CREATEROLE`):
 cd backend && DATABASE_URL=postgres://synthetic:synthetic@localhost:5432/synthetic_capital cargo test
 # SQL invariants: run on an empty, freshly migrated database (everything is rolled back).
 psql "$EMPTY_DATABASE_URL" -f tests/db/0001_invariantes.sql
+psql "$EMPTY_DATABASE_URL" -f tests/db/0006_kyc.sql
 cd frontend && npm test && npm run build
 FRONTEND_URL=http://localhost:3000 node e2e/smoke.mjs   # needs backend (MODO_DEMO=true) + next start
 ```
@@ -131,7 +189,7 @@ the owner and serve as a login that can act only through the `sc_*` roles:
 
 ```sql
 CREATE ROLE sc_app LOGIN PASSWORD '...' NOINHERIT;
-GRANT sc_ifpe, sc_sofom, sc_puente, sc_auditor, sc_kyc, sc_spei TO sc_app;
+GRANT sc_ifpe, sc_sofom, sc_puente, sc_auditor, sc_kyc, sc_kyc_verificador, sc_spei TO sc_app;
 ```
 
 ```bash
@@ -174,12 +232,18 @@ the password is hashed, so a parallel burst cannot test more than 5 passwords.
 
 | Method | Route | Access |
 |---|---|---|
-| POST | `/api/v1/auth/registro`, `/api/v1/auth/login` | public |
+| POST | `/api/v1/auth/registro`, `/api/v1/auth/login` | public (sign-up starts with KYC `PENDIENTE`) |
+| GET | `/api/v1/kyc/expediente` | client: onboarding state, attempts, last biometric result |
+| POST | `/api/v1/kyc/perfil` | client: step 1, personal data, CURP, RFC and address |
+| POST | `/api/v1/kyc/verificar` | client: steps 2-3, INE images and data + liveness frames + consent (up to 12 MB) |
+| POST | `/api/v1/kyc/webhook` | biometric provider (HMAC signature `X-Kyc-Firma`) |
+| GET | `/api/v1/operaciones/kyc/pendientes` | operator: files awaiting human review |
+| POST | `/api/v1/operaciones/kyc/{cliente_id}` | operator: verify / reject (with reason) / reopen, risk level |
 | GET | `/api/v1/tablero` | client: vault + investment + live reserve |
 | GET | `/api/v1/ifpe/cuenta`, `/api/v1/ifpe/movimientos` | client |
 | POST | `/api/v1/ifpe/transferencias` | client: internal transfer |
 | POST | `/api/v1/ifpe/retiros` | client: withdrawal to own external CLABE (an outgoing SPEI) |
-| POST | `/api/v1/ifpe/depositos/simulados` | client, `MODO_DEMO` only |
+| POST | `/api/v1/ifpe/depositos/simulados` | client with verified KYC, `MODO_DEMO` only |
 | GET | `/api/v1/sofom/tasas` | public: terms and rates |
 | GET | `/api/v1/sofom/posicion` | client |
 | POST | `/api/v1/sofom/mutuos` | client: **IFPE -> SOFOM bridge** |

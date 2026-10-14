@@ -34,6 +34,7 @@ pub fn rutas() -> Router<AppState> {
         .route("/operaciones/spei/recibidos/{id}/correccion", post(corregir_spei))
         .route("/operaciones/depositos", post(deposito))
         .route("/operaciones/retenciones", post(retencion))
+        .route("/operaciones/kyc/pendientes", get(kyc_pendientes))
         .route("/operaciones/kyc/{cliente_id}", post(dictamen_kyc))
         .route("/operaciones/alertas", get(alertas))
         .route("/operaciones/creditos", get(listar_creditos).post(originar_credito))
@@ -142,7 +143,24 @@ async fn dictamen_kyc(
     Json(d): Json<DictamenKyc>,
 ) -> AppResult<Json<Cliente>> {
     u.exigir_operador()?;
-    Ok(Json(kyc::dictaminar(&e.pool, cliente_id, &d).await?))
+    Ok(Json(kyc::dictaminar(&e.pool, u.cliente_id, cliente_id, &d).await?))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FiltroPendientes {
+    limite: Option<i64>,
+}
+
+/// Expedientes EN_REVISION con el resultado del proveedor (cola del oficial
+/// de cumplimiento).
+async fn kyc_pendientes(
+    State(e): State<AppState>,
+    u: Usuario,
+    Query(f): Query<FiltroPendientes>,
+) -> AppResult<Json<Vec<kyc::dictamen::PendienteRevision>>> {
+    u.exigir_operador()?;
+    Ok(Json(kyc::dictamen::pendientes(&e.pool, f.limite.unwrap_or(100)).await?))
 }
 
 #[derive(Deserialize)]

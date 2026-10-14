@@ -16,7 +16,7 @@
 
 use std::{future::Future, io, sync::Arc, time::Duration};
 
-use axum::Router;
+use axum::{extract::ConnectInfo, Router};
 use hyper::server::conn::http1;
 use hyper_util::{
     rt::{TokioIo, TokioTimer},
@@ -26,6 +26,7 @@ use tokio::{
     net::TcpListener,
     sync::{watch, Semaphore},
 };
+use tower::ServiceExt;
 
 use crate::config::LimitesHttp;
 
@@ -58,7 +59,13 @@ pub async fn servir(listener: TcpListener, app: Router, limites: &LimitesHttp, a
             () = &mut apagado => break,
         };
         let _ = socket.set_nodelay(true);
-        let servicio = TowerToHyperService::new(app.clone());
+        // La IP remota viaja en cada petición (ConnectInfo) para la bitácora KYC.
+        let servicio = TowerToHyperService::new(app.clone().map_request(
+            move |mut peticion: hyper::Request<hyper::body::Incoming>| {
+                peticion.extensions_mut().insert(ConnectInfo(remoto));
+                peticion
+            },
+        ));
         let constructor = constructor.clone();
         let mut aviso = aviso.clone();
         tokio::spawn(async move {

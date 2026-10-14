@@ -28,6 +28,7 @@ use crate::{
     error::{AppError, AppResult},
     models::{
         ifpe::{CuentaIfpe, ReservaCustodia, TipoTxIfpe, TransaccionIfpe},
+        kyc::EstatusKyc,
         Entidad, EstadoCuenta,
     },
     pld::{self, EventoPld},
@@ -342,6 +343,14 @@ async fn transferir_tx(
         return Err(AppError::negocio(
             "DESTINO_EN_LISTA_BLOQUEADAS",
             "el beneficiario está en la Lista de Personas Bloqueadas",
+        ));
+    }
+    // Una transferencia es un depósito para el beneficiario: también exige su
+    // KYC verificado (la política RLS de ifpe.transacciones lo repite).
+    if perfil_destino.estatus_kyc != EstatusKyc::Verificado {
+        return Err(AppError::negocio(
+            "DESTINO_KYC_NO_VERIFICADO",
+            "el beneficiario aún no tiene su identidad verificada; no puede recibir transferencias",
         ));
     }
     exigir_debitable(&origen)?;

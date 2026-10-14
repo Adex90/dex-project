@@ -69,7 +69,19 @@ async fn api(pool: &PgPool) -> Api {
     Api { app: routes::router(AppState::nuevo(pool.clone(), cfg)) }
 }
 
+/// Registro + onboarding completo por HTTP (datos, INE y selfie).
 async fn registrar(api: &Api, nombre: &str) -> (String, Value) {
+    let (token, r) = registrar_sin_kyc(api, nombre).await;
+    let id = IdentidadPrueba::nueva(nombre);
+    let (s, d) = api.llamar("POST", "/api/v1/kyc/perfil", Some(&token), Some(id.datos_json())).await;
+    assert_eq!(s, StatusCode::OK, "{d}");
+    let (s, v) = api.llamar("POST", "/api/v1/kyc/verificar", Some(&token), Some(id.solicitud_json())).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert_eq!(v["estado_kyc"], "VERIFICADO", "{v}");
+    (token, r)
+}
+
+async fn registrar_sin_kyc(api: &Api, nombre: &str) -> (String, Value) {
     let (s, r) = api
         .llamar(
             "POST",
@@ -94,11 +106,33 @@ async fn flujo_completo_cliente(pool: PgPool) {
     let (s, _) = api.llamar("GET", "/salud", None, None).await;
     assert_eq!(s, StatusCode::OK);
 
-    let (token, registro) = registrar(&api, "Ana").await;
-    assert_eq!(registro["cliente"]["estatus_kyc"], "VERIFICADO");
+    let (token, registro) = registrar_sin_kyc(&api, "Ana").await;
+    assert_eq!(registro["cliente"]["estatus_kyc"], "PENDIENTE");
+
+    // Sin KYC verificado no entra dinero.
+    let deposito = json!({ "monto": "10000.00", "clave_idempotencia": "deposito-0001" });
+    let (s, e) = api.llamar("POST", "/api/v1/ifpe/depositos/simulados", Some(&token), Some(deposito.clone())).await;
+    assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY, "{e}");
+    assert_eq!(e["error"]["codigo"], "KYC_NO_VERIFICADO");
+
+    // Onboarding: datos personales, INE + selfie -> VERIFICADO.
+    let id = IdentidadPrueba::nueva("Ana");
+    let (s, exp) = api.llamar("GET", "/api/v1/kyc/expediente", Some(&token), None).await;
+    assert_eq!(s, StatusCode::OK, "{exp}");
+    assert_eq!(exp["estado_kyc"], "PENDIENTE");
+    assert_eq!(exp["intentos_restantes"], 3);
+    let (s, d) = api.llamar("POST", "/api/v1/kyc/perfil", Some(&token), Some(id.datos_json())).await;
+    assert_eq!(s, StatusCode::OK, "{d}");
+    assert_eq!(d["advertencias"], json!([]));
+    let (s, v) = api.llamar("POST", "/api/v1/kyc/verificar", Some(&token), Some(id.solicitud_json())).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert_eq!(v["estado_kyc"], "VERIFICADO");
+    assert_eq!(v["resultado"]["resultado"], "APROBADO");
+    let (_, yo) = api.llamar("GET", "/api/v1/yo", Some(&token), None).await;
+    assert_eq!(yo["estatus_kyc"], "VERIFICADO");
+    assert_eq!(yo["curp"], id.curp.as_str());
 
     // Depósito simulado (modo demo) e idempotencia HTTP: 201 y luego 200.
-    let deposito = json!({ "monto": "10000.00", "clave_idempotencia": "deposito-0001" });
     let (s, r) = api.llamar("POST", "/api/v1/ifpe/depositos/simulados", Some(&token), Some(deposito.clone())).await;
     assert_eq!(s, StatusCode::CREATED, "{r}");
     let (s, r2) = api.llamar("POST", "/api/v1/ifpe/depositos/simulados", Some(&token), Some(deposito)).await;

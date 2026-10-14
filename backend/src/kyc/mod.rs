@@ -1,9 +1,28 @@
-//! Alta de clientes, expediente KYC y bandeja PLD (rol `sc_kyc`).
+//! Identidad: alta de clientes, expediente KYC biométrico y bandeja PLD.
 //!
 //! El alta crea, en una sola transacción, el cliente, sus credenciales y su
 //! cuenta en la bóveda IFPE. El rol `sc_kyc` solo puede insertar las columnas
 //! de identidad de `ifpe.cuentas` (`cliente_id`, `clabe`): los saldos nacen en
 //! cero por DEFAULT y este código no tendría privilegio para fijarlos.
+//!
+//! Un cliente recién dado de alta está PENDIENTE y la base de datos (RLS) le
+//! impide recibir depósitos, transferir o invertir hasta que su expediente
+//! quede VERIFICADO:
+//!
+//! 1. [`expediente::guardar_datos`]: datos personales, CURP, RFC y domicilio.
+//! 2. [`verificar_identidad`]: INE (anverso y reverso) + selfie con prueba de
+//!    vida -> proveedor biométrico -> [`verificacion::procesar`] (resultado
+//!    firmado) -> VERIFICADO, revisión humana, reintento o RECHAZADO.
+//! 3. [`dictamen::dictaminar`]: decisión del oficial de cumplimiento.
+
+pub mod biometria;
+pub mod curp;
+pub mod dictamen;
+pub mod expediente;
+pub mod ine;
+pub mod rfc;
+pub mod texto;
+pub mod verificacion;
 
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
@@ -12,12 +31,18 @@ use uuid::Uuid;
 
 use crate::{
     auth::password,
+    config::ConfigKyc,
     db::{self, Rol},
     dinero,
     error::{AppError, AppResult},
-    models::kyc::{AlertaPld, Cliente, EstatusKyc, NivelRiesgo, TipoPersona},
-    spei::clabe,
+    models::kyc::{AlertaPld, Cliente, TipoPersona},
+    spei::{self, clabe},
 };
+
+pub use dictamen::{dictaminar, DictamenKyc};
+use biometria::{Entrega, ProveedorBiometrico, SolicitudProveedor};
+use expediente::{EstadoKyc, IdentidadPropia, OrigenEnvio, SolicitudVerificacion};
+use verificacion::ResultadoVerificacion;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -74,18 +99,7 @@ fn rfc_valido(rfc: &str) -> bool {
     prefijo.iter().all(|ch| ch.is_ascii_uppercase() || *ch == 'Ñ' || *ch == '&')
         && resto[..6].iter().all(char::is_ascii_digit)
         && resto[6..].iter().all(|ch| ch.is_ascii_uppercase() || ch.is_ascii_digit())
-}
-
-fn curp_valida(curp: &str) -> bool {
-    // ^[A-Z]{4}[0-9]{6}[HMX][A-Z]{5}[A-Z0-9][0-9]$
-    let b = curp.as_bytes();
-    b.len() == 18
-        && b[..4].iter().all(u8::is_ascii_uppercase)
-        && b[4..10].iter().all(u8::is_ascii_digit)
-        && matches!(b[10], b'H' | b'M' | b'X')
-        && b[11..16].iter().all(u8::is_ascii_uppercase)
-        && (b[16].is_ascii_uppercase() || b[16].is_ascii_digit())
-        && b[17].is_ascii_digit()
+        && rfc::digito_verificador(&c[..c.len() - 1].iter().collect::<String>()) == c.last().copied()
 }
 
 fn email_valido(email: &str) -> bool {
@@ -103,9 +117,10 @@ fn telefono_valido(t: &str) -> bool {
     (10..=15).contains(&digitos.len()) && digitos.bytes().all(|b| b.is_ascii_digit())
 }
 
-/// Alta de cliente + credenciales + cuenta IFPE. En modo demo el KYC queda
-/// verificado al instante (riesgo BAJO) para poder operar de inmediato.
-pub async fn registrar(pool: &PgPool, clabe_prefijo: &str, modo_demo: bool, d: DatosRegistro) -> AppResult<Registro> {
+/// Alta de cliente + credenciales + cuenta IFPE. El expediente KYC nace
+/// PENDIENTE (lo crea la base de datos) y la cuenta no opera hasta que el
+/// cliente complete la verificación de identidad.
+pub async fn registrar(pool: &PgPool, clabe_prefijo: &str, d: DatosRegistro) -> AppResult<Registro> {
     let nombre = d.nombre.trim().to_string();
     if nombre.is_empty() {
         return Err(AppError::validacion("el nombre es obligatorio"));
@@ -136,10 +151,12 @@ pub async fn registrar(pool: &PgPool, clabe_prefijo: &str, modo_demo: bool, d: D
         return Err(AppError::validacion("una persona moral no tiene CURP"));
     }
     if rfc.as_deref().is_some_and(|r| !rfc_valido(r)) {
-        return Err(AppError::validacion("RFC inválido (12 o 13 caracteres: letras, fecha AAMMDD y homoclave)"));
+        return Err(AppError::validacion(
+            "RFC inválido (12 o 13 caracteres: letras, fecha AAMMDD, homoclave y dígito verificador)",
+        ));
     }
-    if curp.as_deref().is_some_and(|c| !curp_valida(c)) {
-        return Err(AppError::validacion("CURP inválida (18 caracteres)"));
+    if let Some(c) = curp.as_deref() {
+        curp::Curp::parse(c).map_err(|e| AppError::validacion(e.to_string()))?;
     }
     if telefono.as_deref().is_some_and(|t| !telefono_valido(t)) {
         return Err(AppError::validacion("teléfono inválido (10 a 15 dígitos, con + opcional)"));
@@ -178,15 +195,6 @@ pub async fn registrar(pool: &PgPool, clabe_prefijo: &str, modo_demo: bool, d: D
         .bind(&hash)
         .execute(&mut *tx)
         .await?;
-    if modo_demo {
-        sqlx::query(
-            "UPDATE kyc.clientes SET estatus_kyc = 'VERIFICADO', kyc_verificado_en = now(), \
-             nivel_riesgo_pld = 'BAJO', riesgo_evaluado_en = now() WHERE id = $1",
-        )
-        .bind(cliente_id)
-        .execute(&mut *tx)
-        .await?;
-    }
 
     // Apertura de la cuenta IFPE. Colisión de CLABE aleatoria: reintentar.
     let mut cuenta = None;
@@ -224,40 +232,6 @@ pub async fn perfil(pool: &PgPool, cliente_id: Uuid) -> AppResult<Cliente> {
     Ok(cliente)
 }
 
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct DictamenKyc {
-    pub estatus_kyc: EstatusKyc,
-    pub nivel_riesgo_pld: Option<NivelRiesgo>,
-    pub nivel_cuenta: Option<i16>,
-}
-
-/// Dictamen del oficial de cumplimiento sobre el expediente KYC.
-pub async fn dictaminar(pool: &PgPool, cliente_id: Uuid, d: &DictamenKyc) -> AppResult<Cliente> {
-    if d.nivel_cuenta.is_some_and(|n| !(1..=4).contains(&n)) {
-        return Err(AppError::validacion("nivel_cuenta debe estar entre 1 y 4"));
-    }
-    let mut tx = db::begin(pool, Rol::Kyc).await?;
-    let cliente: Cliente = sqlx::query_as(
-        "UPDATE kyc.clientes SET \
-           estatus_kyc = $2, \
-           kyc_verificado_en = CASE WHEN $2 = 'VERIFICADO' THEN now() ELSE kyc_verificado_en END, \
-           nivel_riesgo_pld = coalesce($3, nivel_riesgo_pld), \
-           riesgo_evaluado_en = CASE WHEN $3 IS NULL THEN riesgo_evaluado_en ELSE now() END, \
-           nivel_cuenta = coalesce($4, nivel_cuenta) \
-         WHERE id = $1 RETURNING *",
-    )
-    .bind(cliente_id)
-    .bind(d.estatus_kyc)
-    .bind(d.nivel_riesgo_pld)
-    .bind(d.nivel_cuenta)
-    .fetch_optional(&mut *tx)
-    .await?
-    .ok_or_else(|| AppError::no_encontrado("cliente no encontrado"))?;
-    tx.commit().await?;
-    Ok(cliente)
-}
-
 pub async fn alertas_abiertas(pool: &PgPool, limite: i64) -> AppResult<Vec<AlertaPld>> {
     let mut tx = db::begin_lectura(pool, Rol::Kyc).await?;
     let alertas = sqlx::query_as(
@@ -272,6 +246,49 @@ pub async fn alertas_abiertas(pool: &PgPool, limite: i64) -> AppResult<Vec<Alert
     Ok(alertas)
 }
 
+/// Respuesta del envío de INE + selfie.
+#[derive(Debug, Clone, Serialize)]
+pub struct EnvioVerificacion {
+    pub verificacion_id: uuid::Uuid,
+    pub estado_kyc: EstadoKyc,
+    pub intentos: i16,
+    /// Dictamen inmediato (proveedor síncrono). `None`: el resultado llegará
+    /// por el webhook del proveedor y el expediente sigue EN_REVISION.
+    pub resultado: Option<ResultadoVerificacion>,
+}
+
+/// Pasos 2 y 3 del onboarding: envía INE y selfie al proveedor y procesa su
+/// resultado firmado por el mismo camino que el webhook.
+pub async fn verificar_identidad(
+    pool: &PgPool,
+    cfg: &ConfigKyc,
+    proveedor: &dyn ProveedorBiometrico,
+    cliente_id: uuid::Uuid,
+    s: &SolicitudVerificacion,
+    origen: &OrigenEnvio,
+) -> AppResult<EnvioVerificacion> {
+    let imagenes = expediente::decodificar_imagenes(s)?;
+    let enviado = expediente::enviar(pool, cliente_id, s, &imagenes, origen, spei::hoy_cdmx()).await?;
+    let verificacion_id = enviado
+        .verificacion_en_curso
+        .ok_or_else(|| AppError::Interno(anyhow::anyhow!("envío sin id de verificación")))?;
+    let solicitud = SolicitudProveedor { verificacion_id, cliente_id, identidad: IdentidadPropia::de(&enviado)?, imagenes };
+    let pendiente = EnvioVerificacion { verificacion_id, estado_kyc: enviado.estado_kyc, intentos: enviado.intentos, resultado: None };
+    match proveedor.verificar(&solicitud).await {
+        Ok(Entrega::Inmediata { cuerpo, firma }) => {
+            let r = verificacion::procesar(pool, cfg, Some(&firma), &cuerpo).await?;
+            Ok(EnvioVerificacion { estado_kyc: r.estado_kyc, intentos: r.intentos, resultado: Some(r), ..pendiente })
+        }
+        Ok(Entrega::Pendiente) => Ok(pendiente),
+        // El expediente queda EN_REVISION: el resultado puede llegar después
+        // por el webhook, o un operador lo reabre.
+        Err(e) => {
+            tracing::warn!(cliente = %cliente_id, error = %e, proveedor = proveedor.nombre(), "proveedor biométrico no disponible");
+            Ok(pendiente)
+        }
+    }
+}
+
 #[cfg(test)]
 mod pruebas {
     use super::*;
@@ -279,12 +296,15 @@ mod pruebas {
     #[test]
     fn identidades_como_los_check_de_la_base() {
         assert!(rfc_valido("GODE561231GR8"));
-        assert!(rfc_valido("ÑAB0101019Z1"));
+        assert!(rfc_valido(&rfc::construir_desde_curp("LOOA531113HTCPBN07", "AB")));
+        assert!(!rfc_valido("GODE561231GR9"));
         assert!(!rfc_valido("ABCDEFGHIJKLMNOPQ"));
         assert!(!rfc_valido("GODE5612311GR8"));
-        assert!(curp_valida("GODE561231HDFRRN09"));
-        assert!(!curp_valida("GODE561231HDFRRN09XXXXX"));
-        assert!(!curp_valida("GODE561231ZDFRRN09"));
+        assert!(curp::Curp::parse("LOOA531113HTCPBN07").is_ok());
+        assert!(curp::Curp::parse("GODE561231HDFRRN09XXXXX").is_err());
+        assert!(curp::Curp::parse("GODE561231ZDFRRN09").is_err());
+        // Estructura válida pero dígito verificador incorrecto.
+        assert!(curp::Curp::parse("GODE561231HDFRRN09").is_err());
         assert!(email_valido("ana@banco.mx"));
         assert!(!email_valido("ana@banco"));
         assert!(!email_valido("ana @banco.mx"));

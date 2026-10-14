@@ -216,11 +216,7 @@ async fn webhook_devuelve_lo_que_no_puede_abonar(pool: PgPool) {
     let b = banco(&pool).await;
     let ana = cliente(&pool, &b.cfg, "Ana").await;
     let beto = cliente(&pool, &b.cfg, "Beto").await;
-    sqlx::query("UPDATE kyc.clientes SET estatus_kyc = 'PENDIENTE' WHERE id = $1")
-        .bind(beto.cliente.id)
-        .execute(&pool)
-        .await
-        .unwrap();
+    revocar_kyc(&pool, beto.cliente.id).await;
     let reserva_antes = reserva_total(&pool).await;
     let casos = [
         (externa(5), "1", "CLABE que no es nuestra"),

@@ -45,6 +45,8 @@ sha2 = "0.10"
 # Firma de webhooks SPEI (HMAC-SHA256, comparación en tiempo constante).
 hmac = "0.12"
 hex = "0.4"
+# Imágenes del onboarding KYC (base64 en JSON).
+base64 = "0.22"
 jsonwebtoken = "9"
 argon2 = "0.5"
 rand = "0.8"
@@ -56,13 +58,14 @@ serde_json = { version = "1", features = ["raw_value"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 thiserror = "2"
+# IP del cliente (ConnectInfo) en cada petición.
+tower = { version = "0.5", features = ["util"] }
 anyhow = "1"
 dotenvy = "0.15"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
-tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 
 [profile.release]

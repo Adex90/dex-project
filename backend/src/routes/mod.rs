@@ -6,6 +6,10 @@
 //! | POST | `/api/v1/auth/registro` | público |
 //! | POST | `/api/v1/auth/login` | público |
 //! | GET  | `/api/v1/yo` | cliente |
+//! | GET  | `/api/v1/kyc/expediente` | cliente: estado del onboarding |
+//! | POST | `/api/v1/kyc/perfil` | cliente: datos personales (paso 1) |
+//! | POST | `/api/v1/kyc/verificar` | cliente: INE + selfie (pasos 2 y 3) |
+//! | POST | `/api/v1/kyc/webhook` | proveedor biométrico (firma HMAC) |
 //! | GET  | `/api/v1/tablero` | cliente |
 //! | GET  | `/api/v1/ifpe/cuenta` | cliente |
 //! | GET  | `/api/v1/ifpe/movimientos` | cliente |
@@ -26,6 +30,7 @@
 //! | GET  | `/api/v1/auditoria/ledger/{ifpe,sofom}` | operador / auditor |
 //! | POST | `/api/v1/operaciones/depositos` | operador (SPEI entrante) |
 //! | POST | `/api/v1/operaciones/retenciones` | operador |
+//! | GET  | `/api/v1/operaciones/kyc/pendientes` | operador |
 //! | POST | `/api/v1/operaciones/kyc/{cliente_id}` | operador |
 //! | GET  | `/api/v1/operaciones/alertas` | operador |
 //! | GET/POST | `/api/v1/operaciones/creditos` | operador |
@@ -39,6 +44,7 @@
 mod auth;
 mod extraccion;
 mod ifpe;
+mod kyc;
 mod operaciones;
 mod reserva;
 mod sofom;
@@ -75,6 +81,7 @@ pub fn router(estado: AppState) -> Router {
     let api = Router::new()
         .merge(auth::rutas())
         .merge(ifpe::rutas())
+        .merge(kyc::rutas())
         .merge(sofom::rutas())
         .merge(reserva::rutas())
         .merge(operaciones::rutas())

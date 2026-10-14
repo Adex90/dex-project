@@ -29,8 +29,12 @@ pub enum Rol {
     Puente,
     /// Proof of Reserve: lectura de la bóveda y registro de cortes.
     Auditor,
-    /// Identidad: alta, autenticación, KYC, bandeja PLD.
+    /// Identidad: alta, autenticación, captura del expediente KYC, bandeja PLD.
     Kyc,
+    /// Dictamen KYC: registra resultados del proveedor biométrico y verifica,
+    /// rechaza o reabre expedientes. Solo el webhook firmado del proveedor y
+    /// los operadores.
+    KycVerificador,
     /// SPEI: registra lo que informa el proveedor (abonos, estados de órdenes,
     /// reembolsos) y las correcciones del operador. Solo lo usan los webhooks
     /// firmados, el despachador y el operador; nunca una ruta del cliente.
@@ -45,6 +49,7 @@ impl Rol {
             Rol::Puente => "sc_puente",
             Rol::Auditor => "sc_auditor",
             Rol::Kyc => "sc_kyc",
+            Rol::KycVerificador => "sc_kyc_verificador",
             Rol::Spei => "sc_spei",
         }
     }
@@ -58,6 +63,7 @@ impl Rol {
             Rol::Puente => "SET LOCAL ROLE sc_puente",
             Rol::Auditor => "SET LOCAL ROLE sc_auditor",
             Rol::Kyc => "SET LOCAL ROLE sc_kyc",
+            Rol::KycVerificador => "SET LOCAL ROLE sc_kyc_verificador",
             Rol::Spei => "SET LOCAL ROLE sc_spei",
         }
     }
@@ -141,12 +147,13 @@ pub async fn verificar_usuario_de_aplicacion(pool: &PgPool) -> Result<(), sqlx::
                          AND pg_has_role(current_user, nspowner, 'USAGE')), \
                 pg_has_role(current_user, 'sc_ifpe', 'MEMBER') AND pg_has_role(current_user, 'sc_sofom', 'MEMBER') \
                 AND pg_has_role(current_user, 'sc_puente', 'MEMBER') AND pg_has_role(current_user, 'sc_auditor', 'MEMBER') \
-                AND pg_has_role(current_user, 'sc_kyc', 'MEMBER') AND pg_has_role(current_user, 'sc_spei', 'MEMBER')",
+                AND pg_has_role(current_user, 'sc_kyc', 'MEMBER') AND pg_has_role(current_user, 'sc_spei', 'MEMBER') \
+                AND pg_has_role(current_user, 'sc_kyc_verificador', 'MEMBER')",
     )
     .fetch_one(pool)
     .await?;
     if !miembro {
-        tracing::error!(%usuario, "el usuario de la aplicación no es miembro de sc_ifpe, sc_sofom, sc_puente, sc_auditor, sc_kyc y sc_spei");
+        tracing::error!(%usuario, "el usuario de la aplicación no es miembro de sc_ifpe, sc_sofom, sc_puente, sc_auditor, sc_kyc, sc_kyc_verificador y sc_spei");
     }
     if superusuario || dueno {
         tracing::warn!(

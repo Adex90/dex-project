@@ -17,8 +17,8 @@ pub struct Config {
     pub jwt_secret: String,
     pub jwt_ttl_minutos: i64,
     pub frontend_origin: String,
-    /// Habilita atajos de demostración: KYC automático al registrarse y
-    /// depósitos simulados por el propio cliente. Nunca en producción.
+    /// Habilita depósitos simulados por el propio cliente (solo con KYC
+    /// verificado). Nunca en producción.
     pub modo_demo: bool,
     pub migrar_al_inicio: bool,
     /// Prefijo de las CLABEs propias: banco (3) + plaza (3) [+ hasta 4 dígitos].
@@ -39,6 +39,23 @@ pub struct Config {
     pub operador_password: Option<String>,
     pub http: LimitesHttp,
     pub spei: ConfigSpei,
+    pub kyc: ConfigKyc,
+}
+
+/// Onboarding y KYC biométrico.
+#[derive(Debug, Clone)]
+pub struct ConfigKyc {
+    /// Secretos HMAC con que firma sus resultados el proveedor biométrico (el
+    /// vigente y, durante una rotación, el anterior). Sin `KYC_WEBHOOK_SECRETO`
+    /// se genera uno aleatorio al arrancar: solo el proveedor simulado de este
+    /// proceso puede firmar y el webhook externo queda cerrado.
+    pub webhook_secretos: Vec<String>,
+    pub tolerancia_firma_seg: u64,
+    /// Si se indican, el arranque los fija en `kyc.parametros` (la base de
+    /// datos es la que los hace cumplir).
+    pub score_minimo: Option<Decimal>,
+    pub score_revision: Option<Decimal>,
+    pub max_intentos: Option<i16>,
 }
 
 /// Integración SPEI.
@@ -98,11 +115,22 @@ pub struct LimitesHttp {
     pub max_conexiones: usize,
     /// Plazo para terminar las peticiones en curso al apagar.
     pub apagado_seg: u64,
+    /// Detrás de un proxy inverso propio: la IP del cliente es la última de
+    /// `X-Forwarded-For` (la que agregó el proxy). Sin proxy, nunca: cualquiera
+    /// podría escribir esa cabecera.
+    pub proxy_confiable: bool,
 }
 
 impl Default for LimitesHttp {
     fn default() -> Self {
-        Self { cabeceras_seg: 10, cuerpo_seg: 15, peticion_seg: 30, max_conexiones: 512, apagado_seg: 20 }
+        Self {
+            cabeceras_seg: 10,
+            cuerpo_seg: 15,
+            peticion_seg: 30,
+            max_conexiones: 512,
+            apagado_seg: 20,
+            proxy_confiable: false,
+        }
     }
 }
 
@@ -234,6 +262,36 @@ impl Config {
                     peticion_seg: var_o("HTTP_PETICION_SEG", d.peticion_seg)?.max(1),
                     max_conexiones: var_o("HTTP_MAX_CONEXIONES", d.max_conexiones)?.max(1),
                     apagado_seg: var_o("HTTP_APAGADO_SEG", d.apagado_seg)?,
+                    proxy_confiable: var_o("HTTP_PROXY_CONFIABLE", d.proxy_confiable)?,
+                }
+            },
+            kyc: {
+                let mut webhook_secretos = Vec::new();
+                for nombre in ["KYC_WEBHOOK_SECRETO", "KYC_WEBHOOK_SECRETO_ANTERIOR"] {
+                    if let Some(s) = var(nombre) {
+                        validar_secreto(nombre, &s)?;
+                        webhook_secretos.push(s);
+                    }
+                }
+                if webhook_secretos.is_empty() {
+                    let aleatorio: [u8; 32] = rand::random();
+                    webhook_secretos.push(hex::encode(aleatorio));
+                }
+                let score = |nombre: &str| -> anyhow::Result<Option<Decimal>> {
+                    let v: Option<Decimal> = var(nombre).map(|v| v.parse()).transpose()
+                        .map_err(|e| anyhow::anyhow!("{nombre} inválida: {e}"))?;
+                    if v.is_some_and(|s| s < Decimal::new(5, 1) || s >= Decimal::ONE) {
+                        bail!("{nombre} debe estar entre 0.5 y 0.9999");
+                    }
+                    Ok(v)
+                };
+                ConfigKyc {
+                    webhook_secretos,
+                    tolerancia_firma_seg: var_o("KYC_TOLERANCIA_FIRMA_SEG", 300)?,
+                    score_minimo: score("KYC_SCORE_MINIMO")?,
+                    score_revision: score("KYC_SCORE_REVISION")?,
+                    max_intentos: var("KYC_MAX_INTENTOS").map(|v| v.parse::<i16>()).transpose()
+                        .map_err(|e| anyhow::anyhow!("KYC_MAX_INTENTOS inválida: {e}"))?,
                 }
             },
         })
@@ -267,6 +325,13 @@ impl Config {
                 webhook_secretos: vec!["secreto-webhook-spei-de-pruebas-0123456789abcdef".into()],
                 despacho_intervalo_ms: 0,
                 ..ConfigSpei::default()
+            },
+            kyc: ConfigKyc {
+                webhook_secretos: vec!["secreto-resultados-kyc-de-pruebas-0123456789abcdef".into()],
+                tolerancia_firma_seg: 300,
+                score_minimo: None,
+                score_revision: None,
+                max_intentos: None,
             },
         }
     }

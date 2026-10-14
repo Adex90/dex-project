@@ -243,11 +243,7 @@ async fn retencion_y_liberacion(pool: PgPool) {
 async fn kyc_pendiente_no_opera(pool: PgPool) {
     let cfg = preparar(&pool).await;
     let ana = cliente(&pool, &cfg, "Ana").await;
-    sqlx::query("UPDATE kyc.clientes SET estatus_kyc = 'PENDIENTE' WHERE id = $1")
-        .bind(ana.cliente.id)
-        .execute(&pool)
-        .await
-        .unwrap();
+    revocar_kyc(&pool, ana.cliente.id).await;
     let err = inbound::abonar(
         &pool,
         &cfg.pld,

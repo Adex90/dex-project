@@ -15,7 +15,7 @@ use uuid::Uuid;
 use crate::{
     db::{self, Rol},
     error::{AppError, AppResult},
-    models::kyc::{EstatusKyc, RolUsuario},
+    models::kyc::RolUsuario,
     state::AppState,
 };
 
@@ -95,7 +95,6 @@ where
 #[derive(sqlx::FromRow)]
 struct FilaSesion {
     rol: RolUsuario,
-    estatus_kyc: EstatusKyc,
     en_lista_bloqueadas: bool,
     revocado: bool,
 }
@@ -107,7 +106,7 @@ struct FilaSesion {
 async fn validar_contra_bd(pool: &PgPool, claims: &jwt::Claims) -> AppResult<Usuario> {
     let mut tx = db::begin_lectura(pool, Rol::Kyc).await?;
     let fila: Option<FilaSesion> = sqlx::query_as(
-        "SELECT cr.rol, c.estatus_kyc, c.en_lista_bloqueadas, \
+        "SELECT cr.rol, c.en_lista_bloqueadas, \
                 coalesce(floor(extract(epoch FROM cr.tokens_validos_desde)) > $2, false) AS revocado \
          FROM kyc.credenciales cr JOIN kyc.clientes c ON c.id = cr.cliente_id \
          WHERE cr.cliente_id = $1",
@@ -121,7 +120,7 @@ async fn validar_contra_bd(pool: &PgPool, claims: &jwt::Claims) -> AppResult<Usu
     if fila.revocado || fila.rol != claims.rol {
         return Err(AppError::NoAutenticado);
     }
-    if fila.en_lista_bloqueadas || fila.estatus_kyc == EstatusKyc::Rechazado {
+    if fila.en_lista_bloqueadas {
         return Err(AppError::Prohibido);
     }
     Ok(Usuario { cliente_id: claims.sub, rol: fila.rol })
@@ -160,7 +159,6 @@ pub struct Sesion {
 #[derive(sqlx::FromRow)]
 struct FilaLogin {
     cliente_id: Uuid,
-    estatus_kyc: EstatusKyc,
     en_lista_bloqueadas: bool,
 }
 
@@ -218,12 +216,12 @@ pub async fn iniciar_sesion(estado: &AppState, email: &str, password_plano: &str
 
     let mut tx = db::begin(pool, Rol::Kyc).await?;
     let fila: FilaLogin = sqlx::query_as(
-        "SELECT c.id AS cliente_id, c.estatus_kyc, c.en_lista_bloqueadas FROM kyc.clientes c WHERE c.id = $1",
+        "SELECT c.id AS cliente_id, c.en_lista_bloqueadas FROM kyc.clientes c WHERE c.id = $1",
     )
     .bind(cliente_id)
     .fetch_one(&mut *tx)
     .await?;
-    if fila.en_lista_bloqueadas || fila.estatus_kyc == EstatusKyc::Rechazado {
+    if fila.en_lista_bloqueadas {
         tx.commit().await?;
         return Err(AppError::Prohibido);
     }

@@ -187,7 +187,12 @@ fn traducir_error_bd(codigo_sql: &str, mensaje: &str, restriccion: &str) -> Opti
             AppError::negocio("RESTRICCION_VIOLADA", format!("la operación viola la restricción {restriccion}"))
         }),
         // unique_violation
-        "23505" => Some(if restriccion.contains("deposito_spei") {
+        "23505" => Some(if restriccion.starts_with("ux_perfiles") {
+            AppError::conflicto(
+                "IDENTIDAD_EN_USO",
+                "esa CURP, RFC o clave de elector ya está en un expediente verificado o en revisión",
+            )
+        } else if restriccion.contains("deposito_spei") {
             AppError::conflicto("SPEI_DUPLICADO", "ese SPEI (clave de rastreo) ya fue acreditado")
         } else if restriccion.contains("clave_idempotencia") {
             AppError::conflicto("OPERACION_DUPLICADA", "ya existe una operación con esa clave de idempotencia")
@@ -214,6 +219,15 @@ fn traducir_error_bd(codigo_sql: &str, mensaje: &str, restriccion: &str) -> Opti
         }
         // serialization_failure, deadlock_detected, lock_not_available, query_canceled (timeout)
         "40001" | "40P01" | "55P03" | "57014" => Some(AppError::Reintentable),
+        // Política RLS: el titular no tiene KYC verificado (la base de datos lo
+        // impide aunque el backend no lo hubiera comprobado).
+        "42501" if mensaje.contains("row-level security") => {
+            tracing::warn!(%mensaje, "operación bloqueada por RLS: KYC no verificado");
+            Some(AppError::negocio(
+                "KYC_NO_VERIFICADO",
+                "la operación requiere que el titular tenga su identidad verificada (KYC)",
+            ))
+        }
         // insufficient_privilege: el código intentó cruzar el aislamiento de roles.
         "42501" => {
             tracing::error!(%mensaje, "VIOLACIÓN DE AISLAMIENTO: una transacción intentó acceder fuera de su rol");
@@ -333,6 +347,13 @@ mod pruebas {
         let e = traducir_error_bd("23505", "x", "transacciones_clave_idempotencia_key").unwrap();
         assert_eq!(e.status(), StatusCode::CONFLICT);
         assert!(traducir_error_bd("42501", "permission denied", "").is_none());
+        assert_eq!(
+            traducir_error_bd("42501", "new row violates row-level security policy for table \"transacciones\"", "")
+                .unwrap()
+                .codigo(),
+            "KYC_NO_VERIFICADO"
+        );
+        assert_eq!(traducir_error_bd("23505", "dup", "ux_perfiles_curp").unwrap().codigo(), "IDENTIDAD_EN_USO");
         assert!(matches!(traducir_error_bd("40P01", "deadlock", ""), Some(AppError::Reintentable)));
     }
 }

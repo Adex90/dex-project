@@ -38,7 +38,7 @@ async fn arrancar(pool: &PgPool, limites: LimitesHttp) -> Servidor {
 }
 
 fn limites() -> LimitesHttp {
-    LimitesHttp { cabeceras_seg: 1, cuerpo_seg: 1, peticion_seg: 5, max_conexiones: 64, apagado_seg: 1 }
+    LimitesHttp { cabeceras_seg: 1, cuerpo_seg: 1, peticion_seg: 5, max_conexiones: 64, apagado_seg: 1, proxy_confiable: false }
 }
 
 /// Lee hasta que el servidor cierre la conexión; devuelve lo recibido.

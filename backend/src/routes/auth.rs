@@ -37,7 +37,7 @@ async fn registro(
     State(e): State<AppState>,
     Json(datos): Json<DatosRegistro>,
 ) -> AppResult<(StatusCode, Json<RespuestaRegistro>)> {
-    let r = kyc::registrar(&e.pool, &e.config.clabe_prefijo, e.config.modo_demo, datos).await?;
+    let r = kyc::registrar(&e.pool, &e.config.clabe_prefijo, datos).await?;
     let (token, expira_en) = e.jwt.emitir(r.cliente.id, crate::models::kyc::RolUsuario::Cliente)?;
     let sesion = Sesion { token, expira_en, cliente_id: r.cliente.id, rol: crate::models::kyc::RolUsuario::Cliente };
     Ok((StatusCode::CREATED, Json(RespuestaRegistro { sesion, cliente: r.cliente, cuenta_ifpe: r.cuenta_ifpe })))

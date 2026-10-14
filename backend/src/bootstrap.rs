@@ -45,6 +45,21 @@ pub async fn asegurar_infraestructura(pool: &PgPool, cfg: &Config) -> AppResult<
     .bind(&cfg.caja_cuenta)
     .execute(pool)
     .await?;
+    // Umbrales del KYC biométrico: viven en la base de datos (la que los hace
+    // cumplir); las variables de entorno solo los fijan al arrancar.
+    let k = &cfg.kyc;
+    if k.score_minimo.is_some() || k.score_revision.is_some() || k.max_intentos.is_some() {
+        sqlx::query(
+            "UPDATE kyc.parametros SET umbral_score_minimo = coalesce($1, umbral_score_minimo), \
+                    umbral_revision = coalesce($2, umbral_revision), max_intentos = coalesce($3, max_intentos) \
+             WHERE id",
+        )
+        .bind(k.score_minimo)
+        .bind(k.score_revision)
+        .bind(k.max_intentos)
+        .execute(pool)
+        .await?;
+    }
     Ok(())
 }
 
