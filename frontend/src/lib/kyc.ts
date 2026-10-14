@@ -150,6 +150,26 @@ export const KYC_MESSAGES = {
 const M = KYC_MESSAGES;
 
 // -----------------------------------------------------------------------------
+// Whitespace as Rust sees it
+// -----------------------------------------------------------------------------
+
+// Rust's str::trim, split_whitespace and char::is_whitespace use the Unicode
+// White_Space property; JavaScript's trim() and \s differ on U+0085 (NEL,
+// whitespace in Rust) and U+FEFF (BOM, whitespace in JavaScript).
+const EDGE_WHITESPACE = /^\p{White_Space}+|\p{White_Space}+$/gu;
+const WHITESPACE_RUN = /\p{White_Space}+/gu;
+
+/** `str::trim`: removes leading and trailing Unicode whitespace. */
+export function trimWs(s: string): string {
+  return s.replace(EDGE_WHITESPACE, "");
+}
+
+/** Removes every Unicode whitespace character. */
+function stripWs(s: string): string {
+  return s.replace(WHITESPACE_RUN, "");
+}
+
+// -----------------------------------------------------------------------------
 // Dates
 // -----------------------------------------------------------------------------
 
@@ -158,7 +178,10 @@ function pad2(n: number): string {
 }
 
 function dateExists(year: number, month: number, day: number): boolean {
-  const d = new Date(Date.UTC(year, month - 1, day));
+  if (![year, month, day].every(Number.isInteger)) return false;
+  // setUTCFullYear: Date.UTC would map years 0-99 to 1900-1999.
+  const d = new Date(0);
+  d.setUTCFullYear(year, month - 1, day);
   return d.getUTCFullYear() === year && d.getUTCMonth() === month - 1 && d.getUTCDate() === day;
 }
 
@@ -214,10 +237,14 @@ const ACCENTS: Record<string, string> = {
  * Upper case, without accents or diaeresis, any other sign (hyphen, period,
  * apostrophe, digit...) turned into a space and spaces collapsed. Ñ is kept:
  * each rule decides what to do with it. ("José-María O'Neill" -> "JOSE MARIA O NEILL")
+ *
+ * The text is NFC-normalized first: the backend maps precomposed letters
+ * only, and `checkProfile` sends NFC text, so a decomposed "é" typed here
+ * gives the same verdict the backend will give on the submitted body.
  */
 export function normalizeName(s: string): string {
   let out = "";
-  for (const ch of s) {
+  for (const ch of s.normalize("NFC")) {
     for (const up of ch.toUpperCase()) {
       out += ACCENTS[up] ?? ((up >= "A" && up <= "Z") || up === "Ñ" ? up : " ");
     }
@@ -238,16 +265,25 @@ export function sameName(a: string, b: string, strict: boolean): boolean {
 
 /** Short free text (texto::texto_corto): trimmed, bounded, no control characters, spaces collapsed. */
 export function shortText(label: string, value: string, max: number): Validated<string, "REQUIRED" | "TOO_LONG" | "INVALID"> {
-  const v = value.trim();
+  const v = trimWs(value);
   if (!v) return fail("REQUIRED", M.required(label));
   if ([...v].length > max) return fail("TOO_LONG", M.tooLong(label, max));
   if (/\p{Cc}/u.test(v)) return fail("INVALID", M.invalidChars(label));
-  return { ok: true, value: v.split(/\s+/).join(" ") };
+  return { ok: true, value: v.replace(WHITESPACE_RUN, " ") };
 }
 
 // -----------------------------------------------------------------------------
 // CURP (curp.rs)
 // -----------------------------------------------------------------------------
+
+/**
+ * What an ID field (CURP, RFC, clave de elector) should hold while typing:
+ * upper case without spaces. The validators also accept surrounding spaces
+ * and lower case, like the backend.
+ */
+export function cleanIdInput(value: string): string {
+  return stripWs(value).toUpperCase();
+}
 
 export const CURP_PATTERN = /^[A-Z]{4}[0-9]{6}[HMX][A-Z]{5}[A-Z0-9][0-9]$/;
 const CURP_ALPHABET = "0123456789ABCDEFGHIJKLMNÑOPQRSTUVWXYZ";
@@ -264,14 +300,18 @@ export interface ParsedCurp {
   entidad: string;
 }
 
-/** Check digit (position 18) of the first 17 characters, or null if they are not 17 CURP characters. */
+/**
+ * Check digit (position 18) of the first 17 characters, or null if they are
+ * not 17 characters of the CURP alphabet (curp::digito_verificador): values
+ * over "0-9A-NÑO-Z" weighted 18..2, digit = (10 - sum % 10) % 10.
+ */
 export function curpCheckDigit(first17: string): string | null {
   const chars = [...first17];
   if (chars.length !== 17) return null;
   let sum = 0;
-  for (let i = 0; i < 17; i++) {
-    const value = CURP_ALPHABET.indexOf(chars[i] ?? "");
-    if (value < 0 || chars[i] === "") return null;
+  for (const [i, ch] of chars.entries()) {
+    const value = CURP_ALPHABET.indexOf(ch);
+    if (value < 0) return null;
     sum += value * (18 - i);
   }
   return String((10 - (sum % 10)) % 10);
@@ -279,8 +319,9 @@ export function curpCheckDigit(first17: string): string | null {
 
 /** Structure, birth date, birth state and check digit (Curp::parse). Trims and upper-cases. */
 export function parseCurp(input: string): Validated<ParsedCurp, CurpErrorCode> {
-  const curp = input.trim().toUpperCase();
-  if ([...curp].length !== 18 || /[^\x00-\x7f]/.test(curp)) return fail("LENGTH", M.curpLength);
+  const curp = trimWs(input).toUpperCase();
+  // Rust compares both the character and the byte count with 18.
+  if (curp.length !== 18 || [...curp].some((ch) => ch.charCodeAt(0) > 0x7f)) return fail("LENGTH", M.curpLength);
   if (!CURP_PATTERN.test(curp)) return fail("STRUCTURE", M.curpStructure);
   const century = /[0-9]/.test(curp.charAt(16)) ? 1900 : 2000;
   const year = century + Number(curp.slice(4, 6));
@@ -358,7 +399,7 @@ export function deriveCurpLetters(nombres: string, apellidoPaterno: string, apel
 }
 
 function curpText(curp: string | ParsedCurp): string {
-  return typeof curp === "string" ? curp.trim().toUpperCase() : curp.curp;
+  return typeof curp === "string" ? trimWs(curp).toUpperCase() : curp.curp;
 }
 
 /**
@@ -428,15 +469,18 @@ const GENERIC_RFCS = new Set(["XAXX010101000", "XEXX010101000"]);
 
 export type RfcErrorCode = "LENGTH" | "STRUCTURE" | "DATE" | "CHECK_DIGIT" | "GENERIC";
 
-/** Check digit (mod 11) of the first 12 (individual) or 11 (company) characters. */
+/**
+ * Check digit of the first 12 (individual) or 11 (company, padded with a
+ * leading space) characters (rfc::digito_verificador): values over
+ * "0-9A-N&O-Z Ñ" weighted 13..2; remainder 0 -> "0", 11 - r = 10 -> "A".
+ */
 export function rfcCheckDigit(base: string): string | null {
   const chars = [...base];
   if (chars.length === 11) chars.unshift(" ");
   if (chars.length !== 12) return null;
   let sum = 0;
-  for (let i = 0; i < 12; i++) {
-    const c = chars[i] ?? "";
-    const value = c === "" ? -1 : RFC_ALPHABET.indexOf(c);
+  for (const [i, ch] of chars.entries()) {
+    const value = RFC_ALPHABET.indexOf(ch);
     if (value < 0) return null;
     sum += value * (13 - i);
   }
@@ -447,7 +491,7 @@ export function rfcCheckDigit(base: string): string | null {
 
 /** Validates an individual's RFC (rfc::validar_persona_fisica) and returns it upper-cased. */
 export function validateRfc(input: string): Validated<string, RfcErrorCode> {
-  const rfc = input.trim().toUpperCase();
+  const rfc = trimWs(input).toUpperCase();
   const chars = [...rfc];
   if (chars.length !== 13) return fail("LENGTH", M.rfcLength);
   if (GENERIC_RFCS.has(rfc)) return fail("GENERIC", M.rfcGeneric);
@@ -465,7 +509,7 @@ export function validateRfc(input: string): Validated<string, RfcErrorCode> {
 export function rfcCurpCheck(rfc: string, curp: string | ParsedCurp): { errors: string[]; warnings: string[] } {
   const errors: string[] = [];
   const warnings: string[] = [];
-  const r = [...rfc.trim().toUpperCase()];
+  const r = [...trimWs(rfc).toUpperCase()];
   const c = [...curpText(curp)];
   if (r.length !== 13) {
     errors.push(M.rfcInvalid);
@@ -476,13 +520,20 @@ export function rfcCurpCheck(rfc: string, curp: string | ParsedCurp): { errors: 
   return { errors, warnings };
 }
 
-/** A valid RFC for a CURP with the given 2-character homoclave (rfc::construir_desde_curp). */
+/**
+ * A valid RFC for a CURP with the given 2-character homoclave
+ * (rfc::construir_desde_curp): the CURP's 4 letters and birth date, the
+ * homoclave (SAT assigns the real one) and the check digit. For tests and demos.
+ */
 export function buildRfcFromCurp(curp: string, homoclave: string): string {
-  const base = curp.trim().toUpperCase().slice(0, 10) + homoclave.toUpperCase();
-  const digit = rfcCheckDigit(base);
-  if (digit === null || !/^[A-Z0-9]{2}$/.test(homoclave.toUpperCase())) {
-    throw new RangeError(`cannot build an RFC from ${base}`);
+  const prefix = trimWs(curp).toUpperCase().slice(0, 10);
+  const h = trimWs(homoclave).toUpperCase();
+  if (!/^[A-ZÑ&]{4}[0-9]{6}$/u.test(prefix) || !/^[A-Z0-9]{2}$/.test(h)) {
+    throw new RangeError(`cannot build an RFC from CURP "${curp}" and homoclave "${homoclave}"`);
   }
+  const base = prefix + h;
+  const digit = rfcCheckDigit(base);
+  if (digit === null) throw new RangeError(`cannot build an RFC from ${base}`);
   return base + digit;
 }
 
@@ -503,7 +554,7 @@ export interface ParsedClaveElector {
 
 /** Structure and date of a clave de elector (ClaveElector::parse). Trims and upper-cases. */
 export function parseClaveElector(input: string): Validated<ParsedClaveElector, "FORMAT" | "DATE"> {
-  const clave = input.trim().toUpperCase();
+  const clave = trimWs(input).toUpperCase();
   if (!CLAVE_ELECTOR_PATTERN.test(clave) || clave.slice(12, 14) === "00") return fail("FORMAT", M.claveFormat);
   if (!yymmddExists(clave.slice(6, 12))) return fail("DATE", M.claveDate);
   return {
@@ -558,9 +609,9 @@ export function validateCredential(input: CredentialInput, curp: ParsedCurp, tod
     const inegi = inegiCode(curp.entidad);
     if (inegi !== null && inegi !== clave.value.entidad) check.warnings.push(M.claveEntityMismatch);
   }
-  const cicError = validateCic(input.cic.trim());
+  const cicError = validateCic(trimWs(input.cic));
   if (cicError) error("cic", cicError);
-  const citizenId = input.identificador_ciudadano?.trim();
+  const citizenId = trimWs(input.identificador_ciudadano ?? "");
   if (citizenId) {
     const idError = validateCitizenId(citizenId);
     if (idError) error("identificador_ciudadano", idError);
@@ -612,7 +663,7 @@ export function buildClaveElector(
 
 /** Error message, or null if the postal code (5 digits) is valid. */
 export function validatePostalCode(cp: string): string | null {
-  return /^[0-9]{5}$/.test(cp.trim()) ? null : M.postalCode;
+  return /^[0-9]{5}$/.test(trimWs(cp)) ? null : M.postalCode;
 }
 
 export type ProfileField = Exclude<keyof DatosPersonalesInput, "domicilio"> | keyof Domicilio;
@@ -667,7 +718,7 @@ export function checkProfile(input: DatosPersonalesInput, today: string): Profil
   const errors: ProfileCheck["errors"] = {};
   const warnings: string[] = [];
   const text = (field: keyof typeof PROFILE_MAX_LENGTH, value: string, optional = false): string | null => {
-    if (optional && !value.trim()) return null;
+    if (optional && !trimWs(value)) return null;
     const r = shortText(PROFILE_LABELS[field], value, PROFILE_MAX_LENGTH[field]);
     if (!r.ok) {
       errors[field] = r.error;
@@ -742,7 +793,7 @@ export function checkProfile(input: DatosPersonalesInput, today: string): Profil
           colonia,
           municipio,
           estado,
-          codigo_postal: nfc(d.codigo_postal).trim(),
+          codigo_postal: trimWs(nfc(d.codigo_postal)),
         },
       }
     : null;
@@ -786,7 +837,7 @@ function decodeBase64Prefix(s: string): number[] {
 export function inspectImage(label: string, input: string): Validated<InspectedImage, "BASE64" | "SIZE" | "TYPE"> {
   const comma = input.indexOf(",");
   const payload = comma >= 0 && input.slice(0, comma).startsWith("data:") ? input.slice(comma + 1) : input;
-  const base64 = payload.replace(/\s+/g, "");
+  const base64 = stripWs(payload);
   const len = base64.length;
   const padding = base64.endsWith("==") ? 2 : base64.endsWith("=") ? 1 : 0;
   // Canonical standard base64 with padding (the backend's base64 engine).

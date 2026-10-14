@@ -237,3 +237,169 @@ export interface ResultadoVerificacionPrueba {
   total_pasivo_publicado: Decimal;
   total_reserva_publicado: Decimal;
 }
+
+// -----------------------------------------------------------------------------
+// Digital onboarding / KYC (backend/src/routes/kyc.rs, backend/src/kyc/*.rs).
+// Messages (`mensaje`, `advertencias`, `detalles[].mensaje`, `motivo_rechazo`)
+// are Spanish: translate them with `kycMessageInEnglish` (src/lib/kyc.ts).
+// -----------------------------------------------------------------------------
+
+/** State of the KYC file (`kyc.kyc_perfiles.estado_kyc`). */
+export type EstadoKyc = "PENDIENTE" | "EN_REVISION" | "VERIFICADO" | "RECHAZADO";
+/** H: male, M: female, X: non-binary (as in the CURP). */
+export type Sexo = "H" | "M" | "X";
+/** Automatic verdict on a biometric result. */
+export type ResultadoKyc = "APROBADO" | "REVISION" | "RECHAZADO";
+
+/** Address of step 1. `codigo_postal` has 5 digits. */
+export interface Domicilio {
+  calle: string;
+  numero_exterior: string;
+  numero_interior?: string | null;
+  colonia: string;
+  municipio: string;
+  estado: string;
+  codigo_postal: string;
+}
+
+/**
+ * Body of POST /kyc/perfil (unknown fields are rejected). Birth date, sex and
+ * birth state are derived from the CURP by the backend.
+ */
+export interface DatosPersonalesInput {
+  nombres: string;
+  apellido_paterno: string;
+  apellido_materno?: string | null;
+  curp: string;
+  rfc: string;
+  domicilio: Domicilio;
+}
+
+/** One finding of a verification: errors reject it, warnings send it to human review. */
+export interface DetalleKyc {
+  tipo: "ERROR" | "ADVERTENCIA";
+  mensaje: string;
+}
+
+/** The KYC file as stored (`Expediente`; no IP or image fingerprints). */
+export interface ExpedienteKyc {
+  cliente_id: Uuid;
+  nombres: string | null;
+  apellido_paterno: string | null;
+  apellido_materno: string | null;
+  apellidos: string | null;
+  curp: string | null;
+  rfc: string | null;
+  fecha_nacimiento: IsoDate | null;
+  sexo: Sexo | null;
+  /** RENAPO code ("DF", "NE"...). */
+  entidad_nacimiento: string | null;
+  nacionalidad: string;
+  /** `{}` until step 1 is saved. */
+  domicilio: Partial<Domicilio>;
+  ine_clave_elector: string | null;
+  ine_cic: string | null;
+  ine_identificador_ciudadano: string | null;
+  ine_emision: number | null;
+  ine_vigencia: number | null;
+  estado_kyc: EstadoKyc;
+  /** Submissions so far (each POST /kyc/verificar that reaches the provider counts). */
+  intentos: number;
+  verificacion_en_curso: Uuid | null;
+  enviado_en: IsoDateTime | null;
+  metadata_proveedor: Record<string, unknown>;
+  /** Spanish; set when the file is RECHAZADO. */
+  motivo_rechazo: string | null;
+  verificado_en: IsoDateTime | null;
+  revisado_por: Uuid | null;
+  creado_en: IsoDateTime;
+  actualizado_en: IsoDateTime;
+}
+
+/** Last biometric result of the file (`kyc.kyc_auditoria_biometrica`). */
+export interface ResumenResultado {
+  verificacion_id: Uuid;
+  proveedor: string;
+  /** Decimal string such as "0.9300". */
+  score_similitud: Decimal | null;
+  prueba_vida_exitosa: boolean;
+  documento_valido: boolean;
+  coincide_identidad: boolean;
+  resultado: ResultadoKyc;
+  umbral_aplicado: Decimal;
+  timestamp: IsoDateTime;
+  detalles_fallo: DetalleKyc[];
+}
+
+/** GET /kyc/expediente. */
+export interface VistaExpediente extends ExpedienteKyc {
+  tipo_persona: TipoPersona;
+  max_intentos: number;
+  intentos_restantes: number;
+  ultimo_resultado: ResumenResultado | null;
+}
+
+/** Response of POST /kyc/perfil. */
+export interface DatosGuardados {
+  expediente: ExpedienteKyc;
+  /** Non-blocking findings (Spanish) that will send the file to human review. */
+  advertencias: string[];
+}
+
+/** Credential data and photos (`ine` of POST /kyc/verificar). */
+export interface DatosIneInput {
+  /** 18 characters: 6 letters, birth date YYMMDD, state, sex and 3 digits. */
+  clave_elector: string;
+  /** 9 digits. */
+  cic: string;
+  /** 9 or 13 digits (optional). */
+  identificador_ciudadano?: string | null;
+  /** Issue year. */
+  emision: number;
+  /** Expiry year (valid through December 31). */
+  vigencia: number;
+  /** Data URL (JPEG/PNG/WebP, 1 KB to 3 MB decoded). */
+  frente: string;
+  reverso: string;
+}
+
+export interface SelfieInput {
+  /** 3 to 8 distinct camera frames (data URLs). */
+  frames: string[];
+  /** Liveness challenge shown to the customer (informative). */
+  reto?: string | null;
+}
+
+/** Body of POST /kyc/verificar (unknown fields are rejected; 12 MB body limit). */
+export interface SolicitudVerificacion {
+  ine: DatosIneInput;
+  selfie: SelfieInput;
+  /** Explicit consent to process biometric data; without it the API answers KYC_SIN_CONSENTIMIENTO. */
+  consentimiento_biometrico: true;
+}
+
+/** Verdict on a verification (POST /kyc/verificar and the provider webhook). */
+export interface ResultadoVerificacion {
+  cliente_id: Uuid;
+  verificacion_id: Uuid;
+  /** APROBADO -> VERIFICADO; REVISION -> stays EN_REVISION; RECHAZADO -> PENDIENTE (retry) or RECHAZADO (no attempts left). */
+  resultado: ResultadoKyc;
+  estado_kyc: EstadoKyc;
+  score_similitud: Decimal | null;
+  detalles: DetalleKyc[];
+  intentos: number;
+  intentos_restantes: number;
+  /** The same result had already been processed. */
+  idempotente: boolean;
+}
+
+/**
+ * Response of POST /kyc/verificar: 200 with `resultado`, or 202 with
+ * `resultado: null` when the provider answers later (poll GET /kyc/expediente).
+ */
+export interface EnvioVerificacion {
+  verificacion_id: Uuid;
+  estado_kyc: EstadoKyc;
+  intentos: number;
+  resultado: ResultadoVerificacion | null;
+}

@@ -1,6 +1,9 @@
 import { request } from "./client";
 import type {
   CorteReserva,
+  DatosGuardados,
+  DatosPersonalesInput,
+  EnvioVerificacion,
   EstadoReservaVista,
   Movimiento,
   PlazoTasa,
@@ -11,8 +14,10 @@ import type {
   ResultadoMutuo,
   ResultadoVerificacionPrueba,
   Sesion,
+  SolicitudVerificacion,
   Tablero,
   TransaccionIfpe,
+  VistaExpediente,
 } from "./types";
 
 /** One function per backend route used by the client app (see backend/src/routes). */
@@ -58,6 +63,20 @@ export const api = {
       method: "POST",
       body: { corte_id: proof.corte.id, hoja: proof.hoja, ruta: proof.ruta },
     }),
+
+  /** The customer's KYC file: state, attempts left and the last biometric result. */
+  kycFile: (token: string, signal?: AbortSignal) => request<VistaExpediente>("/api/v1/kyc/expediente", { token, signal }),
+
+  /** Step 1: personal data and address (only while the file is PENDIENTE). */
+  kycSaveProfile: (token: string, body: DatosPersonalesInput) =>
+    request<DatosGuardados>("/api/v1/kyc/perfil", { method: "POST", token, body }),
+
+  /**
+   * Steps 2-3: credential + selfie frames. Resolves on 200 (`resultado` set)
+   * and on 202 (`resultado: null`: the provider answers later, poll kycFile).
+   */
+  kycVerify: (token: string, body: SolicitudVerificacion, signal?: AbortSignal) =>
+    request<EnvioVerificacion>("/api/v1/kyc/verificar", { method: "POST", token, body, signal }),
 };
 
 /** A fresh idempotency key: one per logical operation, reused on retries. */

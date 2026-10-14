@@ -1,4 +1,5 @@
 import { API_URL } from "../config";
+import { kycMessageInEnglish } from "../kyc";
 import type { ApiErrorBody } from "./types";
 
 /** Error returned by the backend ({ error: { codigo, mensaje } }) or by the network. */
@@ -87,6 +88,7 @@ const MESSAGES: Record<string, string> = {
   IDENTIDAD_REGISTRADA: "That CURP/RFC is already registered.",
   SALDO_INSUFICIENTE: "Insufficient available balance in your vault.",
   KYC_NO_VERIFICADO: "Your identity (KYC) has not been verified yet, so money movements are disabled.",
+  DESTINO_KYC_NO_VERIFICADO: "The recipient has not verified their identity yet, so they cannot receive transfers.",
   CLIENTE_EN_LISTA_BLOQUEADAS: "Operations are blocked on this account for compliance reasons.",
   CUENTA_CONGELADA: "Your vault account is frozen.",
   CUENTA_CERRADA: "Your vault account is closed.",
@@ -109,9 +111,14 @@ const MESSAGES: Record<string, string> = {
   FECHA_VALOR: "This operation must be dated today.",
 };
 
+/**
+ * English message for an error. Codes without a fixed message (VALIDACION and
+ * most KYC_* codes, whose `mensaje` depends on the case) are translated from
+ * the backend's Spanish when recognized (see `kycMessageInEnglish`).
+ */
 export function describeError(error: unknown): string {
   if (error instanceof ApiError) {
-    return MESSAGES[error.code] ?? error.message;
+    return MESSAGES[error.code] ?? kycMessageInEnglish(error.message) ?? error.message;
   }
   if (error instanceof Error) return error.message;
   return "Unexpected error.";
