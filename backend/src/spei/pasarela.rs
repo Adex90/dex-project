@@ -9,7 +9,10 @@
 //! - que reenviar una orden sea idempotente: un reenvío con la misma clave de
 //!   rastreo puede volver "rechazado por duplicado" aunque la primera sí vaya a
 //!   liquidarse;
-//! - que una orden registrada aparezca de inmediato en la consulta.
+//! - que una orden registrada aparezca de inmediato en la consulta;
+//! - que el rechazo por duplicado valga entre días: como en Banxico, la clave
+//!   de rastreo es única por emisor y día de operación, así que un reenvío
+//!   registrado en otra fecha de operación puede aceptarse como un pago nuevo.
 //!
 //! La [`PasarelaSimulada`] reproduce esos casos y lleva el saldo de la cuenta
 //! en el custodio para comprobar la conciliación.
@@ -143,8 +146,12 @@ struct OrdenSimulada {
 
 #[derive(Debug, Default)]
 struct Simulacion {
-    /// Por clave de rastreo (única).
-    ordenes: HashMap<String, OrdenSimulada>,
+    /// Por clave de rastreo: un registro por fecha de operación (el
+    /// proveedor solo rechaza el duplicado del mismo día).
+    ordenes: HashMap<String, Vec<OrdenSimulada>>,
+    /// Fecha de operación vigente del proveedor; `None`: la que corresponde a
+    /// la fecha de solicitud de la orden.
+    fecha_operacion_vigente: Option<NaiveDate>,
     reglas: HashMap<String, Vec<Comportamiento>>,
     llamadas_registro: HashMap<String, u32>,
     llamadas_consulta: HashMap<String, u32>,
@@ -156,7 +163,8 @@ struct Simulacion {
 
 /// Pasarela en memoria. Cada orden queda en proceso hasta su
 /// `consultas_para_liquidar`-ésima consulta, salvo regla en contrario. Como
-/// STP, un reenvío con la misma clave de rastreo se rechaza por duplicado.
+/// STP, un reenvío con la misma clave de rastreo se rechaza por duplicado si
+/// cae en el mismo día de operación; en otro día se registra otra vez.
 #[derive(Debug)]
 pub struct PasarelaSimulada {
     estado: Mutex<Simulacion>,
@@ -215,8 +223,14 @@ impl PasarelaSimulada {
         self.sim().liquidaciones.values().copied().max().unwrap_or(0)
     }
 
+    /// Registros aceptados (un reenvío aceptado en otro día cuenta dos veces).
     pub fn ordenes_registradas(&self) -> usize {
-        self.sim().ordenes.len()
+        self.sim().ordenes.values().map(Vec::len).sum()
+    }
+
+    /// El proveedor pasa a otro día de operación (p. ej. tras el corte).
+    pub fn fijar_fecha_operacion(&self, fecha: NaiveDate) {
+        self.sim().fecha_operacion_vigente = Some(fecha);
     }
 
     /// Estado actual de una orden en el proveedor (para pruebas).
@@ -226,7 +240,7 @@ impl PasarelaSimulada {
 
     /// Fuerza la cancelación de una orden en proceso.
     pub fn cancelar(&self, clave_rastreo: &str, causa: i16) {
-        if let Some(o) = self.sim().ordenes.get_mut(clave_rastreo) {
+        for o in self.sim().ordenes.get_mut(clave_rastreo).into_iter().flatten() {
             if matches!(o.estado, EstadoSimulado::EnProceso { .. }) {
                 o.estado = EstadoSimulado::Cancelada { causa };
             }
@@ -237,7 +251,7 @@ impl PasarelaSimulada {
     pub fn liquidar(&self, clave_rastreo: &str) {
         let mut g = self.sim();
         let s = &mut *g;
-        if let Some(o) = s.ordenes.get_mut(clave_rastreo) {
+        for o in s.ordenes.get_mut(clave_rastreo).into_iter().flatten() {
             if matches!(o.estado, EstadoSimulado::EnProceso { .. }) {
                 o.estado = EstadoSimulado::Liquidada;
                 s.saldo_custodio -= o.orden.monto;
@@ -249,7 +263,7 @@ impl PasarelaSimulada {
     pub fn devolver(&self, clave_rastreo: &str, causa: i16) {
         let mut g = self.sim();
         let s = &mut *g;
-        if let Some(o) = s.ordenes.get_mut(clave_rastreo) {
+        for o in s.ordenes.get_mut(clave_rastreo).into_iter().flatten() {
             if matches!(o.estado, EstadoSimulado::Liquidada) {
                 o.estado = EstadoSimulado::Devuelta { causa };
                 s.saldo_custodio += o.orden.monto;
@@ -265,7 +279,8 @@ impl PasarelaSimulada {
             *n += 1;
             *n
         };
-        if s.ordenes.contains_key(&clave) {
+        let fecha = s.fecha_operacion_vigente.unwrap_or_else(|| fecha_operacion_simulada(orden.fecha_solicitud));
+        if s.ordenes.get(&clave).is_some_and(|v| v.iter().any(|o| o.fecha_operacion == fecha)) {
             return Ok(Registro::Rechazada { causa: CAUSA_DUPLICADO, motivo: "clave de rastreo duplicada".into() });
         }
         let reglas = s.reglas.get(&orden.beneficiario_clabe).cloned().unwrap_or_default();
@@ -276,30 +291,26 @@ impl PasarelaSimulada {
                 }
                 Comportamiento::TiempoAgotadoAlRegistrar { veces, registra } if llamada <= veces => {
                     if registra && llamada == 1 {
-                        Self::alta(&mut s, orden);
+                        Self::alta(&mut s, orden, fecha);
                     }
                     return Err(ErrorPasarela::Tiempo);
                 }
                 _ => {}
             }
         }
-        let (id, fecha) = Self::alta(&mut s, orden);
+        let id = Self::alta(&mut s, orden, fecha);
         Ok(Registro::Aceptada { id, fecha_operacion: Some(fecha) })
     }
 
-    fn alta(s: &mut Simulacion, orden: &OrdenPasarela) -> (String, NaiveDate) {
+    fn alta(s: &mut Simulacion, orden: &OrdenPasarela, fecha: NaiveDate) -> String {
         s.siguiente_id += 1;
         let id = format!("STP{:010}", s.siguiente_id);
-        let fecha = fecha_operacion_simulada(orden.fecha_solicitud);
-        s.ordenes.insert(
-            orden.clave_rastreo.clone(),
-            OrdenSimulada {
-                orden: orden.clone(),
-                fecha_operacion: fecha,
-                estado: EstadoSimulado::EnProceso { consultas: 0 },
-            },
-        );
-        (id, fecha)
+        s.ordenes.entry(orden.clave_rastreo.clone()).or_default().push(OrdenSimulada {
+            orden: orden.clone(),
+            fecha_operacion: fecha,
+            estado: EstadoSimulado::EnProceso { consultas: 0 },
+        });
+        id
     }
 
     fn consultar_sync(&self, consulta: &ConsultaOrden) -> Result<EstadoProveedor, ErrorPasarela> {
@@ -311,7 +322,10 @@ impl PasarelaSimulada {
             *n += 1;
             *n
         };
-        let Some(o) = s.ordenes.get_mut(&clave) else { return Ok(EstadoProveedor::NoExiste) };
+        // La consulta muestra el primer registro de la clave de rastreo.
+        let Some(o) = s.ordenes.get_mut(&clave).and_then(|v| v.first_mut()) else {
+            return Ok(EstadoProveedor::NoExiste);
+        };
         let reglas = s.reglas.get(&o.orden.beneficiario_clabe).cloned().unwrap_or_default();
         for regla in &reglas {
             match regla {
@@ -434,6 +448,24 @@ mod pruebas {
         p.programar(&o.beneficiario_clabe, Comportamiento::OcultarEnConsulta { veces: 2 });
         p.registrar(&o).await.unwrap();
         assert_eq!(p.consultar(&consulta("SC3")).await.unwrap(), EstadoProveedor::NoExiste);
+    }
+
+    /// El riesgo que el despachador debe evitar: tras el cambio de día de
+    /// operación, el proveedor acepta otra vez la misma clave de rastreo.
+    #[tokio::test]
+    async fn reenvio_en_otro_dia_de_operacion_se_acepta() {
+        let p = PasarelaSimulada::new(5);
+        let o = orden("012180001234567899", "SC4");
+        assert!(matches!(p.registrar(&o).await.unwrap(), Registro::Aceptada { .. }));
+        assert_eq!(
+            p.registrar(&o).await.unwrap(),
+            Registro::Rechazada { causa: CAUSA_DUPLICADO, motivo: "clave de rastreo duplicada".into() }
+        );
+        p.fijar_fecha_operacion(fecha_operacion_simulada(o.fecha_solicitud) + Days::new(1));
+        assert!(matches!(p.registrar(&o).await.unwrap(), Registro::Aceptada { .. }));
+        assert_eq!(p.ordenes_registradas(), 2);
+        p.liquidar("SC4");
+        assert_eq!(p.max_liquidaciones_por_orden(), 2, "pago doble");
     }
 
     #[test]

@@ -64,7 +64,18 @@ fn verificar_firma(e: &AppState, cabeceras: &HeaderMap, cuerpo: &[u8]) -> AppRes
 /// SPEI recibido. Responde `{"mensaje":"confirmar"}` si se abonó (también
 /// ante una repetición) o `{"mensaje":"devolver","id":<causa>}` si la cuenta
 /// no puede recibir. Un error transitorio responde 503 para que el proveedor
-/// reintente.
+/// reintente. Una notificación autenticada nunca recibe un 409 sin dejar
+/// registro:
+/// - una devolución (de cualquier tipo) que no corresponde a ninguna orden va
+///   a cuarentena y se confirma (`CUARENTENA`): SPEI no permite devolver una
+///   devolución;
+/// - un posible duplicado con otra identidad o una identidad ya registrada
+///   con otro monto o CLABE se retiene sin abonar y se confirma
+///   (`EN_REVISION`): devolverlo dejaría la reserva corta si el pago ya se
+///   abonó con la identidad equivocada. El operador lo resuelve (captura con
+///   `distinto_de`, o anulación de la captura errónea).
+/// Si no se puede guardar el registro, el error se propaga y el proveedor
+/// reintenta: nunca se confirma sin registro.
 async fn webhook_inbound(
     State(e): State<AppState>,
     cabeceras: HeaderMap,
@@ -86,8 +97,30 @@ async fn webhook_inbound(
         }
     };
     let r: ResultadoAbono =
-        inbound::abonar(&e.pool, &e.config.pld, &e.config.spei, &abono, Origen::Webhook, SiNoAcreditable::Devolver)
-            .await?;
+        match inbound::abonar(&e.pool, &e.config.pld, &e.config.spei, &abono, Origen::Webhook, SiNoAcreditable::Devolver)
+            .await
+        {
+            Ok(r) => r,
+            Err(err) if err.codigo() == inbound::DEVOLUCION_SIN_ORDEN => {
+                inbound::cuarentena(&e.pool, "ABONO", &cuerpo, &format!("{}: {err}", err.codigo())).await?;
+                return Ok(Json(json!({
+                    "mensaje": "confirmar",
+                    "estado": "CUARENTENA",
+                    "identidad": abono.identidad.canonica(),
+                })));
+            }
+            Err(err) if err.codigo() == inbound::POSIBLE_DUPLICADO || err.codigo() == inbound::IDENTIDAD_REUTILIZADA => {
+                let tipo = err.codigo().trim_start_matches("SPEI_").to_owned();
+                inbound::retener(&e.pool, &tipo, &abono, &cuerpo, &format!("{}: {err}", err.codigo())).await?;
+                return Ok(Json(json!({
+                    "mensaje": "confirmar",
+                    "estado": "EN_REVISION",
+                    "motivo": tipo,
+                    "identidad": abono.identidad.canonica(),
+                })));
+            }
+            Err(err) => return Err(err),
+        };
     Ok(Json(r.respuesta_proveedor()))
 }
 

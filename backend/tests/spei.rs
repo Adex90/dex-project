@@ -1,23 +1,28 @@
 //! Integración SPEI: webhooks firmados, duplicados concurrentes, despachador
-//! con la pasarela simulada, autoridad de los roles, correcciones y un día de
-//! tráfico interbancario intenso conciliado contra el custodio.
+//! con la pasarela simulada, autoridad de los roles, correcciones, las
+//! regresiones de la revisión de 0005 (migración 0007) y un día de tráfico
+//! interbancario intenso conciliado contra el custodio.
 
 mod comun;
 
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 
 use axum::{
     body::Body,
     http::{Request, StatusCode},
     Router,
 };
-use chrono::{Days, NaiveDate};
+use chrono::{Days, NaiveDate, Utc};
 use comun::*;
 use http_body_util::BodyExt;
 use rust_decimal::Decimal;
 use serde_json::{json, Value};
 use sqlx::PgPool;
 use synthetic_capital::{
+    bootstrap,
     config::Config,
     db::{self, Rol},
     kyc::Registro,
@@ -27,8 +32,11 @@ use synthetic_capital::{
     spei::{
         clabe, firma, hoy_cdmx,
         inbound::{self, Origen, SiNoAcreditable},
-        outbound::{self, SolicitudSpei, SpeiOutbound},
-        pasarela::{Comportamiento, PasarelaSimulada},
+        outbound::{self, Evento, SolicitudResolucion, SolicitudSpei, SpeiOutbound},
+        pasarela::{
+            fecha_operacion_simulada, Comportamiento, ConsultaOrden, ErrorPasarela, EstadoProveedor, Futuro,
+            OrdenPasarela, Pasarela, PasarelaSimulada, Registro as RegistroPasarela,
+        },
     },
     AppState,
 };
@@ -53,11 +61,34 @@ struct Banco {
     pasarela: Arc<PasarelaSimulada>,
 }
 
+/// Hora actual en la Ciudad de México (UTC-6, como `hoy_cdmx`).
+fn ahora_cdmx() -> chrono::NaiveTime {
+    (Utc::now() - chrono::Duration::hours(6)).time()
+}
+
 async fn banco(pool: &PgPool) -> Banco {
-    let cfg = preparar(pool).await;
+    banco_con(pool, |_| {}).await
+}
+
+/// Banco con la configuración ajustada. El corte SPEI queda a 12 horas de
+/// ahora: ninguna prueba cruza por accidente el cambio de día de operación
+/// (el despachador no reenvía si el día pudo cambiar).
+async fn banco_con(pool: &PgPool, ajustar: impl FnOnce(&mut Config)) -> Banco {
+    let mut cfg = preparar(pool).await;
+    cfg.spei.hora_corte = ahora_cdmx() + chrono::Duration::hours(12);
+    ajustar(&mut cfg);
     let pasarela = Arc::new(PasarelaSimulada::new(1));
     let estado = AppState::con_pasarela(pool.clone(), cfg.clone(), pasarela.clone());
     Banco { pool: pool.clone(), app: routes::router(estado.clone()), estado, cfg, pasarela }
+}
+
+/// Operador con credenciales reales (el JWT se valida contra la base de datos).
+async fn operador(pool: &PgPool) -> Uuid {
+    bootstrap::asegurar_operador(pool, "cumplimiento@synthetic.mx", "operador-de-pruebas-123").await.unwrap();
+    sqlx::query_scalar("SELECT id FROM kyc.clientes WHERE email = 'cumplimiento@synthetic.mx'")
+        .fetch_one(pool)
+        .await
+        .unwrap()
 }
 
 impl Banco {
@@ -71,6 +102,25 @@ impl Banco {
             req = req.header(firma::CABECERA, f);
         }
         let resp = self.app.clone().oneshot(req.body(Body::from(cuerpo)).unwrap()).await.unwrap();
+        let status = resp.status();
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        (status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
+    }
+
+    fn token(&self, id: Uuid, rol: RolUsuario) -> String {
+        self.estado.jwt.emitir(id, rol).unwrap().0
+    }
+
+    /// Petición autenticada a la API.
+    async fn llamar(&self, token: &str, ruta: &str, cuerpo: Value) -> (StatusCode, Value) {
+        let req = Request::builder()
+            .method("POST")
+            .uri(ruta)
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::from(cuerpo.to_string()))
+            .unwrap();
+        let resp = self.app.clone().oneshot(req).await.unwrap();
         let status = resp.status();
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();
         (status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
@@ -289,35 +339,54 @@ async fn webhooks_duplicados_concurrentes_abonan_una_vez(pool: PgPool) {
     assert_eq!(contar(&pool, "SELECT count(*) FROM ifpe.spei_inbound").await, 1);
     assert_eq!(contar(&pool, "SELECT count(*) FROM ifpe.transacciones WHERE tipo = 'DEPOSITO'").await, 1);
 
-    // Misma identidad con otro monto: conflicto que requiere revisión, sin abono.
+    // Misma identidad con otro monto: se retiene para revisión (registrada y
+    // confirmada al proveedor, nunca un 409 sin registro), sin abono.
     let cuerpo = cuerpo_abono(&ana.cuenta_ifpe.clabe, "5000.01", "40012", "MBAN0100261013DUP", hoy_cdmx());
     let (s, r) = b.webhook("/api/v1/spei/webhook/inbound", cuerpo).await;
-    assert_eq!(s, StatusCode::CONFLICT, "{r}");
-    assert_eq!(r["error"]["codigo"], "SPEI_IDENTIDAD_REUTILIZADA");
+    assert_eq!((s, &r["mensaje"], &r["estado"]), (StatusCode::OK, &json!("confirmar"), &json!("EN_REVISION")), "{r}");
+    assert_eq!(r["motivo"], "IDENTIDAD_REUTILIZADA");
+    assert_eq!(
+        contar(&pool, "SELECT count(*) FROM ifpe.spei_cuarentena WHERE tipo = 'IDENTIDAD_REUTILIZADA'").await,
+        1
+    );
     assert_eq!(saldo_ifpe(&pool, ana.cuenta_ifpe.id).await.0, d("5000"));
     verificar_invariantes(&pool).await;
 }
 
 /// Hallazgo de la revisión: el operador captura un pago con la fecha
 /// calendario (o un código de emisor equivocado) y después llega el webhook
-/// con la identidad real: no se abona dos veces.
+/// con la identidad real: no se abona dos veces. (inbound-security-2: el
+/// webhook queda retenido y registrado, y se confirma; ya no es un 409.)
 #[sqlx::test(migrations = "../migrations")]
 async fn captura_manual_con_otra_identidad_no_duplica(pool: PgPool) {
     let b = banco(&pool).await;
     let ana = cliente(&pool, &b.cfg, "Ana").await;
+    let op = operador(&pool).await;
     let mut manual = abono(&ana.cuenta_ifpe.clabe, "5000", "MBAN0100MANUAL");
     manual.identidad =
         synthetic_capital::spei::IdentidadSpei::nueva("90012", hoy_cdmx() - Days::new(2), "MBAN0100MANUAL").unwrap();
-    inbound::abonar(&pool, &b.cfg.pld, &b.cfg.spei, &manual, Origen::Webhook, SiNoAcreditable::Rechazar).await.unwrap();
-    let (s, r) = b
-        .webhook(
-            "/api/v1/spei/webhook/inbound",
-            cuerpo_abono(&ana.cuenta_ifpe.clabe, "5000", "40012", "MBAN0100MANUAL", hoy_cdmx()),
-        )
-        .await;
-    assert_eq!(s, StatusCode::CONFLICT, "{r}");
-    assert_eq!(r["error"]["codigo"], "SPEI_POSIBLE_DUPLICADO");
+    inbound::abonar(&pool, &b.cfg.pld, &b.cfg.spei, &manual, Origen::Operador(op), SiNoAcreditable::Rechazar)
+        .await
+        .unwrap();
+    let cuerpo = cuerpo_abono(&ana.cuenta_ifpe.clabe, "5000", "40012", "MBAN0100MANUAL", hoy_cdmx());
+    for _ in 0..2 {
+        let (s, r) = b.webhook("/api/v1/spei/webhook/inbound", cuerpo.clone()).await;
+        assert_eq!((s, &r["mensaje"], &r["estado"]), (StatusCode::OK, &json!("confirmar"), &json!("EN_REVISION")), "{r}");
+        assert_eq!(r["motivo"], "POSIBLE_DUPLICADO");
+    }
     assert_eq!(saldo_ifpe(&pool, ana.cuenta_ifpe.id).await.0, d("5000"));
+    assert_eq!(contar(&pool, "SELECT count(*) FROM ifpe.spei_inbound").await, 1);
+    let identidad = format!("40012:{}:MBAN0100MANUAL", hoy_cdmx().format("%Y%m%d"));
+    let retenidas: Vec<String> =
+        sqlx::query_scalar("SELECT identidad FROM ifpe.spei_cuarentena WHERE tipo = 'POSIBLE_DUPLICADO'")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert_eq!(retenidas, vec![identidad.clone()], "una fila aunque el proveedor reintente");
+    let en_revision: Vec<String> =
+        sqlx::query_scalar("SELECT identidad FROM ifpe.v_spei_en_revision").fetch_all(&pool).await.unwrap();
+    assert_eq!(en_revision, vec![identidad]);
+    verificar_invariantes(&pool).await;
 }
 
 // -----------------------------------------------------------------------------
@@ -579,6 +648,7 @@ async fn devolucion_recibida_como_abono_reembolsa_una_vez(pool: PgPool) {
     assert_eq!(b.orden(o.id).await.estado, "DEVUELTA");
     assert_eq!(saldo_ifpe(&pool, ana.cuenta_ifpe.id).await.0, d("1000"), "un solo reembolso");
     assert_eq!(contar(&pool, "SELECT count(*) FROM ifpe.transacciones WHERE tipo = 'DEPOSITO'").await, 2);
+    assert_eq!(contar(&pool, "SELECT count(*) FROM ifpe.spei_cuarentena").await, 0);
     verificar_invariantes(&pool).await;
 }
 

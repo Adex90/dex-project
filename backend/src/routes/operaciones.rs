@@ -13,7 +13,7 @@ use uuid::Uuid;
 use super::status_de;
 use crate::{
     auth::Usuario,
-    error::AppResult,
+    error::{AppError, AppResult},
     kyc::{self, DictamenKyc},
     ledger::{self, Movimiento},
     models::{
@@ -23,7 +23,11 @@ use crate::{
     routes::extraccion::{Json, Path, Query},
     sofom::credito::{self, ResultadoCastigo, ResultadoCredito, ResultadoPago},
     spei::{
-        inbound::{self, Origen, ResultadoAbono, ResultadoCorreccion, SiNoAcreditable, SolicitudCorreccion},
+        inbound::{
+            self, Origen, PagoDistinto, ResultadoAbono, ResultadoAnulacion, ResultadoCorreccion, SiNoAcreditable,
+            SolicitudAnulacion, SolicitudCorreccion,
+        },
+        outbound::{self, ResultadoResolucion, SolicitudResolucion},
         IdentidadSpei,
     },
     state::AppState,
@@ -32,6 +36,8 @@ use crate::{
 pub fn rutas() -> Router<AppState> {
     Router::new()
         .route("/operaciones/spei/recibidos/{id}/correccion", post(corregir_spei))
+        .route("/operaciones/spei/recibidos/{id}/anulacion", post(anular_spei))
+        .route("/operaciones/spei/enviados/{id}/reembolso", post(reembolsar_spei_enviado))
         .route("/operaciones/depositos", post(deposito))
         .route("/operaciones/retenciones", post(retencion))
         .route("/operaciones/kyc/pendientes", get(kyc_pendientes))
@@ -58,19 +64,60 @@ struct SolicitudDeposito {
     /// la operación idempotente.
     clave_rastreo: String,
     concepto: Option<String>,
+    /// Si el pago es la devolución de una orden nuestra: la clave de rastreo
+    /// de la orden. Se aplica a la orden (reembolso único), nunca como abono.
+    #[serde(default)]
+    clave_rastreo_devolucion: Option<String>,
+    /// Causa Banxico de la devolución (1 a 99).
+    #[serde(default)]
+    causa_devolucion: Option<i16>,
+    /// Abono previo (transacción) del que este pago es distinto, cuando la
+    /// captura recibió SPEI_POSIBLE_DUPLICADO. Requiere `motivo`.
+    #[serde(default)]
+    distinto_de: Option<Uuid>,
+    #[serde(default)]
+    motivo: Option<String>,
 }
 
 /// SPEI entrante capturado por el operador (conciliación manual). Pasa por el
 /// mismo proceso que el webhook del proveedor: misma identidad de pago, así
 /// que un pago capturado a mano y notificado por el proveedor se abona una
 /// sola vez. Si la cuenta no puede recibir, se rechaza la captura (el operador
-/// decide la devolución).
+/// decide la devolución). Con `clave_rastreo_devolucion`, el pago se registra
+/// como devolución de esa orden. Con `distinto_de` y `motivo`, el operador
+/// confirma que el pago es distinto del abono previo que señaló la búsqueda
+/// de posibles duplicados (auditado).
 async fn deposito(
     State(e): State<AppState>,
     u: Usuario,
     Json(s): Json<SolicitudDeposito>,
 ) -> AppResult<(StatusCode, Json<ResultadoAbono>)> {
     u.exigir_operador()?;
+    // Mismo filtro que la notificación del proveedor.
+    let rastreo_devuelto = match s.clave_rastreo_devolucion.as_deref().map(str::trim) {
+        None | Some("") => None,
+        Some(r) => {
+            let r = r.to_ascii_uppercase();
+            if r.len() > 30 || !r.bytes().all(|b| b.is_ascii_alphanumeric()) {
+                return Err(AppError::validacion(
+                    "clave_rastreo_devolucion debe tener de 1 a 30 caracteres alfanuméricos",
+                ));
+            }
+            Some(r)
+        }
+    };
+    let causa_devolucion = match s.causa_devolucion {
+        Some(c) if !(1..=99).contains(&c) => return Err(AppError::validacion("causa_devolucion debe ser de 1 a 99")),
+        otra => otra,
+    };
+    let distinto = match (s.distinto_de, s.motivo.as_deref()) {
+        (Some(transaccion_id), Some(motivo)) => Some(PagoDistinto { transaccion_id, motivo: motivo.to_owned() }),
+        (None, None) => None,
+        _ => return Err(AppError::validacion("distinto_de y motivo van juntos")),
+    };
+    if distinto.is_some() && rastreo_devuelto.is_some() {
+        return Err(AppError::validacion("una devolución no se declara distinta de un abono"));
+    }
     let raw_payload = serde_json::json!({
         "clabe": s.clabe,
         "monto": s.monto.to_string(),
@@ -78,6 +125,10 @@ async fn deposito(
         "fecha_operacion": s.fecha_operacion,
         "clave_rastreo": s.clave_rastreo,
         "concepto": s.concepto,
+        "claveRastreoDevolucion": rastreo_devuelto,
+        "causa_devolucion": causa_devolucion,
+        "distinto_de": s.distinto_de,
+        "motivo": s.motivo,
     });
     let abono = inbound::Abono {
         identidad: IdentidadSpei::nueva(&s.banco_emisor, s.fecha_operacion, &s.clave_rastreo)?,
@@ -90,20 +141,27 @@ async fn deposito(
         referencia_numerica: None,
         concepto: s.concepto,
         tipo_pago: None,
-        rastreo_devuelto: None,
-        causa_devolucion: None,
+        rastreo_devuelto,
+        causa_devolucion,
         id_proveedor: None,
         raw_payload,
     };
-    let r = inbound::abonar(
-        &e.pool,
-        &e.config.pld,
-        &e.config.spei,
-        &abono,
-        Origen::Operador(u.cliente_id),
-        SiNoAcreditable::Rechazar,
-    )
-    .await?;
+    let r = match &distinto {
+        Some(d) => {
+            inbound::abonar_pago_distinto(&e.pool, &e.config.pld, &e.config.spei, &abono, u.cliente_id, d).await?
+        }
+        None => {
+            inbound::abonar(
+                &e.pool,
+                &e.config.pld,
+                &e.config.spei,
+                &abono,
+                Origen::Operador(u.cliente_id),
+                SiNoAcreditable::Rechazar,
+            )
+            .await?
+        }
+    };
     Ok((status_de(r.idempotente), Json(r)))
 }
 
@@ -314,5 +372,52 @@ async fn corregir_spei(
         clave_idempotencia: u.clave(&s.clave_idempotencia)?,
     };
     let r = inbound::corregir(&e.pool, &solicitud).await?;
+    Ok((status_de(r.idempotente), Json(r)))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SolicitudMotivoHttp {
+    motivo: String,
+    clave_idempotencia: String,
+}
+
+/// Anula una captura manual errónea (CLABE o monto equivocados): corrige lo
+/// que falte del abono y libera su identidad, para que el pago real (webhook
+/// o nueva captura) se abone a la cuenta correcta. Solo capturas del operador.
+async fn anular_spei(
+    State(e): State<AppState>,
+    u: Usuario,
+    Path(id): Path<Uuid>,
+    Json(s): Json<SolicitudMotivoHttp>,
+) -> AppResult<(StatusCode, Json<ResultadoAnulacion>)> {
+    u.exigir_operador()?;
+    let solicitud = SolicitudAnulacion {
+        spei_inbound_id: id,
+        motivo: s.motivo,
+        operador_id: u.cliente_id,
+        clave_idempotencia: u.clave(&s.clave_idempotencia)?,
+    };
+    let r = inbound::anular(&e.pool, &solicitud).await?;
+    Ok((status_de(r.idempotente), Json(r)))
+}
+
+/// Reembolsa una orden SPEI en revisión manual que el proveedor nunca
+/// recibió (se consulta al proveedor en ese momento). Auditado en
+/// `ifpe.spei_resoluciones`.
+async fn reembolsar_spei_enviado(
+    State(e): State<AppState>,
+    u: Usuario,
+    Path(id): Path<Uuid>,
+    Json(s): Json<SolicitudMotivoHttp>,
+) -> AppResult<(StatusCode, Json<ResultadoResolucion>)> {
+    u.exigir_operador()?;
+    let solicitud = SolicitudResolucion {
+        orden_id: id,
+        motivo: s.motivo,
+        operador_id: u.cliente_id,
+        clave_idempotencia: u.clave(&s.clave_idempotencia)?,
+    };
+    let r = outbound::reembolsar_revision(&e.pool, &*e.pasarela, &e.config.spei, &solicitud).await?;
     Ok((status_de(r.idempotente), Json(r)))
 }

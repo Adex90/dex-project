@@ -14,11 +14,20 @@
 //! resultado con [`aplicar`].
 //!
 //! **Reglas que protegen el dinero** (un reembolso indebido paga dos veces):
-//! - Solo el primer intento puede tomar un "rechazado" como definitivo. Si ya
-//!   hubo un intento de resultado desconocido, primero se consulta; solo si el
-//!   proveedor dice que no tiene la orden se reenvía, y un rechazo en ese
-//!   reenvío (p. ej. "clave de rastreo duplicada") es ambiguo: revisión
+//! - Solo el primer intento puede tomar un "rechazado" como definitivo, y solo
+//!   si al aplicarlo (con la orden bloqueada) `intentos_envio` sigue siendo el
+//!   del reclamo: si el arrendamiento venció y otro despachador la reclamó,
+//!   ese otro pudo registrarla, y el rechazo tardío va a revisión manual.
+//! - Si ya hubo un intento de resultado desconocido, primero se consulta; solo
+//!   si el proveedor dice que no tiene la orden se reenvía, y un rechazo en
+//!   ese reenvío (p. ej. "clave de rastreo duplicada") es ambiguo: revisión
 //!   manual, nunca reembolso.
+//! - Solo se reenvía si el día de operación del proveedor no pudo cambiar
+//!   desde que se creó la orden (el proveedor rechaza como duplicada la clave
+//!   de rastreo del mismo día, no la de un día anterior); si pudo cambiar,
+//!   revisión manual.
+//! - Una orden en revisión manual que el proveedor nunca recibió la reembolsa
+//!   el operador ([`reembolsar_revision`]), auditado en `ifpe.spei_resoluciones`.
 //! - Tiempo agotado o error: nunca se reembolsa; se reintenta con espera y,
 //!   tras `max_intentos`, revisión manual.
 //! - Reembolso solo ante un rechazo del primer intento, una cancelación o una
@@ -26,12 +35,14 @@
 //!   consultando durante la ventana de devolución.
 //!
 //! El reverso es un DEPOSITO `spei-reverso:<orden>` que restituye cliente y
-//! reserva en la misma transacción que cierra la orden. La orden bloqueada
+//! reserva en la misma transacción que cierra la orden. Un resultado del
+//! proveedor incompatible con el estado final de la orden queda en
+//! `ifpe.spei_incidentes` (evidencia permanente). La orden bloqueada
 //! (`FOR UPDATE`) serializa despachador, webhook de estado y devoluciones
 //! recibidas; la máquina de estados de la base de datos rechaza transiciones
 //! inválidas y la clave única del reverso hace imposible reembolsar dos veces.
 
-use chrono::{DateTime, NaiveDate, Utc};
+use chrono::{DateTime, NaiveDate, NaiveTime, Utc};
 use rust_decimal::Decimal;
 use serde::Serialize;
 use sqlx::{FromRow, PgPool};
@@ -370,10 +381,20 @@ pub enum Evento {
     Liquidada {
         fecha_operacion: Option<NaiveDate>,
     },
-    /// Rechazo definitivo (primer intento) o cancelación: el dinero no salió.
+    /// El proveedor informa (consulta o webhook) que canceló o rechazó la
+    /// orden: el dinero no salió.
     Rechazada {
         causa: i16,
         motivo: String,
+    },
+    /// El proveedor rechazó el registro de un primer intento. Es definitivo
+    /// solo si el reclamo sigue vigente: la orden sigue PENDIENTE con los
+    /// mismos `intentos_envio` (nadie la reclamó después de vencer el
+    /// arrendamiento); si no, revisión manual.
+    RechazoRegistro {
+        causa: i16,
+        motivo: String,
+        intentos_envio: i32,
     },
     /// Devuelta por el banco receptor después de liquidar: el dinero regresó.
     Devuelta {
@@ -392,13 +413,31 @@ pub enum Evento {
     SeguirVigilando,
 }
 
+impl Evento {
+    /// Nombre del evento en `ifpe.spei_incidentes`.
+    fn nombre(&self) -> &'static str {
+        match self {
+            Evento::Aceptada { .. } => "ACEPTADA",
+            Evento::EnProceso { .. } => "EN_PROCESO",
+            Evento::Liquidada { .. } => "LIQUIDADA",
+            Evento::Rechazada { .. } => "RECHAZADA",
+            Evento::Devuelta { .. } => "DEVUELTA",
+            Evento::RechazoRegistro { .. } => "RECHAZO_REGISTRO",
+            Evento::Incierto { .. } => "INCIERTO",
+            Evento::RevisionManual { .. } => "REVISION_MANUAL",
+            Evento::SeguirVigilando => "SEGUIR_VIGILANDO",
+        }
+    }
+}
+
 /// Estado de la orden después de aplicar un evento.
 #[derive(Debug, Clone, Serialize)]
 pub struct Transicion {
     pub orden: SpeiOutbound,
     pub cambio: bool,
-    /// Resultado incompatible con el estado final: no se movió dinero, la
-    /// orden quedó marcada para revisión (si no es final) y se responde 409.
+    /// Resultado incompatible con el estado final: no se movió dinero, el
+    /// incidente quedó en `ifpe.spei_incidentes`, la orden quedó marcada para
+    /// revisión (si no es final) y se responde 409.
     #[serde(skip)]
     pub incidente: Option<String>,
 }
@@ -417,7 +456,7 @@ pub async fn aplicar(pool: &PgPool, cfg: &ConfigSpei, orden_id: Uuid, evento: &E
     db::con_reintentos(|| async {
         let mut tx = db::begin(pool, Rol::Spei).await?;
         let t = aplicar_en(&mut tx, cfg, orden_id, evento).await?;
-        // También se confirma la marca de revisión de un incidente.
+        // También se confirman el incidente y la marca de revisión.
         tx.commit().await?;
         Ok(t)
     })
@@ -429,7 +468,8 @@ pub async fn aplicar(pool: &PgPool, cfg: &ConfigSpei, orden_id: Uuid, evento: &E
 /// Idempotente: el mismo evento dos veces no cambia nada la segunda vez. Un
 /// evento que contradice un estado final (p. ej. "liquidada" de una orden ya
 /// reembolsada) es un incidente de conciliación: no se toca el dinero, se
-/// marca para revisión y se responde 409.
+/// registra en `ifpe.spei_incidentes`, se marca para revisión (si la orden no
+/// es RECHAZADA/DEVUELTA, que ya no cambian) y se responde 409.
 pub async fn aplicar_en(tx: &mut Tx, cfg: &ConfigSpei, orden_id: Uuid, evento: &Evento) -> AppResult<Transicion> {
     // La orden primero: serializa despachador, webhook y devoluciones.
     let o: SpeiOutbound = sqlx::query_as("SELECT * FROM ifpe.spei_outbound WHERE id = $1 FOR UPDATE")
@@ -453,6 +493,32 @@ pub async fn aplicar_en(tx: &mut Tx, cfg: &ConfigSpei, orden_id: Uuid, evento: &
         }
         ("PENDIENTE" | "ENVIADA", Evento::Rechazada { causa, motivo }) => {
             Some(reembolsar(tx, &o, "RECHAZADA", *causa, motivo).await?)
+        }
+        // Rechazo del registro de un primer intento cuyo reclamo sigue
+        // vigente: nadie más pudo registrarla, el rechazo es definitivo.
+        ("PENDIENTE", Evento::RechazoRegistro { causa, motivo, intentos_envio })
+            if o.intentos_envio == *intentos_envio && !o.revision_manual =>
+        {
+            Some(reembolsar(tx, &o, "RECHAZADA", *causa, motivo).await?)
+        }
+        // Reclamo vencido: otro despachador la reclamó y pudo registrarla.
+        ("PENDIENTE" | "ENVIADA", Evento::RechazoRegistro { causa, motivo, intentos_envio }) => Some(
+            revision_manual(
+                tx,
+                &o,
+                &format!(
+                    "rechazo de registro de un reclamo vencido (intento {intentos_envio}; la orden va en {} y está \
+                     {estado}; causa {causa}: {motivo}); otro despachador pudo registrarla",
+                    o.intentos_envio
+                ),
+            )
+            .await?,
+        ),
+        // La orden ya tiene resultado del proveedor: un rechazo tardío de un
+        // registro duplicado no dice nada del dinero.
+        ("LIQUIDADA" | "RECHAZADA" | "DEVUELTA", Evento::RechazoRegistro { .. }) => {
+            tracing::warn!(rastreo = %o.clave_rastreo, estado, ?evento, "rechazo de registro tardío ignorado");
+            None
         }
         ("PENDIENTE" | "ENVIADA" | "LIQUIDADA", Evento::Devuelta { causa, motivo }) => {
             let liquidada = if estado == "LIQUIDADA" { o.clone() } else { liquidar(tx, cfg, &o, None).await? };
@@ -478,6 +544,9 @@ pub async fn aplicar_en(tx: &mut Tx, cfg: &ConfigSpei, orden_id: Uuid, evento: &
                 ?evento,
                 "INCIDENTE DE CONCILIACIÓN SPEI: el proveedor informa un resultado incompatible con el estado final"
             );
+            registrar_incidente(tx, &o, evento).await?;
+            // Una orden RECHAZADA ya no cambia (su reverso está ligado a la
+            // fila): el incidente queda solo en `ifpe.spei_incidentes`.
             let orden = if estado == "LIQUIDADA" {
                 revision_manual(tx, &o, &format!("el proveedor informa {evento:?} de una orden liquidada")).await?
             } else {
@@ -607,11 +676,29 @@ async fn reembolsar(tx: &mut Tx, o: &SpeiOutbound, estado: &str, causa: i16, mot
     Ok(orden)
 }
 
+/// Evidencia de un resultado incompatible con el estado final de la orden.
+/// Los reintentos del proveedor no la duplican.
+async fn registrar_incidente(tx: &mut Tx, o: &SpeiOutbound, evento: &Evento) -> AppResult<()> {
+    let detalle: String = format!("{evento:?}").chars().filter(|c| !c.is_control()).take(500).collect();
+    sqlx::query(
+        "INSERT INTO ifpe.spei_incidentes (spei_outbound_id, estado_orden, evento, detalle) VALUES ($1, $2, $3, $4) \
+         ON CONFLICT (spei_outbound_id, estado_orden, evento) DO NOTHING",
+    )
+    .bind(o.id)
+    .bind(&o.estado)
+    .bind(evento.nombre())
+    .bind(detalle)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
 /// Resultado desconocido. Las PENDIENTE ya contaron su intento al
-/// reclamarse; las ENVIADA cuentan aquí cada consulta fallida.
+/// reclamarse; las ENVIADA cuentan aquí cada consulta fallida. Una orden ya
+/// en revisión manual se queda en el ciclo de una hora (sin perder la causa).
 async fn incierto(tx: &mut Tx, cfg: &ConfigSpei, o: &SpeiOutbound, error: &str) -> AppResult<SpeiOutbound> {
     let intentos = if o.estado == "ENVIADA" { o.intentos_envio + 1 } else { o.intentos_envio };
-    if intentos >= cfg.max_intentos {
+    if o.revision_manual || intentos >= cfg.max_intentos {
         return revision_manual(tx, o, &format!("sin resultado definitivo tras {intentos} intentos: {error}")).await;
     }
     // Espera exponencial con piso: el proveedor necesita tiempo para mostrar
@@ -639,15 +726,219 @@ async fn revision_manual(tx: &mut Tx, o: &SpeiOutbound, motivo: &str) -> AppResu
         %motivo,
         "orden SPEI en revisión manual: resultado ambiguo, NO se reembolsa automáticamente"
     );
-    // Se sigue consultando cada hora: un resultado definitivo la resuelve.
+    // Se sigue consultando cada hora: un resultado definitivo la resuelve. Se
+    // conserva la primera causa (la que el operador necesita); las siguientes
+    // quedan en el log. `reembolsar_revision` y `ifpe.spei_resoluciones`
+    // exigen este prefijo 'REVISION_MANUAL:'.
     Ok(sqlx::query_as(
-        "UPDATE ifpe.spei_outbound SET revision_manual = TRUE, ultimo_error = $2, \
+        "UPDATE ifpe.spei_outbound SET revision_manual = TRUE, \
+         ultimo_error = CASE WHEN revision_manual AND ultimo_error LIKE 'REVISION_MANUAL:%' \
+                             THEN ultimo_error ELSE $2 END, \
          proximo_intento_en = now() + interval '1 hour' WHERE id = $1 RETURNING *",
     )
     .bind(o.id)
     .bind(format!("REVISION_MANUAL: {motivo}"))
     .fetch_one(&mut **tx)
     .await?)
+}
+
+// -----------------------------------------------------------------------------
+// Resolución del operador
+// -----------------------------------------------------------------------------
+
+/// Reembolso, por el operador, de una orden en revisión manual que el
+/// proveedor nunca recibió.
+#[derive(Debug, Clone)]
+pub struct SolicitudResolucion {
+    pub orden_id: Uuid,
+    /// Qué confirmó el operador con el proveedor (10 a 300 caracteres).
+    pub motivo: String,
+    pub operador_id: Uuid,
+    /// Clave ya acotada al operador.
+    pub clave_idempotencia: String,
+}
+
+/// Registro de `ifpe.spei_resoluciones`.
+#[derive(Debug, Clone, Serialize, FromRow)]
+pub struct Resolucion {
+    pub id: Uuid,
+    pub spei_outbound_id: Uuid,
+    pub accion: String,
+    pub motivo: String,
+    /// Causa de la revisión manual al momento de resolver.
+    pub error_previo: String,
+    pub autorizado_por: Uuid,
+    #[serde(skip)]
+    pub clave_idempotencia: String,
+    pub creado_en: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ResultadoResolucion {
+    pub orden: SpeiOutbound,
+    pub resolucion: Resolucion,
+    /// El reverso (DEPOSITO `spei-reverso:<orden>`).
+    pub transaccion: TransaccionIfpe,
+    pub idempotente: bool,
+}
+
+/// Solo una orden PENDIENTE en revisión manual que el proveedor nunca aceptó
+/// (sin id, fecha de operación ni envío confirmado). La base de datos exige
+/// lo mismo al COMMIT (`ifpe.fn_verificar_spei_resolucion`).
+fn exigir_reembolsable(o: &SpeiOutbound) -> AppResult<()> {
+    let en_revision = o.ultimo_error.as_deref().is_some_and(|e| e.starts_with("REVISION_MANUAL:"));
+    if o.estado != "PENDIENTE"
+        || !o.revision_manual
+        || !en_revision
+        || o.id_proveedor.is_some()
+        || o.fecha_operacion.is_some()
+        || o.enviada_en.is_some()
+    {
+        return Err(AppError::negocio(
+            "SPEI_SIN_REVISION",
+            "solo se reembolsa una orden PENDIENTE en revisión manual que el proveedor nunca aceptó",
+        ));
+    }
+    Ok(())
+}
+
+/// Resolución ya registrada: la misma solicitud (idempotente) o un conflicto.
+async fn resolucion_previa(tx: &mut Tx, s: &SolicitudResolucion) -> AppResult<Option<ResultadoResolucion>> {
+    let por_clave: Option<Resolucion> =
+        sqlx::query_as("SELECT * FROM ifpe.spei_resoluciones WHERE clave_idempotencia = $1")
+            .bind(&s.clave_idempotencia)
+            .fetch_optional(&mut **tx)
+            .await?;
+    if let Some(r) = por_clave {
+        if r.spei_outbound_id != s.orden_id || r.motivo != s.motivo.trim() {
+            return Err(AppError::conflicto(
+                "CLAVE_IDEMPOTENCIA_REUTILIZADA",
+                "la clave de idempotencia ya se usó para otra resolución",
+            ));
+        }
+        let orden: SpeiOutbound = sqlx::query_as("SELECT * FROM ifpe.spei_outbound WHERE id = $1")
+            .bind(s.orden_id)
+            .fetch_one(&mut **tx)
+            .await?;
+        let reverso = orden.tx_reverso_id.ok_or_else(|| AppError::Integridad("resolución sin reverso".into()))?;
+        let transaccion = transaccion(tx, reverso).await?;
+        return Ok(Some(ResultadoResolucion { orden, resolucion: r, transaccion, idempotente: true }));
+    }
+    let resuelta: bool =
+        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM ifpe.spei_resoluciones WHERE spei_outbound_id = $1)")
+            .bind(s.orden_id)
+            .fetch_one(&mut **tx)
+            .await?;
+    if resuelta {
+        return Err(AppError::conflicto("SPEI_YA_RESUELTA", "la orden ya fue resuelta por un operador"));
+    }
+    Ok(None)
+}
+
+/// Reembolsa una orden en revisión manual después de confirmar, consultando
+/// al proveedor en ese momento, que no la tiene. Exige que el despachador no
+/// haya tocado la orden durante `espera_resolucion_seg` (ningún registro
+/// tardío en vuelo: las órdenes en revisión nunca se reenvían). El reverso es
+/// el de siempre (`spei-reverso:<orden>`), ligado a la resolución en la misma
+/// transacción. Nunca reembolsa una orden que el proveedor aceptó.
+pub async fn reembolsar_revision(
+    pool: &PgPool,
+    pasarela: &dyn Pasarela,
+    cfg: &ConfigSpei,
+    s: &SolicitudResolucion,
+) -> AppResult<ResultadoResolucion> {
+    let motivo = s.motivo.trim();
+    if !(10..=300).contains(&motivo.chars().count()) || motivo.chars().any(char::is_control) {
+        return Err(AppError::validacion("el motivo de la resolución debe tener de 10 a 300 caracteres"));
+    }
+    let mut tx = db::begin_lectura(pool, Rol::Spei).await?;
+    if let Some(previa) = resolucion_previa(&mut tx, s).await? {
+        tx.commit().await?;
+        return Ok(previa);
+    }
+    let o: SpeiOutbound = sqlx::query_as("SELECT * FROM ifpe.spei_outbound WHERE id = $1")
+        .bind(s.orden_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| AppError::no_encontrado("orden SPEI no encontrada"))?;
+    tx.commit().await?;
+    exigir_reembolsable(&o)?;
+    if o.cliente_id == s.operador_id {
+        return Err(AppError::negocio("SPEI_AUTORESOLUCION", "un operador no resuelve sus propias órdenes"));
+    }
+
+    // Fuera de toda transacción: el proveedor debe decir, ahora, que no la tiene.
+    match pasarela.consultar(&o.consulta()).await {
+        Ok(EstadoProveedor::NoExiste) => {}
+        Ok(estado) => {
+            return Err(AppError::conflicto(
+                "SPEI_PROVEEDOR_TIENE_ORDEN",
+                format!("el proveedor informa {estado:?}: el despachador resolverá la orden; no se reembolsa"),
+            ))
+        }
+        Err(e) => {
+            return Err(AppError::peticion(
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                "SPEI_PROVEEDOR_NO_DISPONIBLE",
+                format!("no se pudo consultar al proveedor: {e}"),
+            ))
+        }
+    }
+
+    db::con_reintentos(|| async {
+        let mut tx = db::begin(pool, Rol::Spei).await?;
+        let o: SpeiOutbound = sqlx::query_as("SELECT * FROM ifpe.spei_outbound WHERE id = $1 FOR UPDATE")
+            .bind(s.orden_id)
+            .fetch_one(&mut *tx)
+            .await?;
+        // Una solicitud concurrente igual esperó el candado: repetición.
+        if let Some(previa) = resolucion_previa(&mut tx, s).await? {
+            tx.commit().await?;
+            return Ok(previa);
+        }
+        exigir_reembolsable(&o)?;
+        let en_reposo: bool = sqlx::query_scalar(
+            "SELECT actualizado_en <= now() - make_interval(secs => $2) FROM ifpe.spei_outbound WHERE id = $1",
+        )
+        .bind(o.id)
+        .bind(cfg.espera_resolucion_seg as f64)
+        .fetch_one(&mut *tx)
+        .await?;
+        if !en_reposo {
+            return Err(AppError::negocio(
+                "SPEI_ORDEN_RECIENTE",
+                format!(
+                    "el despachador tocó la orden hace menos de {} s; reintente más tarde",
+                    cfg.espera_resolucion_seg
+                ),
+            ));
+        }
+        let error_previo = o.ultimo_error.clone().unwrap_or_default();
+        let orden = reembolsar(&mut tx, &o, "RECHAZADA", 99, &format!("reembolso por revisión manual: {motivo}")).await?;
+        let resolucion: Resolucion = sqlx::query_as(
+            "INSERT INTO ifpe.spei_resoluciones \
+             (spei_outbound_id, accion, motivo, error_previo, autorizado_por, clave_idempotencia) \
+             VALUES ($1, 'REEMBOLSO', $2, $3, $4, $5) RETURNING *",
+        )
+        .bind(o.id)
+        .bind(motivo)
+        .bind(&error_previo)
+        .bind(s.operador_id)
+        .bind(&s.clave_idempotencia)
+        .fetch_one(&mut *tx)
+        .await?;
+        let reverso = orden.tx_reverso_id.ok_or_else(|| AppError::Integridad("reembolso sin reverso".into()))?;
+        let transaccion = transaccion(&mut tx, reverso).await?;
+        tx.commit().await?;
+        tracing::warn!(
+            rastreo = %orden.clave_rastreo,
+            monto = %orden.monto,
+            operador = %s.operador_id,
+            "orden SPEI en revisión reembolsada por el operador"
+        );
+        Ok(ResultadoResolucion { orden, resolucion, transaccion, idempotente: false })
+    })
+    .await
 }
 
 // -----------------------------------------------------------------------------
@@ -663,7 +954,10 @@ pub struct Despacho {
 }
 
 /// Arrendamiento de una orden reclamada: tiempo para hablar con el proveedor
-/// antes de que otro despachador pueda retomarla.
+/// antes de que otro despachador pueda retomarla. Que venza no reembolsa de
+/// más: el resultado de un primer intento se aplica solo si `intentos_envio`
+/// sigue siendo el del reclamo (todo reclamo de una PENDIENTE lo incrementa y
+/// lo confirma antes de llamar al proveedor; nadie más llama a `registrar`).
 const ARRENDAMIENTO_SEG: f64 = 60.0;
 
 /// Un ciclo: reclama órdenes vencidas (contando el intento de las PENDIENTE
@@ -691,7 +985,7 @@ pub async fn despachar(pool: &PgPool, pasarela: &dyn Pasarela, cfg: &ConfigSpei)
 
     let mut d = Despacho { reclamadas: reclamadas.len(), ..Despacho::default() };
     for o in reclamadas {
-        let evento = consultar_proveedor(pasarela, &o).await;
+        let evento = consultar_proveedor(pasarela, cfg, &o).await;
         match aplicar(pool, cfg, o.id, &evento).await {
             Ok(t) if t.cambio && t.orden.estado != o.estado => d.cambios += 1,
             Ok(_) => {}
@@ -722,8 +1016,22 @@ fn desde_consulta(estado: EstadoProveedor, o: &SpeiOutbound) -> Option<Evento> {
     })
 }
 
+/// ¿Pudo cambiar el día de operación del proveedor entre `desde` y `hasta`?
+/// Conservador: basta con que la hora de corte diaria (Ciudad de México,
+/// UTC-6 como `hoy_cdmx`) caiga en `[desde - margen, hasta + margen]`, aunque
+/// sea un día inhábil.
+fn pudo_cambiar_dia_operacion(
+    desde: DateTime<Utc>,
+    hasta: DateTime<Utc>,
+    corte: NaiveTime,
+    margen: chrono::Duration,
+) -> bool {
+    let dia = |t: DateTime<Utc>| ((t - chrono::Duration::hours(6)).naive_utc() - (corte - NaiveTime::MIN)).date();
+    dia(desde - margen) != dia(hasta + margen)
+}
+
 /// Qué hacer con la orden según el proveedor (sin tocar la base de datos).
-async fn consultar_proveedor(pasarela: &dyn Pasarela, o: &SpeiOutbound) -> Evento {
+async fn consultar_proveedor(pasarela: &dyn Pasarela, cfg: &ConfigSpei, o: &SpeiOutbound) -> Evento {
     let primer_intento = o.estado == "PENDIENTE" && o.intentos_envio <= 1 && !o.revision_manual;
     if !primer_intento {
         // Ya hubo contacto (o pudo haberlo): primero se pregunta.
@@ -742,6 +1050,21 @@ async fn consultar_proveedor(pasarela: &dyn Pasarela, o: &SpeiOutbound) -> Event
             _ if o.revision_manual => return Evento::Incierto { error: "en revisión manual: no se reenvía".into() },
             _ => {}
         }
+        // El reenvío solo es seguro si el proveedor lo rechazaría como
+        // duplicado de un registro que aún no muestra: eso vale dentro del
+        // mismo día de operación. `creado_en` (inmutable) es anterior a todo
+        // intento; la orden no guarda la fecha que pudo recibir un intento
+        // cuya respuesta se perdió.
+        let margen = chrono::Duration::seconds(i64::try_from(cfg.margen_corte_seg).unwrap_or(86_400).min(86_400));
+        if pudo_cambiar_dia_operacion(o.creado_en, Utc::now(), cfg.hora_corte, margen) {
+            return Evento::RevisionManual {
+                motivo: format!(
+                    "el día de operación pudo cambiar desde el primer intento (corte {}): el proveedor no \
+                     rechazaría el reenvío como duplicado; no se reenvía",
+                    cfg.hora_corte.format("%H:%M")
+                ),
+            };
+        }
         // Reenvío con la misma clave de rastreo. Un rechazo aquí es ambiguo.
         return match pasarela.registrar(&o.orden_pasarela()).await {
             Ok(Registro::Aceptada { id, fecha_operacion }) => {
@@ -755,8 +1078,11 @@ async fn consultar_proveedor(pasarela: &dyn Pasarela, o: &SpeiOutbound) -> Event
     }
     match pasarela.registrar(&o.orden_pasarela()).await {
         Ok(Registro::Aceptada { id, fecha_operacion }) => Evento::Aceptada { id_proveedor: Some(id), fecha_operacion },
-        // Primer intento: nada pudo haberse registrado antes; el rechazo es definitivo.
-        Ok(Registro::Rechazada { causa, motivo }) => Evento::Rechazada { causa, motivo },
+        // Primer intento: nada pudo registrarse antes con este reclamo; el
+        // rechazo es definitivo si al aplicarlo nadie más la reclamó.
+        Ok(Registro::Rechazada { causa, motivo }) => {
+            Evento::RechazoRegistro { causa, motivo, intentos_envio: o.intentos_envio }
+        }
         Err(ErrorPasarela::Tiempo) => Evento::Incierto { error: ErrorPasarela::Tiempo.to_string() },
         Err(e) => Evento::Incierto { error: e.to_string() },
     }
@@ -816,6 +1142,8 @@ pub struct Conciliacion {
     pub ordenes_en_transito: i64,
     pub ordenes_en_revision: i64,
     pub saldo_esperado_custodio: Decimal,
+    /// Órdenes con un incidente registrado en `ifpe.spei_incidentes`.
+    pub incidentes_conciliacion: i64,
 }
 
 pub async fn conciliacion(pool: &PgPool) -> AppResult<Vec<Conciliacion>> {
@@ -841,6 +1169,25 @@ mod pruebas {
             referencia_numerica: Some(1_234_567),
             clave_idempotencia: "cli:x:1".into(),
         }
+    }
+
+    /// Instante de la Ciudad de México (UTC-6) en UTC.
+    fn cdmx(dia: u32, h: u32, m: u32) -> DateTime<Utc> {
+        let local = NaiveDate::from_ymd_opt(2026, 10, dia).unwrap().and_hms_opt(h, m, 0).unwrap();
+        (local + chrono::Duration::hours(6)).and_utc()
+    }
+
+    #[test]
+    fn cambio_de_dia_de_operacion_por_corte() {
+        let corte = NaiveTime::from_hms_opt(17, 30, 0).unwrap();
+        let margen = chrono::Duration::minutes(10);
+        let cambia = |a, b| pudo_cambiar_dia_operacion(a, b, corte, margen);
+        // Lunes 12 de octubre de 2026.
+        assert!(!cambia(cdmx(12, 10, 0), cdmx(12, 11, 0)), "misma mañana");
+        assert!(cambia(cdmx(12, 17, 10), cdmx(12, 17, 50)), "cruza el corte");
+        assert!(cambia(cdmx(12, 17, 21), cdmx(12, 17, 22)), "antes del corte, dentro del margen");
+        assert!(!cambia(cdmx(12, 17, 45), cdmx(13, 9, 0)), "mismo día de operación: el corte, no la medianoche");
+        assert!(cambia(cdmx(12, 10, 0), cdmx(13, 9, 0)), "lunes a martes");
     }
 
     #[test]
