@@ -5,6 +5,7 @@ import { useCallback } from "react";
 
 import { BridgeForm } from "@/components/dashboard/bridge-form";
 import { DashboardHeader } from "@/components/dashboard/dashboard-header";
+import { KycBanner, isKycLocked } from "@/components/dashboard/kyc-status";
 import { LedgerFeed } from "@/components/dashboard/ledger-feed";
 import { ProofOfReservePanel } from "@/components/dashboard/proof-of-reserve";
 import { SofomCard } from "@/components/dashboard/sofom-card";
@@ -37,7 +38,9 @@ export default function DashboardPage() {
   if (!token) return null;
 
   const client = summary?.cliente ?? null;
-  const kycPending = client !== null && client.estatus_kyc !== "VERIFICADO";
+  // Until the identity is VERIFICADO the database refuses deposits, transfers,
+  // withdrawals and investments: lock those controls rather than let a 422 explain it.
+  const kycLocked = isKycLocked(client);
 
   return (
     <div className="min-h-dvh">
@@ -60,33 +63,35 @@ export default function DashboardPage() {
         {error && summary ? (
           <Alert tone="warning">Showing the last data received. {describeError(error)}</Alert>
         ) : null}
-        {kycPending ? (
-          <Alert tone="warning" title="Identity verification pending">
-            Your KYC file is {client.estatus_kyc.toLowerCase().replace("_", " ")}. You can view your account, but
-            money movements are disabled until compliance verifies it.
-          </Alert>
-        ) : null}
+        {client && kycLocked ? <KycBanner client={client} token={token} /> : null}
 
         <div className="grid gap-6 lg:grid-cols-5">
-          <div className="lg:col-span-2">
-            <VaultCard account={summary?.boveda ?? null} reserve={summary?.reserva ?? null} token={token} onChanged={refresh} />
+          <div className="min-w-0 lg:col-span-2">
+            <VaultCard
+              account={summary?.boveda ?? null}
+              reserve={summary?.reserva ?? null}
+              token={token}
+              kycLocked={kycLocked}
+              onChanged={refresh}
+            />
           </div>
-          <div className="lg:col-span-3">
+          <div className="min-w-0 lg:col-span-3">
             <SofomCard position={summary?.inversion ?? null} token={token} onChanged={refresh} />
           </div>
         </div>
 
         <div className="grid gap-6 lg:grid-cols-5">
-          <div className="lg:col-span-2">
+          <div className="min-w-0 lg:col-span-2">
             <BridgeForm
               available={summary?.boveda?.saldo_disponible ?? null}
               rates={rates}
               token={token}
-              disabled={kycPending}
+              disabled={client === null}
+              kycLocked={kycLocked}
               onInvested={refresh}
             />
           </div>
-          <div className="lg:col-span-3">
+          <div className="min-w-0 lg:col-span-3">
             <ProofOfReservePanel token={token} accountId={summary?.boveda?.id ?? null} />
           </div>
         </div>

@@ -160,7 +160,7 @@ pub struct ResumenResultado {
     pub documento_valido: bool,
     pub coincide_identidad: bool,
     pub resultado: String,
-    pub umbral_aplicado: Decimal,
+    pub umbral_aplicado: Option<Decimal>,
     pub timestamp: DateTime<Utc>,
     pub detalles_fallo: serde_json::Value,
 }
@@ -174,6 +174,17 @@ pub struct VistaExpediente {
     pub max_intentos: i16,
     pub intentos_restantes: i16,
     pub ultimo_resultado: Option<ResumenResultado>,
+}
+
+impl VistaExpediente {
+    /// Sin score ni umbral (ver `routes::kyc::verificar`).
+    pub fn para_cliente(mut self) -> Self {
+        if let Some(r) = self.ultimo_resultado.as_mut() {
+            r.score_similitud = None;
+            r.umbral_aplicado = None;
+        }
+        self
+    }
 }
 
 pub(crate) async fn cargar(tx: &mut Tx, cliente_id: Uuid) -> AppResult<Expediente> {
@@ -297,7 +308,7 @@ pub fn validar_datos(d: &DatosPersonales, hoy: NaiveDate) -> AppResult<DatosVali
     };
     let curp = Curp::parse(&d.curp).map_err(|e| AppError::validacion(e.to_string()))?;
     let rfc = rfc::validar_persona_fisica(&d.rfc).map_err(|e| AppError::validacion(e.to_string()))?;
-    let (errores, mut advertencias) = rfc::cotejar_con_curp(&rfc, &curp);
+    let (errores, mut advertencias) = rfc::cotejar_con_curp(&rfc, &curp, &apellido_paterno, apellido_materno.as_deref());
     if let Some(e) = errores.into_iter().next() {
         return Err(AppError::validacion(e));
     }
@@ -503,6 +514,48 @@ pub struct OrigenEnvio {
     pub user_agent: Option<String>,
 }
 
+pub fn exigir_consentimiento(s: &SolicitudVerificacion) -> AppResult<()> {
+    if s.consentimiento_biometrico {
+        Ok(())
+    } else {
+        Err(AppError::negocio(
+            "KYC_SIN_CONSENTIMIENTO",
+            "para verificar tu identidad necesitamos tu consentimiento expreso para tratar tus datos biométricos",
+        ))
+    }
+}
+
+/// Comprobación barata antes de decodificar imágenes: persona física,
+/// expediente PENDIENTE con sus datos y con intentos disponibles.
+pub async fn exigir_enviable(pool: &PgPool, cliente_id: Uuid) -> AppResult<()> {
+    let mut tx = db::begin_lectura(pool, Rol::Kyc).await?;
+    exigir_persona_fisica(&mut tx, cliente_id).await?;
+    let e = cargar(&mut tx, cliente_id).await?;
+    let max_intentos: i16 = sqlx::query_scalar("SELECT max_intentos FROM kyc.parametros WHERE id").fetch_one(&mut *tx).await?;
+    tx.commit().await?;
+    if e.estado_kyc != EstadoKyc::Pendiente {
+        return Err(no_editable(e.estado_kyc));
+    }
+    if e.intentos >= max_intentos {
+        return Err(AppError::negocio(
+            "KYC_SIN_INTENTOS",
+            "agotaste tus intentos de verificación; cumplimiento revisará tu expediente",
+        ));
+    }
+    if e.curp.is_none() || e.rfc.is_none() || e.nombres.is_none() || e.domicilio.get("codigo_postal").is_none() {
+        return Err(AppError::negocio("KYC_DATOS_INCOMPLETOS", "primero captura tus datos personales y tu domicilio"));
+    }
+    Ok(())
+}
+
+/// Un envío chocó con una identidad registrada en otra cuenta (ver 0007).
+pub async fn registrar_conflicto(pool: &PgPool, cliente_id: Uuid) -> AppResult<()> {
+    let mut tx = db::begin(pool, Rol::Kyc).await?;
+    sqlx::query("SELECT kyc.registrar_conflicto_identidad($1)").bind(cliente_id).execute(&mut *tx).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
 /// Envío a revisión: devuelve el expediente EN_REVISION, con su
 /// `verificacion_en_curso` generada por la base de datos.
 pub async fn enviar(
@@ -513,12 +566,7 @@ pub async fn enviar(
     origen: &OrigenEnvio,
     hoy: NaiveDate,
 ) -> AppResult<Expediente> {
-    if !s.consentimiento_biometrico {
-        return Err(AppError::negocio(
-            "KYC_SIN_CONSENTIMIENTO",
-            "para verificar tu identidad necesitamos tu consentimiento expreso para tratar tus datos biométricos",
-        ));
-    }
+    exigir_consentimiento(s)?;
     let clave_elector = s.ine.clave_elector.trim().to_uppercase();
     let cic = s.ine.cic.trim().to_owned();
     let identificador = s.ine.identificador_ciudadano.as_deref().map(str::trim).filter(|v| !v.is_empty());
@@ -528,6 +576,14 @@ pub async fn enviar(
     if actual.estado_kyc != EstadoKyc::Pendiente {
         return Err(no_editable(actual.estado_kyc));
     }
+    // Bloquea el expediente: la credencial se valida contra la CURP que se
+    // envía, no contra una que /kyc/perfil cambie en paralelo.
+    let actual: Expediente =
+        sqlx::query_as(&format!("SELECT {COLUMNAS} FROM kyc.kyc_perfiles WHERE cliente_id = $1 FOR UPDATE"))
+            .bind(cliente_id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or_else(|| no_editable(EstadoKyc::EnRevision))?;
     let curp = actual
         .curp
         .as_deref()

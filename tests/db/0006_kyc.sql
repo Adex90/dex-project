@@ -89,6 +89,8 @@ VALUES ('0f000000-0000-0000-0000-0000000000f0', 'FISICA', 'Operador', 'Cumplimie
 INSERT INTO kyc.credenciales (cliente_id, password_hash, rol) VALUES ('0f000000-0000-0000-0000-0000000000f0', 'x', 'OPERADOR');
 INSERT INTO ifpe.reserva_custodia (id, institucion, tipo, numero_cuenta) VALUES
   ('e0000000-0000-0000-0000-00000000000e', 'Banco de México', 'BANXICO', 'SC-RES-001');
+-- Esta suite usa el proveedor 'simulado' (0007 solo lo admite en demostración).
+UPDATE kyc.parametros SET permite_proveedor_simulado = true;
 
 -- Alta de un cliente como lo hace el backend (sc_kyc).
 SELECT pg_temp.debe_pasar('Alta: sc_kyc registra un cliente', ARRAY[

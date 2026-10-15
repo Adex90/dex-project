@@ -4,7 +4,8 @@ import { useEffect, useState } from "react";
 import { LogOut, RefreshCw } from "lucide-react";
 
 import { Brand } from "@/components/brand";
-import { Badge, Button } from "@/components/ui/primitives";
+import { KycHeaderBadge } from "@/components/dashboard/kyc-status";
+import { Button } from "@/components/ui/primitives";
 import type { Cliente } from "@/lib/api/types";
 
 function useSecondsSince(timestamp: number | null): number | null {
@@ -55,7 +56,7 @@ export function DashboardHeader({
               <p className="text-[11px] leading-tight text-muted">{client?.email}</p>
             </div>
           ) : null}
-          {client && client.estatus_kyc !== "VERIFICADO" ? <Badge tone="warning">KYC {client.estatus_kyc}</Badge> : null}
+          {client ? <KycHeaderBadge status={client.estatus_kyc} /> : null}
           <Button variant="secondary" size="sm" onClick={onLogout}>
             <LogOut className="size-3.5" aria-hidden />
             <span className="hidden sm:inline">Sign out</span>

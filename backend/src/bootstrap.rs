@@ -45,6 +45,11 @@ pub async fn asegurar_infraestructura(pool: &PgPool, cfg: &Config) -> AppResult<
     .bind(&cfg.caja_cuenta)
     .execute(pool)
     .await?;
+    // El proveedor simulado solo se admite en demostración (0007).
+    sqlx::query("UPDATE kyc.parametros SET permite_proveedor_simulado = $1 WHERE id")
+        .bind(cfg.modo_demo)
+        .execute(pool)
+        .await?;
     // Umbrales del KYC biométrico: viven en la base de datos (la que los hace
     // cumplir); las variables de entorno solo los fijan al arrancar.
     let k = &cfg.kyc;

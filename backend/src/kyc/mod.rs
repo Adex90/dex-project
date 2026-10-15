@@ -259,6 +259,12 @@ pub struct EnvioVerificacion {
 
 /// Pasos 2 y 3 del onboarding: envía INE y selfie al proveedor y procesa su
 /// resultado firmado por el mismo camino que el webhook.
+///
+/// Lo barato va primero (proveedor disponible, consentimiento, estado e
+/// intentos del expediente) para no decodificar 12 MB de imágenes en balde.
+/// Si el proveedor falla, o la petición se interrumpe antes de registrar su
+/// resultado, el intento se devuelve: un cliente no pierde intentos por
+/// fallas que no son suyas.
 pub async fn verificar_identidad(
     pool: &PgPool,
     cfg: &ConfigKyc,
@@ -267,24 +273,92 @@ pub async fn verificar_identidad(
     s: &SolicitudVerificacion,
     origen: &OrigenEnvio,
 ) -> AppResult<EnvioVerificacion> {
+    if !proveedor.disponible() {
+        return Err(AppError::peticion(
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "KYC_PROVEEDOR_NO_DISPONIBLE",
+            "la verificación biométrica no está disponible por ahora; tu expediente no cambió",
+        ));
+    }
+    expediente::exigir_consentimiento(s)?;
+    expediente::exigir_enviable(pool, cliente_id).await?;
     let imagenes = expediente::decodificar_imagenes(s)?;
-    let enviado = expediente::enviar(pool, cliente_id, s, &imagenes, origen, spei::hoy_cdmx()).await?;
+    let enviado = match expediente::enviar(pool, cliente_id, s, &imagenes, origen, spei::hoy_cdmx()).await {
+        // La identidad ya está en otra cuenta: el envío se revirtió, pero el
+        // choque cuenta (averiguar si una CURP es cliente no es gratis).
+        Err(e) if e.codigo() == "IDENTIDAD_EN_USO" => {
+            expediente::registrar_conflicto(pool, cliente_id).await?;
+            return Err(e);
+        }
+        r => r?,
+    };
     let verificacion_id = enviado
         .verificacion_en_curso
         .ok_or_else(|| AppError::Interno(anyhow::anyhow!("envío sin id de verificación")))?;
+    let mut en_vuelo = EnvioEnVuelo { pool: pool.clone(), cliente_id, verificacion_id, activo: true };
     let solicitud = SolicitudProveedor { verificacion_id, cliente_id, identidad: IdentidadPropia::de(&enviado)?, imagenes };
     let pendiente = EnvioVerificacion { verificacion_id, estado_kyc: enviado.estado_kyc, intentos: enviado.intentos, resultado: None };
+    let falla = |motivo: String| async move {
+        let devuelto = verificacion::reembolsar_intento(pool, cliente_id, verificacion_id, &motivo).await?;
+        Err::<EnvioVerificacion, AppError>(AppError::peticion(
+            axum::http::StatusCode::BAD_GATEWAY,
+            "KYC_PROVEEDOR_ERROR",
+            if devuelto {
+                "el proveedor biométrico no pudo evaluar tu envío; intenta de nuevo (este intento no se contó)"
+            } else {
+                "el proveedor biométrico no pudo evaluar tu envío"
+            },
+        ))
+    };
     match proveedor.verificar(&solicitud).await {
-        Ok(Entrega::Inmediata { cuerpo, firma }) => {
-            let r = verificacion::procesar(pool, cfg, Some(&firma), &cuerpo).await?;
-            Ok(EnvioVerificacion { estado_kyc: r.estado_kyc, intentos: r.intentos, resultado: Some(r), ..pendiente })
-        }
-        Ok(Entrega::Pendiente) => Ok(pendiente),
-        // El expediente queda EN_REVISION: el resultado puede llegar después
-        // por el webhook, o un operador lo reabre.
-        Err(e) => {
-            tracing::warn!(cliente = %cliente_id, error = %e, proveedor = proveedor.nombre(), "proveedor biométrico no disponible");
+        Ok(Entrega::Inmediata { cuerpo, firma }) => match verificacion::procesar(pool, cfg, Some(&firma), &cuerpo).await {
+            Ok(r) => {
+                en_vuelo.activo = false;
+                Ok(EnvioVerificacion { estado_kyc: r.estado_kyc, intentos: r.intentos, resultado: Some(r), ..pendiente })
+            }
+            Err(e) => {
+                en_vuelo.activo = false;
+                tracing::error!(cliente = %cliente_id, error = %e, "no se pudo procesar el resultado del proveedor");
+                falla(format!("resultado no procesable: {}", e.codigo())).await
+            }
+        },
+        // El resultado llegará por el webhook.
+        Ok(Entrega::Pendiente) => {
+            en_vuelo.activo = false;
             Ok(pendiente)
+        }
+        Err(e) => {
+            en_vuelo.activo = false;
+            tracing::warn!(cliente = %cliente_id, error = %e, proveedor = proveedor.nombre(), "proveedor biométrico no disponible");
+            falla(e.to_string()).await
+        }
+    }
+}
+
+/// Envío entregado al proveedor cuyo resultado aún no se registra. Si la
+/// petición se abandona (tiempo máximo, cliente desconectado), devuelve el
+/// intento en segundo plano; la base de datos no lo devuelve si el resultado
+/// ya quedó registrado.
+struct EnvioEnVuelo {
+    pool: PgPool,
+    cliente_id: uuid::Uuid,
+    verificacion_id: uuid::Uuid,
+    activo: bool,
+}
+
+impl Drop for EnvioEnVuelo {
+    fn drop(&mut self) {
+        if !self.activo {
+            return;
+        }
+        let (pool, cliente, verificacion) = (self.pool.clone(), self.cliente_id, self.verificacion_id);
+        if let Ok(rt) = tokio::runtime::Handle::try_current() {
+            rt.spawn(async move {
+                let motivo = "la solicitud se interrumpió antes de registrar el resultado";
+                if let Err(e) = verificacion::reembolsar_intento(&pool, cliente, verificacion, motivo).await {
+                    tracing::error!(%cliente, error = %e, "no se pudo devolver el intento de un envío interrumpido");
+                }
+            });
         }
     }
 }

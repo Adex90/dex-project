@@ -236,7 +236,7 @@ fn sin_particulas(s: &str) -> Vec<String> {
     }
 }
 
-fn apellido_util(s: &str) -> Option<String> {
+pub(crate) fn apellido_util(s: &str) -> Option<String> {
     sin_particulas(s).into_iter().next()
 }
 

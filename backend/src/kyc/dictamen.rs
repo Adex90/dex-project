@@ -28,6 +28,11 @@ pub struct DictamenKyc {
     /// Obligatorio para rechazar.
     #[serde(default)]
     pub motivo: Option<String>,
+    /// Envío que el operador revisó (`verificacion_en_curso` de la cola).
+    /// Obligatorio para verificar: si el cliente reenvió mientras tanto, el
+    /// dictamen no se aplica a un envío que nadie revisó.
+    #[serde(default)]
+    pub verificacion_id: Option<Uuid>,
     #[serde(default)]
     pub nivel_riesgo_pld: Option<NivelRiesgo>,
     #[serde(default)]
@@ -48,6 +53,9 @@ pub async fn dictaminar(pool: &PgPool, operador_id: Uuid, cliente_id: Uuid, d: &
     if d.estatus_kyc == Some(EstadoKyc::Rechazado) && motivo.is_none() {
         return Err(AppError::validacion("para rechazar un expediente indica el motivo"));
     }
+    if d.estatus_kyc == Some(EstadoKyc::Verificado) && d.verificacion_id.is_none() {
+        return Err(AppError::validacion("para verificar indica verificacion_id (el envío que revisaste)"));
+    }
     if operador_id == cliente_id {
         return Err(AppError::negocio("KYC_AUTODICTAMEN", "un operador no dictamina su propio expediente"));
     }
@@ -61,16 +69,28 @@ pub async fn dictaminar(pool: &PgPool, operador_id: Uuid, cliente_id: Uuid, d: &
         let n = sqlx::query(
             "UPDATE kyc.kyc_perfiles SET estado_kyc = $2::kyc.estado_kyc, \
                     motivo_rechazo = CASE WHEN $2 = 'RECHAZADO' THEN $3 ELSE motivo_rechazo END \
-             WHERE cliente_id = $1",
+             WHERE cliente_id = $1 AND ($4::uuid IS NULL OR verificacion_en_curso = $4)",
         )
         .bind(cliente_id)
         .bind(estado.como_texto())
         .bind(motivo)
+        .bind(d.verificacion_id)
         .execute(&mut *tx)
         .await?
         .rows_affected();
         if n == 0 {
-            return Err(AppError::no_encontrado("cliente no encontrado"));
+            let existe: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM kyc.kyc_perfiles WHERE cliente_id = $1)")
+                .bind(cliente_id)
+                .fetch_one(&mut *tx)
+                .await?;
+            return Err(if existe {
+                AppError::conflicto(
+                    "KYC_DICTAMEN_DESACTUALIZADO",
+                    "el expediente tiene un envío distinto del que revisaste; vuelve a cargar la cola",
+                )
+            } else {
+                AppError::no_encontrado("cliente no encontrado")
+            });
         }
     }
     if d.nivel_riesgo_pld.is_some() || d.nivel_cuenta.is_some() {

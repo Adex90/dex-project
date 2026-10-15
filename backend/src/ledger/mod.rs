@@ -338,19 +338,17 @@ async fn transferir_tx(
     }
     let perfil = pld::cargar_perfil(&mut tx, origen.cliente_id).await?;
     perfil.exigir_operable()?;
+    // Una transferencia es un depósito para el beneficiario: exige su KYC
+    // verificado (la política RLS de ifpe.transacciones lo repite) y que no
+    // esté en la Lista de Personas Bloqueadas. Una sola respuesta para ambos
+    // casos: el ordenante no tiene por qué conocer el estado KYC ni la
+    // situación PLD de otro cliente (secreto bancario).
     let perfil_destino = pld::cargar_perfil(&mut tx, destino.cliente_id).await?;
-    if perfil_destino.en_lista_bloqueadas {
+    if perfil_destino.en_lista_bloqueadas || perfil_destino.estatus_kyc != EstatusKyc::Verificado {
+        tracing::info!(destino = %destino.id, "transferencia a una cuenta que no puede recibir");
         return Err(AppError::negocio(
-            "DESTINO_EN_LISTA_BLOQUEADAS",
-            "el beneficiario está en la Lista de Personas Bloqueadas",
-        ));
-    }
-    // Una transferencia es un depósito para el beneficiario: también exige su
-    // KYC verificado (la política RLS de ifpe.transacciones lo repite).
-    if perfil_destino.estatus_kyc != EstatusKyc::Verificado {
-        return Err(AppError::negocio(
-            "DESTINO_KYC_NO_VERIFICADO",
-            "el beneficiario aún no tiene su identidad verificada; no puede recibir transferencias",
+            "DESTINO_NO_ACREDITABLE",
+            "la cuenta destino no puede recibir esta transferencia",
         ));
     }
     exigir_debitable(&origen)?;

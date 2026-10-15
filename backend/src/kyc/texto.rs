@@ -1,11 +1,14 @@
 //! Normalización de nombres para cotejar identidades (CURP, RFC, INE, MRZ).
 
+use unicode_normalization::UnicodeNormalization;
+
 /// Mayúsculas, sin acentos ni diéresis, con cualquier signo (guion, punto,
 /// apóstrofo, diagonal) convertido en espacio y los espacios colapsados. La
-/// Ñ se conserva: cada regla decide qué hacer con ella.
+/// Ñ se conserva: cada regla decide qué hacer con ella. Primero compone el
+/// texto (NFC): una "é" escrita como "e" + acento combinado es la misma letra.
 pub fn normalizar(s: &str) -> String {
     let mapeado: String = s
-        .chars()
+        .nfc()
         .flat_map(char::to_uppercase)
         .map(|c| match c {
             'Á' | 'À' | 'Â' | 'Ä' | 'Ã' => 'A',
@@ -24,6 +27,14 @@ pub fn normalizar(s: &str) -> String {
 /// Palabras normalizadas.
 pub fn palabras(s: &str) -> Vec<String> {
     normalizar(s).split(' ').filter(|p| !p.is_empty()).map(str::to_owned).collect()
+}
+
+/// Nombre en el alfabeto de la zona de lectura mecánica (ICAO 9303 parte 3):
+/// sin acentos, Ñ como N, apóstrofos omitidos (O'FARRILL -> OFARRILL) y
+/// espacios o guiones como `<`.
+pub fn transliterar_mrz(s: &str) -> String {
+    let sin_apostrofos: String = s.nfc().filter(|c| !matches!(c, '\'' | '\u{2019}' | '`' | '\u{00B4}')).collect();
+    normalizar(&sin_apostrofos).replace('Ñ', "N").replace(' ', "<")
 }
 
 /// Igualdad de nombres tal como los escribe cada fuente. `estricta = false`
@@ -64,6 +75,9 @@ mod pruebas {
         assert_eq!(palabras("Ma. Guadalupe"), vec!["MA", "GUADALUPE"]);
         assert!(mismo_nombre("Peña", "PENA", false));
         assert!(!mismo_nombre("Peña", "PENA", true));
+        // Acentos descompuestos (NFD): la misma letra, no dos palabras.
+        assert_eq!(normalizar("Mun\u{0303}oz Pe\u{0301}rez"), "MUÑOZ PEREZ");
+        assert_eq!(transliterar_mrz("O'Farrill-Peña"), "OFARRILL<PENA");
     }
 
     #[test]

@@ -1,12 +1,12 @@
 "use client";
 
-import { Suspense, useEffect, useState, type FormEvent } from "react";
+import { Suspense, useState, type FormEvent } from "react";
 import Link from "next/link";
 import { useRouter, useSearchParams } from "next/navigation";
 import { LogIn } from "lucide-react";
 
 import { Alert, Button, Field, Input } from "@/components/ui/primitives";
-import { useSession } from "@/hooks/use-session";
+import { resolveClientHome, useClientHomeRedirect } from "@/hooks/use-client-home";
 import { describeError } from "@/lib/api/client";
 import { useAuthStore } from "@/store/auth";
 
@@ -14,31 +14,33 @@ function LoginForm() {
   const router = useRouter();
   const params = useSearchParams();
   const login = useAuthStore((s) => s.login);
-  const { valid, role } = useSession();
+  // Already signed in: verified clients go to the dashboard, the rest to onboarding.
+  const { claim, release } = useClientHomeRedirect();
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
 
-  useEffect(() => {
-    if (valid && role === "CLIENTE") router.replace("/dashboard");
-  }, [valid, role, router]);
-
   const onSubmit = async (event: FormEvent) => {
     event.preventDefault();
     setError(null);
     setSubmitting(true);
+    claim();
     try {
       const session = await login(email, password);
       if (session.rol !== "CLIENTE") {
         setError("This app is for account holders. Operators and auditors use the operations console.");
         useAuthStore.getState().logout();
+        release();
+        setSubmitting(false);
         return;
       }
-      router.replace("/dashboard");
+      // Money movements stay locked until the identity is VERIFICADO: anyone
+      // else continues (or checks) their verification first.
+      router.replace(await resolveClientHome(session.token));
     } catch (e) {
+      release();
       setError(describeError(e));
-    } finally {
       setSubmitting(false);
     }
   };

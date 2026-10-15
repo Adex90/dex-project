@@ -3,9 +3,10 @@
 import { useState, type FormEvent } from "react";
 import { Landmark, Plus, ShieldAlert, ShieldCheck, X } from "lucide-react";
 
+import { KycLockNote, MovementErrorAlert, kycBlockCode } from "@/components/dashboard/kyc-status";
 import { HashText, Money } from "@/components/ui/data";
 import { Alert, Badge, Button, Card, CardHeader, Input, Skeleton, Stat } from "@/components/ui/primitives";
-import { ApiError, describeError } from "@/lib/api/client";
+import { ApiError } from "@/lib/api/client";
 import { api, newIdempotencyKey } from "@/lib/api/endpoints";
 import type { CuentaIfpe, EstadoReservaVista } from "@/lib/api/types";
 import { addUnits, formatMoney, isZero, parseAmountInput } from "@/lib/decimal";
@@ -19,11 +20,14 @@ export function VaultCard({
   account,
   reserve,
   token,
+  kycLocked = false,
   onChanged,
 }: {
   account: CuentaIfpe | null;
   reserve: EstadoReservaVista | null;
   token: string;
+  /** Identity not verified yet: deposits are refused by the bank (and its database). */
+  kycLocked?: boolean;
   onChanged: () => Promise<void>;
 }) {
   const backed = reserve?.reserva_100 ?? false;
@@ -38,7 +42,9 @@ export function VaultCard({
           reserve ? (
             backed ? (
               <Badge tone="verified" icon={<ShieldCheck className="size-3" aria-hidden />}>
-                100% Fully Backed in Custody
+                {/* Short label on phones: the full one does not fit next to the title. */}
+                <span className="sm:hidden">100% backed</span>
+                <span className="hidden sm:inline">100% Fully Backed in Custody</span>
               </Badge>
             ) : (
               <Badge tone="danger" icon={<ShieldAlert className="size-3" aria-hidden />}>
@@ -62,8 +68,13 @@ export function VaultCard({
                 </p>
               ) : null}
             </div>
-            <dl className="grid grid-cols-2 gap-4 rounded-lg bg-surface-2 p-3">
-              <Stat label="Your CLABE" value={<span className="font-mono text-[13px]">{formatClabe(account.clabe)}</span>} />
+            {/* One column on phones: the CLABE must be readable in full, never ellipsized. */}
+            <dl className="grid grid-cols-1 gap-4 rounded-lg bg-surface-2 p-3 sm:grid-cols-2">
+              <Stat
+                label="Your CLABE"
+                value={<span className="font-mono text-[13px]">{formatClabe(account.clabe)}</span>}
+                hint={kycLocked ? "SPEI transfers are returned to the sender until you are verified" : undefined}
+              />
               <Stat
                 label="Held for you"
                 value={<Money value={addUnits(account.saldo_disponible, account.saldo_bloqueado)} />}
@@ -75,7 +86,7 @@ export function VaultCard({
                 Outgoing movements are disabled.
               </Alert>
             ) : null}
-            <DemoDeposit token={token} onDone={onChanged} />
+            {kycLocked ? <LockedDeposit /> : <DemoDeposit token={token} onDone={onChanged} />}
           </>
         ) : (
           <div className="space-y-3">
@@ -105,19 +116,42 @@ export function VaultCard({
   );
 }
 
+/**
+ * The deposit control while the identity is not verified: visibly disabled
+ * but still focusable (aria-disabled), so the reason can be read.
+ */
+function LockedDeposit() {
+  return (
+    <div className="space-y-1.5">
+      <Button
+        type="button"
+        variant="secondary"
+        size="sm"
+        className="cursor-not-allowed opacity-50 hover:bg-surface"
+        aria-disabled="true"
+        aria-describedby="deposit-locked-note"
+        data-testid="deposit-locked"
+      >
+        <Plus className="size-3.5" aria-hidden /> Add funds (demo SPEI)
+      </Button>
+      <KycLockNote id="deposit-locked-note">Deposits unlock once your identity is verified.</KycLockNote>
+    </div>
+  );
+}
+
 /** Simulated SPEI deposit. Only works when the backend runs with MODO_DEMO=true. */
 function DemoDeposit({ token, onDone }: { token: string; onDone: () => Promise<void> }) {
   const [open, setOpen] = useState(false);
   const [amount, setAmount] = useState("");
   const [key, setKey] = useState(newIdempotencyKey);
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<Error | null>(null);
   const [busy, setBusy] = useState(false);
 
   const submit = async (event: FormEvent) => {
     event.preventDefault();
     const parsed = parseAmountInput(amount);
     if (!parsed.ok) {
-      setError(parsed.error);
+      setError(new Error(parsed.error));
       return;
     }
     setBusy(true);
@@ -131,9 +165,15 @@ function DemoDeposit({ token, onDone }: { token: string; onDone: () => Promise<v
     } catch (e) {
       setError(
         e instanceof ApiError && e.status === 404
-          ? "Simulated deposits are disabled on this server (MODO_DEMO=false). Fund your account by SPEI to your CLABE."
-          : describeError(e),
+          ? new Error(
+              "Simulated deposits are disabled on this server (MODO_DEMO=false). Fund your account by SPEI to your CLABE.",
+            )
+          : e instanceof Error
+            ? e
+            : new Error(String(e)),
       );
+      // The status changed behind our back (e.g. verification revoked): refresh it so the KYC banner shows.
+      if (kycBlockCode(e)) void onDone();
     } finally {
       setBusy(false);
     }
@@ -177,7 +217,7 @@ function DemoDeposit({ token, onDone }: { token: string; onDone: () => Promise<v
         </Button>
       </div>
       <p className="text-[11px] text-muted">The cash in custody rises by the same amount, in the same transaction.</p>
-      {error ? <Alert tone="error">{error}</Alert> : null}
+      {error ? <MovementErrorAlert error={error} /> : null}
     </form>
   );
 }
