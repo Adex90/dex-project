@@ -805,6 +805,26 @@ pub async fn retener(pool: &PgPool, tipo: &str, abono: &Abono, cuerpo: &[u8], er
     Ok(())
 }
 
+/// Notificación retenida sin resolver (`ifpe.v_spei_en_revision`).
+#[derive(Debug, Clone, Serialize, FromRow)]
+pub struct Retenida {
+    pub id: Uuid,
+    pub tipo: String,
+    pub identidad: String,
+    pub error: String,
+    pub recibido_en: DateTime<Utc>,
+}
+
+/// Cola de revisión del operador (más antiguas primero).
+pub async fn en_revision(pool: &PgPool) -> AppResult<Vec<Retenida>> {
+    let mut tx = db::begin_lectura(pool, Rol::Spei).await?;
+    let filas = sqlx::query_as("SELECT * FROM ifpe.v_spei_en_revision ORDER BY recibido_en LIMIT 500")
+        .fetch_all(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(filas)
+}
+
 // -----------------------------------------------------------------------------
 // Corrección de un abono erróneo
 // -----------------------------------------------------------------------------
@@ -1089,6 +1109,7 @@ pub async fn anular(pool: &PgPool, s: &SolicitudAnulacion) -> AppResult<Resultad
     })
     .await
 }
+
 /// SPEI recibidos de un cliente (más recientes primero).
 pub async fn de_cliente(pool: &PgPool, cliente_id: Uuid, limite: i64) -> AppResult<Vec<SpeiInbound>> {
     let mut tx = db::begin_lectura(pool, Rol::Ifpe).await?;

@@ -8,6 +8,7 @@
 //! | GET  | `/spei/transferencias` | cliente: sus órdenes |
 //! | GET  | `/spei/recibidos` | cliente: sus SPEI recibidos |
 //! | GET  | `/spei/conciliacion` | operador / auditor |
+//! | GET  | `/spei/en-revision` | operador / auditor: notificaciones retenidas sin resolver |
 
 use axum::{
     extract::State,
@@ -26,7 +27,7 @@ use crate::{
     routes::extraccion::{Cuerpo, Json, Query},
     spei::{
         firma,
-        inbound::{self, Origen, ResultadoAbono, SiNoAcreditable, SpeiInbound},
+        inbound::{self, Origen, ResultadoAbono, Retenida, SiNoAcreditable, SpeiInbound},
         outbound::{self, Conciliacion, Evento, ResultadoOrden, SolicitudSpei, SpeiOutbound},
         CausaDevolucion,
     },
@@ -41,6 +42,7 @@ pub fn rutas() -> Router<AppState> {
         .route("/spei/transferencias", get(transferencias))
         .route("/spei/recibidos", get(recibidos))
         .route("/spei/conciliacion", get(conciliacion))
+        .route("/spei/en-revision", get(en_revision))
 }
 
 /// Autentica la notificación del proveedor antes de leerla.
@@ -261,4 +263,12 @@ async fn recibidos(
 async fn conciliacion(State(e): State<AppState>, u: Usuario) -> AppResult<Json<Vec<Conciliacion>>> {
     u.exigir_operador_o_auditor()?;
     Ok(Json(outbound::conciliacion(&e.pool).await?))
+}
+
+/// Cola de revisión: notificaciones autenticadas que se confirmaron al
+/// proveedor y se retuvieron sin abonar (posible duplicado, identidad
+/// reutilizada) y que aún no resuelve una captura del operador.
+async fn en_revision(State(e): State<AppState>, u: Usuario) -> AppResult<Json<Vec<Retenida>>> {
+    u.exigir_operador_o_auditor()?;
+    Ok(Json(inbound::en_revision(&e.pool).await?))
 }
