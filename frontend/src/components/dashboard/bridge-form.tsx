@@ -1,11 +1,11 @@
 "use client";
 
 import { useMemo, useState, type FormEvent } from "react";
-import { ArrowRight, ArrowRightLeft, CheckCircle2, Info } from "lucide-react";
+import { ArrowRight, ArrowRightLeft, CheckCircle2, Info, Lock } from "lucide-react";
 
+import { KycLockNote, MovementErrorAlert, kycBlockCode } from "@/components/dashboard/kyc-status";
 import { HashText, Money, formatDate } from "@/components/ui/data";
-import { Alert, Button, Card, CardHeader, Field, Input, Skeleton, cx } from "@/components/ui/primitives";
-import { describeError } from "@/lib/api/client";
+import { Button, Card, CardHeader, Field, Input, Skeleton, cx } from "@/components/ui/primitives";
 import { api, newIdempotencyKey } from "@/lib/api/endpoints";
 import type { PlazoTasa, ResultadoMutuo } from "@/lib/api/types";
 import { addDays, todayUtc, trimDecimal } from "@/lib/dates";
@@ -22,12 +22,16 @@ export function BridgeForm({
   rates,
   token,
   disabled,
+  kycLocked = false,
   onInvested,
 }: {
   available: string | null;
   rates: PlazoTasa[];
   token: string;
+  /** Not ready to submit (e.g. the account summary is still loading). */
   disabled?: boolean;
+  /** Identity not verified yet: investments are refused by the bank (and its database). */
+  kycLocked?: boolean;
   onInvested: () => Promise<void>;
 }) {
   const [amount, setAmount] = useState("");
@@ -35,7 +39,7 @@ export function BridgeForm({
   const [acknowledged, setAcknowledged] = useState(false);
   const [key, setKey] = useState(newIdempotencyKey);
   const [submitting, setSubmitting] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<unknown>(null);
   const [receipt, setReceipt] = useState<ResultadoMutuo | null>(null);
 
   const selected = rates.find((r) => r.plazo_dias === term) ?? null;
@@ -53,7 +57,7 @@ export function BridgeForm({
     };
   }, [parsed, selected]);
 
-  const canSubmit = Boolean(parsed?.ok && !exceeds && selected && acknowledged && !disabled);
+  const canSubmit = Boolean(parsed?.ok && !exceeds && selected && acknowledged && !disabled && !kycLocked);
 
   const changeAmount = (value: string) => {
     setAmount(value);
@@ -85,7 +89,9 @@ export function BridgeForm({
       await onInvested();
     } catch (e) {
       // Keep the same key: retrying the same request is safe and idempotent.
-      setError(describeError(e));
+      setError(e);
+      // The status changed behind our back (e.g. verification revoked): refresh it so the KYC banner shows.
+      if (kycBlockCode(e)) void onInvested();
     } finally {
       setSubmitting(false);
     }
@@ -102,124 +108,145 @@ export function BridgeForm({
         {receipt ? (
           <Receipt receipt={receipt} onDone={() => setReceipt(null)} />
         ) : (
-          <form onSubmit={submit} className="space-y-5" noValidate>
-            <Field
-              label="Amount to move from your vault"
-              htmlFor="bridge-amount"
-              error={amountError}
-              hint={
-                available !== null ? (
-                  <>
-                    Available: <Money value={available} />
-                  </>
-                ) : undefined
-              }
-            >
-              <div className="flex gap-2">
-                <div className="relative flex-1">
-                  <span className="pointer-events-none absolute top-1/2 left-3 -translate-y-1/2 text-sm text-muted">$</span>
-                  <Input
-                    id="bridge-amount"
-                    inputMode="decimal"
-                    autoComplete="off"
-                    placeholder="0.00"
-                    className="pl-6 tabular-nums"
-                    value={amount}
-                    invalid={Boolean(amountError)}
-                    aria-describedby={amountError ? "bridge-amount-error" : undefined}
-                    onChange={(e) => changeAmount(e.target.value)}
-                  />
-                </div>
-                <Button
-                  type="button"
-                  variant="secondary"
-                  onClick={() => available && changeAmount(trimDecimal(available))}
-                  disabled={!available || compareAmounts(available, "0") <= 0}
-                >
-                  Max
-                </Button>
+          <form
+            onSubmit={submit}
+            className="space-y-5"
+            noValidate
+            aria-describedby={kycLocked ? "bridge-locked-note" : undefined}
+          >
+            {kycLocked ? (
+              <div className="rounded-lg border border-dashed border-border-strong bg-surface-2 px-3 py-2.5">
+                <KycLockNote id="bridge-locked-note">
+                  Fixed-term investments unlock once your identity is verified.
+                </KycLockNote>
               </div>
-            </Field>
-
-            <fieldset className="space-y-2">
-              <legend className="text-xs font-medium text-ink-2">Term</legend>
-              {rates.length === 0 ? (
-                <Skeleton className="h-16 w-full" />
-              ) : (
-                <div className="grid grid-cols-3 gap-2 sm:grid-cols-5">
-                  {rates.map((r) => (
-                    <label
-                      key={r.plazo_dias}
-                      className={cx(
-                        "cursor-pointer rounded-lg border px-2 py-2.5 text-center transition",
-                        "focus-within:ring-2 focus-within:ring-accent",
-                        term === r.plazo_dias
-                          ? "border-accent bg-accent-soft"
-                          : "border-border-strong hover:border-accent/60",
-                      )}
-                    >
-                      <input
-                        type="radio"
-                        name="term"
-                        value={r.plazo_dias}
-                        checked={term === r.plazo_dias}
-                        onChange={() => changeTerm(r.plazo_dias)}
-                        className="sr-only"
-                      />
-                      <span className="block text-sm font-semibold">{r.plazo_dias}d</span>
-                      <span className="block text-[11px] text-muted">{formatRate(r.tasa_anual)} APR</span>
-                    </label>
-                  ))}
+            ) : null}
+            {/* A disabled fieldset disables every control inside it (amount, Max, terms, acknowledgement). */}
+            <fieldset disabled={kycLocked} className="min-w-0 space-y-5 disabled:opacity-60">
+              <Field
+                label="Amount to move from your vault"
+                htmlFor="bridge-amount"
+                error={amountError}
+                hint={
+                  available !== null ? (
+                    <>
+                      Available: <Money value={available} />
+                    </>
+                  ) : undefined
+                }
+              >
+                <div className="flex gap-2">
+                  <div className="relative flex-1">
+                    <span className="pointer-events-none absolute top-1/2 left-3 -translate-y-1/2 text-sm text-muted">$</span>
+                    <Input
+                      id="bridge-amount"
+                      inputMode="decimal"
+                      autoComplete="off"
+                      placeholder="0.00"
+                      className="pl-6 tabular-nums"
+                      value={amount}
+                      invalid={Boolean(amountError)}
+                      aria-describedby={amountError ? "bridge-amount-error" : undefined}
+                      onChange={(e) => changeAmount(e.target.value)}
+                    />
+                  </div>
+                  <Button
+                    type="button"
+                    variant="secondary"
+                    onClick={() => available && changeAmount(trimDecimal(available))}
+                    disabled={!available || compareAmounts(available, "0") <= 0}
+                  >
+                    Max
+                  </Button>
                 </div>
-              )}
+              </Field>
+
+              <fieldset className="space-y-2">
+                <legend className="text-xs font-medium text-ink-2">Term</legend>
+                {rates.length === 0 ? (
+                  <Skeleton className="h-16 w-full" />
+                ) : (
+                  <div className="grid grid-cols-3 gap-2 sm:grid-cols-5">
+                    {rates.map((r) => (
+                      <label
+                        key={r.plazo_dias}
+                        className={cx(
+                          "cursor-pointer rounded-lg border px-2 py-2.5 text-center transition",
+                          "focus-within:ring-2 focus-within:ring-accent",
+                          term === r.plazo_dias
+                            ? "border-accent bg-accent-soft"
+                            : "border-border-strong hover:border-accent/60",
+                        )}
+                      >
+                        <input
+                          type="radio"
+                          name="term"
+                          value={r.plazo_dias}
+                          checked={term === r.plazo_dias}
+                          onChange={() => changeTerm(r.plazo_dias)}
+                          className="sr-only"
+                        />
+                        <span className="block text-sm font-semibold">{r.plazo_dias}d</span>
+                        <span className="block text-[11px] text-muted">{formatRate(r.tasa_anual)} APR</span>
+                      </label>
+                    ))}
+                  </div>
+                )}
+              </fieldset>
+
+              {preview ? (
+                <dl className="grid grid-cols-3 gap-3 rounded-lg bg-surface-2 p-3 text-xs animate-reveal">
+                  <div>
+                    <dt className="text-muted">Matures</dt>
+                    <dd className="mt-0.5 font-semibold">{formatDate(preview.maturity)}</dd>
+                  </div>
+                  <div>
+                    <dt className="text-muted">Interest</dt>
+                    <dd className="mt-0.5 font-semibold">
+                      <Money value={preview.interest} />
+                    </dd>
+                  </div>
+                  <div>
+                    <dt className="text-muted">You receive</dt>
+                    <dd className="mt-0.5 font-semibold">
+                      <Money value={preview.total} />
+                    </dd>
+                  </div>
+                </dl>
+              ) : null}
+
+              <div className="flex gap-2 rounded-lg border border-info/25 bg-info-soft px-3 py-2.5 text-[12px] leading-relaxed text-info">
+                <Info className="mt-0.5 size-3.5 shrink-0" aria-hidden />
+                <p>
+                  These funds leave the 100% reserve vault and become a fixed-term loan (mutuum) to the credit division.
+                  They are lent only to borrowers whose loans mature on or before your contract, and return to your vault
+                  with interest at maturity.
+                </p>
+              </div>
+
+              <label className="flex items-start gap-2 text-sm text-ink-2">
+                <input
+                  type="checkbox"
+                  checked={acknowledged}
+                  onChange={(e) => setAcknowledged(e.target.checked)}
+                  className="mt-0.5 size-4 accent-[var(--accent)]"
+                />
+                <span>I understand there is no early withdrawal before the maturity date.</span>
+              </label>
             </fieldset>
 
-            {preview ? (
-              <dl className="grid grid-cols-3 gap-3 rounded-lg bg-surface-2 p-3 text-xs animate-reveal">
-                <div>
-                  <dt className="text-muted">Matures</dt>
-                  <dd className="mt-0.5 font-semibold">{formatDate(preview.maturity)}</dd>
-                </div>
-                <div>
-                  <dt className="text-muted">Interest</dt>
-                  <dd className="mt-0.5 font-semibold">
-                    <Money value={preview.interest} />
-                  </dd>
-                </div>
-                <div>
-                  <dt className="text-muted">You receive</dt>
-                  <dd className="mt-0.5 font-semibold">
-                    <Money value={preview.total} />
-                  </dd>
-                </div>
-              </dl>
-            ) : null}
+            {error ? <MovementErrorAlert error={error} /> : null}
 
-            <div className="flex gap-2 rounded-lg border border-info/25 bg-info-soft px-3 py-2.5 text-[12px] leading-relaxed text-info">
-              <Info className="mt-0.5 size-3.5 shrink-0" aria-hidden />
-              <p>
-                These funds leave the 100% reserve vault and become a fixed-term loan (mutuum) to the credit division.
-                They are lent only to borrowers whose loans mature on or before your contract, and return to your vault
-                with interest at maturity.
-              </p>
-            </div>
-
-            <label className="flex items-start gap-2 text-sm text-ink-2">
-              <input
-                type="checkbox"
-                checked={acknowledged}
-                onChange={(e) => setAcknowledged(e.target.checked)}
-                className="mt-0.5 size-4 accent-[var(--accent)]"
-              />
-              <span>I understand there is no early withdrawal before the maturity date.</span>
-            </label>
-
-            {disabled ? (
-              <Alert tone="warning">Money movements are available once your identity (KYC) is verified.</Alert>
-            ) : null}
-            {error ? <Alert tone="error">{error}</Alert> : null}
-
-            <Button type="submit" size="lg" className="w-full" loading={submitting} disabled={!canSubmit}>
+            <Button
+              type="submit"
+              size="lg"
+              className="w-full"
+              loading={submitting}
+              disabled={!canSubmit}
+              aria-disabled={kycLocked || undefined}
+              aria-describedby={kycLocked ? "bridge-locked-note" : undefined}
+            >
+              {kycLocked ? <Lock className="size-4" aria-hidden /> : null}
               Lock funds in a mutuum contract <ArrowRight className="size-4" aria-hidden />
             </Button>
           </form>

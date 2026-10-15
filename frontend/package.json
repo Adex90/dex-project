@@ -9,7 +9,7 @@
     "start": "next start --port 3000",
     "lint": "eslint .",
     "typecheck": "tsc --noEmit",
-    "test": "node --test src/lib/*.test.ts"
+    "test": "node --test src/lib/*.test.ts src/components/onboarding/*.test.ts"
   },
   "dependencies": {
     "geist": "1.7.2",
