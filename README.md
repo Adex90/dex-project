@@ -138,12 +138,41 @@ credential photograph.
   are HMAC-signed JSON (`X-Kyc-Firma`, same scheme as SPEI) and always go
   through the same path, whether the provider answers immediately or later on
   `POST /api/v1/kyc/webhook`. Replays are idempotent, and a result for an
-  outdated submission is refused. The bundled `ProveedorSimulado` only checks
-  that the camera frames differ and returns a configurable score. A certified
-  provider (passive/active liveness, 1:1 face match, INE nominal-list and
-  RENAPO validation) plugs in behind the same trait.
+  outdated submission is refused. The score is read from the exact JSON text,
+  never through a float.
+- **Simulated provider = demo only (fails closed).** The bundled
+  `ProveedorSimulado` only checks that the camera frames differ, and its "OCR"
+  echoes the declared identity. It is installed only with `MODO_DEMO=true`.
+  Otherwise `/kyc/verificar` answers 503 `KYC_PROVEEDOR_NO_DISPONIBLE` without
+  using an attempt, and the database refuses results from `simulado` unless
+  `kyc.parametros.permite_proveedor_simulado` is set (startup sets it from
+  `MODO_DEMO`). A certified provider (passive/active liveness, 1:1 face match,
+  INE nominal-list and RENAPO validation) plugs in behind the same trait.
+- **Attempts are fair and bounded** (migration `0007`):
+  - A provider failure, or a request cut off before the result is recorded,
+    gives the attempt back.
+  - An operator who asks for a new submission always leaves at least one
+    attempt.
+  - A CURP with 3 rejected results in *other* accounts in 30 days is blocked,
+    so attackers cannot cycle accounts against one identity.
+  - Probing whether a CURP belongs to a customer (`409 IDENTIDAD_EN_USO`)
+    counts against a per-account limit.
+  - Clients never see the exact similarity score or the threshold; operators
+    do, and an operator's verdict must name the submission
+    (`verificacion_id`) they reviewed.
+  - `/kyc/verificar` runs at most 8 at a time, and cheap checks run before
+    any image is decoded.
 - **Identity squatting:** CURP, RFC and voter key are unique only among
   submitted or verified files. A value merely typed at sign-up blocks no one.
+- **No side doors** (`0007`): only the bridge role (`sc_puente`) writes
+  `TRASPASO_A_SOFOM` / `RETORNO_DE_SOFOM`. Every `RETORNO_DE_SOFOM` must be
+  the maturity of a real contract: its SOFOM `RETORNO_A_IFPE`, same amount and
+  transaction, back to the account that funded that contract. Mutuum
+  contracts belong to the owner of both their accounts, and SOFOM accounts
+  never change owner. A loan's borrower is fixed, and disbursing requires
+  their KYC to be valid. A transfer to an account that cannot receive returns
+  a generic `DESTINO_NO_ACREDITABLE`, so another customer's KYC or
+  blocked-list status is never revealed.
 
 ## Layout
 
@@ -177,6 +206,7 @@ cd backend && DATABASE_URL=postgres://synthetic:synthetic@localhost:5432/synthet
 # SQL invariants: run on an empty, freshly migrated database (everything is rolled back).
 psql "$EMPTY_DATABASE_URL" -f tests/db/0001_invariantes.sql
 psql "$EMPTY_DATABASE_URL" -f tests/db/0006_kyc.sql
+psql "$EMPTY_DATABASE_URL" -f tests/db/0007_kyc.sql
 cd frontend && npm test && npm run build
 FRONTEND_URL=http://localhost:3000 node e2e/smoke.mjs   # needs backend (MODO_DEMO=true) + next start
 ```

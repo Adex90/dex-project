@@ -17,7 +17,7 @@
 //!    misma transacción. La base de datos vuelve a exigir la evidencia.
 
 use chrono::{NaiveDate, Utc};
-use rust_decimal::{prelude::FromPrimitive, Decimal};
+use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sqlx::PgPool;
@@ -128,19 +128,30 @@ pub fn evaluar(
     match Curp::parse(&identidad.curp) {
         Err(e) => errores.push(e.to_string()),
         Ok(curp) => {
+            // Consistencia de la credencial con la CURP (fecha, sexo y entidad
+            // de nacimiento en la clave de elector, vigencia).
+            let (e, a) = ine::validar_credencial(&identidad.como_declarada().credencial, &curp, hoy);
+            errores.extend(e);
+            advertencias.extend(a);
             advertencias.extend(curp.advertencias_de_nombre(
                 &identidad.nombres,
                 &identidad.apellido_paterno,
                 identidad.apellido_materno.as_deref(),
             ));
-            let (e, a) = rfc::cotejar_con_curp(&identidad.rfc, &curp);
+            let (e, a) = rfc::cotejar_con_curp(
+                &identidad.rfc,
+                &curp,
+                &identidad.apellido_paterno,
+                identidad.apellido_materno.as_deref(),
+            );
             errores.extend(e);
             advertencias.extend(a);
         }
     }
     let score = match r.comparacion_facial.score {
-        Some(s) if s.is_finite() && (0.0..=1.0).contains(&s) => {
-            Decimal::from_f64(s).map(|d| d.round_dp_with_strategy(4, rust_decimal::RoundingStrategy::ToZero))
+        // Truncar (nunca redondear hacia arriba) a la escala de la columna.
+        Some(s) if s >= Decimal::ZERO && s <= Decimal::ONE => {
+            Some(s.round_dp_with_strategy(4, rust_decimal::RoundingStrategy::ToZero))
         }
         Some(_) => {
             errores.push("score de similitud fuera de rango".to_owned());
@@ -203,7 +214,8 @@ pub async fn procesar(
     })?;
     let crudo: serde_json::Value = serde_json::from_slice(cuerpo)
         .map_err(|e| AppError::validacion(format!("el resultado del proveedor no es JSON: {e}")))?;
-    let r: ResultadoProveedor = serde_json::from_value(crudo.clone())
+    // Del texto, no del Value: el score se lee con todos sus dígitos.
+    let r: ResultadoProveedor = serde_json::from_slice(cuerpo)
         .map_err(|e| AppError::validacion(format!("resultado del proveedor inválido: {e}")))?;
     let firma = cabecera.unwrap_or_default().chars().take(512).collect::<String>();
 
@@ -333,6 +345,32 @@ pub async fn procesar(
     })
 }
 
+/// El proveedor falló sin evaluar el envío (error, tiempo agotado o un
+/// resultado que no se pudo procesar): el expediente vuelve a PENDIENTE y la
+/// base de datos devuelve el intento, solo si ese envío no tiene resultado.
+/// Si el expediente ya cambió (otro proceso registró el resultado), no hace nada.
+pub async fn reembolsar_intento(pool: &PgPool, cliente_id: Uuid, verificacion_id: Uuid, motivo: &str) -> AppResult<bool> {
+    let mut tx = db::begin(pool, Rol::KycVerificador).await?;
+    sqlx::query("SELECT set_config('sc.reembolsar_intento', 'si', true)").execute(&mut *tx).await?;
+    let n = sqlx::query(
+        "UPDATE kyc.kyc_perfiles SET estado_kyc = 'PENDIENTE', \
+                metadata_proveedor = metadata_proveedor || jsonb_build_object('ultima_falla_proveedor', $3::text) \
+         WHERE cliente_id = $1 AND estado_kyc = 'EN_REVISION' AND verificacion_en_curso = $2 \
+           AND NOT EXISTS (SELECT 1 FROM kyc.kyc_auditoria_biometrica WHERE verificacion_id = $2)",
+    )
+    .bind(cliente_id)
+    .bind(verificacion_id)
+    .bind(motivo.chars().take(300).collect::<String>())
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+    tx.commit().await?;
+    if n > 0 {
+        tracing::warn!(cliente = %cliente_id, verificacion = %verificacion_id, %motivo, "falla del proveedor biométrico: intento devuelto");
+    }
+    Ok(n > 0)
+}
+
 #[cfg(test)]
 mod pruebas {
     use super::*;
@@ -365,7 +403,7 @@ mod pruebas {
         Evidencia { ine_frente: "a".repeat(64), ine_reverso: "b".repeat(64), selfie: vec!["c".repeat(64); 3] }
     }
 
-    fn resultado(score: Option<f64>) -> ResultadoProveedor {
+    fn resultado(score: Option<Decimal>) -> ResultadoProveedor {
         let id = identidad();
         ResultadoProveedor {
             verificacion_id: Uuid::new_v4(),
@@ -387,39 +425,68 @@ mod pruebas {
         NaiveDate::from_ymd_opt(2026, 10, 13).unwrap()
     }
 
+    fn d(s: &str) -> Decimal {
+        s.parse().unwrap()
+    }
+
     #[test]
     fn aprueba_revisa_o_rechaza_segun_el_score() {
         let id = identidad();
-        let ev = |s| evaluar(&resultado(s), &id, Some(&evidencia()), &U, hoy());
-        assert_eq!(ev(Some(0.93)).resultado, Resultado::Aprobado);
-        assert_eq!(ev(Some(0.93)).score, Some(Decimal::new(9300, 4)));
-        assert_eq!(ev(Some(0.85)).resultado, Resultado::Aprobado);
-        assert_eq!(ev(Some(0.8499)).resultado, Resultado::Revision);
-        assert_eq!(ev(Some(0.70)).resultado, Resultado::Revision);
-        assert_eq!(ev(Some(0.6999)).resultado, Resultado::Rechazado);
+        let ev = |s: Option<&str>| evaluar(&resultado(s.map(d)), &id, Some(&evidencia()), &U, hoy());
+        assert_eq!(ev(Some("0.93")).resultado, Resultado::Aprobado);
+        assert_eq!(ev(Some("0.93")).score, Some(d("0.9300")));
+        assert_eq!(ev(Some("0.85")).resultado, Resultado::Aprobado);
+        assert_eq!(ev(Some("0.8499")).resultado, Resultado::Revision);
+        // Justo debajo del umbral: se trunca, nunca se redondea hacia arriba.
+        assert_eq!(ev(Some("0.8499999999999998")).resultado, Resultado::Revision);
+        assert_eq!(ev(Some("0.70")).resultado, Resultado::Revision);
+        assert_eq!(ev(Some("0.6999")).resultado, Resultado::Rechazado);
         assert_eq!(ev(None).resultado, Resultado::Rechazado);
-        assert_eq!(ev(Some(1.5)).resultado, Resultado::Rechazado);
-        assert_eq!(ev(Some(f64::NAN)).resultado, Resultado::Rechazado);
+        assert_eq!(ev(Some("1.5")).resultado, Resultado::Rechazado);
+        assert_eq!(ev(Some("-0.1")).resultado, Resultado::Rechazado);
+    }
+
+    #[test]
+    fn el_score_se_lee_del_texto_exacto() {
+        let mut v = serde_json::to_value(resultado(Some(d("0.93")))).unwrap();
+        v["comparacion_facial"]["score"] = serde_json::json!(0.93);
+        let texto = serde_json::to_string(&v).unwrap().replace("0.93", "0.8499999999999998");
+        let r: ResultadoProveedor = serde_json::from_str(&texto).unwrap();
+        assert_eq!(r.comparacion_facial.score, Some(d("0.8499999999999998")));
+        let r: ResultadoProveedor = serde_json::from_str(&texto.replace("0.8499999999999998", "8.5e-1")).unwrap();
+        assert_eq!(r.comparacion_facial.score, Some(d("0.85")));
+        assert!(serde_json::from_str::<ResultadoProveedor>(&texto.replace("0.8499999999999998", "\"0.9\"")).is_err());
+    }
+
+    #[test]
+    fn entidad_de_la_clave_distinta_va_a_revision() {
+        let mut id = identidad();
+        // Misma fecha y sexo, entidad 14 (Jalisco) contra CURP de la CDMX.
+        id.clave_elector = ine::construir_clave_elector("Ludwig", "Von Mises", None, id.fecha_nacimiento, 14, Sexo::H, 1);
+        let mut r = resultado(Some(d("0.99")));
+        r.documento.ocr = Some(ine::ocr_de(&id.como_declarada()));
+        let e = evaluar(&r, &id, Some(&evidencia()), &U, hoy());
+        assert_eq!(e.resultado, Resultado::Revision, "{e:?}");
     }
 
     #[test]
     fn rechaza_sin_prueba_de_vida_documento_o_evidencia() {
         let id = identidad();
-        let mut r = resultado(Some(0.99));
+        let mut r = resultado(Some(d("0.99")));
         r.prueba_vida = PruebaVida { exitosa: false, motivo: Some("foto de una pantalla".into()) };
         assert_eq!(evaluar(&r, &id, Some(&evidencia()), &U, hoy()).resultado, Resultado::Rechazado);
 
-        let mut r = resultado(Some(0.99));
+        let mut r = resultado(Some(d("0.99")));
         r.documento.valido = false;
         assert_eq!(evaluar(&r, &id, Some(&evidencia()), &U, hoy()).resultado, Resultado::Rechazado);
 
-        let r = resultado(Some(0.99));
+        let r = resultado(Some(d("0.99")));
         let mut otra = evidencia();
         otra.selfie[1] = "d".repeat(64);
         assert_eq!(evaluar(&r, &id, Some(&otra), &U, hoy()).resultado, Resultado::Rechazado);
         assert_eq!(evaluar(&r, &id, None, &U, hoy()).resultado, Resultado::Rechazado);
 
-        let mut r = resultado(Some(0.99));
+        let mut r = resultado(Some(d("0.99")));
         r.documento.ocr.as_mut().unwrap().curp = "LOOA531113HTCPBN07".into();
         let e = evaluar(&r, &id, Some(&evidencia()), &U, hoy());
         assert_eq!(e.resultado, Resultado::Rechazado);
@@ -429,7 +496,7 @@ mod pruebas {
     #[test]
     fn advertencias_van_a_revision() {
         let id = identidad();
-        let mut r = resultado(Some(0.99));
+        let mut r = resultado(Some(d("0.99")));
         r.documento.ocr.as_mut().unwrap().nombres = "Luis".into();
         let e = evaluar(&r, &id, Some(&evidencia()), &U, hoy());
         assert_eq!(e.resultado, Resultado::Revision, "{e:?}");

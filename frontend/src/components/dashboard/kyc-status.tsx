@@ -42,10 +42,15 @@ export function isKycLocked(client: Pick<Cliente, "estatus_kyc"> | null | undefi
   return Boolean(client && client.estatus_kyc !== "VERIFICADO");
 }
 
-/** The API refused an operation because a party's identity is not verified. */
-export function kycBlockCode(error: unknown): "KYC_NO_VERIFICADO" | "DESTINO_KYC_NO_VERIFICADO" | null {
+/**
+ * The API refused an operation because the client's own identity is not
+ * verified. (A recipient that cannot receive comes back as the generic
+ * DESTINO_NO_ACREDITABLE: the bank does not disclose another client's KYC or
+ * compliance status.)
+ */
+export function kycBlockCode(error: unknown): "KYC_NO_VERIFICADO" | null {
   if (!(error instanceof ApiError)) return null;
-  return error.code === "KYC_NO_VERIFICADO" || error.code === "DESTINO_KYC_NO_VERIFICADO" ? error.code : null;
+  return error.code === "KYC_NO_VERIFICADO" ? error.code : null;
 }
 
 const linkClass = "font-medium underline underline-offset-2 hover:no-underline";
@@ -293,9 +298,8 @@ export function KycLockNote({ id, children }: { id: string; children: ReactNode 
 }
 
 /**
- * Error of a money movement. A KYC refusal (422 KYC_NO_VERIFICADO or
- * DESTINO_KYC_NO_VERIFICADO) is explained as such, with a way forward,
- * instead of a bare error.
+ * Error of a money movement. A KYC refusal (422 KYC_NO_VERIFICADO) is
+ * explained as such, with a way forward, instead of a bare error.
  */
 export function MovementErrorAlert({ error }: { error: unknown }) {
   const code = kycBlockCode(error);
@@ -306,13 +310,6 @@ export function MovementErrorAlert({ error }: { error: unknown }) {
         <Link href={ONBOARDING_PATH} className={linkClass}>
           Complete verification
         </Link>
-      </Alert>
-    );
-  }
-  if (code === "DESTINO_KYC_NO_VERIFICADO") {
-    return (
-      <Alert tone="warning" title="Recipient not verified">
-        {describeError(error)}
       </Alert>
     );
   }

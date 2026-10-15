@@ -74,8 +74,11 @@ pub fn validar_persona_fisica(entrada: &str) -> Result<String, ErrorRfc> {
 }
 
 /// Cruce con la CURP: la fecha es la misma (error si no); las letras casi
-/// siempre (el SAT usa otra lista de palabras inconvenientes: advertencia).
-pub fn cotejar_con_curp(rfc: &str, curp: &Curp) -> (Vec<String>, Vec<String>) {
+/// siempre (advertencia si difieren). El SAT las forma distinto que RENAPO
+/// cuando no hay segundo apellido o el primero tiene una o dos letras (reglas
+/// 4 y 7 del instructivo del RFC: UC PECH -> UPJU, no UXPJ); en esos casos
+/// no se comparan. También usa otra lista de palabras inconvenientes.
+pub fn cotejar_con_curp(rfc: &str, curp: &Curp, paterno: &str, materno: Option<&str>) -> (Vec<String>, Vec<String>) {
     let (mut errores, mut advertencias) = (Vec::new(), Vec::new());
     let r: Vec<char> = rfc.chars().collect();
     let c: Vec<char> = curp.as_str().chars().collect();
@@ -86,7 +89,9 @@ pub fn cotejar_con_curp(rfc: &str, curp: &Curp) -> (Vec<String>, Vec<String>) {
     if r[4..10] != c[4..10] {
         errores.push("la fecha de nacimiento del RFC no coincide con la de la CURP".to_owned());
     }
-    if r[..4] != c[..4] {
+    let materno_util = materno.and_then(super::curp::apellido_util);
+    let paterno_corto = super::curp::apellido_util(paterno).is_none_or(|p| p.chars().count() <= 2);
+    if materno_util.is_some() && !paterno_corto && r[..4] != c[..4] {
         advertencias.push("las letras del RFC no coinciden con las de la CURP".to_owned());
     }
     (errores, advertencias)
@@ -126,8 +131,13 @@ mod pruebas {
         let curp = Curp::parse("LOOA531113HTCPBN07").unwrap();
         let rfc = construir_desde_curp(curp.as_str(), "XY");
         assert!(validar_persona_fisica(&rfc).is_ok());
-        assert_eq!(cotejar_con_curp(&rfc, &curp), (vec![], vec![]));
+        assert_eq!(cotejar_con_curp(&rfc, &curp, "López", Some("Obrador")), (vec![], vec![]));
         let otra_fecha = construir_desde_curp("LOOA531114HTCPBN07", "XY");
-        assert_eq!(cotejar_con_curp(&otra_fecha, &curp).0.len(), 1);
+        assert_eq!(cotejar_con_curp(&otra_fecha, &curp, "López", Some("Obrador")).0.len(), 1);
+        // Letras distintas: advertencia, salvo donde el SAT forma otras letras.
+        let otras_letras = construir_desde_curp("LOBA531113HTCPBN07", "XY");
+        assert_eq!(cotejar_con_curp(&otras_letras, &curp, "López", Some("Obrador")).1.len(), 1);
+        assert!(cotejar_con_curp(&otras_letras, &curp, "Ruiz", None).1.is_empty(), "un solo apellido");
+        assert!(cotejar_con_curp(&otras_letras, &curp, "Uc", Some("Pech")).1.is_empty(), "apellido de dos letras");
     }
 }

@@ -59,7 +59,9 @@ uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 thiserror = "2"
 # IP del cliente (ConnectInfo) en cada petición.
-tower = { version = "0.5", features = ["util"] }
+tower = { version = "0.5", features = ["util", "limit"] }
+# Nombres en NFC antes de cotejarlos (CURP, OCR, MRZ).
+unicode-normalization = "0.1"
 anyhow = "1"
 dotenvy = "0.15"
 tracing = "0.1"

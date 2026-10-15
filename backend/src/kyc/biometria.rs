@@ -17,6 +17,7 @@
 use std::{collections::HashMap, future::Future, pin::Pin, sync::Mutex};
 
 use chrono::{DateTime, Utc};
+use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -56,8 +57,40 @@ pub struct PruebaVida {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ComparacionFacial {
     /// Similitud entre la selfie y la fotografía de la credencial, de 0 a 1.
-    /// `None`: no se encontró un rostro comparable.
-    pub score: Option<f64>,
+    /// `None`: no se encontró un rostro comparable. Se lee del texto JSON
+    /// exacto (nunca de un f64): 0.8499999999999998 no se redondea a 0.85.
+    #[serde(default, with = "score_exacto")]
+    pub score: Option<Decimal>,
+}
+
+mod score_exacto {
+    use std::str::FromStr;
+
+    use rust_decimal::Decimal;
+    use serde::{de::Error as _, ser::Error as _, Deserialize, Deserializer, Serialize, Serializer};
+    use serde_json::value::RawValue;
+
+    pub fn serialize<S: Serializer>(v: &Option<Decimal>, s: S) -> Result<S::Ok, S::Error> {
+        match v {
+            None => s.serialize_none(),
+            Some(d) => RawValue::from_string(d.to_string()).map_err(S::Error::custom)?.serialize(s),
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Decimal>, D::Error> {
+        let Some(crudo) = Option::<Box<RawValue>>::deserialize(d)? else { return Ok(None) };
+        let texto = crudo.get().trim();
+        if texto == "null" {
+            return Ok(None);
+        }
+        if !texto.starts_with(|c: char| c == '-' || c.is_ascii_digit()) {
+            return Err(D::Error::custom("el score debe ser un número JSON"));
+        }
+        Decimal::from_str(texto)
+            .or_else(|_| Decimal::from_scientific(texto))
+            .map(Some)
+            .map_err(|_| D::Error::custom("score fuera del rango representable"))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -97,7 +130,31 @@ pub enum ErrorProveedor {
 pub trait ProveedorBiometrico: Send + Sync {
     fn nombre(&self) -> &'static str;
 
+    /// `false`: no hay proveedor real configurado. El onboarding responde 503
+    /// antes de consumir un intento.
+    fn disponible(&self) -> bool {
+        true
+    }
+
     fn verificar<'a>(&'a self, solicitud: &'a SolicitudProveedor) -> Futuro<'a, Result<Entrega, ErrorProveedor>>;
+}
+
+/// Sin proveedor certificado configurado (producción sin integración): nadie
+/// se verifica de forma automática; el simulado solo existe en MODO_DEMO.
+pub struct ProveedorNoConfigurado;
+
+impl ProveedorBiometrico for ProveedorNoConfigurado {
+    fn nombre(&self) -> &'static str {
+        "no_configurado"
+    }
+
+    fn disponible(&self) -> bool {
+        false
+    }
+
+    fn verificar<'a>(&'a self, _: &'a SolicitudProveedor) -> Futuro<'a, Result<Entrega, ErrorProveedor>> {
+        Box::pin(async { Err(ErrorProveedor::NoDisponible("no hay proveedor biométrico configurado".into())) })
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -108,7 +165,7 @@ pub trait ProveedorBiometrico: Send + Sync {
 #[derive(Debug, Clone, Default)]
 pub struct Regla {
     /// Score de similitud (por omisión 0.93). `Some(None)`: sin rostro.
-    pub score: Option<Option<f64>>,
+    pub score: Option<Option<Decimal>>,
     pub vida_fallida: bool,
     pub documento_invalido: bool,
     /// Modifica lo que "lee" de la credencial.
@@ -117,11 +174,13 @@ pub struct Regla {
     pub secreto_ajeno: bool,
     /// Analiza otras imágenes (huellas distintas de las enviadas).
     pub otra_evidencia: bool,
+    /// Falla sin entregar resultado (caída del proveedor).
+    pub falla: bool,
     /// No responde de inmediato (el resultado llegaría por webhook).
     pub asincrono: bool,
 }
 
-pub const SCORE_SIMULADO: f64 = 0.93;
+pub const SCORE_SIMULADO: Decimal = Decimal::from_parts(93, 0, 0, false, 2);
 
 pub struct ProveedorSimulado {
     secreto: Vec<u8>,
@@ -202,6 +261,9 @@ impl ProveedorBiometrico for ProveedorSimulado {
     fn verificar<'a>(&'a self, s: &'a SolicitudProveedor) -> Futuro<'a, Result<Entrega, ErrorProveedor>> {
         Box::pin(async move {
             let regla = self.reglas.lock().expect("mutex").get(&s.identidad.curp).cloned().unwrap_or_default();
+            if regla.falla {
+                return Err(ErrorProveedor::NoDisponible("proveedor simulado caído".into()));
+            }
             let resultado = self.resultado(s, &regla);
             let cuerpo = serde_json::to_vec(&resultado).map_err(|e| ErrorProveedor::NoDisponible(e.to_string()))?;
             let firma = if regla.secreto_ajeno {

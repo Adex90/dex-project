@@ -154,6 +154,8 @@ fn es_invariante(codigo: &str) -> bool {
             | "SPEI_SIN_REGISTRO"
             | "SPEI_DESCUADRE"
             | "SPEI_TRANSICION"
+            | "RETORNO_SIN_CONTRATO"
+            | "MUTUO_TITULAR"
     ) || codigo.ends_with("_INMUTABLE")
 }
 

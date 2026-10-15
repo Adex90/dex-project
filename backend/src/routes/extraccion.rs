@@ -58,13 +58,15 @@ impl FromRequestParts<AppState> for IpCliente {
 
     async fn from_request_parts(parts: &mut Parts, estado: &AppState) -> Result<Self, Self::Rejection> {
         if estado.config.http.proxy_confiable {
+            // Solo el último segmento (el del proxy), leído como bytes: un
+            // valor no ASCII escrito por el cliente antes no lo invalida.
             let reenviada = parts
                 .headers
                 .get_all("x-forwarded-for")
                 .iter()
                 .next_back()
-                .and_then(|v| v.to_str().ok())
-                .and_then(|v| v.rsplit(',').next())
+                .and_then(|v| v.as_bytes().rsplit(|b| *b == b',').next())
+                .and_then(|segmento| std::str::from_utf8(segmento).ok())
                 .and_then(|v| v.trim().parse::<IpAddr>().ok());
             if reenviada.is_some() {
                 return Ok(Self(reenviada));

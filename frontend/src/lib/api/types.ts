@@ -326,7 +326,8 @@ export interface ResumenResultado {
   documento_valido: boolean;
   coincide_identidad: boolean;
   resultado: ResultadoKyc;
-  umbral_aplicado: Decimal;
+  /** Hidden from clients (null): only compliance sees the threshold and the exact score. */
+  umbral_aplicado: Decimal | null;
   timestamp: IsoDateTime;
   detalles_fallo: DetalleKyc[];
 }

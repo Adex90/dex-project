@@ -13,6 +13,9 @@ use axum::{
     routing::{get, post},
     Router,
 };
+use std::convert::Infallible;
+
+use tower::limit::ConcurrencyLimitLayer;
 
 use crate::{
     auth::Usuario,
@@ -32,17 +35,26 @@ use crate::{
 /// API conserva su límite de 64 KB.
 const MAX_CUERPO_VERIFICACION: usize = 12 * 1024 * 1024;
 
+/// Verificaciones simultáneas: acota la memoria (cuerpos de hasta 12 MB más
+/// sus imágenes decodificadas). Las demás esperan sin leer su cuerpo.
+const VERIFICACIONES_SIMULTANEAS: usize = 8;
+
 pub fn rutas() -> Router<AppState> {
     Router::new()
         .route("/kyc/expediente", get(ver_expediente))
         .route("/kyc/perfil", post(guardar_perfil))
-        .route("/kyc/verificar", post(verificar).layer(DefaultBodyLimit::max(MAX_CUERPO_VERIFICACION)))
+        .route(
+            "/kyc/verificar",
+            post(verificar)
+                .layer::<_, Infallible>(DefaultBodyLimit::max(MAX_CUERPO_VERIFICACION))
+                .layer::<_, Infallible>(ConcurrencyLimitLayer::new(VERIFICACIONES_SIMULTANEAS)),
+        )
         .route("/kyc/webhook", post(webhook))
 }
 
 async fn ver_expediente(State(e): State<AppState>, u: Usuario) -> AppResult<Json<VistaExpediente>> {
     u.exigir_cliente()?;
-    Ok(Json(expediente::vista(&e.pool, u.cliente_id).await?))
+    Ok(Json(expediente::vista(&e.pool, u.cliente_id).await?.para_cliente()))
 }
 
 async fn guardar_perfil(
@@ -68,8 +80,13 @@ async fn verificar(
         ip,
         user_agent: cabeceras.get(header::USER_AGENT).and_then(|v| v.to_str().ok()).map(str::to_owned),
     };
-    let r = kyc::verificar_identidad(&e.pool, &e.config.kyc, e.biometria.as_ref(), u.cliente_id, &s, &origen).await?;
+    let mut r = kyc::verificar_identidad(&e.pool, &e.config.kyc, e.biometria.as_ref(), u.cliente_id, &s, &origen).await?;
     let status = if r.resultado.is_some() { StatusCode::OK } else { StatusCode::ACCEPTED };
+    // El score exacto no se muestra al cliente: serviría para ajustar una
+    // suplantación hasta pasar el umbral. Lo ven cumplimiento y la bitácora.
+    if let Some(v) = r.resultado.as_mut() {
+        v.score_similitud = None;
+    }
     Ok((status, Json(r)))
 }
 

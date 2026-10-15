@@ -74,7 +74,7 @@ export function StepStatus({
   const fallback = !last && immediate ? immediate : null;
   const details = splitDetails(last ? last.detalles_fallo : fallback?.detalles);
   const score = formatPercent(last ? last.score_similitud : fallback?.score_similitud);
-  const threshold = last ? formatPercent(last.umbral_aplicado, 0) : null;
+  const threshold = last && last.umbral_aplicado !== null ? formatPercent(last.umbral_aplicado, 0) : null;
   const result = last?.resultado ?? fallback?.resultado ?? null;
   const awaitingProvider =
     file.estado_kyc === "EN_REVISION" && (!last || (file.verificacion_en_curso !== null && last.verificacion_id !== file.verificacion_en_curso));
@@ -154,11 +154,15 @@ export function StepStatus({
                 <CheckRow ok={last.prueba_vida_exitosa} label="Liveness (a live person in front of the camera)" />
                 <CheckRow ok={last.documento_valido} label="Credential (authentic and current)" />
                 <CheckRow ok={last.coincide_identidad} label="Identity data matches your file" />
-                <CheckRow
-                  ok={score === null ? null : last.score_similitud !== null && Number(last.score_similitud) >= Number(last.umbral_aplicado)}
-                  label="Face match with your INE photo"
-                  detail={score ?? undefined}
-                />
+                {/* The bank does not disclose the exact similarity score; the
+                    overall result above already says whether the face matched. */}
+                {score !== null && last.umbral_aplicado !== null ? (
+                  <CheckRow
+                    ok={last.score_similitud !== null && Number(last.score_similitud) >= Number(last.umbral_aplicado)}
+                    label="Face match with your INE photo"
+                    detail={score}
+                  />
+                ) : null}
               </ul>
             ) : null}
             {details.errors.length > 0 ? (

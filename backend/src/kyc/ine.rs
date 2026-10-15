@@ -232,9 +232,11 @@ pub mod mrz {
         format!("{v:<<largo$}")
     }
 
-    /// Nombre en el alfabeto MRZ: sin acentos, Ñ como N, espacios como `<`.
-    fn nombre_mrz(s: &str) -> String {
-        texto::normalizar(s).replace('Ñ', "N").replace(' ', "<")
+    /// Línea 3 (nombres) que corresponde a una persona: apellidos `<<`
+    /// nombres, transliterados según ICAO 9303 y truncados o rellenados a 30.
+    pub fn linea_nombres(apellido_paterno: &str, apellido_materno: Option<&str>, nombres: &str) -> String {
+        let apellidos = format!("{} {}", apellido_paterno, apellido_materno.unwrap_or_default());
+        relleno(&format!("{}<<{}", texto::transliterar_mrz(&apellidos), texto::transliterar_mrz(nombres)), 30)
     }
 
     /// MRZ de una credencial INE (la usan el proveedor simulado y las pruebas).
@@ -261,9 +263,7 @@ pub mod mrz {
         );
         let compuesto = format!("{}{}{}{}", &l1[5..30], &l2[0..7], &l2[8..15], &l2[18..29]);
         l2.push(digito(&compuesto).expect("alfabeto MRZ"));
-        let apellidos = format!("{} {}", apellido_paterno, apellido_materno.unwrap_or_default());
-        let l3 = relleno(&format!("{}<<{}", nombre_mrz(&apellidos), nombre_mrz(nombres)), 30);
-        vec![l1, l2, l3]
+        vec![l1, l2, linea_nombres(apellido_paterno, apellido_materno, nombres)]
     }
 }
 
@@ -359,15 +359,11 @@ pub fn cotejar(ocr: &OcrIne, d: &IdentidadDeclarada<'_>, hoy: NaiveDate) -> Cote
             if m.vencimiento[..2] != format!("{:02}", d.credencial.vigencia % 100) {
                 error("el vencimiento de la MRZ no coincide con la vigencia");
             }
-            let apellidos = format!("{} {}", d.apellido_paterno, d.apellido_materno.unwrap_or_default());
-            if !texto::mismo_nombre(&m.apellidos.join(" "), &apellidos, false)
-                || !texto::mismo_nombre(&m.nombres.join(" "), d.nombres, false)
-            {
-                // La línea de nombres se trunca a 30 caracteres: no es error.
-                let truncado = format!("{}<<{}", m.apellidos.join("<"), m.nombres.join("<")).len() >= 29;
-                if !truncado {
-                    c.advertencias.push("el nombre de la MRZ no coincide con el capturado".to_owned());
-                }
+            // La línea 3 no tiene dígito de control: se compara entera con la
+            // que corresponde al nombre capturado (misma transliteración y el
+            // mismo truncado a 30 caracteres).
+            if ocr.mrz[2] != mrz::linea_nombres(d.apellido_paterno, d.apellido_materno, d.nombres) {
+                c.advertencias.push("el nombre de la MRZ no coincide con el capturado".to_owned());
             }
         }
     }
@@ -563,6 +559,25 @@ mod pruebas {
         let mut vencida = buena.clone();
         vencida.vigencia = 2025;
         assert!(cotejar(&vencida, &d, hoy()).errores.iter().any(|e| e.contains("vencida")));
+
+        // Línea de nombres truncada: se compara entera, no se omite.
+        let largo = IdentidadDeclarada {
+            nombres: "María Guadalupe Concepción",
+            apellido_paterno: "Hernández",
+            apellido_materno: Some("Gutiérrez"),
+            ..d
+        };
+        let mut ajena = ocr_de(&largo);
+        assert_eq!(cotejar(&ajena, &largo, hoy()).advertencias, Vec::<String>::new());
+        ajena.mrz[2] = mrz::linea_nombres("Ramírez", Some("Gutiérrez"), "Francisco Javier Alejandro");
+        assert_eq!(cotejar(&ajena, &largo, hoy()).advertencias.len(), 1);
+
+        // Apóstrofo omitido en la MRZ (ICAO): O'FARRILL -> OFARRILL.
+        let apostrofo = IdentidadDeclarada { apellido_paterno: "O'Farrill", ..d };
+        let mut o = ocr_de(&apostrofo);
+        assert!(o.mrz[2].starts_with("OFARRILL<OBRADOR<<"), "{}", o.mrz[2]);
+        o.apellido_paterno = "O'Farrill".into();
+        assert_eq!(cotejar(&o, &apostrofo, hoy()), Cotejo::default());
 
         let mut otro_nombre = buena.clone();
         otro_nombre.nombres = "Andrés".into();
