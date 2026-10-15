@@ -90,7 +90,7 @@ pub fn cotejar_con_curp(rfc: &str, curp: &Curp, paterno: &str, materno: Option<&
         errores.push("la fecha de nacimiento del RFC no coincide con la de la CURP".to_owned());
     }
     let materno_util = materno.and_then(super::curp::apellido_util);
-    let paterno_corto = super::curp::apellido_util(paterno).is_none_or(|p| p.chars().count() <= 2);
+    let paterno_corto = !matches!(super::curp::apellido_util(paterno), Some(p) if p.chars().count() > 2);
     if materno_util.is_some() && !paterno_corto && r[..4] != c[..4] {
         advertencias.push("las letras del RFC no coinciden con las de la CURP".to_owned());
     }
