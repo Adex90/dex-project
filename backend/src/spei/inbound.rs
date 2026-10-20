@@ -7,8 +7,10 @@
 //! 1. candado consultivo sobre la identidad del pago (emisor + fecha + rastreo):
 //!    todas las notificaciones del mismo pago se procesan de una en una, sin
 //!    importar a qué CLABE digan ir;
-//! 2. si el pago ya se registró, se devuelve el resultado original (o 409 si
-//!    la misma identidad llega con otro monto o CLABE);
+//! 2. si el pago ya se registró, se devuelve el resultado original (o un
+//!    conflicto si la misma identidad llega con otro monto o CLABE). Si el
+//!    registro vigente es una captura anulada por el operador, el pago se
+//!    registra como su reemplazo (`reemplaza_a`);
 //! 3. se resuelve la CLABE receptora en `ifpe.clabes_asignadas` y se bloquea la
 //!    cuenta; si no puede recibir (inexistente, cancelada, cliente bloqueado o
 //!    sin KYC) el pago se registra DEVUELTO con su causa Banxico y no toca
@@ -19,14 +21,28 @@
 //!    la reserva del 100%, la sombra del ledger y la liga SPEI <-> DEPOSITO.
 //!
 //! Además:
-//! - una **devolución de una orden nuestra** (tipo de pago 0 con la clave de
-//!   rastreo original) no se abona como depósito: se aplica a la orden, que
-//!   reembolsa una sola vez aunque el proveedor también avise por el webhook
-//!   de estado;
+//! - una **devolución de una orden nuestra** (cualquier tipo de pago de
+//!   devolución: 0, 16, 17, 18, 23, 24, o una notificación con clave de
+//!   rastreo de devolución) no se abona como depósito: se aplica a la orden,
+//!   que reembolsa una sola vez aunque el proveedor también avise por el
+//!   webhook de estado. La base de datos rechaza un ABONADO que sea una
+//!   devolución (`ck_spei_inbound_abonado_no_es_devolucion`) y exige que la
+//!   devolución regrese a la CLABE ordenante de la orden. La que captura el
+//!   operador ([`capturar_devolucion`]) solo se aplica a una orden ya
+//!   liquidada que el proveedor, consultado en ese momento, informa devuelta,
+//!   y nunca a una orden propia;
 //! - antes de abonar se buscan **posibles duplicados con otra identidad**
 //!   (mismo rastreo, monto y cuenta, emisor con los mismos 3 últimos dígitos,
-//!   fecha a ±7 días): una captura manual con la fecha o la clave de emisor
-//!   equivocadas, o un abono anterior a 0005, no se vuelve a acreditar;
+//!   fecha a ±7 días; o un abono anterior a 0005 con la misma clave de
+//!   rastreo): una captura manual con la fecha o la clave de emisor
+//!   equivocadas, o un abono anterior a 0005, no se vuelve a acreditar. Dos
+//!   identidades informadas por el proveedor nunca son duplicado una de otra.
+//!   El operador puede declarar que un pago es distinto ([`abonar_pago_distinto`]);
+//! - el webhook nunca responde un 409 sin registro: un posible duplicado o una
+//!   identidad reutilizada se retiene ([`retener`]) y se confirma; el
+//!   operador lo resuelve;
+//! - una captura manual errónea se anula ([`anular`]: corrección total) y su
+//!   identidad queda libre para el pago real;
 //! - todo corre con el rol `sc_spei`, que ninguna ruta del cliente usa.
 
 use std::str::FromStr;
@@ -38,7 +54,11 @@ use serde_json::{json, value::RawValue, Value};
 use sqlx::{FromRow, PgPool};
 use uuid::Uuid;
 
-use super::{clabe, outbound, validar_monto_spei, CausaDevolucion, IdentidadSpei};
+use super::{
+    clabe, outbound,
+    pasarela::{EstadoProveedor, Pasarela},
+    validar_monto_spei, CausaDevolucion, IdentidadSpei,
+};
 use crate::{
     config::{ConfigSpei, UmbralesPld},
     db::{self, Rol, Tx},
@@ -76,6 +96,10 @@ pub struct SpeiInbound {
     #[serde(skip)]
     pub raw_payload: Value,
     pub recibido_en: DateTime<Utc>,
+    /// Abono previo parecido del que el operador declaró distinto este pago.
+    pub distinto_de_tx: Option<Uuid>,
+    /// Registro anulado de la misma identidad al que este reemplaza.
+    pub reemplaza_a: Option<Uuid>,
 }
 
 /// SPEI entrante ya validado.
@@ -92,7 +116,8 @@ pub struct Abono {
     pub rfc_curp_ordenante: Option<String>,
     pub referencia_numerica: Option<i32>,
     pub concepto: Option<String>,
-    /// Tipo de pago SPEI informado por el participante (0 = devolución).
+    /// Tipo de pago SPEI informado por el participante (ver
+    /// [`TIPOS_PAGO_DEVOLUCION`]).
     pub tipo_pago: Option<i16>,
     /// En una devolución: la clave de rastreo de nuestra orden original.
     pub rastreo_devuelto: Option<String>,
@@ -103,8 +128,43 @@ pub struct Abono {
     pub raw_payload: Value,
 }
 
-/// Tipo de pago SPEI de una devolución.
-pub const TIPO_PAGO_DEVOLUCION: i16 = 0;
+/// Tipos de pago SPEI de devolución (catálogo Banxico): 0 no acreditada, 16
+/// extemporánea no acreditada, 17 acreditada, 18 extemporánea acreditada, 23
+/// especial acreditada, 24 extemporánea especial acreditada.
+pub const TIPOS_PAGO_DEVOLUCION: [i16; 6] = [0, 16, 17, 18, 23, 24];
+
+impl Abono {
+    /// Una devolución (de una orden nuestra) nunca se abona como depósito:
+    /// cualquier tipo de pago de devolución, o la clave de rastreo del pago
+    /// devuelto.
+    pub fn es_devolucion(&self) -> bool {
+        self.tipo_pago.is_some_and(|t| TIPOS_PAGO_DEVOLUCION.contains(&t)) || self.rastreo_devuelto.is_some()
+    }
+}
+
+/// Devolución que no corresponde a ninguna orden (el webhook la pone en
+/// cuarentena y la confirma: SPEI no permite devolver una devolución).
+pub const DEVOLUCION_SIN_ORDEN: &str = "SPEI_DEVOLUCION_SIN_ORDEN";
+/// Posible duplicado con otra identidad (el webhook lo retiene y confirma).
+pub const POSIBLE_DUPLICADO: &str = "SPEI_POSIBLE_DUPLICADO";
+/// Identidad ya registrada con otro monto o CLABE (el webhook la retiene y
+/// confirma).
+pub const IDENTIDAD_REUTILIZADA: &str = "SPEI_IDENTIDAD_REUTILIZADA";
+
+/// El operador declara que el pago es distinto de un abono previo parecido.
+#[derive(Debug, Clone)]
+pub struct PagoDistinto {
+    /// El DEPOSITO previo que señaló la búsqueda de posibles duplicados.
+    pub transaccion_id: Uuid,
+    pub motivo: String,
+}
+
+/// Datos del registro que no vienen de la notificación.
+#[derive(Debug, Clone, Copy, Default)]
+struct Vinculos<'a> {
+    reemplaza_a: Option<Uuid>,
+    distinto: Option<&'a PagoDistinto>,
+}
 
 /// Quién registra el pago.
 #[derive(Debug, Clone, Copy)]
@@ -301,7 +361,32 @@ pub async fn abonar(
     si_no_acreditable: SiNoAcreditable,
 ) -> AppResult<ResultadoAbono> {
     validar_monto_spei(abono.monto)?;
-    db::con_reintentos(|| abonar_tx(pool, umbrales, cfg, abono, origen, si_no_acreditable)).await
+    db::con_reintentos(|| abonar_tx(pool, umbrales, cfg, abono, origen, si_no_acreditable, None)).await
+}
+
+/// Captura del operador de un pago que la búsqueda de posibles duplicados
+/// confunde con un abono previo (`distinto.transaccion_id`): el operador
+/// confirmó que es otro pago. Solo se ignora ese abono; queda auditado en el
+/// registro (`distinto_de_tx`, `motivo`, `registrado_por`) y la base de datos
+/// exige que el abono previo sea de la misma cuenta, monto y clave de rastreo.
+pub async fn abonar_pago_distinto(
+    pool: &PgPool,
+    umbrales: &UmbralesPld,
+    cfg: &ConfigSpei,
+    abono: &Abono,
+    operador_id: Uuid,
+    distinto: &PagoDistinto,
+) -> AppResult<ResultadoAbono> {
+    validar_monto_spei(abono.monto)?;
+    let motivo = distinto.motivo.trim();
+    if !(5..=200).contains(&motivo.chars().count()) || motivo.chars().any(char::is_control) {
+        return Err(AppError::validacion("el motivo debe tener de 5 a 200 caracteres"));
+    }
+    let distinto = PagoDistinto { transaccion_id: distinto.transaccion_id, motivo: motivo.to_owned() };
+    db::con_reintentos(|| {
+        abonar_tx(pool, umbrales, cfg, abono, Origen::Operador(operador_id), SiNoAcreditable::Rechazar, Some(&distinto))
+    })
+    .await
 }
 
 /// Por qué la cuenta destino no puede recibir.
@@ -339,6 +424,15 @@ async fn resolver_destino(tx: &mut Tx, abono: &Abono) -> AppResult<Destino> {
     Ok(Destino::Acreditable { cuenta_id, perfil })
 }
 
+/// Todas las notificaciones (y anulaciones) del mismo pago, de una en una.
+async fn bloquear_identidad(tx: &mut Tx, identidad: &str) -> AppResult<()> {
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+        .bind(format!("spei-inbound:{identidad}"))
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
+}
+
 async fn abonar_tx(
     pool: &PgPool,
     umbrales: &UmbralesPld,
@@ -346,19 +440,21 @@ async fn abonar_tx(
     abono: &Abono,
     origen: Origen,
     si_no_acreditable: SiNoAcreditable,
+    distinto: Option<&PagoDistinto>,
 ) -> AppResult<ResultadoAbono> {
     let identidad = abono.identidad.canonica();
     let mut tx = db::begin(pool, Rol::Spei).await?;
-    // Todas las notificaciones del mismo pago, de una en una.
-    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
-        .bind(format!("spei-inbound:{identidad}"))
-        .execute(&mut *tx)
-        .await?;
-    if let Some(previa) = buscar(&mut tx, &abono.identidad).await? {
-        return repeticion(&mut tx, previa, abono, &identidad).await;
+    bloquear_identidad(&mut tx, &identidad).await?;
+    let mut vinculos = Vinculos { reemplaza_a: None, distinto };
+    if let Some(vigente) = buscar(&mut tx, &abono.identidad).await? {
+        if !anulado(&mut tx, vigente.id).await? {
+            return repeticion(&mut tx, vigente, abono, &identidad).await;
+        }
+        // La captura con esta identidad se anuló: este pago la reemplaza.
+        vinculos.reemplaza_a = Some(vigente.id);
     }
-    if abono.tipo_pago == Some(TIPO_PAGO_DEVOLUCION) {
-        return devolucion_de_orden(tx, cfg, abono, origen, &identidad).await;
+    if abono.es_devolucion() {
+        return devolucion_de_orden(pool, tx, cfg, abono, origen, &identidad, vinculos).await;
     }
 
     let (cuenta_id, perfil) = match resolver_destino(&mut tx, abono).await? {
@@ -366,27 +462,35 @@ async fn abonar_tx(
         Destino::NoAcreditable { error, .. } if si_no_acreditable == SiNoAcreditable::Rechazar => return Err(error),
         Destino::NoAcreditable { cuenta_id, causa, error } => {
             let motivo = format!("{} ({error})", causa.descripcion());
-            let spei = insertar(&mut tx, abono, origen, cuenta_id, None, Some((causa, &motivo))).await?;
+            let spei = insertar(&mut tx, abono, origen, vinculos, cuenta_id, None, Some((causa, &motivo))).await?;
             tx.commit().await?;
             tracing::warn!(%identidad, causa = causa.codigo(), %motivo, "SPEI recibido devuelto al emisor");
             return Ok(ResultadoAbono { spei, transaccion: None, idempotente: false });
         }
     };
 
-    exigir_sin_duplicado(&mut tx, abono, cuenta_id, &identidad).await?;
+    let nuevo_es_webhook = matches!(origen, Origen::Webhook);
+    exigir_sin_duplicado(&mut tx, abono, cuenta_id, &identidad, nuevo_es_webhook, distinto.map(|d| d.transaccion_id))
+        .await?;
     let reserva = ledger::bloquear_reserva(&mut tx).await?;
     let concepto = concepto_ledger(abono);
+    // Igual que `ifpe.referencia_abono_spei`: el reemplazo de un registro
+    // anulado lleva el id del anulado (su DEPOSITO ya tiene la identidad sola).
+    let referencia = match vinculos.reemplaza_a {
+        Some(anulado) => format!("{identidad}/{anulado}"),
+        None => identidad.clone(),
+    };
     let t = ledger::abonar_efectivo(
         &mut tx,
         cuenta_id,
         reserva.id,
         abono.monto,
         Some(&concepto),
-        Some(&identidad),
-        &format!("spei:{identidad}"),
+        Some(&referencia),
+        &format!("spei:{referencia}"),
     )
     .await?;
-    let spei = insertar(&mut tx, abono, origen, Some(cuenta_id), Some(t.id), None).await?;
+    let spei = insertar(&mut tx, abono, origen, vinculos, Some(cuenta_id), Some(t.id), None).await?;
     let evento = EventoPld {
         entidad: Entidad::Ifpe,
         cliente: &perfil,
@@ -415,10 +519,13 @@ fn concepto_ledger(abono: &Abono) -> String {
     c.chars().take(140).collect()
 }
 
+/// Registro vigente de la identidad: el último de su cadena de reemplazos (a
+/// lo sumo uno; la base de datos solo admite reemplazar un registro anulado).
 async fn buscar(tx: &mut Tx, id: &IdentidadSpei) -> AppResult<Option<SpeiInbound>> {
     Ok(sqlx::query_as(
-        "SELECT * FROM ifpe.spei_inbound \
-         WHERE institucion_emisora = $1 AND clave_rastreo = $2 AND fecha_operacion = $3",
+        "SELECT * FROM ifpe.spei_inbound s \
+         WHERE institucion_emisora = $1 AND clave_rastreo = $2 AND fecha_operacion = $3 \
+           AND NOT EXISTS (SELECT 1 FROM ifpe.spei_inbound r WHERE r.reemplaza_a = s.id)",
     )
     .bind(&id.institucion_emisora)
     .bind(&id.clave_rastreo)
@@ -427,10 +534,42 @@ async fn buscar(tx: &mut Tx, id: &IdentidadSpei) -> AppResult<Option<SpeiInbound
     .await?)
 }
 
+async fn anulado(tx: &mut Tx, spei_inbound_id: Uuid) -> AppResult<bool> {
+    Ok(sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM ifpe.spei_anulaciones WHERE spei_inbound_id = $1)")
+        .bind(spei_inbound_id)
+        .fetch_one(&mut **tx)
+        .await?)
+}
+
 /// El mismo pago llegó otra vez: misma identidad, mismo monto y misma cuenta
 /// = repetición (se devuelve el resultado original). Misma identidad con otros
-/// datos = conflicto que requiere revisión; nunca se abona.
+/// datos = conflicto que requiere revisión; nunca se abona. Si el registro
+/// previo es una captura errónea, el operador la anula y el pago real se
+/// registra como su reemplazo.
 async fn repeticion(tx: &mut Tx, previa: SpeiInbound, abono: &Abono, identidad: &str) -> AppResult<ResultadoAbono> {
+    // Una devolución ya aplicada solo se repite si devuelve la misma orden:
+    // otra clave de rastreo devuelta es otro pago (p. ej. la captura del
+    // operador se aplicó a la orden equivocada) y queda para revisión.
+    let misma_orden = match previa.spei_outbound_id {
+        Some(orden_id) => {
+            let rastreo: String = sqlx::query_scalar("SELECT clave_rastreo FROM ifpe.spei_outbound WHERE id = $1")
+                .bind(orden_id)
+                .fetch_one(&mut **tx)
+                .await?;
+            abono.rastreo_devuelto.as_deref() == Some(rastreo.as_str())
+        }
+        None => true,
+    };
+    if !misma_orden {
+        tracing::error!(%identidad, devuelto = ?abono.rastreo_devuelto, "devolución SPEI repetida con otra orden: requiere revisión");
+        return Err(AppError::conflicto(
+            IDENTIDAD_REUTILIZADA,
+            format!(
+                "ese SPEI (emisor, fecha y clave de rastreo) ya se registró como devolución de otra orden (registro {})",
+                previa.id
+            ),
+        ));
+    }
     if previa.monto != abono.monto || previa.receptor_clabe != abono.receptor_clabe {
         tracing::error!(
             %identidad,
@@ -441,8 +580,12 @@ async fn repeticion(tx: &mut Tx, previa: SpeiInbound, abono: &Abono, identidad: 
             "SPEI con identidad repetida y datos distintos: requiere revisión"
         );
         return Err(AppError::conflicto(
-            "SPEI_IDENTIDAD_REUTILIZADA",
-            "ese SPEI (emisor, fecha y clave de rastreo) ya se registró con otro monto o cuenta",
+            IDENTIDAD_REUTILIZADA,
+            format!(
+                "ese SPEI (emisor, fecha y clave de rastreo) ya se registró con otro monto o cuenta (registro {}); \
+                 si esa captura fue un error, anúlela y vuelva a capturar el pago",
+                previa.id
+            ),
         ));
     }
     let transaccion = match previa.transaccion_id {
@@ -461,21 +604,25 @@ async fn insertar(
     tx: &mut Tx,
     abono: &Abono,
     origen: Origen,
+    vinculos: Vinculos<'_>,
     cuenta_id: Option<Uuid>,
     transaccion_id: Option<Uuid>,
     devolucion: Option<(CausaDevolucion, &str)>,
 ) -> AppResult<SpeiInbound> {
     let estado = if devolucion.is_some() { "DEVUELTO" } else { "ABONADO" };
+    // El motivo de un ABONADO es el del operador que lo declaró distinto.
+    let motivo = devolucion.map(|(_, m)| m).or(vinculos.distinto.map(|d| d.motivo.as_str()));
     insertar_registro(
         tx,
         abono,
         origen,
+        vinculos,
         cuenta_id,
         transaccion_id,
         None,
         estado,
         devolucion.map(|(c, _)| c.codigo()),
-        devolucion.map(|(_, m)| m),
+        motivo,
     )
     .await
 }
@@ -485,6 +632,7 @@ async fn insertar_registro(
     tx: &mut Tx,
     abono: &Abono,
     origen: Origen,
+    vinculos: Vinculos<'_>,
     cuenta_id: Option<Uuid>,
     transaccion_id: Option<Uuid>,
     spei_outbound_id: Option<Uuid>,
@@ -502,8 +650,9 @@ async fn insertar_registro(
          (institucion_emisora, clave_rastreo, fecha_operacion, institucion_receptora, receptor_clabe, cuenta_id, \
           monto, nombre_ordenante, cuenta_ordenante, rfc_curp_ordenante, referencia_numerica, concepto, estado, \
           causa_devolucion, motivo, transaccion_id, origen, registrado_por, id_proveedor, raw_payload, tipo_pago, \
-          spei_outbound_id) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22) \
+          spei_outbound_id, reemplaza_a, distinto_de_tx) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, \
+                 $23, $24) \
          RETURNING *",
     )
     .bind(&abono.identidad.institucion_emisora)
@@ -528,46 +677,103 @@ async fn insertar_registro(
     .bind(&abono.raw_payload)
     .bind(abono.tipo_pago)
     .bind(spei_outbound_id)
+    .bind(vinculos.reemplaza_a)
+    .bind(vinculos.distinto.map(|d| d.transaccion_id))
     .fetch_one(&mut **tx)
     .await?)
 }
 
+fn sin_orden(identidad: &str, detalle: String) -> AppError {
+    tracing::error!(%identidad, %detalle, "devolución SPEI sin orden que le corresponda: requiere revisión");
+    AppError::conflicto(DEVOLUCION_SIN_ORDEN, detalle)
+}
+
+/// ¿La devolución corresponde a la orden? El emisor es el banco al que se
+/// envió, el monto el enviado y regresa a la CLABE ordenante (la cuenta del
+/// cliente). La del operador, además: solo sobre una orden ya liquidada (una
+/// PENDIENTE o ENVIADA puede pagarla el proveedor después) y nunca de sus
+/// propias órdenes. La base de datos exige lo mismo al COMMIT
+/// (`ifpe.fn_verificar_spei_devolucion_de_orden`).
+fn exigir_aplicable(orden: &outbound::SpeiOutbound, abono: &Abono, origen: Origen, identidad: &str) -> AppResult<()> {
+    let rastreo = &orden.clave_rastreo;
+    if orden.monto != abono.monto || !abono.identidad.institucion_emisora.ends_with(&orden.banco_receptor) {
+        return Err(sin_orden(identidad, format!("la devolución no coincide con la orden {rastreo} (monto o banco)")));
+    }
+    if abono.receptor_clabe != orden.ordenante_clabe {
+        return Err(sin_orden(
+            identidad,
+            format!("la devolución no regresa a la CLABE ordenante de la orden {rastreo}"),
+        ));
+    }
+    if let Origen::Operador(operador_id) = origen {
+        if operador_id == orden.cliente_id {
+            return Err(AppError::negocio(
+                "SPEI_AUTORESOLUCION",
+                "un operador no captura devoluciones de sus propias órdenes",
+            ));
+        }
+        if orden.estado != "LIQUIDADA" {
+            return Err(AppError::negocio(
+                "SPEI_DEVOLUCION_NO_APLICABLE",
+                format!(
+                    "la orden {rastreo} está {}: el operador solo captura la devolución de una orden liquidada",
+                    orden.estado
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// La devolución de una orden nuestra se aplica a la orden (que reembolsa una
 /// sola vez) y se registra ligada a ella. Nunca se abona como depósito nuevo
-/// ni se "devuelve" al emisor.
+/// ni se "devuelve" al emisor. Si no corresponde a ninguna orden, o el
+/// reverso es imposible (cuenta cerrada: la orden queda en revisión manual),
+/// no se escribe nada aquí: el webhook la pone en cuarentena y la confirma; el
+/// operador recibe el 409.
 async fn devolucion_de_orden(
+    pool: &PgPool,
     mut tx: Tx,
     cfg: &ConfigSpei,
     abono: &Abono,
     origen: Origen,
     identidad: &str,
+    vinculos: Vinculos<'_>,
 ) -> AppResult<ResultadoAbono> {
-    let sin_orden = |detalle: String| {
-        tracing::error!(%identidad, %detalle, "devolución SPEI sin orden que le corresponda: requiere revisión");
-        AppError::conflicto("SPEI_DEVOLUCION_SIN_ORDEN", detalle)
-    };
     let Some(rastreo) = abono.rastreo_devuelto.as_deref() else {
-        return Err(sin_orden("la devolución no trae la clave de rastreo del pago original".into()));
+        return Err(sin_orden(identidad, "la devolución no trae la clave de rastreo del pago original".into()));
     };
     let Some(orden) = outbound::buscar_por_rastreo_en(&mut tx, rastreo).await? else {
-        return Err(sin_orden(format!("no hay una orden con clave de rastreo {rastreo}")));
+        return Err(sin_orden(identidad, format!("no hay una orden con clave de rastreo {rastreo}")));
     };
-    // El emisor de la devolución es el banco al que se envió, y el monto, el enviado.
-    if orden.monto != abono.monto || !abono.identidad.institucion_emisora.ends_with(&orden.banco_receptor) {
-        return Err(sin_orden(format!("la devolución no coincide con la orden {rastreo} (monto o banco)")));
-    }
+    exigir_aplicable(&orden, abono, origen, identidad)?;
     let causa = abono.causa_devolucion.unwrap_or(99);
     let evento = outbound::Evento::Devuelta { causa, motivo: "devolución recibida del banco receptor".into() };
-    let t = outbound::aplicar_en(&mut tx, cfg, orden.id, &evento).await?;
+    let t = match outbound::aplicar_en(&mut tx, cfg, orden.id, &evento).await {
+        Ok(t) => t,
+        Err(e) if e.codigo() == outbound::CUENTA_CERRADA => {
+            // Se descarta lo hecho; la orden queda marcada y la devolución, en cuarentena.
+            drop(tx);
+            outbound::marcar_revision(
+                pool,
+                orden.id,
+                &format!("devolución recibida, reverso imposible: {}", e.detalle()),
+            )
+            .await?;
+            return Err(sin_orden(identidad, format!("la orden {rastreo} no se puede reembolsar: {}", e.detalle())));
+        }
+        Err(e) => return Err(e),
+    };
     if t.incidente.is_some() {
         // Se conserva la marca de revisión; la devolución no se registra.
         tx.commit().await?;
-        return Err(sin_orden(t.incidente.unwrap_or_default()));
+        return Err(sin_orden(identidad, t.incidente.unwrap_or_default()));
     }
     let spei = insertar_registro(
         &mut tx,
         abono,
         origen,
+        vinculos,
         Some(orden.cuenta_id),
         None,
         Some(orden.id),
@@ -581,41 +787,128 @@ async fn devolucion_de_orden(
     Ok(ResultadoAbono { spei, transaccion: None, idempotente: false })
 }
 
-/// Busca en el ledger un abono SPEI que muy probablemente sea el mismo pago con
-/// otra identidad: misma cuenta, monto y clave de rastreo; emisor con los
-/// mismos 3 últimos dígitos (código de banco); fecha a ±7 días. Incluye los
-/// abonos anteriores a 0005 (que no tienen registro en `spei_inbound`).
-async fn exigir_sin_duplicado(tx: &mut Tx, abono: &Abono, cuenta_id: Uuid, identidad: &str) -> AppResult<()> {
-    let previo: Option<String> = sqlx::query_scalar(
-        "SELECT referencia_externa FROM ifpe.transacciones \
-          WHERE tipo = 'DEPOSITO' AND cuenta_destino_id = $1 AND monto = $2 AND clave_idempotencia LIKE 'spei:%' \
-            AND referencia_externa IS DISTINCT FROM $3 \
-            AND upper(split_part(referencia_externa, ':', 3)) = $4 \
-            AND right(split_part(referencia_externa, ':', 1), 3) = right($5, 3) \
-            AND CASE WHEN split_part(referencia_externa, ':', 2) ~ '^[0-9]{8}$' \
-                     THEN to_date(split_part(referencia_externa, ':', 2), 'YYYYMMDD') END \
-                BETWEEN $6::date - 7 AND $6::date + 7 \
-          LIMIT 1",
+/// Devolución de una orden nuestra capturada por el operador (conciliación
+/// con el estado de cuenta del custodio). Antes de aplicarla: la orden debe
+/// estar liquidada, la devolución regresar a su CLABE ordenante, el operador
+/// no ser el titular y el proveedor, consultado en ese momento, informar la
+/// orden devuelta. Una repetición de una captura ya registrada no consulta.
+pub async fn capturar_devolucion(
+    pool: &PgPool,
+    pasarela: &dyn Pasarela,
+    umbrales: &UmbralesPld,
+    cfg: &ConfigSpei,
+    abono: &Abono,
+    operador_id: Uuid,
+) -> AppResult<ResultadoAbono> {
+    validar_monto_spei(abono.monto)?;
+    let identidad = abono.identidad.canonica();
+    let Some(rastreo) = abono.rastreo_devuelto.as_deref() else {
+        return Err(AppError::validacion("la devolución requiere la clave de rastreo de la orden"));
+    };
+    let origen = Origen::Operador(operador_id);
+    let mut tx = db::begin_lectura(pool, Rol::Spei).await?;
+    let ya_registrada = match buscar(&mut tx, &abono.identidad).await? {
+        Some(vigente) => !anulado(&mut tx, vigente.id).await?,
+        None => false,
+    };
+    let orden = outbound::buscar_por_rastreo_en(&mut tx, rastreo).await?;
+    tx.commit().await?;
+    if !ya_registrada {
+        let Some(orden) = orden else {
+            return Err(sin_orden(&identidad, format!("no hay una orden con clave de rastreo {rastreo}")));
+        };
+        exigir_aplicable(&orden, abono, origen, &identidad)?;
+        // Fuera de toda transacción: el proveedor debe decir, ahora, que la devolvió.
+        match pasarela.consultar(&orden.consulta()).await {
+            Ok(EstadoProveedor::Devuelta { .. }) => {}
+            Ok(estado) => {
+                return Err(AppError::conflicto(
+                    "SPEI_PROVEEDOR_SIN_DEVOLUCION",
+                    format!("el proveedor informa {estado:?} para la orden {rastreo}: no se aplica la devolución"),
+                ))
+            }
+            Err(e) => {
+                return Err(AppError::peticion(
+                    axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                    "SPEI_PROVEEDOR_NO_DISPONIBLE",
+                    format!("no se pudo consultar al proveedor: {e}"),
+                ))
+            }
+        }
+    }
+    db::con_reintentos(|| abonar_tx(pool, umbrales, cfg, abono, origen, SiNoAcreditable::Rechazar, None)).await
+}
+
+/// Busca un abono que muy probablemente sea el mismo pago con otra identidad:
+/// misma cuenta, monto y clave de rastreo; emisor con los mismos 3 últimos
+/// dígitos (código de banco); fecha a ±7 días. También los abonos anteriores
+/// a 0005 sin registro en `spei_inbound` (clave de rastreo sola, emisor de 3
+/// dígitos, claves `op:`), con la misma ventana: la clave de rastreo sola no
+/// trae fecha y se usa la del abono (así un pagador recurrente que reutiliza
+/// su clave de rastreo solo choca con el abono legado de esa semana). No
+/// cuentan los registros anulados, el abono que el
+/// operador declaró distinto (`ignorar`) ni, si el pago nuevo lo informa el
+/// proveedor, los que también informó el proveedor: dos identidades del
+/// proveedor son dos pagos (la misma clave de rastreo otro día o de otro
+/// emisor es legítima).
+async fn exigir_sin_duplicado(
+    tx: &mut Tx,
+    abono: &Abono,
+    cuenta_id: Uuid,
+    identidad: &str,
+    nuevo_es_webhook: bool,
+    ignorar: Option<Uuid>,
+) -> AppResult<()> {
+    let previo: Option<(Uuid, Option<String>)> = sqlx::query_as(
+        "SELECT id, referencia_externa FROM ( \
+           SELECT t.id, t.referencia_externa, t.secuencia \
+             FROM ifpe.spei_inbound s JOIN ifpe.transacciones t ON t.id = s.transaccion_id \
+            WHERE s.estado = 'ABONADO' AND s.cuenta_id = $1 AND s.monto = $2 AND s.clave_rastreo = $3 \
+              AND right(s.institucion_emisora, 3) = right($4, 3) \
+              AND s.fecha_operacion BETWEEN $5::date - 7 AND $5::date + 7 \
+              AND NOT EXISTS (SELECT 1 FROM ifpe.spei_anulaciones a WHERE a.spei_inbound_id = s.id) \
+              AND NOT ($6::bool AND s.origen = 'WEBHOOK') \
+           UNION ALL \
+           SELECT t.id, t.referencia_externa, t.secuencia \
+             FROM ifpe.transacciones t \
+            WHERE t.tipo = 'DEPOSITO' AND t.cuenta_destino_id = $1 AND t.monto = $2 \
+              AND t.clave_idempotencia NOT LIKE 'spei-reverso:%' \
+              AND NOT EXISTS (SELECT 1 FROM ifpe.spei_inbound s WHERE s.transaccion_id = t.id) \
+              AND ((upper(btrim(t.referencia_externa)) = $3 \
+                    AND t.creado_en >= ($5::date - 7)::timestamp AT TIME ZONE 'America/Mexico_City' \
+                    AND t.creado_en < ($5::date + 8)::timestamp AT TIME ZONE 'America/Mexico_City') \
+                   OR (t.referencia_externa ~ '^[0-9]{3,5}:[0-9]{8}:[A-Za-z0-9]{1,30}$' \
+                       AND upper(split_part(t.referencia_externa, ':', 3)) = $3 \
+                       AND right(split_part(t.referencia_externa, ':', 1), 3) = right($4, 3) \
+                       AND split_part(t.referencia_externa, ':', 2) \
+                           BETWEEN to_char($5::date - 7, 'YYYYMMDD') AND to_char($5::date + 7, 'YYYYMMDD'))) \
+         ) c WHERE id IS DISTINCT FROM $7 ORDER BY secuencia LIMIT 1",
     )
     .bind(cuenta_id)
     .bind(abono.monto)
-    .bind(identidad)
     .bind(&abono.identidad.clave_rastreo)
     .bind(&abono.identidad.institucion_emisora)
     .bind(abono.identidad.fecha_operacion)
+    .bind(nuevo_es_webhook)
+    .bind(ignorar)
     .fetch_optional(&mut **tx)
     .await?;
-    if let Some(previo) = previo {
-        tracing::error!(%identidad, %previo, monto = %abono.monto, "posible SPEI duplicado con otra identidad: no se abona");
+    if let Some((id, referencia)) = previo {
+        let previo = referencia.unwrap_or_default();
+        tracing::error!(%identidad, %previo, transaccion = %id, monto = %abono.monto, "posible SPEI duplicado con otra identidad: no se abona");
         return Err(AppError::conflicto(
-            "SPEI_POSIBLE_DUPLICADO",
-            format!("ya se abonó un pago con la misma clave de rastreo, monto y cuenta ({previo}); requiere revisión"),
+            POSIBLE_DUPLICADO,
+            format!(
+                "ya se abonó un pago con la misma clave de rastreo, monto y cuenta ({previo}, transacción {id}); \
+                 si es un pago distinto, captúrelo con distinto_de={id} y un motivo"
+            ),
         ));
     }
     Ok(())
 }
 
-/// Guarda una notificación autenticada que no se pudo interpretar.
+/// Guarda una notificación autenticada que no se pudo interpretar (o una
+/// devolución sin orden).
 pub async fn cuarentena(pool: &PgPool, tipo: &str, cuerpo: &[u8], error: &str) -> AppResult<()> {
     let mut tx = db::begin(pool, Rol::Spei).await?;
     sqlx::query("INSERT INTO ifpe.spei_cuarentena (tipo, cuerpo, error) VALUES ($1, $2, $3)")
@@ -627,6 +920,137 @@ pub async fn cuarentena(pool: &PgPool, tipo: &str, cuerpo: &[u8], error: &str) -
     tx.commit().await?;
     tracing::error!(tipo, %error, "notificación SPEI autenticada en cuarentena");
     Ok(())
+}
+
+/// Retiene, sin abonar, una notificación autenticada que necesita revisión
+/// (`POSIBLE_DUPLICADO` o `IDENTIDAD_REUTILIZADA`), con su identidad. Una fila
+/// por cuerpo: los reintentos del proveedor no se acumulan. La cola es
+/// `ifpe.v_spei_en_revision`.
+pub async fn retener(pool: &PgPool, tipo: &str, abono: &Abono, cuerpo: &[u8], error: &str) -> AppResult<()> {
+    let identidad = abono.identidad.canonica();
+    let mut tx = db::begin(pool, Rol::Spei).await?;
+    sqlx::query(
+        "INSERT INTO ifpe.spei_cuarentena (tipo, cuerpo, error, identidad) VALUES ($1, $2, $3, $4) \
+         ON CONFLICT DO NOTHING",
+    )
+    .bind(tipo)
+    .bind(cuerpo)
+    .bind(error.chars().take(500).collect::<String>())
+    .bind(&identidad)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    tracing::error!(tipo, %identidad, %error, "SPEI retenido para revisión: confirmado al proveedor, sin abonar");
+    Ok(())
+}
+
+/// El operador descarta como duplicado una notificación retenida.
+#[derive(Debug, Clone)]
+pub struct SolicitudDescarte {
+    /// Id de la notificación retenida (`ifpe.v_spei_en_revision`).
+    pub cuarentena_id: Uuid,
+    pub motivo: String,
+    pub operador_id: Uuid,
+    /// Clave ya acotada al operador.
+    pub clave_idempotencia: String,
+}
+
+/// Registro de `ifpe.spei_descartes`.
+#[derive(Debug, Clone, Serialize, FromRow)]
+pub struct Descarte {
+    pub id: Uuid,
+    pub cuarentena_id: Uuid,
+    pub motivo: String,
+    pub autorizado_por: Uuid,
+    #[serde(skip)]
+    pub clave_idempotencia: String,
+    pub creado_en: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ResultadoDescarte {
+    pub descarte: Descarte,
+    pub idempotente: bool,
+}
+
+/// Saca de la cola de revisión una notificación retenida que el operador
+/// confirmó como duplicado de un pago ya abonado (p. ej. de un abono anterior
+/// a 0005 sin registro que anular). No mueve dinero; queda auditado.
+pub async fn descartar(pool: &PgPool, s: &SolicitudDescarte) -> AppResult<ResultadoDescarte> {
+    let motivo = validar_motivo(&s.motivo, "decisión")?;
+    db::con_reintentos(|| async {
+        let mut tx = db::begin(pool, Rol::Spei).await?;
+        let identidad: Option<Option<String>> =
+            sqlx::query_scalar("SELECT identidad FROM ifpe.spei_cuarentena WHERE id = $1")
+                .bind(s.cuarentena_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        let Some(identidad) = identidad.flatten() else {
+            return Err(AppError::no_encontrado("notificación retenida no encontrada"));
+        };
+        // El mismo candado que las notificaciones de este pago.
+        bloquear_identidad(&mut tx, &identidad).await?;
+        let previo: Option<Descarte> =
+            sqlx::query_as("SELECT * FROM ifpe.spei_descartes WHERE clave_idempotencia = $1 OR cuarentena_id = $2")
+                .bind(&s.clave_idempotencia)
+                .bind(s.cuarentena_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        if let Some(previo) = previo {
+            if previo.clave_idempotencia != s.clave_idempotencia {
+                return Err(AppError::conflicto("SPEI_YA_DESCARTADO", "esa notificación ya fue descartada"));
+            }
+            if previo.cuarentena_id != s.cuarentena_id || previo.motivo != motivo {
+                return Err(AppError::conflicto(
+                    "CLAVE_IDEMPOTENCIA_REUTILIZADA",
+                    "la clave de idempotencia ya se usó para otro descarte",
+                ));
+            }
+            tx.commit().await?;
+            return Ok(ResultadoDescarte { descarte: previo, idempotente: true });
+        }
+        let pendiente: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM ifpe.v_spei_en_revision WHERE id = $1)")
+            .bind(s.cuarentena_id)
+            .fetch_one(&mut *tx)
+            .await?;
+        if !pendiente {
+            return Err(AppError::negocio("SPEI_NO_RETENIDO", "la notificación ya no está pendiente de revisión"));
+        }
+        let descarte: Descarte = sqlx::query_as(
+            "INSERT INTO ifpe.spei_descartes (cuarentena_id, motivo, autorizado_por, clave_idempotencia) \
+             VALUES ($1, $2, $3, $4) RETURNING *",
+        )
+        .bind(s.cuarentena_id)
+        .bind(&motivo)
+        .bind(s.operador_id)
+        .bind(&s.clave_idempotencia)
+        .fetch_one(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        tracing::warn!(%identidad, operador = %s.operador_id, "notificación SPEI retenida descartada como duplicado");
+        Ok(ResultadoDescarte { descarte, idempotente: false })
+    })
+    .await
+}
+
+/// Notificación retenida sin resolver (`ifpe.v_spei_en_revision`).
+#[derive(Debug, Clone, Serialize, FromRow)]
+pub struct Retenida {
+    pub id: Uuid,
+    pub tipo: String,
+    pub identidad: String,
+    pub error: String,
+    pub recibido_en: DateTime<Utc>,
+}
+
+/// Cola de revisión del operador (más antiguas primero).
+pub async fn en_revision(pool: &PgPool) -> AppResult<Vec<Retenida>> {
+    let mut tx = db::begin_lectura(pool, Rol::Spei).await?;
+    let filas = sqlx::query_as("SELECT * FROM ifpe.v_spei_en_revision ORDER BY recibido_en LIMIT 500")
+        .fetch_all(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(filas)
 }
 
 // -----------------------------------------------------------------------------
@@ -664,15 +1088,20 @@ pub struct ResultadoCorreccion {
     pub idempotente: bool,
 }
 
+fn validar_motivo(motivo: &str, que: &str) -> AppResult<String> {
+    let motivo = motivo.trim();
+    if !(5..=200).contains(&motivo.chars().count()) || motivo.chars().any(char::is_control) {
+        return Err(AppError::validacion(format!("el motivo de la {que} debe tener de 5 a 200 caracteres")));
+    }
+    Ok(motivo.to_owned())
+}
+
 /// Revierte (total o parcialmente) un abono SPEI erróneo: cargo al saldo
 /// disponible del cliente y a la reserva, ligado al abono original. La base de
 /// datos impide corregir más que el monto abonado.
 pub async fn corregir(pool: &PgPool, s: &SolicitudCorreccion) -> AppResult<ResultadoCorreccion> {
     let monto = validar_monto_spei(s.monto)?;
-    let motivo = s.motivo.trim();
-    if !(5..=200).contains(&motivo.chars().count()) || motivo.chars().any(char::is_control) {
-        return Err(AppError::validacion("el motivo de la corrección debe tener de 5 a 200 caracteres"));
-    }
+    let motivo = validar_motivo(&s.motivo, "corrección")?;
     db::con_reintentos(|| async {
         let mut tx = db::begin(pool, Rol::Spei).await?;
         let abono: SpeiInbound = sqlx::query_as("SELECT * FROM ifpe.spei_inbound WHERE id = $1")
@@ -683,7 +1112,7 @@ pub async fn corregir(pool: &PgPool, s: &SolicitudCorreccion) -> AppResult<Resul
         let (Some(cuenta_id), "ABONADO") = (abono.cuenta_id, abono.estado.as_str()) else {
             return Err(AppError::negocio("SPEI_NO_ABONADO", "solo se corrige un SPEI que se abonó"));
         };
-        let cuenta = ledger::bloquear_cuenta_ifpe(&mut tx, cuenta_id).await?;
+        ledger::bloquear_cuenta_ifpe(&mut tx, cuenta_id).await?;
         let previa: Option<Correccion> =
             sqlx::query_as("SELECT * FROM ifpe.spei_correcciones WHERE clave_idempotencia = $1")
                 .bind(&s.clave_idempotencia)
@@ -703,58 +1132,209 @@ pub async fn corregir(pool: &PgPool, s: &SolicitudCorreccion) -> AppResult<Resul
             tx.commit().await?;
             return Ok(ResultadoCorreccion { correccion: previa, transaccion, idempotente: true });
         }
-        let corregido: Decimal =
-            sqlx::query_scalar("SELECT coalesce(sum(monto), 0) FROM ifpe.spei_correcciones WHERE spei_inbound_id = $1")
-                .bind(s.spei_inbound_id)
-                .fetch_one(&mut *tx)
-                .await?;
-        if corregido + monto > abono.monto {
-            return Err(AppError::negocio(
-                "CORRECCION_EXCEDE_ABONO",
-                format!("el abono fue de {} y ya se corrigieron {corregido}", abono.monto),
-            ));
-        }
-        ledger::exigir_saldo(&cuenta, monto)?;
-        // Mismo custodio al que entró el abono.
-        let reserva_id: Uuid = sqlx::query_scalar("SELECT reserva_id FROM ifpe.transacciones WHERE id = $1")
-            .bind(abono.transaccion_id)
-            .fetch_one(&mut *tx)
-            .await?;
-        sqlx::query("SELECT 1 FROM ifpe.reserva_custodia WHERE id = $1 FOR NO KEY UPDATE")
-            .bind(reserva_id)
-            .execute(&mut *tx)
-            .await?;
-        let id = Uuid::new_v4();
-        let concepto = format!("Corrección de SPEI recibido {}: {motivo}", abono.clave_rastreo);
-        let concepto: String = concepto.chars().take(140).collect();
-        let t = ledger::cargar_efectivo(
-            &mut tx,
-            cuenta_id,
-            reserva_id,
-            monto,
-            Some(&concepto),
-            Some(&format!("correccion:{}", abono.id)),
-            &format!("spei-correccion:{id}"),
-        )
-        .await?;
-        let correccion: Correccion = sqlx::query_as(
-            "INSERT INTO ifpe.spei_correcciones \
-             (id, spei_inbound_id, cuenta_id, monto, motivo, autorizado_por, clave_idempotencia, tx_id) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *",
-        )
-        .bind(id)
-        .bind(abono.id)
-        .bind(cuenta_id)
-        .bind(monto)
-        .bind(motivo)
-        .bind(s.operador_id)
-        .bind(&s.clave_idempotencia)
-        .bind(t.id)
-        .fetch_one(&mut *tx)
-        .await?;
+        let (correccion, t) =
+            corregir_en(&mut tx, &abono, monto, &motivo, s.operador_id, &s.clave_idempotencia).await?;
         tx.commit().await?;
         tracing::warn!(spei = %abono.id, %monto, operador = %s.operador_id, "abono SPEI corregido");
         Ok(ResultadoCorreccion { correccion, transaccion: t, idempotente: false })
+    })
+    .await
+}
+
+/// Cargo de corrección ligado al abono, dentro de una transacción `sc_spei`
+/// que ya bloqueó la cuenta del abono.
+async fn corregir_en(
+    tx: &mut Tx,
+    abono: &SpeiInbound,
+    monto: Decimal,
+    motivo: &str,
+    operador_id: Uuid,
+    clave_idempotencia: &str,
+) -> AppResult<(Correccion, TransaccionIfpe)> {
+    let (Some(cuenta_id), "ABONADO") = (abono.cuenta_id, abono.estado.as_str()) else {
+        return Err(AppError::negocio("SPEI_NO_ABONADO", "solo se corrige un SPEI que se abonó"));
+    };
+    let cuenta = ledger::bloquear_cuenta_ifpe(tx, cuenta_id).await?;
+    let corregido: Decimal =
+        sqlx::query_scalar("SELECT coalesce(sum(monto), 0) FROM ifpe.spei_correcciones WHERE spei_inbound_id = $1")
+            .bind(abono.id)
+            .fetch_one(&mut **tx)
+            .await?;
+    if corregido + monto > abono.monto {
+        return Err(AppError::negocio(
+            "CORRECCION_EXCEDE_ABONO",
+            format!("el abono fue de {} y ya se corrigieron {corregido}", abono.monto),
+        ));
+    }
+    ledger::exigir_saldo(&cuenta, monto)?;
+    // Mismo custodio al que entró el abono.
+    let reserva_id: Uuid = sqlx::query_scalar("SELECT reserva_id FROM ifpe.transacciones WHERE id = $1")
+        .bind(abono.transaccion_id)
+        .fetch_one(&mut **tx)
+        .await?;
+    sqlx::query("SELECT 1 FROM ifpe.reserva_custodia WHERE id = $1 FOR NO KEY UPDATE")
+        .bind(reserva_id)
+        .execute(&mut **tx)
+        .await?;
+    let id = Uuid::new_v4();
+    let concepto = format!("Corrección de SPEI recibido {}: {motivo}", abono.clave_rastreo);
+    let concepto: String = concepto.chars().take(140).collect();
+    let t = ledger::cargar_efectivo(
+        tx,
+        cuenta_id,
+        reserva_id,
+        monto,
+        Some(&concepto),
+        Some(&format!("correccion:{}", abono.id)),
+        &format!("spei-correccion:{id}"),
+    )
+    .await?;
+    let correccion: Correccion = sqlx::query_as(
+        "INSERT INTO ifpe.spei_correcciones \
+         (id, spei_inbound_id, cuenta_id, monto, motivo, autorizado_por, clave_idempotencia, tx_id) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *",
+    )
+    .bind(id)
+    .bind(abono.id)
+    .bind(cuenta_id)
+    .bind(monto)
+    .bind(motivo)
+    .bind(operador_id)
+    .bind(clave_idempotencia)
+    .bind(t.id)
+    .fetch_one(&mut **tx)
+    .await?;
+    Ok((correccion, t))
+}
+
+// -----------------------------------------------------------------------------
+// Anulación de una captura errónea
+// -----------------------------------------------------------------------------
+
+#[derive(Debug, Clone)]
+pub struct SolicitudAnulacion {
+    pub spei_inbound_id: Uuid,
+    pub motivo: String,
+    pub operador_id: Uuid,
+    /// Clave ya acotada al operador.
+    pub clave_idempotencia: String,
+}
+
+/// Registro de `ifpe.spei_anulaciones`.
+#[derive(Debug, Clone, Serialize, FromRow)]
+pub struct Anulacion {
+    pub id: Uuid,
+    pub spei_inbound_id: Uuid,
+    pub correccion_id: Option<Uuid>,
+    pub motivo: String,
+    pub autorizado_por: Uuid,
+    #[serde(skip)]
+    pub clave_idempotencia: String,
+    pub creado_en: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ResultadoAnulacion {
+    pub anulacion: Anulacion,
+    /// La corrección que completó la reversión (ausente si ya estaba
+    /// corregido por completo).
+    pub correccion: Option<Correccion>,
+    pub idempotente: bool,
+}
+
+/// Anula una captura manual errónea (CLABE o monto equivocados): corrige lo
+/// que falte del abono (cargo `spei-correccion:` ligado a él, como
+/// [`corregir`]) y libera su identidad. El pago real (webhook o nueva captura)
+/// se registra después como reemplazo del anulado y se abona a la cuenta
+/// correcta. Solo capturas del operador o anteriores a 0005: lo que informa
+/// el proveedor no se anula. La base de datos exige la corrección total al
+/// COMMIT y que el operador no sea el titular de la cuenta.
+pub async fn anular(pool: &PgPool, s: &SolicitudAnulacion) -> AppResult<ResultadoAnulacion> {
+    let motivo = validar_motivo(&s.motivo, "anulación")?;
+    db::con_reintentos(|| async {
+        let mut tx = db::begin(pool, Rol::Spei).await?;
+        let abono: SpeiInbound = sqlx::query_as("SELECT * FROM ifpe.spei_inbound WHERE id = $1")
+            .bind(s.spei_inbound_id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or_else(|| AppError::no_encontrado("SPEI recibido no encontrado"))?;
+        // El mismo candado que las notificaciones de este pago.
+        let identidad = IdentidadSpei {
+            institucion_emisora: abono.institucion_emisora.clone(),
+            fecha_operacion: abono.fecha_operacion,
+            clave_rastreo: abono.clave_rastreo.clone(),
+        }
+        .canonica();
+        bloquear_identidad(&mut tx, &identidad).await?;
+
+        let previa: Option<Anulacion> =
+            sqlx::query_as("SELECT * FROM ifpe.spei_anulaciones WHERE clave_idempotencia = $1 OR spei_inbound_id = $2")
+                .bind(&s.clave_idempotencia)
+                .bind(abono.id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        if let Some(previa) = previa {
+            if previa.clave_idempotencia != s.clave_idempotencia {
+                return Err(AppError::conflicto("SPEI_YA_ANULADO", "ese SPEI recibido ya fue anulado"));
+            }
+            if previa.spei_inbound_id != abono.id || previa.motivo != motivo {
+                return Err(AppError::conflicto(
+                    "CLAVE_IDEMPOTENCIA_REUTILIZADA",
+                    "la clave de idempotencia ya se usó para otra anulación",
+                ));
+            }
+            let correccion = match previa.correccion_id {
+                Some(id) => Some(
+                    sqlx::query_as("SELECT * FROM ifpe.spei_correcciones WHERE id = $1").bind(id).fetch_one(&mut *tx).await?,
+                ),
+                None => None,
+            };
+            tx.commit().await?;
+            return Ok(ResultadoAnulacion { anulacion: previa, correccion, idempotente: true });
+        }
+        let (Some(cuenta_id), "ABONADO", "OPERADOR" | "LEGADO") =
+            (abono.cuenta_id, abono.estado.as_str(), abono.origen.as_str())
+        else {
+            return Err(AppError::negocio(
+                "SPEI_NO_ANULABLE",
+                "solo se anula un abono capturado por el operador (o anterior a 0005); lo que informó el proveedor se corrige",
+            ));
+        };
+        let titular: Uuid = sqlx::query_scalar("SELECT cliente_id FROM ifpe.cuentas WHERE id = $1")
+            .bind(cuenta_id)
+            .fetch_one(&mut *tx)
+            .await?;
+        if titular == s.operador_id {
+            return Err(AppError::negocio("SPEI_AUTORESOLUCION", "un operador no anula abonos a su propia cuenta"));
+        }
+        ledger::bloquear_cuenta_ifpe(&mut tx, cuenta_id).await?;
+        let corregido: Decimal =
+            sqlx::query_scalar("SELECT coalesce(sum(monto), 0) FROM ifpe.spei_correcciones WHERE spei_inbound_id = $1")
+                .bind(abono.id)
+                .fetch_one(&mut *tx)
+                .await?;
+        let resto = abono.monto - corregido;
+        let correccion = if resto > Decimal::ZERO {
+            let clave = format!("{}:anulacion", s.clave_idempotencia);
+            let (c, _) = corregir_en(&mut tx, &abono, resto, &motivo, s.operador_id, &clave).await?;
+            Some(c)
+        } else {
+            None
+        };
+        let anulacion: Anulacion = sqlx::query_as(
+            "INSERT INTO ifpe.spei_anulaciones (spei_inbound_id, correccion_id, motivo, autorizado_por, clave_idempotencia) \
+             VALUES ($1, $2, $3, $4, $5) RETURNING *",
+        )
+        .bind(abono.id)
+        .bind(correccion.as_ref().map(|c| c.id))
+        .bind(&motivo)
+        .bind(s.operador_id)
+        .bind(&s.clave_idempotencia)
+        .fetch_one(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        tracing::warn!(spei = %abono.id, %identidad, %resto, operador = %s.operador_id, "captura SPEI anulada: identidad liberada");
+        Ok(ResultadoAnulacion { anulacion, correccion, idempotente: false })
     })
     .await
 }

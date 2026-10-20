@@ -41,7 +41,7 @@ Integrity checks (migration `0004` and the backend):
   the leaf is the customer's own account and that the cut matches the public,
   unauthenticated copy (`GET /reserva/cortes/{id}`).
 
-## SPEI (interbank transfers, migration `0005`)
+## SPEI (interbank transfers, migrations `0005` and `0008`)
 
 Real transfers through a settlement partner such as STP. SPEI moves only the
 IFPE vault and its custody reserve; the SOFOM never sees it.
@@ -55,22 +55,73 @@ IFPE vault and its custody reserve; the SOFOM never sees it.
   with the Banxico cause when the CLABE is unknown (1), the account is blocked
   or has no KYC (2), or it is closed (3). Authenticated notifications that
   cannot be used are quarantined and returned (14), never answered with a 4xx.
+  A return (`tipoPago` 0, 16, 17, 18, 23, 24, or any notification carrying
+  `claveRastreoDevolucion`) is applied to its order, which is refunded once;
+  the database refuses to book a return as an ordinary credit, and requires
+  it to come back to the order's originating CLABE for the amount sent. A
+  return that matches no order, or whose reversal is impossible (closed
+  account: the order is flagged for manual review), is quarantined and
+  answered `confirmar` (`CUARENTENA`): SPEI does not allow returning a return.
+  An operator can enter a return by hand (`clave_rastreo_devolucion` on
+  `POST /api/v1/operaciones/depositos`) only for a settled order that the
+  provider, queried at that moment, reports as returned, and never for their
+  own order. A later notification with the same identity that names another
+  order is held for review, not confirmed as a repeat.
 - **No double credit:** a payment's identity is issuing participant + tracking
   key + operation date (Banxico makes the tracking key unique per participant
   per day). A unique index plus a per-identity advisory lock mean concurrent
   or repeated webhooks credit once. A second check blocks the same payment
   under another identity (an operator typing the calendar date or a wrong
-  issuer code, or credits from before 0005).
+  issuer code, or credits from before 0005); two identities reported by the
+  provider are never duplicates of each other. Migration `0008` logs pre-0005
+  credits with a canonical identity (origin `LEGADO`), so a new notification of
+  the same payment is an idempotent repeat. A webhook that hits the
+  possible-duplicate check, or an identity already logged with another amount
+  or CLABE, is held without crediting and answered `confirmar`
+  (`EN_REVISION`); `GET /api/v1/spei/en-revision` (operator / auditor) lists
+  what is still open. The operator resolves it by entering the payment with
+  `distinto_de` (the earlier transaction named in the 409) and a `motivo`, by
+  voiding a wrong manual entry (below), or by discarding a held notification
+  that really is a duplicate:
+  `POST /api/v1/operaciones/spei/en-revision/{id}/descarte` (`motivo`,
+  `clave_idempotencia`; moves no money, logged in `ifpe.spei_descartes`).
+  Pre-0004 credits that kept only the bare tracking key match with the same
+  ±7-day window as everything else, so a payer who reuses a tracking key
+  every week is not held forever.
 - **Sending:** `POST /api/v1/spei/transfer`. The balance and the reserve go
   down at once (the money is committed to the order and cannot be spent
   twice), and the order is dispatched by a background worker. The worker
   never refunds on a timeout or an ambiguous answer. A rejection counts as
   final only on the first attempt; afterwards (for example "duplicate
-  tracking key" on a resend) the order goes to manual review. Refunds happen
+  tracking key" on a resend) the order goes to manual review. A first-attempt
+  rejection is applied only if, under the order's lock, `intentos_envio` still
+  matches the claim (no other dispatcher took the order after the lease
+  expired). Right before every `registrar` the worker re-checks its claim
+  against the live row (same state, same `intentos_envio`, not in review) and
+  renews the lease, and every gateway call is capped at 20 s, far below the
+  60 s lease: a slow batch's stale snapshot never registers an order that
+  another worker took over, that went to review or that an operator
+  refunded. The worker never resends when the provider's operating day may
+  have changed since the first call that might have registered the order
+  (`registro_incierto_desde`; `SPEI_HORA_CORTE`, default 17:30 Mexico City,
+  plus `SPEI_MARGEN_CORTE_SEG`): the provider rejects a repeated tracking key
+  only within the same day. A call that provably never reached the provider
+  (connection refused) does not count, so orders stuck behind a provider
+  outage are sent once it recovers, even after the cutoff. Status queries
+  cover every operating date any `registrar` call could have been given. A
+  second accepted registration of the same order (another provider id or
+  operating date) is logged as an incident and flagged for review. Refunds happen
   only on a first-attempt rejection, a cancellation or a return, exactly once
   (`spei-reverso:<order>`), even when the status webhook, the poller and an
   incoming return all report it. Settled orders are polled for returns during
-  `SPEI_VENTANA_DEVOLUCION_DIAS`.
+  `SPEI_VENTANA_DEVOLUCION_DIAS`. An order in manual review that the provider
+  never received is refunded by an operator:
+  `POST /api/v1/operaciones/spei/enviados/{id}/reembolso` with `motivo` and
+  `clave_idempotencia`. It re-queries the provider (it must not have the
+  order), requires the dispatcher to have left the order alone for
+  `SPEI_ESPERA_RESOLUCION_SEG` (default 900), and is logged in
+  `ifpe.spei_resoluciones`, bound by the database to the reversal of an order
+  the provider never acknowledged.
 - **Database guarantees:** every new DEPOSITO is a logged SPEI or an order
   reversal, and every new RETIRO is an order or an operator correction, each
   created in the same transaction as its record. A separate role (`sc_spei`)
@@ -81,9 +132,19 @@ IFPE vault and its custody reserve; the SOFOM never sees it.
   PostgreSQL. CLABEs live in `ifpe.clabes_asignadas` (STP virtual CLABEs
   `646...` included) and are never reassigned.
 - **Reconciliation:** `GET /api/v1/spei/conciliacion` reports, per custody
-  account, book reserve plus orders not yet confirmed as settled.
+  account, book reserve plus orders not yet confirmed as settled, orders in
+  manual review (settled ones included) and orders with a reconciliation
+  incident. A provider result that contradicts an order's final state (for
+  example "settled" for an order already refunded) moves no money and is kept
+  in the append-only `ifpe.spei_incidentes`.
 - **Corrections:** `POST /api/v1/operaciones/spei/recibidos/{id}/correccion`
   (operator) reverses a wrong credit, up to the credited amount.
+  `POST /api/v1/operaciones/spei/recibidos/{id}/anulacion` (operator, `motivo`,
+  `clave_idempotencia`) voids a wrong manual entry (wrong CLABE or amount): it
+  corrects whatever is left of the credit and frees the payment identity, so
+  the real payment (webhook or a new entry) is credited to the right account
+  as its replacement (`reemplaza_a`). Provider-reported credits cannot be
+  voided.
 
 `backend/src/spei/pasarela.rs` defines the gateway interface. The simulated
 gateway reproduces STP's behaviour, including duplicate rejections on resend
@@ -207,6 +268,7 @@ cd backend && DATABASE_URL=postgres://synthetic:synthetic@localhost:5432/synthet
 psql "$EMPTY_DATABASE_URL" -f tests/db/0001_invariantes.sql
 psql "$EMPTY_DATABASE_URL" -f tests/db/0006_kyc.sql
 psql "$EMPTY_DATABASE_URL" -f tests/db/0007_kyc.sql
+psql "$EMPTY_DATABASE_URL" -f tests/db/0008_spei.sql
 cd frontend && npm test && npm run build
 FRONTEND_URL=http://localhost:3000 node e2e/smoke.mjs   # needs backend (MODO_DEMO=true) + next start
 ```
@@ -289,8 +351,11 @@ the password is hashed, so a parallel burst cannot test more than 5 passwords.
 | POST | `/api/v1/spei/webhook/inbound`, `/api/v1/spei/webhook/estado` | SPEI provider (HMAC signature) |
 | POST | `/api/v1/spei/transfer` | client: send an SPEI |
 | GET | `/api/v1/spei/transferencias`, `/api/v1/spei/recibidos` | client |
-| GET | `/api/v1/spei/conciliacion` | operator / auditor |
+| GET | `/api/v1/spei/conciliacion`, `/api/v1/spei/en-revision` | operator / auditor |
 | POST | `/api/v1/operaciones/spei/recibidos/{id}/correccion` | operator: reverse a wrong SPEI credit |
+| POST | `/api/v1/operaciones/spei/recibidos/{id}/anulacion` | operator: void a wrong manual SPEI entry and free its identity |
+| POST | `/api/v1/operaciones/spei/enviados/{id}/reembolso` | operator: refund an order in manual review that the provider never received |
+| POST | `/api/v1/operaciones/spei/en-revision/{id}/descarte` | operator: discard a held SPEI notification as a duplicate (no money moves) |
 | POST | `/api/v1/operaciones/...` | operator: holds, KYC, AML alerts, capital |
 
 Full table in `backend/src/routes/mod.rs`.

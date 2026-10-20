@@ -39,7 +39,11 @@
 //! | POST | `/api/v1/spei/webhook/inbound`, `/api/v1/spei/webhook/estado` | proveedor SPEI (firma HMAC) |
 //! | POST | `/api/v1/spei/transfer` | cliente: SPEI saliente |
 //! | GET  | `/api/v1/spei/transferencias`, `/api/v1/spei/recibidos` | cliente |
-//! | GET  | `/api/v1/spei/conciliacion` | operador / auditor |
+//! | GET  | `/api/v1/spei/conciliacion`, `/api/v1/spei/en-revision` | operador / auditor |
+//! | POST | `/api/v1/operaciones/spei/recibidos/{id}/correccion` | operador: revierte un abono SPEI erróneo |
+//! | POST | `/api/v1/operaciones/spei/recibidos/{id}/anulacion` | operador: anula una captura manual errónea |
+//! | POST | `/api/v1/operaciones/spei/enviados/{id}/reembolso` | operador: reembolsa una orden en revisión que el proveedor no tiene |
+//! | POST | `/api/v1/operaciones/spei/en-revision/{id}/descarte` | operador: descarta como duplicado una notificación retenida |
 
 mod auth;
 mod extraccion;

@@ -82,6 +82,20 @@ pub struct ConfigSpei {
     /// Días después de liquidar durante los que se consulta si la orden fue
     /// devuelta por el banco receptor.
     pub ventana_devolucion_dias: i32,
+    /// Reposo exigido (sin que el despachador toque la orden) antes de que el
+    /// operador reembolse una orden en revisión manual. Debe exceder el
+    /// arrendamiento del despachador (60 s) más el tiempo máximo de una
+    /// llamada al proveedor: así ningún registro tardío sigue en vuelo.
+    pub espera_resolucion_seg: u64,
+    /// Hora (Ciudad de México) en que el proveedor cambia la fecha de
+    /// operación (corte SPEI). Una orden de resultado desconocido no se
+    /// reenvía si el día de operación pudo cambiar desde su creación: el
+    /// proveedor solo rechaza como duplicada la clave de rastreo del mismo día.
+    pub hora_corte: chrono::NaiveTime,
+    /// Holgura alrededor del corte: desfase de relojes (nuestro, de la base de
+    /// datos y del proveedor) más la duración máxima de una llamada al
+    /// proveedor.
+    pub margen_corte_seg: u64,
 }
 
 impl Default for ConfigSpei {
@@ -96,6 +110,10 @@ impl Default for ConfigSpei {
             lote: 50,
             espera_incierto_seg: 60,
             ventana_devolucion_dias: 3,
+            espera_resolucion_seg: 900,
+            // Por confirmar contra el contrato con el participante liquidador.
+            hora_corte: chrono::NaiveTime::from_hms_opt(17, 30, 0).expect("hora válida"),
+            margen_corte_seg: 600,
         }
     }
 }
@@ -252,6 +270,13 @@ impl Config {
                     espera_incierto_seg: var_o("SPEI_ESPERA_INCIERTO_SEG", d.espera_incierto_seg)?,
                     ventana_devolucion_dias: var_o("SPEI_VENTANA_DEVOLUCION_DIAS", d.ventana_devolucion_dias)?
                         .clamp(0, 60),
+                    espera_resolucion_seg: var_o("SPEI_ESPERA_RESOLUCION_SEG", d.espera_resolucion_seg)?,
+                    hora_corte: match var("SPEI_HORA_CORTE") {
+                        None => d.hora_corte,
+                        Some(v) => chrono::NaiveTime::parse_from_str(v.trim(), "%H:%M")
+                            .map_err(|e| anyhow::anyhow!("SPEI_HORA_CORTE debe ser HH:MM ({v}): {e}"))?,
+                    },
+                    margen_corte_seg: var_o("SPEI_MARGEN_CORTE_SEG", d.margen_corte_seg)?.max(60),
                 }
             },
             http: {
