@@ -16,7 +16,7 @@
  * syntax). Dates are "YYYY-MM-DD" strings; "today" is always an argument
  * (see `todayInMexicoCity`) so results are reproducible.
  */
-import type { DatosIneInput, DatosPersonalesInput, Domicilio, EstadoKyc, Sexo } from "./api/types.ts";
+import type { BloqueoKyc, DatosIneInput, DatosPersonalesInput, Domicilio, EstadoKyc, Sexo } from "./api/types.ts";
 import { COMPLIANCE_EMAIL } from "./config.ts";
 
 /** Result of a validator: the normalized value, or a stable code plus an English message. */
@@ -1034,6 +1034,9 @@ const PROVIDER_REASONS: Record<string, string> = {
 };
 
 const EXACT: Record<string, string> = {
+  // Face-similarity findings carry neither the score nor the threshold.
+  "la similitud facial entre la selfie y la credencial no alcanza el mínimo aceptable": FACE_NO_MATCH,
+  "la similitud facial entre la selfie y la credencial requiere revisión humana": FACE_NEEDS_REVIEW,
   // curp.rs
   "la CURP debe tener 18 caracteres": M.curpLength,
   "la CURP no tiene la estructura oficial (4 letras, fecha AAMMDD, sexo, entidad, 3 consonantes, homoclave y dígito)":
@@ -1201,6 +1204,27 @@ export function kycMessageInEnglish(message: string): string | null {
   const translated = parts.map(translateOne);
   if (translated.every((t) => t === null)) return null;
   return translated.map((t, i) => t ?? parts[i]).join(" ");
+}
+
+/** Customer copy for a submission lock. */
+export function lockMessage(bloqueo: BloqueoKyc): { title: string; body: string } {
+  switch (bloqueo) {
+    case "SIN_INTENTOS":
+      return {
+        title: "No verification attempts left",
+        body: `You have used all your verification attempts. ${CONTACT_COMPLIANCE}`,
+      };
+    case "CONFLICTOS_IDENTIDAD":
+      return {
+        title: "Remote verification is locked",
+        body: `Too many submissions used a CURP, RFC or voter key that is registered to another account, so remote verification is locked for up to 30 days. ${CONTACT_COMPLIANCE}`,
+      };
+    case "IDENTIDAD_BLOQUEADA":
+      return {
+        title: "This CURP cannot be verified remotely",
+        body: `Verifications with this CURP were rejected on other accounts, so it is locked for up to 30 days. ${CONTACT_COMPLIANCE}`,
+      };
+  }
 }
 
 /** `kycMessageInEnglish`, falling back to the original text. */

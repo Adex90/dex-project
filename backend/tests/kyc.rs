@@ -26,12 +26,12 @@ use synthetic_capital::{
         self,
         biometria::{ProveedorBiometrico, ProveedorSimulado, Regla},
         dictamen::DictamenKyc,
-        expediente::{self, EstadoKyc, OrigenEnvio},
+        expediente::{self, Bloqueo, EstadoKyc, OrigenEnvio},
         ine::OcrIne,
         verificacion::Resultado,
     },
     ledger,
-    models::kyc::TipoPersona,
+    models::kyc::{EstatusKyc, TipoPersona},
     routes,
     sofom::{credito, puente},
     spei::{
@@ -565,6 +565,15 @@ async fn fallas_consumen_intentos_hasta_rechazar(pool: PgPool) {
         .unwrap();
     assert!(motivo.unwrap().starts_with("intentos agotados"));
     assert_eq!(contar(&pool, "SELECT count(*) FROM kyc.kyc_auditoria_biometrica WHERE cliente_id = $1", ana.cliente.id).await, 3);
+    // coincide_identidad solo mira la identidad: verdadero si solo falla el
+    // rostro; falso con la CURP ajena o sin lectura de la credencial.
+    let coincide: Vec<bool> =
+        sqlx::query_scalar("SELECT coincide_identidad FROM kyc.kyc_auditoria_biometrica WHERE cliente_id = $1 ORDER BY id")
+            .bind(ana.cliente.id)
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert_eq!(coincide, vec![true, false, false]);
 
     // Sin intentos, un nuevo envío ni siquiera llega al proveedor.
     let e = onboarding(&pool, &cfg, ana.cliente.id, &id, &p).await.unwrap_err();
@@ -933,9 +942,16 @@ async fn sondear_identidades_ajenas_tiene_limite(pool: PgPool) {
     assert_eq!(enviar(&pool, &cfg, ana.cliente.id, &id, &p).await.estado_kyc, EstadoKyc::Verificado);
     let beto = cliente_sin_kyc(&pool, &cfg, "Beto").await;
     for _ in 0..3 {
+        let v = expediente::vista(&pool, beto.cliente.id).await.unwrap();
+        assert_eq!((v.bloqueo, v.intentos_restantes), (None, 3));
         let e = onboarding(&pool, &cfg, beto.cliente.id, &id, &p).await.unwrap_err();
         assert_eq!(e.codigo(), "IDENTIDAD_EN_USO");
     }
+    // El expediente sigue PENDIENTE y sin intentos gastados, pero la vista ya
+    // dice que no puede enviarse (antes anunciaba 3 intentos restantes).
+    let v = expediente::vista(&pool, beto.cliente.id).await.unwrap();
+    assert_eq!((v.expediente.estado_kyc, v.expediente.intentos), (EstadoKyc::Pendiente, 0));
+    assert_eq!((v.bloqueo, v.intentos_restantes), (Some(Bloqueo::ConflictosIdentidad), 0));
     let e = onboarding(&pool, &cfg, beto.cliente.id, &id, &p).await.unwrap_err();
     assert_eq!(e.codigo(), "KYC_SIN_INTENTOS", "el cuarto sondeo ya no responde si la CURP es cliente");
 }
@@ -956,6 +972,21 @@ async fn una_curp_rechazada_en_otras_cuentas_se_bloquea(pool: PgPool) {
     let e = onboarding(&pool, &cfg, trudy.cliente.id, &victima, &p).await.unwrap_err();
     assert_eq!(e.codigo(), "KYC_IDENTIDAD_BLOQUEADA");
     assert_eq!(estado(&pool, trudy.cliente.id).await.2, 0);
+    let v = expediente::vista(&pool, trudy.cliente.id).await.unwrap();
+    assert_eq!((v.bloqueo, v.intentos_restantes), (Some(Bloqueo::IdentidadBloqueada), 0));
+    assert_eq!(v.estatus_cliente, EstatusKyc::Pendiente);
+
+    // Un expediente rechazado no lleva bloqueo (su estado ya lo dice); la
+    // vista sí distingue la suspensión de la cuenta.
+    let v = expediente::vista(&pool, mallory.cliente.id).await.unwrap();
+    assert_eq!((v.bloqueo, v.estatus_cliente), (None, EstatusKyc::Rechazado));
+    sqlx::query("UPDATE kyc.clientes SET estatus_kyc = 'SUSPENDIDO' WHERE id = $1")
+        .bind(mallory.cliente.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let v = expediente::vista(&pool, mallory.cliente.id).await.unwrap();
+    assert_eq!((v.expediente.estado_kyc, v.estatus_cliente), (EstadoKyc::Rechazado, EstatusKyc::Suspendido));
 }
 
 #[sqlx::test(migrations = "../migrations")]
@@ -1014,6 +1045,17 @@ async fn el_cliente_no_ve_el_score_exacto(pool: PgPool) {
     let (_, exp) = api.llamar("GET", "/api/v1/kyc/expediente", Some(&token), None, &[]).await;
     assert_eq!(exp["ultimo_resultado"]["score_similitud"], Value::Null);
     assert_eq!(exp["ultimo_resultado"]["umbral_aplicado"], Value::Null);
+    // Ni en el texto de los hallazgos (antes: "similitud facial 0.78 menor que 0.85").
+    let mensajes: Vec<&str> = v["resultado"]["detalles"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .chain(exp["ultimo_resultado"]["detalles_fallo"].as_array().unwrap())
+        .map(|d| d["mensaje"].as_str().unwrap())
+        .collect();
+    assert!(mensajes.iter().any(|m| m.contains("similitud facial")), "{mensajes:?}");
+    assert!(mensajes.iter().all(|m| !m.contains("0.78") && !m.contains("0.85") && !m.contains("0.7")), "{mensajes:?}");
+    assert_eq!((&exp["bloqueo"], &exp["estatus_cliente"]), (&Value::Null, &json!("EN_REVISION")));
     // Cumplimiento sí lo ve.
     let cola = kyc::dictamen::pendientes(&pool, 10).await.unwrap();
     assert_eq!(cola[0].expediente.cliente_id, ana);

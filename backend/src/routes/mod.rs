@@ -28,6 +28,10 @@
 //! | GET  | `/api/v1/reserva/prueba` | cliente |
 //! | POST | `/api/v1/reserva/cortes` | operador / auditor |
 //! | GET  | `/api/v1/auditoria/ledger/{ifpe,sofom}` | operador / auditor |
+//! | GET  | `/api/v1/kyc/expediente` | cliente: estado, intentos, bloqueo y último resultado |
+//! | POST | `/api/v1/kyc/perfil` | cliente: datos personales y domicilio |
+//! | POST | `/api/v1/kyc/verificar` | cliente: INE + selfie (hasta 12 MB) |
+//! | POST | `/api/v1/kyc/webhook` | proveedor biométrico (firma HMAC `X-Kyc-Firma`) |
 //! | POST | `/api/v1/operaciones/depositos` | operador (SPEI entrante) |
 //! | POST | `/api/v1/operaciones/retenciones` | operador |
 //! | GET  | `/api/v1/operaciones/kyc/pendientes` | operador |

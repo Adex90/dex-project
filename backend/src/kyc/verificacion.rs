@@ -82,9 +82,23 @@ pub struct Detalle {
 pub struct Evaluacion {
     pub resultado: Resultado,
     pub score: Option<Decimal>,
+    /// La credencial leída es la del cliente: el OCR coincide con lo
+    /// declarado (CURP, clave de elector, nombre, fecha, sexo, MRZ), la
+    /// credencial y el RFC son consistentes con la CURP, y el proveedor
+    /// analizó las imágenes enviadas. No depende de la prueba de vida, del
+    /// documento ni de la similitud facial (tienen su propia columna o su
+    /// score).
+    pub coincide_identidad: bool,
     pub errores: Vec<String>,
     pub advertencias: Vec<String>,
 }
+
+/// Hallazgos de similitud facial. Sin el score ni el umbral: el texto llega
+/// al cliente (`detalles`), y conocer el número serviría para ajustar una
+/// suplantación hasta pasar el umbral. Cumplimiento ve ambos en la bitácora.
+pub const SIMILITUD_INSUFICIENTE: &str =
+    "la similitud facial entre la selfie y la credencial no alcanza el mínimo aceptable";
+pub const SIMILITUD_EN_REVISION: &str = "la similitud facial entre la selfie y la credencial requiere revisión humana";
 
 impl Evaluacion {
     pub fn detalles(&self) -> Vec<Detalle> {
@@ -102,7 +116,9 @@ pub fn evaluar(
     hoy: NaiveDate,
 ) -> Evaluacion {
     let (mut errores, mut advertencias) = (Vec::new(), Vec::new());
+    let mut coincide_identidad = true;
     if evidencia_enviada != Some(&r.evidencia) {
+        coincide_identidad = false;
         errores.push("las imágenes analizadas por el proveedor no son las que envió el cliente".to_owned());
     }
     if !r.prueba_vida.exitosa {
@@ -118,19 +134,27 @@ pub fn evaluar(
         ));
     }
     match &r.documento.ocr {
-        None => errores.push("el proveedor no entregó la lectura de la credencial".to_owned()),
+        None => {
+            coincide_identidad = false;
+            errores.push("el proveedor no entregó la lectura de la credencial".to_owned());
+        }
         Some(ocr) => {
             let c = ine::cotejar(ocr, &identidad.como_declarada(), hoy);
+            coincide_identidad &= c.errores.is_empty();
             errores.extend(c.errores);
             advertencias.extend(c.advertencias);
         }
     }
     match Curp::parse(&identidad.curp) {
-        Err(e) => errores.push(e.to_string()),
+        Err(e) => {
+            coincide_identidad = false;
+            errores.push(e.to_string());
+        }
         Ok(curp) => {
             // Consistencia de la credencial con la CURP (fecha, sexo y entidad
             // de nacimiento en la clave de elector, vigencia).
             let (e, a) = ine::validar_credencial(&identidad.como_declarada().credencial, &curp, hoy);
+            coincide_identidad &= e.is_empty();
             errores.extend(e);
             advertencias.extend(a);
             advertencias.extend(curp.advertencias_de_nombre(
@@ -144,6 +168,7 @@ pub fn evaluar(
                 &identidad.apellido_paterno,
                 identidad.apellido_materno.as_deref(),
             );
+            coincide_identidad &= e.is_empty();
             errores.extend(e);
             advertencias.extend(a);
         }
@@ -166,17 +191,17 @@ pub fn evaluar(
             Resultado::Rechazado
         }
         Some(s) if s < u.umbral_revision => {
-            errores.push(format!("similitud facial {s} por debajo del mínimo aceptable {}", u.umbral_revision));
+            errores.push(SIMILITUD_INSUFICIENTE.to_owned());
             Resultado::Rechazado
         }
         Some(s) if s < u.umbral_score_minimo => {
-            advertencias.push(format!("similitud facial {s} menor que {}: requiere revisión humana", u.umbral_score_minimo));
+            advertencias.push(SIMILITUD_EN_REVISION.to_owned());
             Resultado::Revision
         }
         Some(_) if !advertencias.is_empty() => Resultado::Revision,
         Some(_) => Resultado::Aprobado,
     };
-    Evaluacion { resultado, score, errores, advertencias }
+    Evaluacion { resultado, score, coincide_identidad, errores, advertencias }
 }
 
 /// Lo que responde `POST /kyc/verificar` y el webhook.
@@ -285,7 +310,7 @@ pub async fn procesar(
     .bind(r.documento.valido)
     .bind(ocr.and_then(|o| corto(&o.curp)))
     .bind(ocr.and_then(|o| corto(&o.clave_elector)))
-    .bind(ev.errores.is_empty())
+    .bind(ev.coincide_identidad)
     .bind(ev.resultado.como_texto())
     .bind(serde_json::to_value(&detalles).map_err(|err| AppError::Interno(err.into()))?)
     .bind(&firma)
@@ -501,5 +526,44 @@ mod pruebas {
         let e = evaluar(&r, &id, Some(&evidencia()), &U, hoy());
         assert_eq!(e.resultado, Resultado::Revision, "{e:?}");
         assert!(e.errores.is_empty());
+    }
+
+    #[test]
+    fn los_hallazgos_no_revelan_score_ni_umbral() {
+        let id = identidad();
+        for (score, resultado_esperado, mensaje) in [
+            (Some("0.42"), Resultado::Rechazado, SIMILITUD_INSUFICIENTE),
+            (Some("0.7812"), Resultado::Revision, SIMILITUD_EN_REVISION),
+        ] {
+            let e = evaluar(&resultado(score.map(d)), &id, Some(&evidencia()), &U, hoy());
+            assert_eq!(e.resultado, resultado_esperado);
+            let detalles = e.detalles();
+            assert!(detalles.iter().any(|x| x.mensaje == mensaje), "{e:?}");
+            for x in &detalles {
+                assert!(!x.mensaje.chars().any(|c| c.is_ascii_digit()), "un hallazgo con números: {}", x.mensaje);
+            }
+        }
+    }
+
+    #[test]
+    fn coincide_identidad_no_depende_del_rostro_ni_de_la_prueba_de_vida() {
+        let id = identidad();
+        let coincide =
+            |r: &ResultadoProveedor, ev: Option<&Evidencia>| evaluar(r, &id, ev, &U, hoy()).coincide_identidad;
+        // Solo falla el rostro (score bajo o sin rostro): la identidad sí coincide.
+        assert!(coincide(&resultado(Some(d("0.42"))), Some(&evidencia())));
+        assert!(coincide(&resultado(None), Some(&evidencia())));
+        let mut r = resultado(Some(d("0.99")));
+        r.prueba_vida = PruebaVida { exitosa: false, motivo: None };
+        assert!(coincide(&r, Some(&evidencia())));
+        // La credencial no es la declarada, falta la lectura o se analizaron otras imágenes: no.
+        let mut r = resultado(Some(d("0.99")));
+        r.documento.ocr.as_mut().unwrap().curp = "LOOA531113HTCPBN07".into();
+        assert!(!coincide(&r, Some(&evidencia())));
+        let mut r = resultado(Some(d("0.99")));
+        r.documento.ocr = None;
+        assert!(!coincide(&r, Some(&evidencia())));
+        assert!(!coincide(&resultado(Some(d("0.99"))), None));
+        assert!(coincide(&resultado(Some(d("0.99"))), Some(&evidencia())));
     }
 }

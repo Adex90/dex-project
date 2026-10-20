@@ -693,6 +693,12 @@ test("backend messages are translated to English", () => {
     ["similitud facial 0.8012 menor que 0.8500: requiere revisión humana", FACE_NEEDS_REVIEW],
     ["intentos agotados: similitud facial 0.6512 por debajo del mínimo aceptable 0.7000", `No verification attempts left. ${FACE_NO_MATCH}`],
     ["similitud facial 0.61 (formato nuevo)", FACE_NO_MATCH],
+    ["la similitud facial entre la selfie y la credencial no alcanza el mínimo aceptable", FACE_NO_MATCH],
+    ["la similitud facial entre la selfie y la credencial requiere revisión humana", FACE_NEEDS_REVIEW],
+    [
+      "intentos agotados: la similitud facial entre la selfie y la credencial no alcanza el mínimo aceptable",
+      `No verification attempts left. ${FACE_NO_MATCH}`,
+    ],
   ] as const) {
     const out = describeKycMessage(message);
     assert.equal(out, english);

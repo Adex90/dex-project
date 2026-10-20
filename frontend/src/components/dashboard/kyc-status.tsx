@@ -20,7 +20,7 @@ import { ApiError, describeError } from "@/lib/api/client";
 import { api } from "@/lib/api/endpoints";
 import type { Cliente, EstatusKyc, TipoPersona, VistaExpediente } from "@/lib/api/types";
 import { COMPLIANCE_EMAIL } from "@/lib/config";
-import { ESTADO_KYC_LABELS, describeKycMessage } from "@/lib/kyc";
+import { ESTADO_KYC_LABELS, describeKycMessage, lockMessage } from "@/lib/kyc";
 
 /**
  * KYC gating on the dashboard. Until the client's identity is VERIFICADO the
@@ -186,6 +186,15 @@ function fileDetails(status: EstatusKyc, file: VistaExpediente | null): ReactNod
       );
     }
   } else if (status === "PENDIENTE") {
+    if (file.bloqueo) {
+      const lock = lockMessage(file.bloqueo);
+      lines.push(
+        <span key="lock" data-testid="kyc-lock">
+          <span className="font-semibold">{lock.title}.</span> {lock.body}
+        </span>,
+      );
+      return lines;
+    }
     if (file.intentos > 0 && file.ultimo_resultado?.resultado === "RECHAZADO") {
       const reason = lastFailure(file);
       lines.push(

@@ -27,7 +27,7 @@ use super::{
 use crate::{
     db::{self, Rol, Tx},
     error::{AppError, AppResult},
-    models::kyc::TipoPersona,
+    models::kyc::{EstatusKyc, TipoPersona},
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
@@ -165,14 +165,82 @@ pub struct ResumenResultado {
     pub detalles_fallo: serde_json::Value,
 }
 
+/// Por qué un expediente PENDIENTE no puede enviarse: las mismas reglas que
+/// `kyc.fn_proteger_perfil` aplica al envío (0007).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum Bloqueo {
+    /// Agotó sus intentos (`kyc.parametros.max_intentos`).
+    SinIntentos,
+    /// Demasiados envíos con identidades registradas en otra cuenta en los
+    /// últimos 30 días (`kyc.conflictos_recientes`).
+    ConflictosIdentidad,
+    /// Su CURP acumula verificaciones rechazadas en otras cuentas en los
+    /// últimos 30 días (`kyc.rechazos_de_identidad`).
+    IdentidadBloqueada,
+}
+
+impl Bloqueo {
+    fn error(self) -> AppError {
+        match self {
+            Bloqueo::SinIntentos => AppError::negocio(
+                "KYC_SIN_INTENTOS",
+                "agotaste tus intentos de verificación; cumplimiento revisará tu expediente",
+            ),
+            Bloqueo::ConflictosIdentidad => AppError::negocio(
+                "KYC_SIN_INTENTOS",
+                "demasiados envíos con identidades registradas en otra cuenta; acude a cumplimiento",
+            ),
+            Bloqueo::IdentidadBloqueada => AppError::negocio(
+                "KYC_IDENTIDAD_BLOQUEADA",
+                "esa CURP acumula verificaciones rechazadas en otras cuentas; acude a cumplimiento",
+            ),
+        }
+    }
+}
+
+/// Bloqueo vigente de un expediente PENDIENTE (`None` en otro estado: ahí
+/// el cliente no envía de todos modos).
+async fn bloqueo(tx: &mut Tx, e: &Expediente, max_intentos: i16) -> AppResult<Option<Bloqueo>> {
+    if e.estado_kyc != EstadoKyc::Pendiente {
+        return Ok(None);
+    }
+    if e.intentos >= max_intentos {
+        return Ok(Some(Bloqueo::SinIntentos));
+    }
+    let conflictos: i64 =
+        sqlx::query_scalar("SELECT kyc.conflictos_recientes($1)").bind(e.cliente_id).fetch_one(&mut **tx).await?;
+    if conflictos >= i64::from(max_intentos) {
+        return Ok(Some(Bloqueo::ConflictosIdentidad));
+    }
+    if let Some(curp) = e.curp.as_deref() {
+        let rechazos: i64 = sqlx::query_scalar("SELECT kyc.rechazos_de_identidad($1, $2)")
+            .bind(curp)
+            .bind(e.cliente_id)
+            .fetch_one(&mut **tx)
+            .await?;
+        if rechazos >= i64::from(max_intentos) {
+            return Ok(Some(Bloqueo::IdentidadBloqueada));
+        }
+    }
+    Ok(None)
+}
+
 /// Lo que ve el cliente en el paso 4 (y el operador).
 #[derive(Debug, Clone, Serialize)]
 pub struct VistaExpediente {
     #[serde(flatten)]
     pub expediente: Expediente,
     pub tipo_persona: TipoPersona,
+    /// Estatus de la cuenta (`kyc.clientes.estatus_kyc`): espejo del
+    /// expediente, salvo SUSPENDIDO (medida de cumplimiento sobre un
+    /// expediente RECHAZADO).
+    pub estatus_cliente: EstatusKyc,
     pub max_intentos: i16,
+    /// 0 si hay un bloqueo.
     pub intentos_restantes: i16,
+    /// Por qué un expediente PENDIENTE no puede enviarse.
+    pub bloqueo: Option<Bloqueo>,
     pub ultimo_resultado: Option<ResumenResultado>,
 }
 
@@ -198,11 +266,13 @@ pub(crate) async fn cargar(tx: &mut Tx, cliente_id: Uuid) -> AppResult<Expedient
 pub async fn vista(pool: &PgPool, cliente_id: Uuid) -> AppResult<VistaExpediente> {
     let mut tx = db::begin_lectura(pool, Rol::Kyc).await?;
     let expediente = cargar(&mut tx, cliente_id).await?;
-    let tipo_persona: TipoPersona = sqlx::query_scalar("SELECT tipo_persona FROM kyc.clientes WHERE id = $1")
-        .bind(cliente_id)
-        .fetch_one(&mut *tx)
-        .await?;
+    let (tipo_persona, estatus_cliente): (TipoPersona, EstatusKyc) =
+        sqlx::query_as("SELECT tipo_persona, estatus_kyc FROM kyc.clientes WHERE id = $1")
+            .bind(cliente_id)
+            .fetch_one(&mut *tx)
+            .await?;
     let max_intentos: i16 = sqlx::query_scalar("SELECT max_intentos FROM kyc.parametros WHERE id").fetch_one(&mut *tx).await?;
+    let bloqueo = bloqueo(&mut tx, &expediente, max_intentos).await?;
     let ultimo_resultado = sqlx::query_as(
         "SELECT verificacion_id, proveedor, score_similitud, prueba_vida_exitosa, documento_valido, coincide_identidad, \
                 resultado, umbral_aplicado, \"timestamp\", detalles_fallo \
@@ -212,8 +282,16 @@ pub async fn vista(pool: &PgPool, cliente_id: Uuid) -> AppResult<VistaExpediente
     .fetch_optional(&mut *tx)
     .await?;
     tx.commit().await?;
-    let intentos_restantes = (max_intentos - expediente.intentos).max(0);
-    Ok(VistaExpediente { expediente, tipo_persona, max_intentos, intentos_restantes, ultimo_resultado })
+    let intentos_restantes = if bloqueo.is_some() { 0 } else { (max_intentos - expediente.intentos).max(0) };
+    Ok(VistaExpediente {
+        expediente,
+        tipo_persona,
+        estatus_cliente,
+        max_intentos,
+        intentos_restantes,
+        bloqueo,
+        ultimo_resultado,
+    })
 }
 
 fn no_editable(estado: EstadoKyc) -> AppError {
@@ -526,21 +604,21 @@ pub fn exigir_consentimiento(s: &SolicitudVerificacion) -> AppResult<()> {
 }
 
 /// Comprobación barata antes de decodificar imágenes: persona física,
-/// expediente PENDIENTE con sus datos y con intentos disponibles.
+/// expediente PENDIENTE con sus datos y sin [`Bloqueo`] (intentos,
+/// conflictos de identidad o CURP bloqueada; la base de datos lo vuelve a
+/// exigir al enviar).
 pub async fn exigir_enviable(pool: &PgPool, cliente_id: Uuid) -> AppResult<()> {
     let mut tx = db::begin_lectura(pool, Rol::Kyc).await?;
     exigir_persona_fisica(&mut tx, cliente_id).await?;
     let e = cargar(&mut tx, cliente_id).await?;
     let max_intentos: i16 = sqlx::query_scalar("SELECT max_intentos FROM kyc.parametros WHERE id").fetch_one(&mut *tx).await?;
+    let bloqueo = bloqueo(&mut tx, &e, max_intentos).await?;
     tx.commit().await?;
     if e.estado_kyc != EstadoKyc::Pendiente {
         return Err(no_editable(e.estado_kyc));
     }
-    if e.intentos >= max_intentos {
-        return Err(AppError::negocio(
-            "KYC_SIN_INTENTOS",
-            "agotaste tus intentos de verificación; cumplimiento revisará tu expediente",
-        ));
+    if let Some(b) = bloqueo {
+        return Err(b.error());
     }
     if e.curp.is_none() || e.rfc.is_none() || e.nombres.is_none() || e.domicilio.get("codigo_postal").is_none() {
         return Err(AppError::negocio("KYC_DATOS_INCOMPLETOS", "primero captura tus datos personales y tu domicilio"));

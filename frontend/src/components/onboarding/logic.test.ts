@@ -95,8 +95,10 @@ function vista(overrides: Partial<VistaExpediente> = {}): VistaExpediente {
   return {
     ...expediente(),
     tipo_persona: "FISICA",
+    estatus_cliente: "PENDIENTE",
     max_intentos: 3,
     intentos_restantes: 3,
+    bloqueo: null,
     ultimo_resultado: null,
     ...overrides,
   };
@@ -145,6 +147,17 @@ test("retry and headline follow the attempts left", () => {
   assert.match(statusHeadline(vista({ estado_kyc: "RECHAZADO" }), { suspended: true }).title, /suspended/);
 });
 
+test("a submission lock blocks the retry and replaces the attempts headline", () => {
+  // The file is PENDIENTE with attempts on paper, but the server will refuse the submission.
+  const locked = vista({ intentos: 1, intentos_restantes: 0, bloqueo: "CONFLICTOS_IDENTIDAD" });
+  assert.equal(canRetry(locked), false);
+  assert.equal(canRetry({ ...locked, intentos_restantes: 2 }), false);
+  assert.match(statusHeadline(locked).title, /locked/);
+  assert.doesNotMatch(statusHeadline(locked).body, /attempts? left/);
+  assert.match(statusHeadline(vista({ bloqueo: "IDENTIDAD_BLOQUEADA", intentos_restantes: 0 })).title, /CURP/);
+  assert.match(statusHeadline(vista({ bloqueo: "SIN_INTENTOS", intentos_restantes: 0 })).title, /No verification attempts/);
+});
+
 test("saving step 1 keeps the view-only fields and recomputes the attempts left", () => {
   const before = vista({ intentos: 1, intentos_restantes: 2, ultimo_resultado: null });
   const merged = mergeSavedProfile(before, expediente({ intentos: 1, nombres: "Andrés" }));
@@ -152,6 +165,18 @@ test("saving step 1 keeps the view-only fields and recomputes the attempts left"
   assert.equal(merged.tipo_persona, "FISICA");
   assert.equal(merged.max_intentos, 3);
   assert.equal(merged.intentos_restantes, 2);
+});
+
+test("saving step 1 keeps a lock, except a CURP lock when the CURP changed", () => {
+  const conflicts = vista({ intentos: 1, intentos_restantes: 0, bloqueo: "CONFLICTOS_IDENTIDAD" });
+  const kept = mergeSavedProfile(conflicts, expediente({ intentos: 1, curp: "GODE561231HDFRRN04" }));
+  assert.equal(kept.bloqueo, "CONFLICTOS_IDENTIDAD");
+  assert.equal(kept.intentos_restantes, 0);
+  const curpLock = vista({ intentos: 1, intentos_restantes: 0, bloqueo: "IDENTIDAD_BLOQUEADA" });
+  assert.equal(mergeSavedProfile(curpLock, expediente({ intentos: 1 })).bloqueo, "IDENTIDAD_BLOQUEADA");
+  const lifted = mergeSavedProfile(curpLock, expediente({ intentos: 1, curp: "GODE561231HDFRRN04" }));
+  assert.equal(lifted.bloqueo, null);
+  assert.equal(lifted.intentos_restantes, 2);
 });
 
 test("profile form round-trips to the API body; empty optional fields become null", () => {

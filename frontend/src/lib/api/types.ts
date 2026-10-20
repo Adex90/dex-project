@@ -333,10 +333,23 @@ export interface ResumenResultado {
 }
 
 /** GET /kyc/expediente. */
+/** Why a PENDIENTE file cannot be submitted (same rules the database applies on submission). */
+export type BloqueoKyc =
+  /** All attempts used. */
+  | "SIN_INTENTOS"
+  /** Too many submissions with an identity registered to another account (30 days). */
+  | "CONFLICTOS_IDENTIDAD"
+  /** The CURP has rejected verifications in other accounts (30 days). */
+  | "IDENTIDAD_BLOQUEADA";
+
 export interface VistaExpediente extends ExpedienteKyc {
   tipo_persona: TipoPersona;
+  /** The account status (`estatus_kyc` of the client): mirrors the file, except SUSPENDIDO. */
+  estatus_cliente: EstatusKyc;
   max_intentos: number;
+  /** 0 while `bloqueo` is set. */
   intentos_restantes: number;
+  bloqueo: BloqueoKyc | null;
   ultimo_resultado: ResumenResultado | null;
 }
 

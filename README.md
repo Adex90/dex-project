@@ -218,9 +218,17 @@ credential photograph.
     so attackers cannot cycle accounts against one identity.
   - Probing whether a CURP belongs to a customer (`409 IDENTIDAD_EN_USO`)
     counts against a per-account limit.
-  - Clients never see the exact similarity score or the threshold; operators
-    do, and an operator's verdict must name the submission
-    (`verificacion_id`) they reviewed.
+  - `GET /kyc/expediente` reports these locks (`bloqueo`: `SIN_INTENTOS`,
+    `CONFLICTOS_IDENTIDAD`, `IDENTIDAD_BLOQUEADA`, with
+    `intentos_restantes = 0`) and the account status (`estatus_cliente`,
+    e.g. `SUSPENDIDO`), so the client is never offered an attempt the
+    database will refuse.
+  - Clients never see the exact similarity score or the threshold, not even
+    in the text of the findings; operators do, and an operator's verdict
+    must name the submission (`verificacion_id`) they reviewed.
+  - `coincide_identidad` in the audit log means the INE reading matches the
+    declared identity (and the provider analyzed the images sent); the face
+    match, liveness and document checks have their own columns.
   - `/kyc/verificar` runs at most 8 at a time, and cheap checks run before
     any image is decoded.
 - **Identity squatting:** CURP, RFC and voter key are unique only among

@@ -7,6 +7,7 @@
  * backend); this module only adapts them to the wizard's forms.
  */
 import type {
+  BloqueoKyc,
   DatosPersonalesInput,
   DetalleKyc,
   EstadoKyc,
@@ -17,6 +18,7 @@ import type { CredentialField, CredentialInput, ParsedCurp, ProfileField } from 
 import {
   CONTACT_COMPLIANCE,
   KYC_MESSAGES,
+  lockMessage,
   describeKycMessage,
   kycMessageInEnglish,
   parseCurp,
@@ -102,15 +104,30 @@ export function canVisitStep(
   }
 }
 
+type RetryView = Pick<VistaExpediente, "estado_kyc" | "intentos" | "intentos_restantes"> & {
+  bloqueo?: BloqueoKyc | null;
+};
+
 /** A verification was submitted and rejected, and the customer may submit again. */
-export function canRetry(file: Pick<VistaExpediente, "estado_kyc" | "intentos" | "intentos_restantes">): boolean {
-  return file.estado_kyc === "PENDIENTE" && file.intentos > 0 && file.intentos_restantes > 0;
+export function canRetry(file: RetryView): boolean {
+  return file.estado_kyc === "PENDIENTE" && !file.bloqueo && file.intentos > 0 && file.intentos_restantes > 0;
 }
 
-/** The view after POST /kyc/perfil: the saved file plus the view-only fields of the previous one. */
+/**
+ * The view after POST /kyc/perfil: the saved file plus the view-only fields of
+ * the previous one. A CURP lock belongs to the old CURP; the server re-checks
+ * the new one on submission.
+ */
 export function mergeSavedProfile(view: VistaExpediente, saved: ExpedienteKyc): VistaExpediente {
-  return { ...view, ...saved, intentos_restantes: Math.max(0, view.max_intentos - saved.intentos) };
+  const bloqueo = view.bloqueo === "IDENTIDAD_BLOQUEADA" && saved.curp !== view.curp ? null : view.bloqueo;
+  return {
+    ...view,
+    ...saved,
+    bloqueo,
+    intentos_restantes: bloqueo ? 0 : Math.max(0, view.max_intentos - saved.intentos),
+  };
 }
+
 
 // -----------------------------------------------------------------------------
 // Step 1 form
@@ -600,7 +617,7 @@ export const STATUS_TONES: Record<EstadoKyc, StatusTone> = {
  * is SUSPENDIDO (its file reads RECHAZADO).
  */
 export function statusHeadline(
-  file: Pick<VistaExpediente, "estado_kyc" | "intentos" | "intentos_restantes">,
+  file: RetryView,
   context: { awaitingProvider?: boolean; suspended?: boolean } = {},
 ): {
   title: string;
@@ -635,6 +652,7 @@ export function statusHeadline(
         body: "Your file was closed after the verification checks. Only our compliance team can reopen it.",
       };
     case "PENDIENTE":
+      if (file.bloqueo) return lockMessage(file.bloqueo);
       return canRetry(file)
         ? {
             title: "Your last attempt was not approved",

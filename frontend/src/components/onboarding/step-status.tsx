@@ -270,10 +270,11 @@ export function StepStatus({
                   detail={simulatedNote}
                 />
                 <CheckRow ok={last.documento_valido} label="Credential (authentic and current)" detail={simulatedNote} />
-                {/* coincide_identidad is false for any blocking finding, the face match included. */}
+                {/* coincide_identidad covers the identity only (the INE reading
+                    matches your details); the face match is part of the overall result. */}
                 <CheckRow
                   ok={last.coincide_identidad}
-                  label="Identity and face match checks"
+                  label="Identity (your INE matches your details)"
                   detail={simulatedNote}
                 />
                 {/* The bank does not disclose the exact similarity score; the

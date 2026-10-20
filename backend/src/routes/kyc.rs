@@ -2,7 +2,7 @@
 //!
 //! | Método | Ruta | Acceso |
 //! |---|---|---|
-//! | GET  | `/kyc/expediente` | cliente: estado, intentos y último resultado |
+//! | GET  | `/kyc/expediente` | cliente: estado, intentos, bloqueo y último resultado |
 //! | POST | `/kyc/perfil` | cliente: datos personales y domicilio (paso 1) |
 //! | POST | `/kyc/verificar` | cliente: INE + selfie (pasos 2 y 3) |
 //! | POST | `/kyc/webhook` | proveedor biométrico (firma HMAC `X-Kyc-Firma`) |
