@@ -8,7 +8,8 @@ const M0003: &str = include_str!("../../migrations/0003_endurecimiento.sql");
 const M0004: &str = include_str!("../../migrations/0004_saldos_ligados_al_ledger.sql");
 const M0005: &str = include_str!("../../migrations/0005_spei_integration.sql");
 const M0006: &str = include_str!("../../migrations/0006_kyc_biometricos.sql");
-const M0007: &str = include_str!("../../migrations/0007_spei_endurecimiento.sql");
+const M0007: &str = include_str!("../../migrations/0007_kyc_endurecimiento.sql");
+const M0008: &str = include_str!("../../migrations/0008_spei_endurecimiento.sql");
 
 /// Depósito como lo registraba el código anterior a 0004: clave
 /// `spei:<rastreo>` y la clave de rastreo tal cual en `referencia_externa`.
@@ -101,13 +102,13 @@ async fn migracion_0004_tolera_duplicados_heredados(pool: PgPool) {
     assert!(e.contains("ux_ifpe_tx_deposito_spei"), "{e}");
 }
 
-/// inbound-security-3: 0005-0007 se aplican sobre abonos heredados y 0007
+/// inbound-security-3: 0005-0008 se aplican sobre abonos heredados y 0008
 /// registra con origen LEGADO los de identidad canónica (una nueva
 /// notificación del mismo pago es una repetición, no un segundo abono). Los
 /// de clave de rastreo sola quedan como historia (el backend los trata como
 /// posibles duplicados).
 #[sqlx::test(migrations = false)]
-async fn migracion_0007_registra_abonos_anteriores(pool: PgPool) {
+async fn migracion_0008_registra_abonos_anteriores(pool: PgPool) {
     for m in [M0001, M0002, M0003] {
         sqlx::raw_sql(m).execute(&pool).await.unwrap();
     }
@@ -125,8 +126,8 @@ async fn migracion_0007_registra_abonos_anteriores(pool: PgPool) {
     deposito_heredado(&pool, "rastreo123").await;
     sqlx::raw_sql(M0004).execute(&pool).await.unwrap();
     deposito_heredado_con(&pool, "spei:40012:20261001:LEGADO1", "40012:20261001:LEGADO1").await;
-    for m in [M0005, M0006, M0007] {
-        sqlx::raw_sql(m).execute(&pool).await.expect("0005-0007 deben aplicarse sobre datos heredados");
+    for m in [M0005, M0006, M0007, M0008] {
+        sqlx::raw_sql(m).execute(&pool).await.expect("0005-0008 deben aplicarse sobre datos heredados");
     }
     let legados: Vec<(String, String, String, rust_decimal::Decimal)> = sqlx::query_as(
         "SELECT institucion_emisora, clave_rastreo, origen, monto FROM ifpe.spei_inbound ORDER BY clave_rastreo",

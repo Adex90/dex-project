@@ -1,8 +1,8 @@
 -- =============================================================================
---  Pruebas de la migración 0007 (endurecimiento SPEI). Corren en una
+--  Pruebas de la migración 0008 (endurecimiento SPEI). Corren en una
 --  transacción que termina en ROLLBACK: no dejan datos.
 --
---    psql "$DATABASE_URL" -f tests/db/0007_spei.sql
+--    psql "$DATABASE_URL" -f tests/db/0008_spei.sql
 --
 --  Lo que la base de datos garantiza por sí sola, sin importar el backend:
 --  resoluciones del operador ligadas a su reembolso, incidentes inmutables,
@@ -434,4 +434,4 @@ SELECT pg_temp.exigir('Conciliación: cuenta la LIQUIDADA en revisión y las ór
 
 ROLLBACK;
 \o
-\echo 'tests/db/0007_spei.sql: todas las pruebas pasaron (ROLLBACK)'
+\echo 'tests/db/0008_spei.sql: todas las pruebas pasaron (ROLLBACK)'

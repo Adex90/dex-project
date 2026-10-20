@@ -1,6 +1,6 @@
 //! Integración SPEI: webhooks firmados, duplicados concurrentes, despachador
 //! con la pasarela simulada, autoridad de los roles, correcciones, las
-//! regresiones de la revisión de 0005 (migración 0007) y un día de tráfico
+//! regresiones de la revisión de 0005 (migración 0008) y un día de tráfico
 //! interbancario intenso conciliado contra el custodio.
 
 mod comun;
@@ -997,7 +997,7 @@ async fn dia_de_trafico_interbancario_intenso(pool: PgPool) {
 }
 
 // -----------------------------------------------------------------------------
-// Regresiones de la revisión de 0005 (migración 0007)
+// Regresiones de la revisión de 0005 (migración 0008)
 // -----------------------------------------------------------------------------
 
 /// Pasarela cuyo primer registro se detiene hasta que la prueba lo libera: un
@@ -1674,7 +1674,7 @@ async fn deposito_anterior_a_0005(pool: &PgPool, cuenta_id: Uuid, monto: &str, c
 }
 
 /// inbound-security-3: abonos anteriores a 0005. (a) El de identidad
-/// canónica se registra con origen LEGADO (lo hace 0007 al aplicarse): una
+/// canónica se registra con origen LEGADO (lo hace 0008 al aplicarse): una
 /// nueva notificación del mismo pago es una repetición (`confirmar`), no un
 /// 409. (b) El de clave de rastreo sola (sin emisor ni fecha) se abonaba otra
 /// vez: ahora es un posible duplicado (retenido sin abonar).
@@ -1687,7 +1687,7 @@ async fn abonos_anteriores_a_0005_no_se_abonan_dos_veces(pool: PgPool) {
     let identidad = format!("40012:{}:LEGADOA", ayer.format("%Y%m%d"));
     deposito_anterior_a_0005(&pool, ana.cuenta_ifpe.id, "800", &format!("spei:{identidad}"), &identidad).await;
     deposito_anterior_a_0005(&pool, ana.cuenta_ifpe.id, "900", "spei:LEGADOB", "LEGADOB").await;
-    // Lo que hace 0007 al aplicarse sobre una base con abonos anteriores.
+    // Lo que hace 0008 al aplicarse sobre una base con abonos anteriores.
     let registrados: i32 = sqlx::query_scalar("SELECT ifpe.registrar_abonos_legados()").fetch_one(&pool).await.unwrap();
     assert_eq!(registrados, 1, "solo el de identidad canónica");
     let saldo = saldo_ifpe(&pool, ana.cuenta_ifpe.id).await.0;

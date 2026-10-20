@@ -1,8 +1,8 @@
 -- =============================================================================
---  Synthetic Capital — 0007: endurecimiento SPEI
+--  Synthetic Capital — 0008: endurecimiento SPEI
 -- =============================================================================
 --
---  Correcciones de la revisión de 0005 (0001-0006 no se modifican):
+--  Correcciones de la revisión de 0005 (0001-0007 no se modifican):
 --
 --  1. `intentos_envio` nunca disminuye: el despachador lo usa como testigo de
 --     su reclamo (un rechazo de registro de un reclamo vencido no reembolsa).
@@ -29,7 +29,7 @@
 --
 --  La reserva del 100%, la sombra del ledger, la lista blanca de 0005 (todo
 --  DEPOSITO es un SPEI registrado o el reverso de una orden; todo RETIRO una
---  orden o una corrección) y el RLS de 0006 no cambian: ningún camino nuevo
+--  orden o una corrección) y el RLS de 0006 y 0007 no cambian: ningún camino nuevo
 --  mueve dinero fuera de `spei:`, `spei-reverso:` y `spei-correccion:`.
 -- =============================================================================
 
