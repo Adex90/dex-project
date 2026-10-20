@@ -76,6 +76,7 @@ fn verificar_firma(e: &AppState, cabeceras: &HeaderMap, cuerpo: &[u8]) -> AppRes
 ///   (`EN_REVISION`): devolverlo dejaría la reserva corta si el pago ya se
 ///   abonó con la identidad equivocada. El operador lo resuelve (captura con
 ///   `distinto_de`, o anulación de la captura errónea).
+///
 /// Si no se puede guardar el registro, el error se propaga y el proveedor
 /// reintenta: nunca se confirma sin registro.
 async fn webhook_inbound(

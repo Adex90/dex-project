@@ -41,7 +41,7 @@ Integrity checks (migration `0004` and the backend):
   the leaf is the customer's own account and that the cut matches the public,
   unauthenticated copy (`GET /reserva/cortes/{id}`).
 
-## SPEI (interbank transfers, migrations `0005` and `0007`)
+## SPEI (interbank transfers, migrations `0005` and `0008`)
 
 Real transfers through a settlement partner such as STP. SPEI moves only the
 IFPE vault and its custody reserve; the SOFOM never sees it.
@@ -66,7 +66,7 @@ IFPE vault and its custody reserve; the SOFOM never sees it.
   or repeated webhooks credit once. A second check blocks the same payment
   under another identity (an operator typing the calendar date or a wrong
   issuer code, or credits from before 0005); two identities reported by the
-  provider are never duplicates of each other. Migration `0007` logs pre-0005
+  provider are never duplicates of each other. Migration `0008` logs pre-0005
   credits with a canonical identity (origin `LEGADO`), so a new notification of
   the same payment is an idempotent repeat. A webhook that hits the
   possible-duplicate check, or an identity already logged with another amount
@@ -244,6 +244,7 @@ cd backend && DATABASE_URL=postgres://synthetic:synthetic@localhost:5432/synthet
 psql "$EMPTY_DATABASE_URL" -f tests/db/0001_invariantes.sql
 psql "$EMPTY_DATABASE_URL" -f tests/db/0006_kyc.sql
 psql "$EMPTY_DATABASE_URL" -f tests/db/0007_kyc.sql
+psql "$EMPTY_DATABASE_URL" -f tests/db/0008_spei.sql
 cd frontend && npm test && npm run build
 FRONTEND_URL=http://localhost:3000 node e2e/smoke.mjs   # needs backend (MODO_DEMO=true) + next start
 ```
