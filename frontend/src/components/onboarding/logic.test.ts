@@ -13,6 +13,7 @@ import {
   CHALLENGES,
   EMPTY_INE,
   IDENTITY_IN_USE,
+  identityKey,
   PROFILE_FIELDS,
   PROFILE_INPUT_IDS,
   canRetry,
@@ -138,6 +139,10 @@ test("retry and headline follow the attempts left", () => {
   assert.equal(canRetry(vista({ estado_kyc: "EN_REVISION", intentos: 1, intentos_restantes: 2 })), false);
   assert.match(statusHeadline(vista({ intentos: 2, intentos_restantes: 1 })).body, /1 attempt left/);
   assert.match(statusHeadline(vista({ estado_kyc: "VERIFICADO" })).title, /verified/);
+  // 202: the headline must not claim a human review while the provider has not answered.
+  assert.doesNotMatch(statusHeadline(vista({ estado_kyc: "EN_REVISION" }), { awaitingProvider: true }).title, /analyst/);
+  assert.match(statusHeadline(vista({ estado_kyc: "EN_REVISION" })).title, /analyst/);
+  assert.match(statusHeadline(vista({ estado_kyc: "RECHAZADO" }), { suspended: true }).title, /suspended/);
 });
 
 test("saving step 1 keeps the view-only fields and recomputes the attempts left", () => {
@@ -301,8 +306,22 @@ test("errors of POST /kyc/verificar map to the next action", () => {
   assert.equal(verificationProblem("KYC_SIN_CONSENTIMIENTO", "x")?.action, "consent");
   assert.equal(verificationProblem("KYC_DATOS_INCOMPLETOS", "x")?.action, "profile");
   assert.equal(verificationProblem("KYC_SIN_INTENTOS", "x")?.action, "status");
+  // The conflict lockout and the identity lock are terminal: shown on the status page, no retry.
+  const locked = verificationProblem("KYC_SIN_INTENTOS", "demasiados envíos con identidades registradas en otra cuenta");
+  assert.equal(locked?.lock, true);
+  assert.match(locked?.message ?? "", /locked for up to 30 days/);
+  const blocked = verificationProblem(
+    "KYC_IDENTIDAD_BLOQUEADA",
+    "esa CURP acumula verificaciones rechazadas en otras cuentas; acude a cumplimiento",
+  );
+  assert.equal(blocked?.action, "status");
+  assert.equal(blocked?.lock, true);
+  assert.match(blocked?.message ?? "", /compliance team at /);
   assert.equal(verificationProblem("KYC_EXPEDIENTE_NO_EDITABLE", "el expediente ya está en revisión; espera el resultado")?.action, "status");
-  assert.equal(verificationProblem("IDENTIDAD_EN_USO", "x")?.action, null);
+  assert.equal(verificationProblem("IDENTIDAD_EN_USO", "x")?.action, "identity");
+  assert.match(verificationProblem("IDENTIDAD_EN_USO", "x")?.message ?? "", /30 days/);
+  assert.equal(identityKey("A", "B", " abc "), identityKey("A", "B", "ABC"));
+  assert.notEqual(identityKey("A", "B", "ABC"), identityKey("A", "C", "ABC"));
   assert.equal(verificationProblem("CUERPO_DEMASIADO_GRANDE", "x")?.message, KYC_MESSAGES.bodyTooLarge);
   assert.equal(verificationProblem("RED", "x"), null);
 });

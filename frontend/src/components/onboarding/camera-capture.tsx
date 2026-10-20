@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Camera, Loader2, RotateCcw, X } from "lucide-react";
 
 import { Alert, Button } from "@/components/ui/primitives";
@@ -10,7 +10,9 @@ import { ImageError, captureVideoFrame, useCamera } from "./media";
 
 /**
  * Rear camera with a live preview and a card-shaped guide, to photograph one
- * side of the credential. The camera starts on mount and stops on unmount.
+ * side of the credential. The camera starts on mount and stops on unmount
+ * (and when the page is hidden: "Try the camera again" restarts it).
+ * Keyboard focus moves into it on mount (Cancel) and to Capture once live.
  */
 export function CameraCapture({
   label,
@@ -26,10 +28,18 @@ export function CameraCapture({
 }) {
   const { videoRef, state, start, stop } = useCamera("environment");
   const [error, setError] = useState<string | null>(null);
+  const cancelRef = useRef<HTMLButtonElement>(null);
+  const captureRef = useRef<HTMLButtonElement>(null);
+  const live = state.status === "live";
 
   useEffect(() => {
+    cancelRef.current?.focus();
     void start();
   }, [start]);
+
+  useEffect(() => {
+    if (live) captureRef.current?.focus();
+  }, [live]);
 
   const capture = () => {
     const video = videoRef.current;
@@ -85,12 +95,13 @@ export function CameraCapture({
             Try the camera again
           </Button>
         ) : (
-          <Button type="button" size="sm" onClick={capture} disabled={state.status !== "live"}>
+          <Button ref={captureRef} type="button" size="sm" onClick={capture} disabled={!live}>
             <Camera className="size-3.5" aria-hidden />
             Capture
           </Button>
         )}
         <Button
+          ref={cancelRef}
           type="button"
           variant="ghost"
           size="sm"

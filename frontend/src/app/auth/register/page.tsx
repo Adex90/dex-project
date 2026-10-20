@@ -6,10 +6,11 @@ import { useRouter } from "next/navigation";
 import { AlertTriangle, UserPlus } from "lucide-react";
 
 import { formatDate } from "@/components/ui/data";
-import { Alert, Button, Field, Input, cx } from "@/components/ui/primitives";
+import { Alert, Button, Field, Input, cx, fieldDescribedBy } from "@/components/ui/primitives";
 import { ONBOARDING_PATH, useClientHomeRedirect } from "@/hooks/use-client-home";
 import { describeError } from "@/lib/api/client";
 import type { RegistroInput, TipoPersona } from "@/lib/api/types";
+import { COMPLIANCE_EMAIL } from "@/lib/config";
 import {
   KYC_MESSAGES,
   SEXO_LABELS,
@@ -43,6 +44,9 @@ interface FormState {
 }
 
 type Errors = Partial<Record<keyof FormState, string>>;
+
+/** Form order, for focusing the first invalid input after a failed submit. */
+const FIELD_ORDER: readonly (keyof FormState)[] = ["nombre", "paterno", "email", "password", "confirm", "curp", "rfc"];
 
 /** Company RFC as the backend checks it at sign-up (kyc::rfc_valido): structure and check digit. */
 function companyRfcError(rfc: string): string | null {
@@ -148,7 +152,12 @@ export default function RegisterPage() {
     setTouched(true);
     setError(null);
     if (allErrors.curp || allErrors.rfc) setIdsOpen(true);
-    if (Object.keys(allErrors).length) return;
+    const firstInvalid = FIELD_ORDER.find((f) => allErrors[f]);
+    if (firstInvalid) {
+      // After the commit: the IDs section may only now be opening.
+      requestAnimationFrame(() => document.getElementById(firstInvalid)?.focus());
+      return;
+    }
     const input: RegistroInput = {
       tipo_persona: form.tipo,
       nombre: form.nombre.trim(),
@@ -178,8 +187,9 @@ export default function RegisterPage() {
       <div className="space-y-1">
         <h1 className="text-xl font-semibold tracking-tight">Open an account</h1>
         <p className="text-sm text-muted">
-          You get a vault account with its own CLABE right away. Next, verify your identity to unlock deposits,
-          transfers and investments.
+          {form.tipo === "MORAL"
+            ? "You get a vault account with its own CLABE right away. Deposits, transfers and investments unlock once your company is verified at a branch with its legal representative."
+            : "You get a vault account with its own CLABE right away. Next, verify your identity to unlock deposits, transfers and investments."}
         </p>
       </div>
 
@@ -220,6 +230,7 @@ export default function RegisterPage() {
           value={form.nombre}
           onChange={(e) => set("nombre", e.target.value)}
           invalid={Boolean(errors.nombre)}
+          aria-describedby={fieldDescribedBy("nombre", errors.nombre, undefined)}
         />
       </Field>
 
@@ -232,10 +243,16 @@ export default function RegisterPage() {
               value={form.paterno}
               onChange={(e) => set("paterno", e.target.value)}
               invalid={Boolean(errors.paterno)}
+            aria-describedby={fieldDescribedBy("paterno", errors.paterno, undefined)}
             />
           </Field>
           <Field label="Maternal surname" htmlFor="materno" hint="Optional">
-            <Input id="materno" value={form.materno} onChange={(e) => set("materno", e.target.value)} />
+            <Input
+              id="materno"
+              value={form.materno}
+              onChange={(e) => set("materno", e.target.value)}
+              aria-describedby="materno-hint"
+            />
           </Field>
         </div>
       ) : null}
@@ -248,6 +265,7 @@ export default function RegisterPage() {
           value={form.email}
           onChange={(e) => set("email", e.target.value)}
           invalid={Boolean(errors.email)}
+          aria-describedby={fieldDescribedBy("email", errors.email, undefined)}
         />
       </Field>
 
@@ -260,6 +278,7 @@ export default function RegisterPage() {
             value={form.password}
             onChange={(e) => set("password", e.target.value)}
             invalid={Boolean(errors.password)}
+            aria-describedby={fieldDescribedBy("password", errors.password, `${MIN_PASSWORD}+ characters`)}
           />
         </Field>
         <Field label="Confirm password" htmlFor="confirm" error={errors.confirm}>
@@ -270,6 +289,7 @@ export default function RegisterPage() {
             value={form.confirm}
             onChange={(e) => set("confirm", e.target.value)}
             invalid={Boolean(errors.confirm)}
+            aria-describedby={fieldDescribedBy("confirm", errors.confirm, undefined)}
           />
         </Field>
       </div>
@@ -302,7 +322,7 @@ export default function RegisterPage() {
                 onChange={(e) => set("curp", cleanIdInput(e.target.value).slice(0, 18))}
                 onBlur={() => setBlurred((b) => ({ ...b, curp: true }))}
                 invalid={Boolean(errors.curp)}
-                aria-describedby={errors.curp ? "curp-error" : undefined}
+                aria-describedby={fieldDescribedBy("curp", errors.curp, true)}
                 className="font-mono uppercase"
               />
             </Field>
@@ -321,7 +341,7 @@ export default function RegisterPage() {
               onChange={(e) => set("rfc", cleanIdInput(e.target.value).slice(0, 13))}
               onBlur={() => setBlurred((b) => ({ ...b, rfc: true }))}
               invalid={Boolean(errors.rfc)}
-              aria-describedby={errors.rfc ? "rfc-error" : undefined}
+              aria-describedby={fieldDescribedBy("rfc", errors.rfc, true)}
               className="font-mono uppercase"
             />
           </Field>
@@ -337,7 +357,7 @@ export default function RegisterPage() {
               {ids.warnings.map((w) => (
                 <p key={w}>{w}</p>
               ))}
-              <p className="opacity-90">
+              <p>
                 You can still open the account, but your identity verification will be reviewed by a person instead of
                 being approved automatically. Check for typos first.
               </p>
@@ -350,6 +370,15 @@ export default function RegisterPage() {
         <UserPlus className="size-4" aria-hidden />
         Create account
       </Button>
+
+      <p className="text-xs leading-relaxed text-ink-2">
+        Synthetic Capital is responsible for the personal data you give here (name, email, CURP, RFC). To get our full
+        privacy notice (aviso de privacidad integral) or exercise your ARCO rights, write to{" "}
+        <a href={`mailto:${COMPLIANCE_EMAIL}`} className="font-medium break-all text-accent hover:underline">
+          {COMPLIANCE_EMAIL}
+        </a>
+        .
+      </p>
 
       <p className="text-center text-sm text-muted">
         Already a client?{" "}

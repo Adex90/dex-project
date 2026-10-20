@@ -17,6 +17,7 @@
  * (see `todayInMexicoCity`) so results are reproducible.
  */
 import type { DatosIneInput, DatosPersonalesInput, Domicilio, EstadoKyc, Sexo } from "./api/types.ts";
+import { COMPLIANCE_EMAIL } from "./config.ts";
 
 /** Result of a validator: the normalized value, or a stable code plus an English message. */
 export type Validated<T, C extends string> = { ok: true; value: T } | { ok: false; code: C; error: string };
@@ -1014,6 +1015,13 @@ function backendImageLabel(field: string): string {
   return frame ? imageLabel(Number(frame[1])) : field;
 }
 
+/** Where every "contact compliance" message points (one team name, one channel). */
+export const CONTACT_COMPLIANCE = `Contact our compliance team at ${COMPLIANCE_EMAIL}.`;
+/** Face-match findings, without the hidden score or threshold. */
+export const FACE_NO_MATCH = "Your face did not match the photo on your INE closely enough.";
+export const FACE_NEEDS_REVIEW = "The face match needs a person to confirm it.";
+const ADMIN_RESTRICTION = `Your account was restricted by our compliance team. ${CONTACT_COMPLIANCE}`;
+
 /** Reasons the provider gives after "prueba de vida fallida:" / "credencial no válida:". */
 const PROVIDER_REASONS: Record<string, string> = {
   "no se detectó un rostro vivo frente a la cámara": "no live face was detected in front of the camera",
@@ -1097,6 +1105,16 @@ const EXACT: Record<string, string> = {
   "primero captura tus datos personales y tu domicilio": "First save your personal details and address.",
   "el expediente no tiene completos sus datos de identidad": "Your file does not have complete identity details yet.",
   "expediente KYC no encontrado": "Identity file not found.",
+  // mod.rs: KYC_PROVEEDOR_ERROR (the second part only when the attempt was refunded)
+  "el proveedor biométrico no pudo evaluar tu envío": "The verification service could not evaluate your submission.",
+  "intenta de nuevo (este intento no se contó)": "Please try again; this attempt was not counted.",
+  // KYC_SIN_INTENTOS / KYC_IDENTIDAD_BLOQUEADA (expediente.rs, migration 0007)
+  "agotaste tus intentos de verificación": "You have used all your verification attempts.",
+  "cumplimiento revisará tu expediente": "Our compliance team will review your file.",
+  "demasiados envíos con identidades registradas en otra cuenta": `Remote verification is locked for up to 30 days: too many submissions used a CURP, RFC or voter key that is registered to another account. ${CONTACT_COMPLIANCE}`,
+  "esa CURP acumula verificaciones rechazadas en otras cuentas":
+    "This CURP has too many rejected verifications in other accounts, so it cannot be verified remotely.",
+  "acude a cumplimiento": CONTACT_COMPLIANCE,
   // error.rs (unique indexes of kyc_perfiles)
   "esa CURP, RFC o clave de elector ya está en un expediente verificado o en revisión":
     "That CURP, RFC or voter key is already in a verified or in-review file.",
@@ -1138,18 +1156,17 @@ const PATTERNS: [RegExp, (m: RegExpExecArray) => string][] = [
     (m) => `Liveness check failed: ${PROVIDER_REASONS[m[1] ?? ""] ?? m[1]}.`,
   ],
   [/^credencial no válida: (.*)$/s, (m) => `The credential is not valid: ${PROVIDER_REASONS[m[1] ?? ""] ?? m[1]}.`],
-  [
-    /^similitud facial ([\d.]+) por debajo del mínimo aceptable ([\d.]+)$/,
-    (m) => `Face similarity ${m[1]} is below the minimum acceptable ${m[2]}.`,
-  ],
-  [
-    /^similitud facial ([\d.]+) menor que ([\d.]+): requiere revisión humana$/,
-    (m) => `Face similarity ${m[1]} is below ${m[2]}: a person will review it.`,
-  ],
+  // The bank never discloses the similarity score or the threshold (the API
+  // nulls score_similitud / umbral_aplicado), so these findings, which carry
+  // both numbers, get fixed copy without them.
+  [/^similitud facial \S+ por debajo del mínimo aceptable \S+$/, () => FACE_NO_MATCH],
+  [/^similitud facial \S+ menor que \S+: requiere revisión humana$/, () => FACE_NEEDS_REVIEW],
   [
     /^el expediente \S+ agotó sus (\d+) intentos$/,
-    (m) => `You have used all ${m[1]} verification attempts. Contact support to reopen your file.`,
+    (m) => `You have used all ${m[1]} verification attempts. ${CONTACT_COMPLIANCE}`,
   ],
+  // Administrative states carried over by migration 0006 (database-internal text).
+  [/^(estado (SUSPENDIDO|RECHAZADO) anterior a 0006|alta administrativa en estado \S+)$/, () => ADMIN_RESTRICTION],
   [
     /^la identidad del expediente \S+ no cambia en estado (\S+)$/,
     (m) => `Your identity details cannot change while your file is ${(ESTADO_KYC_LABELS[m[1] as EstadoKyc] ?? m[1] ?? "").toLowerCase()}.`,
@@ -1168,6 +1185,8 @@ function translateOne(message: string): string | null {
     const reason = exhausted[1] ?? "";
     return `No verification attempts left. ${reason ? (translateOne(reason) ?? reason) : ""}`.trim();
   }
+  // Any other wording of a face-similarity finding would carry the hidden score.
+  if (/similitud facial/.test(message)) return FACE_NO_MATCH;
   return null;
 }
 

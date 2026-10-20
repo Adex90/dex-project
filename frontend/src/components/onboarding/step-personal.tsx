@@ -267,7 +267,7 @@ export function StepPersonal({
           autoComplete="address-level2"
           maxLength={PROFILE_MAX_LENGTH.municipio}
         />
-        <div className="grid grid-cols-[1fr_8rem] gap-4">
+        <div className="grid grid-cols-1 gap-4 sm:grid-cols-[1fr_8rem]">
           <FormField
             id="estado"
             label={PROFILE_LABELS.estado}

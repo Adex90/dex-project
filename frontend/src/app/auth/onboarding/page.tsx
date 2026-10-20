@@ -8,7 +8,7 @@ import { Building2, Loader2, LogOut } from "lucide-react";
 import { StepIne } from "@/components/onboarding/step-ine";
 import { StepLiveness, type VerificationOutcome } from "@/components/onboarding/step-liveness";
 import { StepPersonal } from "@/components/onboarding/step-personal";
-import { KycStatusBadge, StepStatus } from "@/components/onboarding/step-status";
+import { KycStatusBadge, StepStatus, type SubmitNotice } from "@/components/onboarding/step-status";
 import {
   EMPTY_INE,
   MORAL_EXPLANATION,
@@ -18,6 +18,7 @@ import {
   checkCredentialDraft,
   checkIneImages,
   effectiveStep,
+  identityKey,
   ineDraftFromFile,
   isProfileSaved,
   mergeSavedProfile,
@@ -49,6 +50,12 @@ function isAbort(error: unknown): boolean {
   return error instanceof DOMException && error.name === "AbortError";
 }
 
+/** Failures after which the submission may or may not have changed the file: reload it. */
+function outcomeUnknown(error: unknown): boolean {
+  if (!(error instanceof ApiError)) return true;
+  return error.code === "KYC_PROVEEDOR_ERROR" || error.code === "TIEMPO_AGOTADO" || error.code === "RED" || error.status >= 500;
+}
+
 /**
  * Digital onboarding (KYC): personal data -> INE -> liveness selfie ->
  * status. Until the file is VERIFICADO the database blocks deposits,
@@ -64,6 +71,14 @@ export default function OnboardingPage() {
   const [immediate, setImmediate] = useState<ResultadoVerificacion | null>(null);
   const [checking, setChecking] = useState(false);
   const [lastChecked, setLastChecked] = useState<Date | null>(null);
+  // Page-level, so it survives leaving step 3: why the last submission was refused.
+  const [notice, setNotice] = useState<SubmitNotice | null>(null);
+  // POST /kyc/verificar in flight: the stepper is frozen until it answers.
+  const [submitting, setSubmitting] = useState(false);
+  // The identity (CURP|RFC|voter key) last refused with IDENTIDAD_EN_USO.
+  const [conflictKey, setConflictKey] = useState<string | null>(null);
+  // estatus_kyc of GET /yo: a SUSPENDIDO client has a RECHAZADO file.
+  const [suspended, setSuspended] = useState(false);
   const headingRef = useRef<HTMLHeadingElement>(null);
   const focusPending = useRef(false);
 
@@ -109,6 +124,10 @@ export default function OnboardingPage() {
       setStep(resumeStep(fresh));
       setIne(ineDraftFromFile(fresh));
     });
+    api.me(token, ctrl.signal).then(
+      (me) => setSuspended(me.estatus_kyc === "SUSPENDIDO"),
+      () => undefined, // optional: the file's own state is shown either way
+    );
     return () => ctrl.abort();
   }, [token, role, fetchFile]);
 
@@ -130,10 +149,15 @@ export default function OnboardingPage() {
         hasAttempt: file.intentos > 0 || file.ultimo_resultado !== null,
       }
     : null;
-  const current: Step = routing ? effectiveStep(step, routing) : step;
+  const locked = notice?.lock ?? false;
+  const current: Step = locked ? 4 : routing ? effectiveStep(step, routing) : step;
+  const identityConflict =
+    conflictKey !== null && file !== null && conflictKey === identityKey(file.curp, file.rfc, ine.clave_elector);
 
   const goTo = useCallback((next: Step) => {
     focusPending.current = true;
+    // A notice about a refused submission belongs to the status page; a lock stays until a reload.
+    if (next !== 4) setNotice((n) => (n?.lock ? n : null));
     setStep(next);
   }, []);
 
@@ -187,8 +211,11 @@ export default function OnboardingPage() {
         selfie: { frames, reto },
         consentimiento_biometrico: true,
       };
+      setSubmitting(true);
       try {
         const sent = await api.kycVerify(token, body);
+        setNotice(null);
+        setConflictKey(null);
         setImmediate(sent.resultado);
         const fresh = await fetchFile();
         if (!fresh) {
@@ -214,17 +241,33 @@ export default function OnboardingPage() {
           }
           const problem = verificationProblem(error.code, error.message);
           if (problem) {
+            if (problem.action === "identity") {
+              setConflictKey(identityKey(file?.curp, file?.rfc, credential.clave_elector));
+            }
             if (problem.action === "status") {
+              // Step 3 unmounts: the page keeps the message for the status page.
+              setNotice({ message: problem.message, lock: problem.lock ?? false });
               await fetchFile();
               goTo(4);
             }
-            return { ok: false, ...problem };
+            return { ok: false, message: problem.message, action: problem.action };
           }
         }
-        return { ok: false, message: describeError(error), action: "selfie" };
+        const message = describeError(error);
+        if (outcomeUnknown(error)) {
+          // The submission may have been settled meanwhile (e.g. no refund): show the real state.
+          const fresh = await fetchFile();
+          if (fresh && fresh.estado_kyc !== "PENDIENTE") {
+            setNotice({ message, lock: false });
+            goTo(4);
+          }
+        }
+        return { ok: false, message, action: "selfie" };
+      } finally {
+        setSubmitting(false);
       }
     },
-    [token, curp, ine, fetchFile, goTo, expire],
+    [token, curp, ine, file?.curp, file?.rfc, fetchFile, goTo, expire],
   );
 
   // ---------------------------------------------------------------------------
@@ -282,7 +325,8 @@ export default function OnboardingPage() {
             </Button>
           </Alert>
         ) : (
-          <div className="space-y-4" aria-busy="true" aria-label="Loading your verification file">
+          <div className="space-y-4" role="status" aria-busy="true">
+            <span className="sr-only">Loading your verification file…</span>
             <Skeleton className="h-10 w-full" />
             <Skeleton className="h-5 w-2/3" />
             <Skeleton className="h-40 w-full" />
@@ -319,7 +363,15 @@ export default function OnboardingPage() {
   return (
     <div className="space-y-6">
       {header}
-      {routing ? <Stepper current={current} canVisit={(s) => canVisitStep(s, routing)} onVisit={goTo} /> : null}
+      {routing ? (
+        <Stepper
+          current={current}
+          canVisit={(s) => !submitting && (locked ? s === 4 : canVisitStep(s, routing))}
+          // A file created in a final state (administrative, no attempt) completed none of the steps.
+          isDone={(s) => s < current && !(file.estado_kyc !== "PENDIENTE" && !routing.hasAttempt)}
+          onVisit={goTo}
+        />
+      ) : null}
       {loadError ? <Alert tone="warning">Could not refresh your file: {loadError}</Alert> : null}
 
       <StepFrame key={current} step={current} title={title} description={DESCRIPTIONS[current]} headingRef={headingRef}>
@@ -351,6 +403,7 @@ export default function OnboardingPage() {
         {current === 3 && ine.frente && ine.reverso ? (
           <StepLiveness
             ineImages={{ frente: ine.frente, reverso: ine.reverso }}
+            identityConflict={identityConflict}
             onSubmit={submitVerification}
             onBack={() => goTo(2)}
             onEditProfile={() => goTo(1)}
@@ -360,6 +413,8 @@ export default function OnboardingPage() {
           <StepStatus
             file={file}
             immediate={immediate}
+            notice={notice}
+            suspended={suspended}
             polling={{ active: polling, checking, lastChecked, onCheckNow: () => void checkNow() }}
             onTryAgain={() => goTo(2)}
             onResume={() => goTo(resumeStep(file))}

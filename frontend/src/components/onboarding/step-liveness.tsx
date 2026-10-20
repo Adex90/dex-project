@@ -4,10 +4,12 @@ import { useEffect, useRef, useState } from "react";
 import { ArrowLeft, Loader2, Lock, RotateCcw, ScanFace, VideoOff } from "lucide-react";
 
 import { Alert, Button, cx } from "@/components/ui/primitives";
+import { COMPLIANCE_EMAIL } from "@/lib/config";
 import { checkVerificationImages, imageLabel } from "@/lib/kyc";
 
 import {
   FRAME_INTERVAL_MS,
+  IDENTITY_CONFLICT_RETRY,
   SELFIE_FRAMES,
   SELFIE_MAX_SIDE,
   describeCameraProblem,
@@ -36,6 +38,9 @@ function isAbort(error: unknown): boolean {
   return error instanceof DOMException && error.name === "AbortError";
 }
 
+/** The camera was released mid-run (page hidden, track ended): useCamera already reports why. */
+class CameraStopped extends Error {}
+
 /**
  * Step 3: explicit biometric consent, then a live camera check: a random
  * challenge is shown while 4 distinct frames are captured, and everything
@@ -44,11 +49,14 @@ function isAbort(error: unknown): boolean {
  */
 export function StepLiveness({
   ineImages,
+  identityConflict,
   onSubmit,
   onBack,
   onEditProfile,
 }: {
   ineImages: { frente: string; reverso: string };
+  /** The declared CURP / RFC / voter key were refused as in use elsewhere and have not changed since. */
+  identityConflict: boolean;
   onSubmit: (selfie: { frames: string[]; reto: string }) => Promise<VerificationOutcome>;
   onBack: () => void;
   onEditProfile: () => void;
@@ -66,6 +74,7 @@ export function StepLiveness({
   useEffect(() => () => runRef.current?.abort(), []);
 
   const busy = phase === "starting" || phase === "countdown" || phase === "challenge" || phase === "submitting";
+  const submitting = phase === "submitting";
 
   const cancelRun = () => {
     runRef.current?.abort();
@@ -75,8 +84,13 @@ export function StepLiveness({
     setChallenge(null);
   };
 
+  /** Throws when useCamera released the stream (page hidden, camera unplugged or revoked). */
+  const assertCameraOn = () => {
+    if (!videoRef.current?.srcObject) throw new CameraStopped();
+  };
+
   const run = async () => {
-    if (!consent || busy) return;
+    if (!consent || busy || identityConflict) return;
     runRef.current?.abort();
     const ctrl = new AbortController();
     runRef.current = ctrl;
@@ -95,6 +109,7 @@ export function StepLiveness({
       for (let n = COUNTDOWN_FROM; n >= 1; n--) {
         setCount(n);
         await sleep(COUNTDOWN_TICK_MS, ctrl.signal);
+        assertCameraOn();
       }
       const picked = pickChallenge(randomUnit());
       setChallenge(picked);
@@ -104,6 +119,7 @@ export function StepLiveness({
       const frames: string[] = [];
       let captures = 0;
       while (frames.length < SELFIE_FRAMES) {
+        assertCameraOn();
         const video = videoRef.current;
         if (!video) throw new ImageError("The camera preview is not available. Try again.");
         if (captures >= SELFIE_FRAMES + MAX_RECAPTURES) {
@@ -136,11 +152,18 @@ export function StepLiveness({
         setPhase("error");
         if (outcome.action === "consent") {
           setConsent(false);
-          consentRef.current?.focus();
+          // After the commit: until then the checkbox is still disabled and focus() would do nothing.
+          requestAnimationFrame(() => consentRef.current?.focus());
         }
       }
     } catch (e) {
       if (isAbort(e)) return;
+      if (e instanceof CameraStopped) {
+        // Nothing was sent; keep the camera's own explanation ("turned off", "stopped") visible.
+        setPhase("idle");
+        setChallenge(null);
+        return;
+      }
       stop();
       setError({
         message: e instanceof ImageError ? e.message : "The liveness check could not be completed. Try again.",
@@ -187,13 +210,25 @@ export function StepLiveness({
             identity-verification provider.
           </li>
           <li>
-            <span className="font-medium text-ink-2">What we keep:</span> the result, cryptographic fingerprints
-            (SHA-256) of the images and the time of your consent, not the images themselves.
+            <span className="font-medium text-ink-2">What we keep:</span> not the images themselves, but a permanent
+            audit record of each attempt: the result and the provider&apos;s signed report, the face-match score (not
+            shown to you), cryptographic fingerprints (SHA-256) of the images, the CURP and voter key read from your
+            INE, the IP address and browser of the submission, and the time of your consent.
           </li>
           <li>
-            <span className="font-medium text-ink-2">Your choice:</span> without consent remote verification is not
-            possible; you can verify in person at a branch instead. You can exercise your ARCO rights (access,
-            rectification, cancellation, opposition) at any time.
+            <span className="font-medium text-ink-2">How long:</span> anti-money-laundering rules require us to keep
+            identification records for at least 10 years after the relationship ends, so a cancellation request
+            cannot erase this audit record before then.
+          </li>
+          <li>
+            <span className="font-medium text-ink-2">Your choice:</span> remote verification requires this consent;
+            if you do not give it, contact us to ask about alternatives. To get our full privacy notice (aviso de
+            privacidad integral), exercise your ARCO rights (access, rectification, cancellation, opposition) or
+            withdraw this consent, write to{" "}
+            <a href={`mailto:${COMPLIANCE_EMAIL}`} className="font-medium text-accent underline underline-offset-2">
+              {COMPLIANCE_EMAIL}
+            </a>
+            .
           </li>
         </ul>
         <label htmlFor="consentimiento" className="flex cursor-pointer items-start gap-2.5 pt-1 text-sm text-ink">
@@ -202,7 +237,7 @@ export function StepLiveness({
             id="consentimiento"
             type="checkbox"
             checked={consent}
-            disabled={busy}
+            disabled={submitting}
             onChange={(e) => {
               setConsent(e.target.checked);
               if (!e.target.checked) cancelRun();
@@ -278,7 +313,7 @@ export function StepLiveness({
           <Loader2 className="mt-0.5 size-4 shrink-0 animate-spin" aria-hidden />
           <div>
             <p className="font-semibold">Verifying your identity…</p>
-            <p className="text-[13px] opacity-90">
+            <p className="text-[13px]">
               Uploading {SELFIE_FRAMES} frames and your INE photos, checking liveness and matching your face with your
               credential. Do not close this page.
             </p>
@@ -306,6 +341,20 @@ export function StepLiveness({
               {error.action === "id" ? "Edit ID details and photos" : "Edit personal data"}
             </Button>
           ) : null}
+          {error.action === "identity" ? (
+            <div className="mt-2 flex flex-wrap gap-2">
+              <Button type="button" variant="secondary" size="sm" onClick={onBack}>
+                Edit ID details
+              </Button>
+              <Button type="button" variant="secondary" size="sm" onClick={onEditProfile}>
+                Edit personal data
+              </Button>
+            </div>
+          ) : null}
+        </Alert>
+      ) : identityConflict ? (
+        <Alert tone="warning" title="Your identity details are already in use">
+          {IDENTITY_CONFLICT_RETRY}
         </Alert>
       ) : null}
 
@@ -316,23 +365,26 @@ export function StepLiveness({
         </ul>
       ) : null}
 
-      <div className="flex gap-3">
-        <Button type="button" variant="secondary" size="lg" onClick={onBack} disabled={busy}>
+      {/* Stacked on narrow screens so the main button's label never overflows it. */}
+      <div className="flex flex-col-reverse gap-3 sm:flex-row">
+        <Button type="button" variant="secondary" size="lg" onClick={onBack} disabled={submitting}>
           <ArrowLeft className="size-4" aria-hidden />
           Back
         </Button>
-        {phase === "countdown" || phase === "challenge" ? (
-          <Button type="button" variant="ghost" size="lg" className="flex-1" onClick={cancelRun}>
+        {phase === "starting" || phase === "countdown" || phase === "challenge" ? (
+          // Also while the camera starts: a permission prompt left unanswered must not trap the customer.
+          <Button type="button" variant="ghost" size="lg" className="sm:flex-1" onClick={cancelRun}>
+            {phase === "starting" ? <Loader2 className="size-4 animate-spin" aria-hidden /> : null}
             Cancel
           </Button>
         ) : (
           <Button
             type="button"
             size="lg"
-            className="flex-1"
+            className="sm:flex-1"
             onClick={() => void run()}
-            disabled={!consent || busy}
-            loading={phase === "starting" || phase === "submitting"}
+            disabled={!consent || busy || identityConflict}
+            loading={submitting}
           >
             {phase === "error" || problem ? <RotateCcw className="size-4" aria-hidden /> : <ScanFace className="size-4" aria-hidden />}
             {phase === "error" || problem ? "Start liveness check again" : "Start liveness check"}

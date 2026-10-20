@@ -14,7 +14,15 @@ import type {
   VistaExpediente,
 } from "../../lib/api/types.ts";
 import type { CredentialField, CredentialInput, ParsedCurp, ProfileField } from "../../lib/kyc.ts";
-import { KYC_MESSAGES, describeKycMessage, kycMessageInEnglish, parseCurp, trimWs, validateCredential } from "../../lib/kyc.ts";
+import {
+  CONTACT_COMPLIANCE,
+  KYC_MESSAGES,
+  describeKycMessage,
+  kycMessageInEnglish,
+  parseCurp,
+  trimWs,
+  validateCredential,
+} from "../../lib/kyc.ts";
 
 // -----------------------------------------------------------------------------
 // Steps
@@ -231,11 +239,21 @@ export function profileProblem(code: string, mensaje: string): ProfileProblem | 
   }
 }
 
-export const MORAL_EXPLANATION =
-  "Remote biometric verification is only for individuals (personas físicas). Companies (personas morales) are onboarded at a branch with their legal representative and incorporation documents.";
+export const MORAL_EXPLANATION = `Remote biometric verification is only for individuals (personas físicas). Companies (personas morales) are onboarded at a branch with their legal representative and incorporation documents. To arrange it, ${CONTACT_COMPLIANCE.charAt(0).toLowerCase()}${CONTACT_COMPLIANCE.slice(1)}`;
 
-export const IDENTITY_IN_USE =
-  "That CURP, RFC or voter key is already linked to another account that is verified or under review. If you think this is a mistake, contact our compliance team.";
+export const IDENTITY_IN_USE = `That CURP, RFC or voter key is already linked to another account that is verified or under review. If you think this is a mistake, ${CONTACT_COMPLIANCE.charAt(0).toLowerCase()}${CONTACT_COMPLIANCE.slice(1)}`;
+
+/** After an IDENTIDAD_EN_USO on POST /kyc/verificar: every identical retry counts against the account. */
+export const IDENTITY_CONFLICT_RETRY =
+  "Correct your CURP, RFC or voter key before trying again: sending the same details again will be refused, and repeated conflicts lock remote verification for up to 30 days.";
+
+/**
+ * The identity a submission declares (CURP, RFC and voter key), to tell
+ * whether the customer changed anything after an IDENTIDAD_EN_USO.
+ */
+export function identityKey(curp: string | null | undefined, rfc: string | null | undefined, claveElector: string): string {
+  return [curp ?? "", rfc ?? "", trimWs(claveElector).toUpperCase()].join("|");
+}
 
 // -----------------------------------------------------------------------------
 // Step 2: credential draft
@@ -396,7 +414,8 @@ export function duplicateIndexes(values: readonly string[]): number[] {
 /**
  * Why the camera cannot be used: a DOMException name from getUserMedia
  * ("NotAllowedError", "NotFoundError"...) or one of our own codes:
- * "insecure", "unsupported", "ended" (track stopped), "no-frame".
+ * "insecure", "unsupported", "ended" (track stopped), "no-frame",
+ * "hidden" (released because the page was hidden).
  */
 export type CameraProblem = string;
 
@@ -450,6 +469,11 @@ export function describeCameraProblem(problem: CameraProblem, purpose: "id" | "s
         title: "The camera is busy",
         message: "Another app or browser tab may be using the camera. Close it and try again." + fallback,
       };
+    case "hidden":
+      return {
+        title: "The camera was turned off",
+        message: "The camera turns off when you leave this page or switch apps, and nothing was sent. Try again." + fallback,
+      };
     case "ended":
       return {
         title: "The camera stopped",
@@ -490,12 +514,18 @@ export function pickChallenge(random: number): Challenge {
   return CHALLENGES[i] ?? { code: "SONRIE", text: "Smile" };
 }
 
-/** What the liveness step should offer after an error of POST /kyc/verificar. */
-export type VerificationAction = "status" | "profile" | "id" | "selfie" | "consent" | null;
+/**
+ * What the liveness step should offer after an error of POST /kyc/verificar.
+ * "identity": the declared identity is in use elsewhere, so edit the CURP,
+ * RFC or voter key before retrying.
+ */
+export type VerificationAction = "status" | "profile" | "id" | "identity" | "selfie" | "consent" | null;
 
 export interface VerificationProblem {
   message: string;
   action: VerificationAction;
+  /** Remote verification cannot be retried now (no more submissions until compliance acts). */
+  lock?: boolean;
 }
 
 /** English copy and next action for the error codes of POST /kyc/verificar; null for generic codes. */
@@ -514,16 +544,18 @@ export function verificationProblem(code: string, mensaje: string): Verification
     case "KYC_DATOS_INCOMPLETOS":
       return { message: "First save your personal details and address (step 1).", action: "profile" };
     case "KYC_SIN_INTENTOS":
+    case "KYC_IDENTIDAD_BLOQUEADA":
       return {
-        message: "You have no verification attempts left. Contact our compliance team to reopen your file.",
+        message: kycMessageInEnglish(mensaje) ?? `You cannot submit another verification right now. ${CONTACT_COMPLIANCE}`,
         action: "status",
+        lock: true,
       };
     case "KYC_EXPEDIENTE_NO_EDITABLE":
       return { message: kycMessageInEnglish(mensaje) ?? "Your file can no longer be changed.", action: "status" };
     case "KYC_SOLO_PERSONA_FISICA":
       return { message: MORAL_EXPLANATION, action: "status" };
     case "IDENTIDAD_EN_USO":
-      return { message: IDENTITY_IN_USE, action: null };
+      return { message: `${IDENTITY_IN_USE} ${IDENTITY_CONFLICT_RETRY}`, action: "identity" };
     case "CUERPO_DEMASIADO_GRANDE":
       return { message: KYC_MESSAGES.bodyTooLarge, action: "id" };
     default:
@@ -562,11 +594,30 @@ export const STATUS_TONES: Record<EstadoKyc, StatusTone> = {
   RECHAZADO: "danger",
 };
 
-/** Headline of the status page. */
-export function statusHeadline(file: Pick<VistaExpediente, "estado_kyc" | "intentos" | "intentos_restantes">): {
+/**
+ * Headline of the status page. `awaitingProvider`: a submission is in review
+ * but its provider result has not arrived yet (202). `suspended`: the client
+ * is SUSPENDIDO (its file reads RECHAZADO).
+ */
+export function statusHeadline(
+  file: Pick<VistaExpediente, "estado_kyc" | "intentos" | "intentos_restantes">,
+  context: { awaitingProvider?: boolean; suspended?: boolean } = {},
+): {
   title: string;
   body: string;
 } {
+  if (context.suspended) {
+    return {
+      title: "Your account is suspended",
+      body: "Operations on this account are suspended for compliance reasons. Only our compliance team can lift the suspension.",
+    };
+  }
+  if (file.estado_kyc === "EN_REVISION" && context.awaitingProvider) {
+    return {
+      title: "We are checking your photos",
+      body: "The verification provider is analyzing your submission. This page updates by itself; you can also leave and come back later.",
+    };
+  }
   switch (file.estado_kyc) {
     case "VERIFICADO":
       return {

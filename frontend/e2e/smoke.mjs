@@ -104,7 +104,10 @@ try {
       permissions: ["camera"],
     });
     const page = await context.newPage();
-    page.on("console", (m) => m.type() === "error" && errors.push(`[${colorScheme}] ${m.text()}`));
+    // The resource URL matters: "Failed to load resource" messages do not name it in their text.
+    page.on("console", (m) => {
+      if (m.type() === "error") errors.push(`[${colorScheme}] ${m.text()} (${m.location().url || "no url"})`);
+    });
     page.on("pageerror", (e) => errors.push(`[${colorScheme}] ${e.message}`));
 
     if (colorScheme === "dark") {
@@ -166,7 +169,8 @@ try {
       (await page.getByTestId("deposit-locked").getAttribute("aria-disabled")) === "true",
       "deposit control is disabled until verified",
     );
-    await page.getByTestId("deposit-locked").click();
+    // Playwright treats aria-disabled as disabled, so force the click to prove it does nothing.
+    await page.getByTestId("deposit-locked").click({ force: true });
     check((await page.locator("#demo-amount").count()) === 0, "clicking the locked deposit control opens no deposit form");
     check(await page.locator("#bridge-amount").isDisabled(), "investment amount is disabled until verified");
     check(
@@ -209,6 +213,44 @@ try {
     const step2 = page.getByTestId("onboarding-step-2");
     await step2.waitFor();
     check(true, "step 1 saves without warnings and advances to the INE step");
+    // Camera privacy: hiding the page turns the INE camera off, and closing it hands focus back.
+    await step2.locator("#ine-frente-camera").click();
+    const ineVideo = step2.locator("video[aria-label='Camera preview for the INE front']");
+    await ineVideo.waitFor();
+    await page.waitForFunction(
+      () => {
+        const v = document.querySelector("video[aria-label='Camera preview for the INE front']");
+        return v instanceof HTMLVideoElement && v.srcObject instanceof MediaStream && v.videoWidth > 0;
+      },
+      undefined,
+      { timeout: 15_000 },
+    );
+    const liveTracks = await page.evaluate(() => {
+      const v = document.querySelector("video[aria-label='Camera preview for the INE front']");
+      // Keep a handle on the stream to check its tracks after the page hides.
+      window.__ineStream = v.srcObject;
+      return window.__ineStream.getTracks().filter((t) => t.readyState === "live").length;
+    });
+    check(liveTracks > 0, "the INE camera preview is live");
+    await page.evaluate(() => {
+      Object.defineProperty(document, "visibilityState", { configurable: true, get: () => "hidden" });
+      Object.defineProperty(document, "hidden", { configurable: true, get: () => true });
+      document.dispatchEvent(new Event("visibilitychange"));
+    });
+    await step2.getByText("The camera was turned off").waitFor();
+    const afterHide = await page.evaluate(() => {
+      const v = document.querySelector("video[aria-label='Camera preview for the INE front']");
+      const stillLive = window.__ineStream.getTracks().filter((t) => t.readyState === "live").length;
+      delete window.__ineStream;
+      delete document.visibilityState;
+      delete document.hidden;
+      return { srcObject: v?.srcObject ?? null, stillLive };
+    });
+    check(afterHide.srcObject === null && afterHide.stillLive === 0, "hiding the page stops the INE camera (no live tracks)");
+    await step2.getByRole("button", { name: "Cancel" }).click();
+    await page.waitForFunction(() => document.activeElement?.id === "ine-frente-camera");
+    check(true, "closing the INE camera returns keyboard focus to the Use camera button");
+
     const front = await renderJpeg(page, "INE FRENTE", 200);
     const back = await renderJpeg(page, "INE REVERSO", 20);
     check(!front.equals(back) && front.length > 1024 && back.length > 1024, "generated two different JPEGs > 1 KB");
@@ -283,15 +325,45 @@ try {
     const verdict = await response.json();
     check(
       response.status() === 200 && verdict.resultado?.resultado === "APROBADO",
-      `verification answered ${response.status()} ${verdict.resultado?.resultado ?? verdict.codigo ?? ""}`.trim(),
+      `verification answered ${response.status()} ${
+        verdict.resultado?.resultado ?? [verdict.error?.codigo, verdict.error?.mensaje].filter(Boolean).join(": ")
+      }`.trim(),
     );
     const file = await (await reloaded).json();
+    // Score or threshold as a decimal ("0.6512") inside any finding would leak them too.
+    const findings = [
+      ...(verdict.resultado.detalles ?? []),
+      ...(file.ultimo_resultado?.detalles_fallo ?? []),
+      ...(file.motivo_rechazo ? [{ mensaje: file.motivo_rechazo }] : []),
+    ];
     check(
       verdict.resultado.score_similitud === null &&
         file.estado_kyc === "VERIFICADO" &&
         file.ultimo_resultado?.score_similitud === null &&
-        file.ultimo_resultado?.umbral_aplicado === null,
-      "the face-match score and threshold are not disclosed to the client",
+        file.ultimo_resultado?.umbral_aplicado === null &&
+        findings.every((d) => !/\b0\.\d{2,}/.test(d.mensaje)),
+      "the face-match score and threshold are not disclosed to the client (fields or findings)",
+    );
+    // Camera released and nothing biometric persisted in the browser.
+    const privacy = await page.evaluate(() => {
+      const live = [...document.querySelectorAll("video")].some(
+        (v) => v.srcObject instanceof MediaStream && v.srcObject.getTracks().some((t) => t.readyState === "live"),
+      );
+      const dump = (store) => Object.keys(store).map((k) => `${k}=${store.getItem(k)}`).join("\n");
+      return {
+        live,
+        sessionKeys: Object.keys(sessionStorage),
+        localKeys: Object.keys(localStorage),
+        images: /data:image/.test(dump(sessionStorage) + dump(localStorage)),
+      };
+    });
+    check(!privacy.live, "the camera is released once the frames are captured (no live track)");
+    check(
+      privacy.sessionKeys.length === 1 &&
+        privacy.sessionKeys[0] === "synthetic-capital-session" &&
+        privacy.localKeys.length === 0 &&
+        !privacy.images,
+      `browser storage holds only the session and no image data (session: ${privacy.sessionKeys.join(",")}; local: ${privacy.localKeys.join(",")})`,
     );
 
     // ---------------------------------------------------------------------
@@ -305,8 +377,8 @@ try {
     await step4.getByText("Your identity is verified").waitFor();
     check(await step4.getByText("Approved", { exact: true }).isVisible(), "last verification shows Approved");
     check(
-      (await step4.getByText("Face match with your INE photo").count()) === 0,
-      "status page shows no face-match percentage",
+      (await step4.getByText(/^Face match/).count()) === 0,
+      "status page shows no face-match score or row (the API withholds it)",
     );
     await shot(page, "onboarding-4-status");
     await step4.getByRole("button", { name: "Go to dashboard" }).click();
@@ -394,8 +466,10 @@ try {
 }
 
 // No console error is tolerated except the browser's own request for a
-// favicon the app does not ship.
-const relevant = errors.filter((e) => !e.includes("favicon"));
+// favicon the app does not ship (a 404 on /favicon.ico, not app code).
+const benign = (e) => /Failed to load resource: .*404/.test(e) && /\/favicon\.ico\)$/.test(e);
+const relevant = errors.filter((e) => !benign(e));
+if (errors.length > relevant.length) console.log(`(ignored ${errors.length - relevant.length} favicon 404 message(s))`);
 if (relevant.length) {
   console.error("Console errors:\n" + relevant.join("\n"));
   process.exit(1);

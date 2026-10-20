@@ -1,4 +1,4 @@
-import type { ButtonHTMLAttributes, HTMLAttributes, InputHTMLAttributes, ReactNode } from "react";
+import type { ButtonHTMLAttributes, HTMLAttributes, InputHTMLAttributes, ReactNode, Ref } from "react";
 import { AlertTriangle, CheckCircle2, Info, Loader2, XCircle } from "lucide-react";
 
 export function cx(...classes: (string | false | null | undefined)[]): string {
@@ -72,6 +72,7 @@ export function Button({
   disabled,
   ...rest
 }: ButtonHTMLAttributes<HTMLButtonElement> & {
+  ref?: Ref<HTMLButtonElement>;
   variant?: ButtonVariant;
   size?: "sm" | "md" | "lg";
   loading?: boolean;
@@ -141,6 +142,12 @@ export function Badge({
 // Form fields
 // ---------------------------------------------------------------------------
 
+/** The aria-describedby of the input inside a `Field`: its error, else its hint. */
+export function fieldDescribedBy(htmlFor: string, error?: string | null, hint?: ReactNode): string | undefined {
+  if (error) return `${htmlFor}-error`;
+  return hint ? `${htmlFor}-hint` : undefined;
+}
+
 export function Field({
   label,
   htmlFor,
@@ -165,7 +172,9 @@ export function Field({
           {error}
         </p>
       ) : hint ? (
-        <p className="text-xs text-muted">{hint}</p>
+        <p id={`${htmlFor}-hint`} className="text-xs text-muted">
+          {hint}
+        </p>
       ) : null}
     </div>
   );
@@ -224,7 +233,8 @@ export function Alert({
       <Icon className="mt-0.5 size-4 shrink-0" aria-hidden />
       <div className="min-w-0 space-y-0.5">
         {title ? <p className="font-semibold">{title}</p> : null}
-        {children ? <div className="text-[13px] leading-relaxed opacity-90">{children}</div> : null}
+        {/* No opacity: the warning tone on its soft background needs full strength for 4.5:1. */}
+        {children ? <div className="text-[13px] leading-relaxed">{children}</div> : null}
       </div>
     </div>
   );

@@ -18,7 +18,8 @@ import { Alert, Badge, cx, type Tone } from "@/components/ui/primitives";
 import { ONBOARDING_PATH } from "@/hooks/use-client-home";
 import { ApiError, describeError } from "@/lib/api/client";
 import { api } from "@/lib/api/endpoints";
-import type { Cliente, EstatusKyc, VistaExpediente } from "@/lib/api/types";
+import type { Cliente, EstatusKyc, TipoPersona, VistaExpediente } from "@/lib/api/types";
+import { COMPLIANCE_EMAIL } from "@/lib/config";
 import { ESTADO_KYC_LABELS, describeKycMessage } from "@/lib/kyc";
 
 /**
@@ -110,15 +111,29 @@ interface BannerCopy {
   cta: string;
 }
 
-function bannerCopy(status: Exclude<EstatusKyc, "VERIFICADO">): BannerCopy {
+/** Why movements are locked at all (shown with the pending copy). */
+const REGULATORY_REASON =
+  "Mexican anti-money-laundering rules require a bank to identify its customers before moving their money.";
+
+function bannerCopy(status: Exclude<EstatusKyc, "VERIFICADO">, tipo: TipoPersona): BannerCopy {
   switch (status) {
     case "PENDIENTE":
+      if (tipo === "MORAL") {
+        return {
+          tone: "warning",
+          title: "Verify your company to unlock your account",
+          body:
+            "Deposits, transfers and fixed-term investments are locked until your company is verified. " +
+            `${REGULATORY_REASON} Companies are verified at a branch with their legal representative and incorporation documents; to arrange it, contact our compliance team:`,
+          cta: "How company verification works",
+        };
+      }
       return {
         tone: "warning",
         title: "Verify your identity to unlock your account",
         body:
           "Deposits, transfers and fixed-term investments are locked until your identity verification is complete. " +
-          "It takes a few minutes: your personal details, both sides of your INE voting credential and a short selfie.",
+          `${REGULATORY_REASON} It takes a few minutes: your personal details, both sides of your INE voting credential and a short selfie.`,
         cta: "Complete verification",
       };
     case "EN_REVISION":
@@ -126,7 +141,7 @@ function bannerCopy(status: Exclude<EstatusKyc, "VERIFICADO">): BannerCopy {
         tone: "info",
         title: "Your identity is being reviewed",
         body:
-          "We received your documents and a compliance officer is reviewing them. Deposits, transfers and " +
+          "We received your documents and are checking them. Deposits, transfers and " +
           "fixed-term investments unlock as soon as your identity is verified; this page updates on its own.",
         cta: "View verification status",
       };
@@ -136,7 +151,7 @@ function bannerCopy(status: Exclude<EstatusKyc, "VERIFICADO">): BannerCopy {
         title: "We could not verify your identity",
         body:
           "Deposits, transfers and fixed-term investments remain locked on this account. " +
-          "Contact support if you believe this is a mistake.",
+          "If you believe this is a mistake, contact our compliance team:",
         cta: "View verification details",
       };
     case "SUSPENDIDO":
@@ -145,7 +160,7 @@ function bannerCopy(status: Exclude<EstatusKyc, "VERIFICADO">): BannerCopy {
         title: "Your account is suspended",
         body:
           "Operations on this account are suspended for compliance reasons: deposits, transfers and fixed-term " +
-          "investments are locked. Contact support for details.",
+          "investments are locked. For details, contact our compliance team:",
         cta: "View verification details",
       };
   }
@@ -216,7 +231,8 @@ export function KycBanner({ client, token }: { client: Cliente; token: string })
   }, [token, status]);
 
   if (status === "VERIFICADO") return null;
-  const copy = bannerCopy(status);
+  const copy = bannerCopy(status, client.tipo_persona);
+  const contact = status === "RECHAZADO" || status === "SUSPENDIDO" || (status === "PENDIENTE" && client.tipo_persona === "MORAL");
   const tone = BANNER_TONES[copy.tone];
   const Icon = STATUS[status].icon;
   // A file fetched before the status changed would describe the old state.
@@ -237,7 +253,18 @@ export function KycBanner({ client, token }: { client: Cliente; token: string })
           <h2 id="kyc-banner-title" className="text-base font-semibold text-ink">
             {copy.title}
           </h2>
-          <p className="text-sm leading-relaxed text-ink-2">{copy.body}</p>
+          <p className="text-sm leading-relaxed text-ink-2">
+            {copy.body}
+            {contact ? (
+              <>
+                {" "}
+                <a href={`mailto:${COMPLIANCE_EMAIL}`} className={cx(linkClass, "break-all")}>
+                  {COMPLIANCE_EMAIL}
+                </a>
+                {copy.body.endsWith(":") ? "." : null}
+              </>
+            ) : null}
+          </p>
           {details.length ? (
             <div className="space-y-1 text-sm leading-relaxed text-ink-2">
               {details.map((line, i) => (
@@ -254,7 +281,7 @@ export function KycBanner({ client, token }: { client: Cliente; token: string })
               </li>
             ))}
           </ul>
-          <p className="text-xs text-muted">
+          <p className="text-xs text-ink-2">
             You can still see your balances and ledger, and collect matured contracts.
           </p>
         </div>

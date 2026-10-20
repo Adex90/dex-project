@@ -1,5 +1,6 @@
 import { request } from "./client";
 import type {
+  Cliente,
   CorteReserva,
   DatosGuardados,
   DatosPersonalesInput,
@@ -63,6 +64,9 @@ export const api = {
       method: "POST",
       body: { corte_id: proof.corte.id, hoja: proof.hoja, ruta: proof.ruta },
     }),
+
+  /** The signed-in client (its `estatus_kyc` tells a SUSPENDIDO client from a rejected one). */
+  me: (token: string, signal?: AbortSignal) => request<Cliente>("/api/v1/yo", { token, signal }),
 
   /** The customer's KYC file: state, attempts left and the last biometric result. */
   kycFile: (token: string, signal?: AbortSignal) => request<VistaExpediente>("/api/v1/kyc/expediente", { token, signal }),

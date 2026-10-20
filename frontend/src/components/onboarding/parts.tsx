@@ -18,10 +18,13 @@ import { STEPS, type Step } from "./logic";
 export function Stepper({
   current,
   canVisit,
+  isDone = (step) => step < current,
   onVisit,
 }: {
   current: Step;
   canVisit: (step: Step) => boolean;
+  /** Whether a step is shown as completed (default: every step before the current one). */
+  isDone?: (step: Step) => boolean;
   onVisit: (step: Step) => void;
 }) {
   return (
@@ -29,7 +32,7 @@ export function Stepper({
       <ol className="grid grid-cols-4 gap-1">
         {STEPS.map(({ n, label }) => {
           const isCurrent = n === current;
-          const done = n < current;
+          const done = !isCurrent && isDone(n);
           const visitable = !isCurrent && canVisit(n);
           const content = (
             <>

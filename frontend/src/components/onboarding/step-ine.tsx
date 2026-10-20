@@ -160,7 +160,7 @@ export function StepIne({
           note={claveOk ? <OkNote>Birth date and sex match your CURP</OkNote> : null}
           hint={`On the front ("CLAVE DE ELECTOR"). Characters 7–12 are your birth date: ${expectedClaveDate(curp)}.`}
         />
-        <div className="grid grid-cols-2 gap-4">
+        <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
           <FormField
             id="cic"
             label="CIC"
@@ -257,11 +257,23 @@ function IdSide({
 }) {
   const info = SIDES[side];
   const fileRef = useRef<HTMLInputElement>(null);
+  const cameraButtonRef = useRef<HTMLButtonElement>(null);
   const [busy, setBusy] = useState(false);
   const [uploadError, setUploadError] = useState<string | null>(null);
+  // Polite screen-reader announcement: processing, captured, replaced.
+  const [announcement, setAnnouncement] = useState("");
   const message = uploadError ?? error;
   const titleId = `ine-${side}-title`;
   const messageId = `ine-${side}-error`;
+
+  const accept = (dataUrl: string) => {
+    setAnnouncement(`${info.title} of your INE ${value ? "replaced" : "captured"}.`);
+    setUploadError(null);
+    onImage(dataUrl);
+  };
+
+  /** Closing the camera unmounts the focused button: hand focus back to "Use camera". */
+  const refocusCameraButton = () => requestAnimationFrame(() => cameraButtonRef.current?.focus());
 
   const onFile = async (event: ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0];
@@ -270,9 +282,11 @@ function IdSide({
     if (!file) return;
     setBusy(true);
     setUploadError(null);
+    setAnnouncement("Processing photo…");
     try {
-      onImage(await reencodeImageFile(file, ID_MAX_SIDE, info.label));
+      accept(await reencodeImageFile(file, ID_MAX_SIDE, info.label));
     } catch (e) {
+      setAnnouncement("");
       setUploadError(e instanceof ImageError ? e.message : `${info.label}: we could not read that file as an image.`);
     } finally {
       setBusy(false);
@@ -312,14 +326,41 @@ function IdSide({
       </div>
 
       {cameraOpen ? (
-        <CameraCapture label={info.label} guide={info.guide} onCapture={onImage} onCancel={onCloseCamera} />
+        <CameraCapture
+          label={info.label}
+          guide={info.guide}
+          onCapture={(dataUrl) => {
+            accept(dataUrl);
+            refocusCameraButton();
+          }}
+          onCancel={() => {
+            onCloseCamera();
+            refocusCameraButton();
+          }}
+        />
       ) : (
         <div className="flex flex-wrap gap-2">
-          <Button id={`ine-${side}-camera`} type="button" variant="secondary" size="sm" onClick={onOpenCamera} disabled={busy}>
+          <Button
+            ref={cameraButtonRef}
+            id={`ine-${side}-camera`}
+            type="button"
+            variant="secondary"
+            size="sm"
+            onClick={onOpenCamera}
+            disabled={busy}
+            aria-describedby={message ? messageId : undefined}
+          >
             <Camera className="size-3.5" aria-hidden />
             {value ? "Retake with camera" : "Use camera"}
           </Button>
-          <Button type="button" variant="secondary" size="sm" onClick={() => fileRef.current?.click()} disabled={busy}>
+          <Button
+            type="button"
+            variant="secondary"
+            size="sm"
+            onClick={() => fileRef.current?.click()}
+            disabled={busy}
+            aria-describedby={message ? messageId : undefined}
+          >
             <Upload className="size-3.5" aria-hidden />
             {value ? "Upload another" : "Upload"}
           </Button>
@@ -336,8 +377,11 @@ function IdSide({
         onChange={(e) => void onFile(e)}
       />
 
+      <p className="sr-only" role="status" aria-live="polite">
+        {announcement}
+      </p>
       {message ? (
-        <p id={messageId} className="text-xs text-danger">
+        <p id={messageId} role="alert" className="text-xs text-danger">
           {message}
         </p>
       ) : null}

@@ -10,8 +10,11 @@ import { test } from "node:test";
 
 import type { DatosPersonalesInput } from "./api/types.ts";
 import {
+  CONTACT_COMPLIANCE,
   ENTIDADES,
   ESTADOS,
+  FACE_NEEDS_REVIEW,
+  FACE_NO_MATCH,
   KYC_MESSAGES,
   SAMPLE_IDENTITY_SPACE,
   ageOn,
@@ -678,13 +681,36 @@ test("backend messages are translated to English", () => {
   );
   assert.equal(
     kycMessageInEnglish("el expediente 3f2a0c1e-0000-4000-8000-000000000000 agotó sus 3 intentos"),
-    "You have used all 3 verification attempts. Contact support to reopen your file.",
+    `You have used all 3 verification attempts. ${CONTACT_COMPLIANCE}`,
   );
   assert.equal(
     kycMessageInEnglish("la identidad del expediente 3f2a0c1e-0000-4000-8000-000000000000 no cambia en estado EN_REVISION"),
     "Your identity details cannot change while your file is in review.",
   );
-  assert.equal(kycMessageInEnglish("similitud facial 0.6500 por debajo del mínimo aceptable 0.70"), "Face similarity 0.6500 is below the minimum acceptable 0.70.");
+  // The hidden face-match score and threshold never reach the customer's screen.
+  for (const [message, english] of [
+    ["similitud facial 0.6512 por debajo del mínimo aceptable 0.7000", FACE_NO_MATCH],
+    ["similitud facial 0.8012 menor que 0.8500: requiere revisión humana", FACE_NEEDS_REVIEW],
+    ["intentos agotados: similitud facial 0.6512 por debajo del mínimo aceptable 0.7000", `No verification attempts left. ${FACE_NO_MATCH}`],
+    ["similitud facial 0.61 (formato nuevo)", FACE_NO_MATCH],
+  ] as const) {
+    const out = describeKycMessage(message);
+    assert.equal(out, english);
+    assert.doesNotMatch(out, /\d\.\d/);
+  }
+  // Both variants of KYC_PROVEEDOR_ERROR: only the refunded one says the attempt was not counted.
+  assert.equal(
+    kycMessageInEnglish("el proveedor biométrico no pudo evaluar tu envío; intenta de nuevo (este intento no se contó)"),
+    "The verification service could not evaluate your submission. Please try again; this attempt was not counted.",
+  );
+  assert.equal(
+    kycMessageInEnglish("el proveedor biométrico no pudo evaluar tu envío"),
+    "The verification service could not evaluate your submission.",
+  );
+  // Administrative states from migration 0006 are not shown as internal text.
+  for (const motivo of ["estado SUSPENDIDO anterior a 0006", "alta administrativa en estado RECHAZADO"]) {
+    assert.match(describeKycMessage(motivo), /^Your account was restricted by our compliance team\./);
+  }
   // Free text (an operator's reason) is not recognized.
   assert.equal(kycMessageInEnglish("documento ilegible"), null);
   assert.equal(describeKycMessage("documento ilegible"), "documento ilegible");

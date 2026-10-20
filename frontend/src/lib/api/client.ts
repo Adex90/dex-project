@@ -77,7 +77,12 @@ export async function request<T>(path: string, options: RequestOptions = {}): Pr
   return data as T;
 }
 
-/** English copy for the backend's stable error codes; falls back to the server message. */
+/**
+ * English copy for the backend's stable error codes; falls back to the server
+ * message. KYC_PROVEEDOR_ERROR and KYC_IDENTIDAD_BLOQUEADA are deliberately
+ * absent: their wording depends on the case (e.g. whether the attempt was
+ * refunded), so they are translated from the server message.
+ */
 const MESSAGES: Record<string, string> = {
   RED: "Cannot reach the bank's servers. Check your connection and try again.",
   NO_AUTENTICADO: "Your session has expired. Please sign in again.",
@@ -90,8 +95,6 @@ const MESSAGES: Record<string, string> = {
   KYC_NO_VERIFICADO: "Your identity (KYC) has not been verified yet, so money movements are disabled.",
   DESTINO_NO_ACREDITABLE: "The destination account cannot receive this transfer.",
   KYC_PROVEEDOR_NO_DISPONIBLE: "Identity verification is not available right now. Your file was not changed; please try again later.",
-  KYC_PROVEEDOR_ERROR: "The verification service could not evaluate your submission. Please try again; this attempt was not counted.",
-  KYC_IDENTIDAD_BLOQUEADA: "This CURP has too many rejected verifications. Please contact compliance.",
   CLIENTE_EN_LISTA_BLOQUEADAS: "Operations are blocked on this account for compliance reasons.",
   CUENTA_CONGELADA: "Your vault account is frozen.",
   CUENTA_CERRADA: "Your vault account is closed.",

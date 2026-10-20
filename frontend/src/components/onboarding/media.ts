@@ -156,18 +156,22 @@ function waitForFrames(video: HTMLVideoElement, timeoutMs: number): Promise<bool
 /**
  * A camera stream bound to a <video>. `start` asks for the camera (the
  * browser prompts the first time); the tracks are stopped by `stop`, by a
- * new `start` and when the component unmounts, so the camera light never
- * stays on after leaving the step.
+ * new `start`, when the component unmounts and when the page is hidden
+ * (another tab or app: state "error" with problem "hidden"), so the camera
+ * light never stays on while the customer cannot see the page.
  */
 export function useCamera(facingMode: "user" | "environment") {
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
   // Bumped by every start/stop: a getUserMedia that resolves late is discarded.
   const generation = useRef(0);
+  // Between start() and release(): a stream is live or being requested.
+  const active = useRef(false);
   const [state, setState] = useState<CameraState>({ status: "idle" });
 
   const release = useCallback(() => {
     generation.current += 1;
+    active.current = false;
     for (const track of streamRef.current?.getTracks() ?? []) track.stop();
     streamRef.current = null;
     if (videoRef.current) videoRef.current.srcObject = null;
@@ -181,8 +185,10 @@ export function useCamera(facingMode: "user" | "environment") {
   const start = useCallback(async (): Promise<boolean> => {
     release();
     const mine = generation.current;
+    active.current = true;
     const support = cameraSupport();
     if (support !== "ok") {
+      active.current = false;
       setState({ status: "error", problem: support });
       return false;
     }
@@ -198,6 +204,7 @@ export function useCamera(facingMode: "user" | "environment") {
       });
     } catch (error) {
       if (mine !== generation.current) return false;
+      active.current = false;
       const name = error instanceof DOMException || error instanceof Error ? error.name : "Error";
       setState({ status: "error", problem: name });
       return false;
@@ -236,6 +243,22 @@ export function useCamera(facingMode: "user" | "environment") {
   }, [facingMode, release]);
 
   useEffect(() => release, [release]);
+
+  // Leaving the page (tab switch, app switch, navigation) turns the camera off.
+  useEffect(() => {
+    const onHide = (event: Event) => {
+      if (event.type === "visibilitychange" && document.visibilityState !== "hidden") return;
+      if (!active.current) return;
+      release();
+      setState({ status: "error", problem: "hidden" });
+    };
+    document.addEventListener("visibilitychange", onHide);
+    window.addEventListener("pagehide", onHide);
+    return () => {
+      document.removeEventListener("visibilitychange", onHide);
+      window.removeEventListener("pagehide", onHide);
+    };
+  }, [release]);
 
   return { videoRef, state, start, stop };
 }
