@@ -11,7 +11,12 @@
 //! arrendamiento (`FOR UPDATE SKIP LOCKED`) y, para las PENDIENTE, cuenta el
 //! intento **antes** de llamar al proveedor (queda confirmado en la base de
 //! datos). Luego habla con el proveedor fuera de toda transacción y aplica el
-//! resultado con [`aplicar`].
+//! resultado con [`aplicar`]. Justo antes de cada `registrar`, el reclamo se
+//! verifica y renueva contra la fila viva (mismo estado, mismos
+//! `intentos_envio`, sin revisión manual): una foto vieja de un lote lento
+//! nunca registra una orden que otro despachador retomó, que fue a revisión o
+//! que el operador reembolsó. Cada llamada al proveedor dura a lo sumo
+//! [`LLAMADA_PASARELA_SEG`], muy por debajo del arrendamiento.
 //!
 //! **Reglas que protegen el dinero** (un reembolso indebido paga dos veces):
 //! - Solo el primer intento puede tomar un "rechazado" como definitivo, y solo
@@ -23,9 +28,12 @@
 //!   ese reenvío (p. ej. "clave de rastreo duplicada") es ambiguo: revisión
 //!   manual, nunca reembolso.
 //! - Solo se reenvía si el día de operación del proveedor no pudo cambiar
-//!   desde que se creó la orden (el proveedor rechaza como duplicada la clave
+//!   desde la primera llamada a `registrar` que pudo registrar la orden
+//!   (`registro_incierto_desde`; el proveedor rechaza como duplicada la clave
 //!   de rastreo del mismo día, no la de un día anterior); si pudo cambiar,
-//!   revisión manual.
+//!   revisión manual. Una llamada que prueba que no llegó al proveedor
+//!   ([`ErrorPasarela::NoRecibida`]) no cuenta: tras una caída del proveedor
+//!   la orden se reenvía aunque haya pasado el corte.
 //! - Una orden en revisión manual que el proveedor nunca recibió la reembolsa
 //!   el operador ([`reembolsar_revision`]), auditado en `ifpe.spei_resoluciones`.
 //! - Tiempo agotado o error: nunca se reembolsa; se reintenta con espera y,
@@ -98,6 +106,17 @@ pub struct SpeiOutbound {
     pub enviada_en: Option<DateTime<Utc>>,
     pub liquidada_en: Option<DateTime<Utc>>,
     pub finalizada_en: Option<DateTime<Utc>>,
+    /// Inicio de la última llamada a `registrar`.
+    #[serde(skip)]
+    pub registro_intentado_en: Option<DateTime<Utc>>,
+    /// Inicio de la primera llamada a `registrar` que pudo registrar la orden.
+    #[serde(skip)]
+    pub registro_incierto_desde: Option<DateTime<Utc>>,
+}
+
+/// Fecha calendario de la Ciudad de México (UTC-6, como `hoy_cdmx`).
+fn fecha_cdmx(t: DateTime<Utc>) -> NaiveDate {
+    (t - chrono::Duration::hours(6)).date_naive()
 }
 
 impl SpeiOutbound {
@@ -118,10 +137,18 @@ impl SpeiOutbound {
         }
     }
 
-    fn consulta(&self) -> ConsultaOrden {
+    /// Consulta al proveedor. Sin fecha de operación confirmada, las fechas
+    /// candidatas cubren toda fecha que pudo asignar alguna llamada a
+    /// `registrar`: de la fecha de solicitud a la de la última llamada
+    /// (`registro_intentado_en`) más [`super::DIAS_FECHA_OPERACION_FUTURA`].
+    /// Un primer registro hecho días después de la solicitud (despachador
+    /// caído, cola atrasada) también se encuentra.
+    pub(crate) fn consulta(&self) -> ConsultaOrden {
         let mut fechas: Vec<NaiveDate> = self.fecha_operacion.into_iter().collect();
-        for d in 0..=super::DIAS_FECHA_OPERACION_FUTURA {
-            let f = self.fecha_solicitud + chrono::Days::new(d);
+        let desde = self.fecha_solicitud;
+        let ultima = self.registro_intentado_en.map(fecha_cdmx).unwrap_or(desde).max(desde);
+        let hasta = ultima + chrono::Days::new(super::DIAS_FECHA_OPERACION_FUTURA);
+        for f in desde.iter_days().take_while(|f| *f <= hasta) {
             if !fechas.contains(&f) {
                 fechas.push(f);
             }
@@ -405,6 +432,15 @@ pub enum Evento {
     Incierto {
         error: String,
     },
+    /// La llamada a `registrar` no llegó al proveedor: como `Incierto`, pero
+    /// si el reclamo sigue vigente (`intentos_envio`) y fue esta llamada la
+    /// que fijó `registro_incierto_desde` (`registro_desde`), se borra: nada
+    /// pudo registrarse y la regla del corte no aplica.
+    NoRecibida {
+        error: String,
+        intentos_envio: i32,
+        registro_desde: Option<DateTime<Utc>>,
+    },
     /// Resultado ambiguo que una persona debe resolver; sin reembolso.
     RevisionManual {
         motivo: String,
@@ -424,6 +460,7 @@ impl Evento {
             Evento::Devuelta { .. } => "DEVUELTA",
             Evento::RechazoRegistro { .. } => "RECHAZO_REGISTRO",
             Evento::Incierto { .. } => "INCIERTO",
+            Evento::NoRecibida { .. } => "NO_RECIBIDA",
             Evento::RevisionManual { .. } => "REVISION_MANUAL",
             Evento::SeguirVigilando => "SEGUIR_VIGILANDO",
         }
@@ -452,16 +489,58 @@ impl Transicion {
 }
 
 /// Aplica un resultado a la orden en su propia transacción (rol `sc_spei`).
+/// Si el reverso no se puede aplicar porque la cuenta está cerrada, la orden
+/// queda marcada para revisión manual (en otra transacción) y se devuelve el
+/// error.
 pub async fn aplicar(pool: &PgPool, cfg: &ConfigSpei, orden_id: Uuid, evento: &Evento) -> AppResult<Transicion> {
-    db::con_reintentos(|| async {
+    let r = db::con_reintentos(|| async {
         let mut tx = db::begin(pool, Rol::Spei).await?;
         let t = aplicar_en(&mut tx, cfg, orden_id, evento).await?;
         // También se confirman el incidente y la marca de revisión.
         tx.commit().await?;
         Ok(t)
     })
-    .await?
-    .exigir_sin_incidente()
+    .await;
+    match r {
+        Err(e) if e.codigo() == CUENTA_CERRADA => {
+            marcar_revision(pool, orden_id, &format!("reverso imposible: {}", e.detalle())).await?;
+            Err(e)
+        }
+        r => r?.exigir_sin_incidente(),
+    }
+}
+
+/// Código del error de un reverso hacia una cuenta cerrada.
+pub const CUENTA_CERRADA: &str = "CUENTA_CERRADA";
+
+/// Marca para revisión manual, en su propia transacción, una orden que aún
+/// no es final (sin mover dinero).
+pub async fn marcar_revision(pool: &PgPool, orden_id: Uuid, motivo: &str) -> AppResult<()> {
+    db::con_reintentos(|| async {
+        let mut tx = db::begin(pool, Rol::Spei).await?;
+        let o: Option<SpeiOutbound> = sqlx::query_as(
+            "SELECT * FROM ifpe.spei_outbound WHERE id = $1 AND estado IN ('PENDIENTE', 'ENVIADA', 'LIQUIDADA') \
+             FOR UPDATE",
+        )
+        .bind(orden_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if let Some(o) = o {
+            revision_manual(&mut tx, &o, motivo).await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    })
+    .await
+}
+
+/// ¿El proveedor informa un registro distinto del que la orden ya tiene
+/// (otro id u otra fecha de operación)? Es un segundo registro aceptado de la
+/// misma orden: posible pago doble.
+fn segundo_registro(o: &SpeiOutbound, id_proveedor: Option<&str>, fecha_operacion: Option<NaiveDate>) -> bool {
+    let otro_id = matches!((o.id_proveedor.as_deref(), id_proveedor), (Some(a), Some(b)) if a != b);
+    let otra_fecha = matches!((o.fecha_operacion, fecha_operacion), (Some(a), Some(b)) if a != b);
+    otro_id || otra_fecha
 }
 
 /// Aplica un resultado dentro de una transacción `sc_spei` abierta.
@@ -479,6 +558,34 @@ pub async fn aplicar_en(tx: &mut Tx, cfg: &ConfigSpei, orden_id: Uuid, evento: &
         .ok_or_else(|| AppError::no_encontrado("orden SPEI no encontrada"))?;
     let estado = o.estado.as_str();
     let nueva = match (estado, evento) {
+        // Un segundo registro aceptado de una orden que el proveedor ya tiene
+        // (p. ej. un reenvío tardío aceptado en otro día de operación): el
+        // proveedor puede pagarla dos veces. Evidencia y revisión manual.
+        ("ENVIADA" | "LIQUIDADA" | "DEVUELTA", Evento::Aceptada { id_proveedor, fecha_operacion })
+            if segundo_registro(&o, id_proveedor.as_deref(), *fecha_operacion) =>
+        {
+            tracing::error!(
+                rastreo = %o.clave_rastreo,
+                estado,
+                ?evento,
+                "INCIDENTE DE CONCILIACIÓN SPEI: segundo registro aceptado de una orden (posible pago doble)"
+            );
+            registrar_incidente(tx, &o, evento).await?;
+            let orden = if estado == "DEVUELTA" {
+                o.clone()
+            } else {
+                revision_manual(tx, &o, &format!("el proveedor aceptó un segundo registro de la orden: {evento:?}"))
+                    .await?
+            };
+            return Ok(Transicion {
+                orden,
+                cambio: false,
+                incidente: Some(format!(
+                    "la orden {} ya tenía un registro con el proveedor; el segundo requiere revisión manual",
+                    o.clave_rastreo
+                )),
+            });
+        }
         ("PENDIENTE", Evento::Aceptada { id_proveedor, fecha_operacion }) => {
             Some(enviada(tx, cfg, &o, id_proveedor.as_deref(), *fecha_operacion).await?)
         }
@@ -525,10 +632,32 @@ pub async fn aplicar_en(tx: &mut Tx, cfg: &ConfigSpei, orden_id: Uuid, evento: &
             Some(reembolsar(tx, &liquidada, "DEVUELTA", *causa, motivo).await?)
         }
         ("PENDIENTE" | "ENVIADA", Evento::Incierto { error }) => Some(incierto(tx, cfg, &o, error).await?),
+        // La llamada no llegó al proveedor: si el reclamo sigue vigente y esa
+        // misma llamada fijó `registro_incierto_desde`, se borra.
+        ("PENDIENTE", Evento::NoRecibida { error, intentos_envio, registro_desde }) => {
+            let vigente = match registro_desde {
+                Some(desde) => sqlx::query_as(
+                    "UPDATE ifpe.spei_outbound SET registro_incierto_desde = NULL \
+                     WHERE id = $1 AND intentos_envio = $2 AND registro_incierto_desde = $3 RETURNING *",
+                )
+                .bind(o.id)
+                .bind(intentos_envio)
+                .bind(desde)
+                .fetch_optional(&mut **tx)
+                .await?
+                .unwrap_or_else(|| o.clone()),
+                None => o.clone(),
+            };
+            Some(incierto(tx, cfg, &vigente, error).await?)
+        }
+        ("ENVIADA", Evento::NoRecibida { error, .. }) => Some(incierto(tx, cfg, &o, error).await?),
         ("PENDIENTE" | "ENVIADA" | "LIQUIDADA", Evento::RevisionManual { motivo }) => {
             Some(revision_manual(tx, &o, motivo).await?)
         }
-        ("LIQUIDADA", Evento::SeguirVigilando | Evento::Incierto { .. } | Evento::EnProceso { .. }) => {
+        (
+            "LIQUIDADA",
+            Evento::SeguirVigilando | Evento::Incierto { .. } | Evento::NoRecibida { .. } | Evento::EnProceso { .. },
+        ) => {
             Some(reprogramar(tx, &o, 6.0 * 3_600.0, None).await?)
         }
         // Repeticiones de un estado ya registrado: sin cambio.
@@ -636,10 +765,7 @@ async fn reembolsar(tx: &mut Tx, o: &SpeiOutbound, estado: &str, causa: i16, mot
     let cuenta = ledger::bloquear_cuenta_ifpe(tx, o.cuenta_id).await?;
     if cuenta.estado == EstadoCuenta::Cerrada {
         tracing::error!(rastreo = %o.clave_rastreo, "reverso SPEI hacia una cuenta cerrada: requiere revisión manual");
-        return Err(AppError::negocio(
-            "CUENTA_CERRADA",
-            "la cuenta de la orden está cerrada; el reverso requiere revisión",
-        ));
+        return Err(AppError::negocio(CUENTA_CERRADA, "la cuenta de la orden está cerrada; el reverso requiere revisión"));
     }
     let reserva_id: Uuid = sqlx::query_scalar("SELECT reserva_id FROM ifpe.transacciones WHERE id = $1")
         .bind(o.tx_retiro_id)
@@ -838,7 +964,10 @@ async fn resolucion_previa(tx: &mut Tx, s: &SolicitudResolucion) -> AppResult<Op
 /// Reembolsa una orden en revisión manual después de confirmar, consultando
 /// al proveedor en ese momento, que no la tiene. Exige que el despachador no
 /// haya tocado la orden durante `espera_resolucion_seg` (ningún registro
-/// tardío en vuelo: las órdenes en revisión nunca se reenvían). El reverso es
+/// tardío en vuelo: las órdenes en revisión nunca se reenvían, todo
+/// `registrar` exige antes un reclamo vigente sin revisión manual y dura a lo
+/// sumo [`LLAMADA_PASARELA_SEG`]). La consulta cubre todas las fechas de
+/// operación que pudo asignar cualquier llamada a `registrar`. El reverso es
 /// el de siempre (`spei-reverso:<orden>`), ligado a la resolución en la misma
 /// transacción. Nunca reembolsa una orden que el proveedor aceptó.
 pub async fn reembolsar_revision(
@@ -954,11 +1083,27 @@ pub struct Despacho {
 }
 
 /// Arrendamiento de una orden reclamada: tiempo para hablar con el proveedor
-/// antes de que otro despachador pueda retomarla. Que venza no reembolsa de
-/// más: el resultado de un primer intento se aplica solo si `intentos_envio`
-/// sigue siendo el del reclamo (todo reclamo de una PENDIENTE lo incrementa y
-/// lo confirma antes de llamar al proveedor; nadie más llama a `registrar`).
+/// antes de que otro despachador pueda retomarla. Se renueva, verificando la
+/// fila viva, justo antes de cada `registrar` ([`renovar_reclamo`]). Que venza
+/// no reembolsa de más: el resultado de un primer intento se aplica solo si
+/// `intentos_envio` sigue siendo el del reclamo (todo reclamo de una
+/// PENDIENTE lo incrementa y lo confirma antes de llamar al proveedor; nadie
+/// más llama a `registrar`).
 const ARRENDAMIENTO_SEG: f64 = 60.0;
+
+/// Tiempo máximo de una llamada al proveedor, muy por debajo de
+/// [`ARRENDAMIENTO_SEG`]: un `registrar` iniciado con el reclamo renovado
+/// termina antes de que otro despachador pueda retomar la orden. Agotarlo es
+/// un resultado desconocido ([`ErrorPasarela::Tiempo`]).
+pub const LLAMADA_PASARELA_SEG: u64 = 20;
+
+async fn con_limite<T>(
+    llamada: impl std::future::Future<Output = Result<T, ErrorPasarela>>,
+) -> Result<T, ErrorPasarela> {
+    tokio::time::timeout(std::time::Duration::from_secs(LLAMADA_PASARELA_SEG), llamada)
+        .await
+        .unwrap_or(Err(ErrorPasarela::Tiempo))
+}
 
 /// Un ciclo: reclama órdenes vencidas (contando el intento de las PENDIENTE
 /// antes de llamar al proveedor), consulta o registra cada una y aplica el
@@ -982,10 +1127,22 @@ pub async fn despachar(pool: &PgPool, pasarela: &dyn Pasarela, cfg: &ConfigSpei)
     .fetch_all(&mut *tx)
     .await?;
     tx.commit().await?;
+    // Las más antiguas primero (RETURNING no garantiza orden).
+    let mut reclamadas = reclamadas;
+    reclamadas.sort_by_key(|o| (o.creado_en, o.id));
 
     let mut d = Despacho { reclamadas: reclamadas.len(), ..Despacho::default() };
     for o in reclamadas {
-        let evento = consultar_proveedor(pasarela, cfg, &o).await;
+        let evento = match procesar(pool, pasarela, cfg, &o).await {
+            Ok(Some(evento)) => evento,
+            // El reclamo ya no es vigente: otro despachador (o el operador) la tiene.
+            Ok(None) => continue,
+            Err(e) => {
+                d.errores += 1;
+                tracing::error!(rastreo = %o.clave_rastreo, codigo = e.codigo(), error = %e.detalle(), "no se pudo renovar el reclamo SPEI");
+                continue;
+            }
+        };
         match aplicar(pool, cfg, o.id, &evento).await {
             Ok(t) if t.cambio && t.orden.estado != o.estado => d.cambios += 1,
             Ok(_) => {}
@@ -1030,62 +1187,106 @@ fn pudo_cambiar_dia_operacion(
     dia(desde - margen) != dia(hasta + margen)
 }
 
-/// Qué hacer con la orden según el proveedor (sin tocar la base de datos).
-async fn consultar_proveedor(pasarela: &dyn Pasarela, cfg: &ConfigSpei, o: &SpeiOutbound) -> Evento {
+/// Verifica contra la fila viva que el reclamo de `o` sigue vigente (misma
+/// orden PENDIENTE, mismos `intentos_envio`, sin revisión manual) y lo
+/// renueva justo antes de llamar a `registrar`; fija `registro_intentado_en` y,
+/// si aún no lo estaba, `registro_incierto_desde` (pesimista: la llamada puede
+/// registrar la orden aunque el despachador muera antes de aplicar el
+/// resultado). `None`: el reclamo se perdió, no se llama al proveedor.
+/// `Some(Some(t))`: esta llamada fijó `registro_incierto_desde = t` (ninguna
+/// llamada anterior pudo registrar la orden).
+async fn renovar_reclamo(pool: &PgPool, o: &SpeiOutbound) -> AppResult<Option<Option<DateTime<Utc>>>> {
+    let mut tx = db::begin(pool, Rol::Spei).await?;
+    let fila: Option<(Option<DateTime<Utc>>,)> = sqlx::query_as(
+        "UPDATE ifpe.spei_outbound \
+            SET proximo_intento_en = now() + make_interval(secs => $3), \
+                registro_intentado_en = greatest(coalesce(registro_intentado_en, now()), now()), \
+                registro_incierto_desde = coalesce(registro_incierto_desde, now()) \
+          WHERE id = $1 AND estado = 'PENDIENTE' AND intentos_envio = $2 AND NOT revision_manual \
+         RETURNING CASE WHEN registro_incierto_desde = now() THEN registro_incierto_desde END",
+    )
+    .bind(o.id)
+    .bind(o.intentos_envio)
+    .bind(ARRENDAMIENTO_SEG)
+    .fetch_optional(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    if fila.is_none() {
+        tracing::warn!(rastreo = %o.clave_rastreo, intentos = o.intentos_envio, "reclamo SPEI vencido: no se llama al proveedor");
+    }
+    Ok(fila.map(|(desde,)| desde))
+}
+
+/// Qué hacer con la orden según el proveedor. `None`: el reclamo ya no es
+/// vigente y no se habló con el proveedor para registrarla.
+async fn procesar(
+    pool: &PgPool,
+    pasarela: &dyn Pasarela,
+    cfg: &ConfigSpei,
+    o: &SpeiOutbound,
+) -> AppResult<Option<Evento>> {
     let primer_intento = o.estado == "PENDIENTE" && o.intentos_envio <= 1 && !o.revision_manual;
     if !primer_intento {
         // Ya hubo contacto (o pudo haberlo): primero se pregunta.
-        match pasarela.consultar(&o.consulta()).await {
-            Err(e) => return Evento::Incierto { error: e.to_string() },
+        match con_limite(pasarela.consultar(&o.consulta())).await {
+            Err(e) => return Ok(Some(Evento::Incierto { error: e.to_string() })),
             Ok(estado) => {
                 if let Some(evento) = desde_consulta(estado, o) {
-                    return evento;
+                    return Ok(Some(evento));
                 }
             }
         }
         // El proveedor no tiene (o aún no muestra) la orden.
         match o.estado.as_str() {
-            "LIQUIDADA" => return Evento::SeguirVigilando,
-            "ENVIADA" => return Evento::Incierto { error: "aceptada pero el proveedor no la encuentra".into() },
-            _ if o.revision_manual => return Evento::Incierto { error: "en revisión manual: no se reenvía".into() },
+            "LIQUIDADA" => return Ok(Some(Evento::SeguirVigilando)),
+            "ENVIADA" => {
+                return Ok(Some(Evento::Incierto { error: "aceptada pero el proveedor no la encuentra".into() }))
+            }
+            _ if o.revision_manual => {
+                return Ok(Some(Evento::Incierto { error: "en revisión manual: no se reenvía".into() }))
+            }
             _ => {}
         }
         // El reenvío solo es seguro si el proveedor lo rechazaría como
         // duplicado de un registro que aún no muestra: eso vale dentro del
-        // mismo día de operación. `creado_en` (inmutable) es anterior a todo
-        // intento; la orden no guarda la fecha que pudo recibir un intento
-        // cuya respuesta se perdió.
+        // mismo día de operación de la primera llamada que pudo registrarla.
+        // Si ninguna pudo (todas probaron no llegar al proveedor), el
+        // proveedor no tiene nada que duplicar.
         let margen = chrono::Duration::seconds(i64::try_from(cfg.margen_corte_seg).unwrap_or(86_400).min(86_400));
-        if pudo_cambiar_dia_operacion(o.creado_en, Utc::now(), cfg.hora_corte, margen) {
-            return Evento::RevisionManual {
-                motivo: format!(
-                    "el día de operación pudo cambiar desde el primer intento (corte {}): el proveedor no \
-                     rechazaría el reenvío como duplicado; no se reenvía",
-                    cfg.hora_corte.format("%H:%M")
-                ),
-            };
-        }
-        // Reenvío con la misma clave de rastreo. Un rechazo aquí es ambiguo.
-        return match pasarela.registrar(&o.orden_pasarela()).await {
-            Ok(Registro::Aceptada { id, fecha_operacion }) => {
-                Evento::Aceptada { id_proveedor: Some(id), fecha_operacion }
+        if let Some(desde) = o.registro_incierto_desde {
+            if pudo_cambiar_dia_operacion(desde, Utc::now(), cfg.hora_corte, margen) {
+                return Ok(Some(Evento::RevisionManual {
+                    motivo: format!(
+                        "el día de operación pudo cambiar desde el primer intento de resultado desconocido (corte \
+                         {}): el proveedor no rechazaría el reenvío como duplicado; no se reenvía",
+                        cfg.hora_corte.format("%H:%M")
+                    ),
+                }));
             }
-            Ok(Registro::Rechazada { causa, motivo }) => Evento::RevisionManual {
-                motivo: format!("rechazo en un reenvío (causa {causa}: {motivo}); la orden original pudo registrarse"),
-            },
-            Err(e) => Evento::Incierto { error: e.to_string() },
-        };
+        }
     }
-    match pasarela.registrar(&o.orden_pasarela()).await {
+    // Reclamo vigente justo antes de registrar (una foto vieja no registra).
+    let Some(marca) = renovar_reclamo(pool, o).await? else {
+        return Ok(None);
+    };
+    Ok(Some(match con_limite(pasarela.registrar(&o.orden_pasarela())).await {
         Ok(Registro::Aceptada { id, fecha_operacion }) => Evento::Aceptada { id_proveedor: Some(id), fecha_operacion },
-        // Primer intento: nada pudo registrarse antes con este reclamo; el
+        // Ninguna llamada anterior pudo registrarla (esta fijó la marca): el
         // rechazo es definitivo si al aplicarlo nadie más la reclamó.
-        Ok(Registro::Rechazada { causa, motivo }) => {
+        Ok(Registro::Rechazada { causa, motivo }) if marca.is_some() => {
             Evento::RechazoRegistro { causa, motivo, intentos_envio: o.intentos_envio }
         }
-        Err(ErrorPasarela::Tiempo) => Evento::Incierto { error: ErrorPasarela::Tiempo.to_string() },
+        // Un rechazo en un reenvío es ambiguo ("duplicada").
+        Ok(Registro::Rechazada { causa, motivo }) => Evento::RevisionManual {
+            motivo: format!("rechazo en un reenvío (causa {causa}: {motivo}); la orden original pudo registrarse"),
+        },
+        Err(ErrorPasarela::NoRecibida(e)) => Evento::NoRecibida {
+            error: ErrorPasarela::NoRecibida(e).to_string(),
+            intentos_envio: o.intentos_envio,
+            registro_desde: marca,
+        },
         Err(e) => Evento::Incierto { error: e.to_string() },
-    }
+    }))
 }
 
 // -----------------------------------------------------------------------------

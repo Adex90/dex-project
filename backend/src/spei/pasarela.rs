@@ -95,6 +95,12 @@ pub enum ErrorPasarela {
     Tiempo,
     #[error("error transitorio del proveedor SPEI: {0}")]
     Transitorio(String),
+    /// La petición nunca llegó al proveedor (conexión rechazada, nombre sin
+    /// resolver, error de TLS antes de enviar): nada pudo registrarse. El
+    /// cliente real solo la usa cuando eso es seguro; ante la duda,
+    /// [`ErrorPasarela::Tiempo`].
+    #[error("la petición no llegó al proveedor SPEI: {0}")]
+    NoRecibida(String),
 }
 
 pub trait Pasarela: Send + Sync {
@@ -127,6 +133,9 @@ pub enum Comportamiento {
     DevolverTrasLiquidar { causa: i16 },
     /// Las primeras `veces` consultas agotan el tiempo.
     TiempoAgotadoAlConsultar { veces: u32 },
+    /// Las primeras `veces` llamadas a `registrar` no llegan al proveedor
+    /// (conexión rechazada): nada se registra.
+    SinConexionAlRegistrar { veces: u32 },
 }
 
 #[derive(Debug, Clone)]
@@ -233,6 +242,16 @@ impl PasarelaSimulada {
         self.sim().fecha_operacion_vigente = Some(fecha);
     }
 
+    /// Llamadas a `registrar` recibidas para una clave de rastreo.
+    pub fn llamadas_registro(&self, clave_rastreo: &str) -> u32 {
+        self.sim().llamadas_registro.get(clave_rastreo).copied().unwrap_or(0)
+    }
+
+    /// Registros aceptados de una clave de rastreo (2 o más: pago doble).
+    pub fn registros_de(&self, clave_rastreo: &str) -> usize {
+        self.sim().ordenes.get(clave_rastreo).map_or(0, Vec::len)
+    }
+
     /// Estado actual de una orden en el proveedor (para pruebas).
     pub fn liquidada(&self, clave_rastreo: &str) -> bool {
         self.sim().liquidaciones.get(clave_rastreo).copied().unwrap_or(0) > 0
@@ -279,11 +298,15 @@ impl PasarelaSimulada {
             *n += 1;
             *n
         };
+        let reglas = s.reglas.get(&orden.beneficiario_clabe).cloned().unwrap_or_default();
+        // Una petición que no llega al proveedor no ve ni registra nada.
+        if reglas.iter().any(|r| matches!(r, Comportamiento::SinConexionAlRegistrar { veces } if llamada <= *veces)) {
+            return Err(ErrorPasarela::NoRecibida("conexión rechazada".into()));
+        }
         let fecha = s.fecha_operacion_vigente.unwrap_or_else(|| fecha_operacion_simulada(orden.fecha_solicitud));
         if s.ordenes.get(&clave).is_some_and(|v| v.iter().any(|o| o.fecha_operacion == fecha)) {
             return Ok(Registro::Rechazada { causa: CAUSA_DUPLICADO, motivo: "clave de rastreo duplicada".into() });
         }
-        let reglas = s.reglas.get(&orden.beneficiario_clabe).cloned().unwrap_or_default();
         for regla in reglas {
             match regla {
                 Comportamiento::RechazarAlRegistrar { causa } => {
@@ -322,8 +345,15 @@ impl PasarelaSimulada {
             *n += 1;
             *n
         };
-        // La consulta muestra el primer registro de la clave de rastreo.
-        let Some(o) = s.ordenes.get_mut(&clave).and_then(|v| v.first_mut()) else {
+        // La consulta muestra el primer registro de la clave de rastreo entre
+        // las fechas candidatas (como un proveedor que consulta por día; sin
+        // fechas, cualquiera).
+        let candidatas = &consulta.fechas_candidatas;
+        let Some(o) = s
+            .ordenes
+            .get_mut(&clave)
+            .and_then(|v| v.iter_mut().find(|o| candidatas.is_empty() || candidatas.contains(&o.fecha_operacion)))
+        else {
             return Ok(EstadoProveedor::NoExiste);
         };
         let reglas = s.reglas.get(&o.orden.beneficiario_clabe).cloned().unwrap_or_default();

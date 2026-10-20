@@ -1484,7 +1484,9 @@ async fn devolucion_de_cualquier_tipo_reembolsa_una_vez(pool: PgPool) {
     assert_eq!((s, &r["estado"]), (StatusCode::OK, &json!("DEVOLUCION_DE_ORDEN")), "{r}");
     assert_eq!(saldo_ifpe(&pool, ana.cuenta_ifpe.id).await.0, d("900"));
 
-    // Captura del operador de la devolución de la tercera orden.
+    // Captura del operador de la devolución de la tercera orden (el
+    // proveedor ya la informa devuelta).
+    b.pasarela.devolver(&o3.clave_rastreo, 1);
     let op = operador(&pool).await;
     let token = b.token(op, RolUsuario::Operador);
     let captura = |devuelto: &str| {
@@ -1807,5 +1809,405 @@ async fn captura_equivocada_se_anula_y_libera_la_identidad(pool: PgPool) {
     let otra = json!({ "motivo": "no es anulable por el operador", "clave_idempotencia": "anulacion-0002" });
     let (s, r) = b.llamar(&token, &anular(&del_proveedor), otra).await;
     assert_eq!((s, &r["error"]["codigo"]), (StatusCode::UNPROCESSABLE_ENTITY, &json!("SPEI_NO_ANULABLE")), "{r}");
+    verificar_invariantes(&pool).await;
+}
+
+// -----------------------------------------------------------------------------
+// Regresiones de la revisión de a04546f
+// -----------------------------------------------------------------------------
+
+/// Captura del operador (BBVA, hoy) de la devolución de la orden `devuelto`.
+fn captura_devolucion(clabe: &str, monto: &str, rastreo: &str, devuelto: &str) -> Value {
+    json!({
+        "clabe": clabe, "monto": monto, "banco_emisor": "40012", "fecha_operacion": hoy_cdmx(),
+        "clave_rastreo": rastreo, "clave_rastreo_devolucion": devuelto,
+    })
+}
+
+/// Hallazgo 1: la "devolución" que captura el operador reembolsaba cualquier
+/// orden con esa clave de rastreo (también PENDIENTE o ENVIADA, sin consultar
+/// al proveedor, sin comparar la CLABE ordenante), para siempre. Ahora: solo
+/// una orden liquidada, que regresa a su CLABE ordenante, que el proveedor
+/// informa devuelta y que no es del operador; el aviso del proveedor con la
+/// misma identidad y otra orden devuelta ya no se confirma como repetición.
+#[sqlx::test(migrations = "../migrations")]
+async fn devolucion_capturada_por_el_operador_se_verifica(pool: PgPool) {
+    let b = banco(&pool).await;
+    let ana = cliente(&pool, &b.cfg, "Ana").await;
+    let beto = cliente(&pool, &b.cfg, "Beto").await;
+    depositar(&pool, &b.cfg, ana.cuenta_ifpe.id, "2000").await;
+    depositar(&pool, &b.cfg, beto.cuenta_ifpe.id, "2000").await;
+    let o1 = b.enviar_spei(&ana, EXTERNA_A, "1000").await;
+    let o2 = b.enviar_spei(&beto, EXTERNA_A, "1000").await;
+    b.despachar(2).await;
+    assert_eq!((b.orden(o1.id).await.estado, b.orden(o2.id).await.estado), ("LIQUIDADA".into(), "LIQUIDADA".into()));
+    let o3 = b.enviar_spei(&ana, EXTERNA_A, "1000").await; // PENDIENTE: el proveedor pudo registrarla
+    b.pasarela.devolver(&o1.clave_rastreo, 1); // el custodio recibió la devolución de la orden de Ana
+    let op = operador(&pool).await;
+    let token = b.token(op, RolUsuario::Operador);
+    let ruta = "/api/v1/operaciones/depositos";
+    let (ana_clabe, beto_clabe) = (ana.cuenta_ifpe.clabe.clone(), beto.cuenta_ifpe.clabe.clone());
+
+    // Orden equivocada: CLABE de Ana con la clave de rastreo de la orden de Beto.
+    let (s, r) = b.llamar(&token, ruta, captura_devolucion(&ana_clabe, "1000", "DEVOPER01", &o2.clave_rastreo)).await;
+    assert_eq!((s, &r["error"]["codigo"]), (StatusCode::CONFLICT, &json!("SPEI_DEVOLUCION_SIN_ORDEN")), "{r}");
+    // La orden de Beto con su CLABE: el proveedor no la informa devuelta.
+    let (s, r) = b.llamar(&token, ruta, captura_devolucion(&beto_clabe, "1000", "DEVOPER01", &o2.clave_rastreo)).await;
+    assert_eq!((s, &r["error"]["codigo"]), (StatusCode::CONFLICT, &json!("SPEI_PROVEEDOR_SIN_DEVOLUCION")), "{r}");
+    // Una orden PENDIENTE nunca se reembolsa por captura.
+    let (s, r) = b.llamar(&token, ruta, captura_devolucion(&ana_clabe, "1000", "DEVOPER01", &o3.clave_rastreo)).await;
+    assert_eq!(
+        (s, &r["error"]["codigo"]),
+        (StatusCode::UNPROCESSABLE_ENTITY, &json!("SPEI_DEVOLUCION_NO_APLICABLE")),
+        "{r}"
+    );
+    assert_eq!(saldo_ifpe(&pool, ana.cuenta_ifpe.id).await.0, d("0"));
+    assert_eq!(saldo_ifpe(&pool, beto.cuenta_ifpe.id).await.0, d("1000"));
+    assert_eq!(contar_reversos(&pool).await, 0);
+    assert_eq!(b.orden(o3.id).await.estado, "PENDIENTE");
+
+    // La correcta.
+    let correcta = captura_devolucion(&ana_clabe, "1000", "DEVOPER01", &o1.clave_rastreo);
+    let (s, r) = b.llamar(&token, ruta, correcta.clone()).await;
+    assert_eq!((s, &r["spei"]["estado"]), (StatusCode::CREATED, &json!("DEVOLUCION_DE_ORDEN")), "{r}");
+    let (s, r) = b.llamar(&token, ruta, correcta).await;
+    assert_eq!((s, &r["idempotente"]), (StatusCode::OK, &json!(true)), "{r}");
+    assert_eq!(saldo_ifpe(&pool, ana.cuenta_ifpe.id).await.0, d("1000"));
+
+    // El aviso del proveedor con la misma identidad y otra orden devuelta se
+    // retiene para revisión (antes: "confirmar" idempotente).
+    let webhook = "/api/v1/spei/webhook/inbound";
+    let otra = cuerpo_devolucion(&ana_clabe, "1000.00", "40012", "DEVOPER01", 17, Some(&o2.clave_rastreo));
+    let (s, r) = b.webhook(webhook, otra).await;
+    assert_eq!(
+        (s, &r["mensaje"], &r["estado"], &r["motivo"]),
+        (StatusCode::OK, &json!("confirmar"), &json!("EN_REVISION"), &json!("IDENTIDAD_REUTILIZADA")),
+        "{r}"
+    );
+    let misma = cuerpo_devolucion(&ana_clabe, "1000.00", "40012", "DEVOPER01", 17, Some(&o1.clave_rastreo));
+    let (s, r) = b.webhook(webhook, misma).await;
+    assert_eq!((s, &r["idempotente"]), (StatusCode::OK, &json!(true)), "{r}");
+    // Un aviso que no regresa a la CLABE ordenante de la orden va a cuarentena.
+    let ajena = cuerpo_devolucion(&ana_clabe, "1000.00", "40012", "DEVWEB02", 17, Some(&o2.clave_rastreo));
+    let (s, r) = b.webhook(webhook, ajena).await;
+    assert_eq!((s, &r["estado"]), (StatusCode::OK, &json!("CUARENTENA")), "{r}");
+    assert_eq!(b.orden(o2.id).await.estado, "LIQUIDADA");
+    assert_eq!(saldo_ifpe(&pool, beto.cuenta_ifpe.id).await.0, d("1000"));
+    assert_eq!(contar_reversos(&pool).await, 1);
+
+    // La base de datos: una devolución de orden capturada por el titular de
+    // la orden, o hacia otra CLABE, no se acepta.
+    let estado = json!({ "claveRastreo": o2.clave_rastreo, "estado": "DEVUELTA", "causaDevolucion": 1 }).to_string();
+    let (s, _) = b.webhook("/api/v1/spei/webhook/estado", estado).await;
+    assert_eq!(s, StatusCode::OK);
+    let insertar = |registrado_por: Uuid, receptor: &str| {
+        format!(
+            "INSERT INTO ifpe.spei_inbound (institucion_emisora, clave_rastreo, fecha_operacion, receptor_clabe, \
+             cuenta_id, monto, estado, causa_devolucion, spei_outbound_id, origen, registrado_por, raw_payload) \
+             VALUES ('40012', 'DEVFALSA01', current_date, '{receptor}', '{}', 1000, 'DEVOLUCION_DE_ORDEN', 1, '{}', \
+                     'OPERADOR', '{registrado_por}', '{{}}')",
+            beto.cuenta_ifpe.id, o2.id
+        )
+    };
+    let e = como(&pool, Rol::Spei, &insertar(beto.cliente.id, &beto_clabe)).await.unwrap_err();
+    assert!(e.contains("SC_SPEI_AUTORESOLUCION"), "{e}");
+    let e = como(&pool, Rol::Spei, &insertar(op, &ana_clabe)).await.unwrap_err();
+    assert!(e.contains("SC_SPEI_DESCUADRE"), "{e}");
+    verificar_invariantes(&pool).await;
+}
+
+/// Hallazgo 2: la consulta solo cubría fecha_solicitud .. +5 días. Un primer
+/// registro hecho más tarde (despachador caído una semana) quedaba fuera: el
+/// reenvío iba a revisión y el operador, con la misma consulta, reembolsaba
+/// una orden que el proveedor iba a pagar. Ahora las fechas candidatas llegan
+/// hasta la última llamada a `registrar` + 5 días.
+#[sqlx::test(migrations = "../migrations")]
+async fn primer_registro_dias_despues_de_la_solicitud_se_encuentra(pool: PgPool) {
+    let b = banco(&pool).await;
+    let ana = cliente(&pool, &b.cfg, "Ana").await;
+    depositar(&pool, &b.cfg, ana.cuenta_ifpe.id, "1000").await;
+    let destino = externa(60);
+    b.pasarela.programar(&destino, Comportamiento::TiempoAgotadoAlRegistrar { veces: 1, registra: true });
+    let o = b.enviar_spei(&ana, &destino, "100").await;
+    // Solicitada hace 8 días: el despachador estuvo caído desde entonces.
+    sqlx::query("ALTER TABLE ifpe.spei_outbound DISABLE TRIGGER trg_spei_outbound_proteger").execute(&pool).await.unwrap();
+    sqlx::query("UPDATE ifpe.spei_outbound SET fecha_solicitud = fecha_solicitud - 8 WHERE id = $1")
+        .bind(o.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("ALTER TABLE ifpe.spei_outbound ENABLE TRIGGER trg_spei_outbound_proteger").execute(&pool).await.unwrap();
+    b.pasarela.fijar_fecha_operacion(fecha_operacion_simulada(hoy_cdmx()));
+
+    b.despachar(1).await; // primer intento: agota el tiempo, pero queda registrada con fecha de hoy
+    assert_eq!(b.pasarela.registros_de(&o.clave_rastreo), 1);
+    assert!(b.orden(o.id).await.registro_intentado_en.is_some());
+    b.despachar(2).await;
+    let final_ = b.orden(o.id).await;
+    assert_eq!(final_.estado, "LIQUIDADA", "{final_:?}");
+    assert!(!final_.revision_manual && final_.tx_reverso_id.is_none(), "{final_:?}");
+    assert_eq!(b.pasarela.registros_de(&o.clave_rastreo), 1);
+    assert_eq!(b.pasarela.max_liquidaciones_por_orden(), 1);
+    assert_eq!(saldo_ifpe(&pool, ana.cuenta_ifpe.id).await.0, d("900"));
+    verificar_invariantes(&pool).await;
+}
+
+fn pasarela_lenta(b: &Banco) -> Arc<PasarelaLenta> {
+    Arc::new(PasarelaLenta {
+        interna: b.pasarela.clone(),
+        frenar: AtomicBool::new(true),
+        detenida: tokio::sync::Notify::new(),
+        liberar: tokio::sync::Notify::new(),
+    })
+}
+
+/// Despachador A: reclama el lote y se detiene dentro del primer `registrar`
+/// (la orden más antigua), con la foto de las demás ya tomada.
+async fn despachador_detenido(b: &Banco, lenta: &Arc<PasarelaLenta>) -> tokio::task::JoinHandle<outbound::Despacho> {
+    let (pool, cfg, pasarela) = (b.pool.clone(), b.cfg.spei.clone(), lenta.clone());
+    let a = tokio::spawn(async move { outbound::despachar(&pool, &*pasarela, &cfg).await.unwrap() });
+    lenta.detenida.notified().await;
+    a
+}
+
+async fn vencer_orden(pool: &PgPool, id: Uuid) {
+    sqlx::query("UPDATE ifpe.spei_outbound SET proximo_intento_en = now() - interval '1 second' WHERE id = $1")
+        .bind(id)
+        .execute(pool)
+        .await
+        .unwrap();
+}
+
+/// Hallazgo 3: el despachador A reclama un lote y tarda; el arrendamiento de
+/// X vence, B la retoma y la reenvía (día D). Cuando A llega a X ya pasó el
+/// corte: con su foto vieja (primer intento) llamaba a `registrar`, el
+/// proveedor lo aceptaba en el día D+1 como un pago nuevo y nada lo
+/// registraba. Ahora A verifica y renueva su reclamo antes de registrar y no
+/// llama al proveedor; un segundo registro aceptado queda como incidente.
+#[sqlx::test(migrations = "../migrations")]
+async fn foto_vieja_del_despachador_no_registra_una_orden_retomada(pool: PgPool) {
+    let b = banco(&pool).await;
+    let ana = cliente(&pool, &b.cfg, "Ana").await;
+    depositar(&pool, &b.cfg, ana.cuenta_ifpe.id, "1000").await;
+    let w = b.enviar_spei(&ana, &externa(70), "100").await;
+    let x = b.enviar_spei(&ana, &externa(71), "200").await;
+    let lenta = pasarela_lenta(&b);
+    let a = despachador_detenido(&b, &lenta).await;
+    assert_eq!(b.orden(x.id).await.intentos_envio, 1, "A reclamó X en su lote");
+
+    vencer_orden(&pool, x.id).await;
+    let despacho_b = outbound::despachar(&pool, &*b.pasarela, &b.cfg.spei).await.unwrap();
+    assert_eq!(despacho_b.reclamadas, 1);
+    let tomada = b.orden(x.id).await;
+    assert_eq!((tomada.estado.as_str(), tomada.intentos_envio), ("ENVIADA", 2), "{tomada:?}");
+    // El proveedor pasa al día siguiente: un registro tardío de X sería un pago nuevo.
+    b.pasarela.fijar_fecha_operacion(fecha_operacion_simulada(x.fecha_solicitud) + Days::new(1));
+    lenta.liberar.notify_one();
+    let despacho_a = a.await.unwrap();
+    assert_eq!(despacho_a.errores, 0, "{despacho_a:?}");
+    assert_eq!(b.pasarela.llamadas_registro(&x.clave_rastreo), 1, "A no registró con su foto vieja");
+    assert_eq!(b.pasarela.registros_de(&x.clave_rastreo), 1);
+    let x2 = b.orden(x.id).await;
+    assert!(x2.estado == "ENVIADA" && !x2.revision_manual, "{x2:?}");
+    assert_eq!(b.orden(w.id).await.estado, "ENVIADA");
+    assert_eq!(contar(&pool, "SELECT count(*) FROM ifpe.spei_incidentes").await, 0);
+    b.despachar(2).await;
+    assert_eq!(b.orden(x.id).await.estado, "LIQUIDADA");
+    assert_eq!(b.pasarela.max_liquidaciones_por_orden(), 1);
+
+    // Si aun así llega un segundo registro aceptado (otro id, otra fecha), ya
+    // no se toma como repetición: incidente y revisión manual.
+    let w1 = b.orden(w.id).await;
+    let segundo = Evento::Aceptada {
+        id_proveedor: Some("STP9999999999".into()),
+        fecha_operacion: w1.fecha_operacion.map(|f| f + Days::new(1)),
+    };
+    let e = outbound::aplicar(&pool, &b.cfg.spei, w.id, &segundo).await.unwrap_err();
+    assert_eq!(e.codigo(), "SPEI_ESTADO_INCONSISTENTE");
+    let w2 = b.orden(w.id).await;
+    assert!(w2.revision_manual && w2.id_proveedor == w1.id_proveedor, "{w2:?}");
+    let incidentes: Vec<(String, String)> =
+        sqlx::query_as("SELECT estado_orden, evento FROM ifpe.spei_incidentes WHERE spei_outbound_id = $1")
+            .bind(w.id)
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert_eq!(incidentes, vec![(w1.estado.clone(), "ACEPTADA".to_owned())]);
+    // La misma aceptación (mismo id) sigue siendo una repetición.
+    let repetida = Evento::Aceptada { id_proveedor: w1.id_proveedor.clone(), fecha_operacion: w1.fecha_operacion };
+    assert!(outbound::aplicar(&pool, &b.cfg.spei, w.id, &repetida).await.is_ok());
+    assert_eq!(saldo_ifpe(&pool, ana.cuenta_ifpe.id).await.0, d("700"));
+    verificar_invariantes(&pool).await;
+}
+
+/// Hallazgo 4: mientras A tiene una foto vieja de X, B la manda a revisión y
+/// el operador la reembolsa (el proveedor no la tiene). Cuando A llegaba a X
+/// la registraba: el proveedor pagaba una orden ya reembolsada. Ahora el
+/// reclamo de A ya no es vigente y no llama al proveedor.
+#[sqlx::test(migrations = "../migrations")]
+async fn reembolso_del_operador_no_compite_con_una_foto_vieja(pool: PgPool) {
+    let b = banco_con(&pool, |c| {
+        c.spei.max_intentos = 2;
+        c.spei.espera_resolucion_seg = 0;
+    })
+    .await;
+    let ana = cliente(&pool, &b.cfg, "Ana").await;
+    depositar(&pool, &b.cfg, ana.cuenta_ifpe.id, "1000").await;
+    let op = operador(&pool).await;
+    let w = b.enviar_spei(&ana, &externa(72), "100").await;
+    let destino = externa(73);
+    b.pasarela.programar(&destino, Comportamiento::TiempoAgotadoAlRegistrar { veces: 1, registra: false });
+    let x = b.enviar_spei(&ana, &destino, "200").await;
+    let lenta = pasarela_lenta(&b);
+    let a = despachador_detenido(&b, &lenta).await;
+
+    vencer_orden(&pool, x.id).await;
+    outbound::despachar(&pool, &*b.pasarela, &b.cfg.spei).await.unwrap(); // B: reenvío sin respuesta
+    let marcada = b.orden(x.id).await;
+    assert!(marcada.estado == "PENDIENTE" && marcada.revision_manual, "{marcada:?}");
+    let s = SolicitudResolucion {
+        orden_id: x.id,
+        motivo: "STP confirma que no tiene la orden".into(),
+        operador_id: op,
+        clave_idempotencia: clave(),
+    };
+    let r = outbound::reembolsar_revision(&pool, &*b.pasarela, &b.cfg.spei, &s).await.unwrap();
+    assert_eq!(r.orden.estado, "RECHAZADA");
+
+    lenta.liberar.notify_one();
+    let despacho_a = a.await.unwrap();
+    assert_eq!(despacho_a.errores, 0, "{despacho_a:?}");
+    assert_eq!(b.pasarela.llamadas_registro(&x.clave_rastreo), 1, "solo el reenvío de B");
+    assert_eq!(b.pasarela.registros_de(&x.clave_rastreo), 0, "el proveedor nunca tuvo la orden reembolsada");
+    let x2 = b.orden(x.id).await;
+    assert_eq!(x2.estado, "RECHAZADA");
+    assert_eq!(contar(&pool, "SELECT count(*) FROM ifpe.spei_incidentes").await, 0);
+    assert_eq!(contar_reversos(&pool).await, 1);
+    assert_eq!(b.orden(w.id).await.estado, "ENVIADA");
+    assert_eq!(saldo_ifpe(&pool, ana.cuenta_ifpe.id).await.0, d("900"));
+    verificar_invariantes(&pool).await;
+}
+
+/// Hallazgo 5: tras una caída del proveedor (conexión rechazada: nada pudo
+/// registrarse) que cruza el corte, toda orden creada antes del corte iba a
+/// revisión para siempre (solo el reembolso del operador la sacaba). Ahora la
+/// regla del corte cuenta desde la primera llamada de resultado desconocido:
+/// la orden que nunca llegó al proveedor se reenvía; la ambigua, no.
+#[sqlx::test(migrations = "../migrations")]
+async fn caida_del_proveedor_sin_registro_se_reenvia_tras_el_corte(pool: PgPool) {
+    let b = banco_con(&pool, |c| c.spei.hora_corte = ahora_cdmx() + chrono::Duration::minutes(2)).await;
+    let ana = cliente(&pool, &b.cfg, "Ana").await;
+    depositar(&pool, &b.cfg, ana.cuenta_ifpe.id, "1000").await;
+    let caida = externa(80);
+    b.pasarela.programar(&caida, Comportamiento::SinConexionAlRegistrar { veces: 2 });
+    let o = b.enviar_spei(&ana, &caida, "100").await;
+    let ambigua = externa(81);
+    b.pasarela.programar(&ambigua, Comportamiento::TiempoAgotadoAlRegistrar { veces: 1, registra: false });
+    let o2 = b.enviar_spei(&ana, &ambigua, "200").await;
+
+    b.despachar(1).await;
+    let tras = b.orden(o.id).await;
+    assert!(tras.registro_incierto_desde.is_none() && !tras.revision_manual, "{tras:?}");
+    assert!(b.orden(o2.id).await.registro_incierto_desde.is_some());
+    b.despachar(1).await; // o: el reenvío tampoco llega; o2: pudo registrarse antes del corte
+    let tras2 = b.orden(o.id).await;
+    assert!(!tras2.revision_manual && tras2.registro_incierto_desde.is_none(), "{tras2:?}");
+    let o2b = b.orden(o2.id).await;
+    assert!(o2b.revision_manual, "{o2b:?}");
+    assert!(o2b.ultimo_error.as_deref().unwrap_or_default().contains("día de operación"), "{o2b:?}");
+
+    b.despachar(3).await;
+    let final_ = b.orden(o.id).await;
+    assert_eq!(final_.estado, "LIQUIDADA", "{final_:?}");
+    assert!(!final_.revision_manual);
+    assert_eq!(b.pasarela.llamadas_registro(&o.clave_rastreo), 3);
+    assert_eq!(b.pasarela.registros_de(&o.clave_rastreo), 1);
+    assert_eq!(b.pasarela.registros_de(&o2.clave_rastreo), 0, "la ambigua no se reenvió");
+    assert_eq!(b.pasarela.max_liquidaciones_por_orden(), 1);
+    assert_eq!(saldo_ifpe(&pool, ana.cuenta_ifpe.id).await.0, d("700"));
+    verificar_invariantes(&pool).await;
+}
+
+/// Hallazgo 6: un abono anterior a 0005 con la clave de rastreo sola
+/// retenía para siempre toda notificación futura con esa clave, monto y
+/// cuenta (sin ventana de fechas), y nada sacaba de la cola un retenido que
+/// sí era duplicado. Ahora la ventana es la misma (±7 días) y el operador
+/// puede descartarlo, auditado y sin mover dinero.
+#[sqlx::test(migrations = "../migrations")]
+async fn abono_legado_con_rastreo_solo_se_acota_y_el_retenido_se_descarta(pool: PgPool) {
+    let b = banco(&pool).await;
+    let ana = cliente(&pool, &b.cfg, "Ana").await;
+    let clabe = ana.cuenta_ifpe.clabe.clone();
+    deposito_anterior_a_0005(&pool, ana.cuenta_ifpe.id, "500", "spei:PAGOSEMANAL", "PAGOSEMANAL").await;
+    let webhook = "/api/v1/spei/webhook/inbound";
+    // Otra semana: se abona.
+    let otra_semana = cuerpo_abono(&clabe, "500", "90646", "PAGOSEMANAL", hoy_cdmx() - Days::new(14));
+    let (s, r) = b.webhook(webhook, otra_semana).await;
+    assert_eq!((s, &r["estado"], &r["idempotente"]), (StatusCode::OK, &json!("ABONADO"), &json!(false)), "{r}");
+    // La semana del abono legado: posible duplicado, retenido.
+    let esta_semana = cuerpo_abono(&clabe, "500", "90646", "PAGOSEMANAL", hoy_cdmx());
+    let (s, r) = b.webhook(webhook, esta_semana.clone()).await;
+    assert_eq!((s, &r["estado"], &r["motivo"]), (StatusCode::OK, &json!("EN_REVISION"), &json!("POSIBLE_DUPLICADO")), "{r}");
+    assert_eq!(saldo_ifpe(&pool, ana.cuenta_ifpe.id).await.0, d("1000"));
+
+    let op = operador(&pool).await;
+    let token = b.token(op, RolUsuario::Operador);
+    let (_, cola) = b.obtener(&token, "/api/v1/spei/en-revision").await;
+    assert_eq!(cola.as_array().map(Vec::len), Some(1), "{cola}");
+    let ruta = format!("/api/v1/operaciones/spei/en-revision/{}/descarte", cola[0]["id"].as_str().unwrap());
+    let cuerpo = json!({ "motivo": "duplicado del abono legado PAGOSEMANAL", "clave_idempotencia": "descarte-0001" });
+    let (s, _) = b.llamar(&b.token(ana.cliente.id, RolUsuario::Cliente), &ruta, cuerpo.clone()).await;
+    assert_eq!(s, StatusCode::FORBIDDEN);
+    let (s, r) = b.llamar(&token, &ruta, cuerpo.clone()).await;
+    assert_eq!((s, &r["descarte"]["autorizado_por"]), (StatusCode::CREATED, &json!(op)), "{r}");
+    let (s, r) = b.llamar(&token, &ruta, cuerpo).await;
+    assert_eq!((s, &r["idempotente"]), (StatusCode::OK, &json!(true)), "{r}");
+    let otra = json!({ "motivo": "duplicado del abono legado PAGOSEMANAL", "clave_idempotencia": "descarte-0002" });
+    let (s, r) = b.llamar(&token, &ruta, otra).await;
+    assert_eq!((s, &r["error"]["codigo"]), (StatusCode::CONFLICT, &json!("SPEI_YA_DESCARTADO")), "{r}");
+    let desconocida = format!("/api/v1/operaciones/spei/en-revision/{}/descarte", Uuid::new_v4());
+    let (s, _) = b.llamar(&token, &desconocida, json!({ "motivo": "no existe esta", "clave_idempotencia": "d-3" })).await;
+    assert_eq!(s, StatusCode::NOT_FOUND);
+    assert_eq!(contar(&pool, "SELECT count(*) FROM ifpe.v_spei_en_revision").await, 0);
+    // Un reintento del proveedor no lo devuelve a la cola.
+    let (s, r) = b.webhook(webhook, esta_semana).await;
+    assert_eq!((s, &r["estado"]), (StatusCode::OK, &json!("EN_REVISION")), "{r}");
+    assert_eq!(contar(&pool, "SELECT count(*) FROM ifpe.v_spei_en_revision").await, 0);
+    assert_eq!(saldo_ifpe(&pool, ana.cuenta_ifpe.id).await.0, d("1000"), "el descarte no mueve dinero");
+    let e = como(&pool, Rol::Spei, "UPDATE ifpe.spei_descartes SET motivo = 'otro motivo'").await.unwrap_err();
+    assert!(e.contains("permission denied"), "{e}");
+    verificar_invariantes(&pool).await;
+}
+
+/// Hallazgo 7: la devolución de una orden cuya cuenta se cerró recibía un 4xx
+/// sin registro (el proveedor reintentaba para siempre). Ahora va a
+/// cuarentena, se confirma y la orden queda en revisión manual.
+#[sqlx::test(migrations = "../migrations")]
+async fn devolucion_a_una_cuenta_cerrada_va_a_cuarentena(pool: PgPool) {
+    let b = banco(&pool).await;
+    let ana = cliente(&pool, &b.cfg, "Ana").await;
+    depositar(&pool, &b.cfg, ana.cuenta_ifpe.id, "300").await;
+    let o = b.enviar_spei(&ana, EXTERNA_A, "300").await;
+    b.despachar(2).await;
+    assert_eq!(b.orden(o.id).await.estado, "LIQUIDADA");
+    sqlx::query("UPDATE ifpe.cuentas SET estado = 'CERRADA' WHERE id = $1")
+        .bind(ana.cuenta_ifpe.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let recibidos = contar(&pool, "SELECT count(*) FROM ifpe.spei_inbound").await;
+    let reserva = reserva_total(&pool).await;
+    let dev = cuerpo_devolucion(&ana.cuenta_ifpe.clabe, "300.00", "40012", "DEVCERRADA17", 17, Some(&o.clave_rastreo));
+    let (s, r) = b.webhook("/api/v1/spei/webhook/inbound", dev).await;
+    assert_eq!((s, &r["mensaje"], &r["estado"]), (StatusCode::OK, &json!("confirmar"), &json!("CUARENTENA")), "{r}");
+    assert_eq!(
+        contar(&pool, "SELECT count(*) FROM ifpe.spei_cuarentena WHERE error LIKE 'SPEI_DEVOLUCION_SIN_ORDEN%cerrada%'")
+            .await,
+        1
+    );
+    let o2 = b.orden(o.id).await;
+    assert!(o2.estado == "LIQUIDADA" && o2.revision_manual && o2.tx_reverso_id.is_none(), "{o2:?}");
+    assert_eq!(contar(&pool, "SELECT count(*) FROM ifpe.spei_inbound").await, recibidos);
+    assert_eq!(reserva_total(&pool).await, reserva);
     verificar_invariantes(&pool).await;
 }

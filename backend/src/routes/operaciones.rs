@@ -24,8 +24,8 @@ use crate::{
     sofom::credito::{self, ResultadoCastigo, ResultadoCredito, ResultadoPago},
     spei::{
         inbound::{
-            self, Origen, PagoDistinto, ResultadoAbono, ResultadoAnulacion, ResultadoCorreccion, SiNoAcreditable,
-            SolicitudAnulacion, SolicitudCorreccion,
+            self, Origen, PagoDistinto, ResultadoAbono, ResultadoAnulacion, ResultadoCorreccion, ResultadoDescarte,
+            SiNoAcreditable, SolicitudAnulacion, SolicitudCorreccion, SolicitudDescarte,
         },
         outbound::{self, ResultadoResolucion, SolicitudResolucion},
         IdentidadSpei,
@@ -38,6 +38,7 @@ pub fn rutas() -> Router<AppState> {
         .route("/operaciones/spei/recibidos/{id}/correccion", post(corregir_spei))
         .route("/operaciones/spei/recibidos/{id}/anulacion", post(anular_spei))
         .route("/operaciones/spei/enviados/{id}/reembolso", post(reembolsar_spei_enviado))
+        .route("/operaciones/spei/en-revision/{id}/descarte", post(descartar_spei_retenido))
         .route("/operaciones/depositos", post(deposito))
         .route("/operaciones/retenciones", post(retencion))
         .route("/operaciones/kyc/pendientes", get(kyc_pendientes))
@@ -84,7 +85,9 @@ struct SolicitudDeposito {
 /// que un pago capturado a mano y notificado por el proveedor se abona una
 /// sola vez. Si la cuenta no puede recibir, se rechaza la captura (el operador
 /// decide la devolución). Con `clave_rastreo_devolucion`, el pago se registra
-/// como devolución de esa orden. Con `distinto_de` y `motivo`, el operador
+/// como devolución de esa orden: solo una orden liquidada, que regresa a su
+/// CLABE ordenante, que no es del operador y que el proveedor informa
+/// devuelta en ese momento. Con `distinto_de` y `motivo`, el operador
 /// confirma que el pago es distinto del abono previo que señaló la búsqueda
 /// de posibles duplicados (auditado).
 async fn deposito(
@@ -147,6 +150,10 @@ async fn deposito(
         raw_payload,
     };
     let r = match &distinto {
+        None if abono.rastreo_devuelto.is_some() => {
+            inbound::capturar_devolucion(&e.pool, &*e.pasarela, &e.config.pld, &e.config.spei, &abono, u.cliente_id)
+                .await?
+        }
         Some(d) => {
             inbound::abonar_pago_distinto(&e.pool, &e.config.pld, &e.config.spei, &abono, u.cliente_id, d).await?
         }
@@ -399,6 +406,26 @@ async fn anular_spei(
         clave_idempotencia: u.clave(&s.clave_idempotencia)?,
     };
     let r = inbound::anular(&e.pool, &solicitud).await?;
+    Ok((status_de(r.idempotente), Json(r)))
+}
+
+/// Descarta como duplicado una notificación retenida (`/spei/en-revision`)
+/// que el operador confirmó como un pago ya abonado. No mueve dinero; queda
+/// auditado en `ifpe.spei_descartes`.
+async fn descartar_spei_retenido(
+    State(e): State<AppState>,
+    u: Usuario,
+    Path(id): Path<Uuid>,
+    Json(s): Json<SolicitudMotivoHttp>,
+) -> AppResult<(StatusCode, Json<ResultadoDescarte>)> {
+    u.exigir_operador()?;
+    let solicitud = SolicitudDescarte {
+        cuarentena_id: id,
+        motivo: s.motivo,
+        operador_id: u.cliente_id,
+        clave_idempotencia: u.clave(&s.clave_idempotencia)?,
+    };
+    let r = inbound::descartar(&e.pool, &solicitud).await?;
     Ok((status_de(r.idempotente), Json(r)))
 }
 

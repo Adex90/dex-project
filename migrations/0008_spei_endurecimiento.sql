@@ -26,6 +26,15 @@
 --  8. `ifpe.spei_anulaciones`: el operador anula una captura manual errónea
 --     (corrección total) y libera su identidad: el pago real se registra como
 --     reemplazo (`reemplaza_a`) y puede abonarse a la cuenta correcta.
+--  9. Registro con el proveedor: `registro_intentado_en` (inicio de la última
+--     llamada a `registrar`, para consultar todas las fechas de operación
+--     posibles) y `registro_incierto_desde` (inicio de la primera llamada que
+--     pudo registrar la orden: base de la regla del corte).
+-- 10. Devoluciones de orden ligadas a su orden (CLABE ordenante, cuenta,
+--     monto); la del operador solo sobre una orden ya liquidada y nunca de
+--     sus propias órdenes.
+-- 11. `ifpe.spei_descartes`: el operador descarta como duplicado una
+--     notificación retenida y la saca de la cola de revisión.
 --
 --  La reserva del 100%, la sombra del ledger, la lista blanca de 0005 (todo
 --  DEPOSITO es un SPEI registrado o el reverso de una orden; todo RETIRO una
@@ -108,8 +117,10 @@ CREATE CONSTRAINT TRIGGER trg_spei_resoluciones_ledger
 CREATE TABLE ifpe.spei_incidentes (
     id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     spei_outbound_id UUID NOT NULL REFERENCES ifpe.spei_outbound (id) ON DELETE RESTRICT,
-    -- Estado final de la orden cuando el proveedor informó lo incompatible.
-    estado_orden     TEXT NOT NULL CHECK (estado_orden IN ('LIQUIDADA', 'RECHAZADA', 'DEVUELTA')),
+    -- Estado de la orden cuando el proveedor informó lo incompatible: final,
+    -- o ENVIADA/LIQUIDADA con un segundo registro aceptado (otro id u otra
+    -- fecha de operación: posible pago doble).
+    estado_orden     TEXT NOT NULL CHECK (estado_orden IN ('ENVIADA', 'LIQUIDADA', 'RECHAZADA', 'DEVUELTA')),
     evento           TEXT NOT NULL CHECK (evento IN ('ACEPTADA', 'LIQUIDADA', 'RECHAZADA', 'DEVUELTA', 'EN_PROCESO')),
     detalle          TEXT NOT NULL CHECK (length(detalle) BETWEEN 1 AND 500),
     registrado_en    TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -456,13 +467,45 @@ $$;
 -- -----------------------------------------------------------------------------
 -- 9. Cola de revisión
 -- -----------------------------------------------------------------------------
+-- El operador descarta una notificación retenida que confirmó como duplicado
+-- de un pago ya abonado (p. ej. de un abono anterior a 0005 sin registro que
+-- anular). No mueve dinero: el excedente queda en el custodio para conciliar.
+CREATE TABLE ifpe.spei_descartes (
+    id                 UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    cuarentena_id      UUID NOT NULL UNIQUE REFERENCES ifpe.spei_cuarentena (id) ON DELETE RESTRICT,
+    motivo             TEXT NOT NULL CHECK (length(btrim(motivo)) BETWEEN 5 AND 200),
+    autorizado_por     UUID NOT NULL REFERENCES kyc.clientes (id) ON DELETE RESTRICT,
+    clave_idempotencia TEXT NOT NULL UNIQUE,
+    creado_en          TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE TRIGGER trg_spei_descartes_inmutable BEFORE UPDATE OR DELETE ON ifpe.spei_descartes
+    FOR EACH ROW EXECUTE FUNCTION nucleo.fn_ledger_inmutable();
+CREATE TRIGGER trg_spei_descartes_no_truncate BEFORE TRUNCATE ON ifpe.spei_descartes
+    FOR EACH STATEMENT EXECUTE FUNCTION nucleo.fn_ledger_inmutable();
+
+-- Solo se descarta una notificación retenida (con identidad).
+CREATE FUNCTION ifpe.fn_verificar_spei_descarte() RETURNS trigger
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp
+AS $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM ifpe.spei_cuarentena WHERE id = NEW.cuarentena_id AND identidad IS NOT NULL) THEN
+        RAISE EXCEPTION 'SC_SPEI_NO_DESCARTABLE: solo se descarta una notificación retenida para revisión';
+    END IF;
+    RETURN NULL;
+END
+$$;
+CREATE TRIGGER trg_spei_descartes_retenida AFTER INSERT ON ifpe.spei_descartes
+    FOR EACH ROW EXECUTE FUNCTION ifpe.fn_verificar_spei_descarte();
+
 -- Notificaciones retenidas que aún no se resuelven con un registro vigente de
 -- esa identidad posterior a la retención (captura del operador con
--- `distinto_de`, o reemplazo tras anular una captura errónea).
+-- `distinto_de`, o reemplazo tras anular una captura errónea) ni con un
+-- descarte del operador.
 CREATE VIEW ifpe.v_spei_en_revision AS
 SELECT q.id, q.tipo, q.identidad, q.error, q.recibido_en
 FROM ifpe.spei_cuarentena q
 WHERE q.identidad IS NOT NULL
+  AND NOT EXISTS (SELECT 1 FROM ifpe.spei_descartes d WHERE d.cuarentena_id = q.id)
   AND NOT EXISTS (
       SELECT 1 FROM ifpe.spei_inbound s
        WHERE ifpe.identidad_spei(s.institucion_emisora, s.fecha_operacion, s.clave_rastreo) = q.identidad
@@ -470,10 +513,90 @@ WHERE q.identidad IS NOT NULL
          AND NOT EXISTS (SELECT 1 FROM ifpe.spei_anulaciones a WHERE a.spei_inbound_id = s.id));
 
 -- -----------------------------------------------------------------------------
--- 10. Permisos
+-- 10. Registro con el proveedor
 -- -----------------------------------------------------------------------------
-GRANT SELECT ON ifpe.spei_resoluciones, ifpe.spei_incidentes, ifpe.spei_anulaciones, ifpe.v_spei_en_revision
+-- registro_intentado_en: inicio de la última llamada a `registrar` (se fija
+-- antes de llamar, con el reclamo renovado). Toda fecha de operación que el
+-- proveedor pudo asignar cae entre fecha_solicitud y esa fecha + 5 días: la
+-- consulta las revisa todas.
+-- registro_incierto_desde: inicio de la primera llamada a `registrar` que
+-- pudo registrar la orden (se fija antes de llamar y solo se borra si esa
+-- misma llamada prueba que no llegó al proveedor). La regla del corte
+-- (no reenviar si el día de operación pudo cambiar) cuenta desde aquí.
+ALTER TABLE ifpe.spei_outbound
+    ADD COLUMN registro_intentado_en   TIMESTAMPTZ,
+    ADD COLUMN registro_incierto_desde TIMESTAMPTZ,
+    ADD CONSTRAINT ck_spei_outbound_registro CHECK (
+        registro_incierto_desde IS NULL
+        OR (registro_intentado_en IS NOT NULL AND registro_incierto_desde <= registro_intentado_en));
+
+CREATE FUNCTION ifpe.fn_spei_outbound_registro_monotono() RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    IF OLD.registro_intentado_en IS NOT NULL
+       AND (NEW.registro_intentado_en IS NULL OR NEW.registro_intentado_en < OLD.registro_intentado_en) THEN
+        RAISE EXCEPTION 'SC_SPEI_INMUTABLE: registro_intentado_en de la orden % no puede retroceder', OLD.clave_rastreo;
+    END IF;
+    RETURN NEW;
+END
+$$;
+CREATE TRIGGER trg_spei_outbound_registro BEFORE UPDATE OF registro_intentado_en ON ifpe.spei_outbound
+    FOR EACH ROW EXECUTE FUNCTION ifpe.fn_spei_outbound_registro_monotono();
+
+-- Órdenes que ya hablaron con el proveedor antes de 0008: conservador, como
+-- la regla anterior (desde la creación; consulta hasta hoy + 5 días).
+UPDATE ifpe.spei_outbound
+   SET registro_intentado_en = greatest(now(), creado_en), registro_incierto_desde = creado_en
+ WHERE intentos_envio > 0;
+
+-- -----------------------------------------------------------------------------
+-- 11. Devoluciones de orden
+-- -----------------------------------------------------------------------------
+-- Un registro DEVOLUCION_DE_ORDEN corresponde a su orden: regresa a la CLABE
+-- ordenante (la cuenta del cliente), por el monto enviado, y la orden quedó
+-- reembolsada. Si lo capturó el operador: solo sobre una orden liquidada en
+-- una transacción anterior (nunca PENDIENTE/ENVIADA, que el proveedor pudo
+-- pagar después) y nunca de sus propias órdenes.
+CREATE FUNCTION ifpe.fn_verificar_spei_devolucion_de_orden() RETURNS trigger
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp
+AS $$
+DECLARE
+    o ifpe.spei_outbound;
+    identidad TEXT := ifpe.identidad_spei(NEW.institucion_emisora, NEW.fecha_operacion, NEW.clave_rastreo);
+BEGIN
+    SELECT * INTO o FROM ifpe.spei_outbound WHERE id = NEW.spei_outbound_id;
+    IF o.id IS NULL OR o.estado NOT IN ('DEVUELTA', 'RECHAZADA') OR NEW.cuenta_id IS DISTINCT FROM o.cuenta_id
+       OR NEW.monto <> o.monto OR NEW.receptor_clabe IS DISTINCT FROM o.ordenante_clabe THEN
+        RAISE EXCEPTION 'SC_SPEI_DESCUADRE: la devolución % no corresponde a la orden % (CLABE ordenante, cuenta o monto)',
+            identidad, coalesce(o.clave_rastreo, NEW.spei_outbound_id::text);
+    END IF;
+    IF NEW.registrado_por IS NOT NULL THEN
+        IF NEW.registrado_por = o.cliente_id THEN
+            RAISE EXCEPTION 'SC_SPEI_AUTORESOLUCION: un operador no captura devoluciones de sus propias órdenes';
+        END IF;
+        IF o.estado <> 'DEVUELTA' OR o.liquidada_en IS NULL OR o.liquidada_en >= now() THEN
+            RAISE EXCEPTION 'SC_SPEI_DESCUADRE: la devolución % capturada por el operador exige una orden ya liquidada',
+                identidad;
+        END IF;
+    END IF;
+    RETURN NULL;
+END
+$$;
+CREATE CONSTRAINT TRIGGER trg_spei_inbound_devolucion_de_orden
+    AFTER INSERT ON ifpe.spei_inbound
+    DEFERRABLE INITIALLY DEFERRED
+    FOR EACH ROW WHEN (NEW.estado = 'DEVOLUCION_DE_ORDEN')
+    EXECUTE FUNCTION ifpe.fn_verificar_spei_devolucion_de_orden();
+
+-- -----------------------------------------------------------------------------
+-- 12. Permisos
+-- -----------------------------------------------------------------------------
+GRANT SELECT ON ifpe.spei_resoluciones, ifpe.spei_incidentes, ifpe.spei_anulaciones, ifpe.v_spei_en_revision,
+                ifpe.spei_descartes
     TO sc_spei, sc_auditor;
+GRANT UPDATE (registro_intentado_en, registro_incierto_desde) ON ifpe.spei_outbound TO sc_spei;
+GRANT INSERT (cuarentena_id, motivo, autorizado_por, clave_idempotencia) ON ifpe.spei_descartes TO sc_spei;
 GRANT INSERT (spei_outbound_id, accion, motivo, error_previo, autorizado_por, clave_idempotencia)
     ON ifpe.spei_resoluciones TO sc_spei;
 GRANT INSERT (spei_outbound_id, estado_orden, evento, detalle) ON ifpe.spei_incidentes TO sc_spei;

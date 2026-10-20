@@ -68,14 +68,17 @@ fn verificar_firma(e: &AppState, cabeceras: &HeaderMap, cuerpo: &[u8]) -> AppRes
 /// no puede recibir. Un error transitorio responde 503 para que el proveedor
 /// reintente. Una notificación autenticada nunca recibe un 409 sin dejar
 /// registro:
-/// - una devolución (de cualquier tipo) que no corresponde a ninguna orden va
-///   a cuarentena y se confirma (`CUARENTENA`): SPEI no permite devolver una
-///   devolución;
+/// - una devolución (de cualquier tipo) que no corresponde a ninguna orden (o
+///   cuyo reverso es imposible porque la cuenta está cerrada: la orden queda
+///   en revisión manual) va a cuarentena y se confirma (`CUARENTENA`): SPEI no
+///   permite devolver una devolución;
 /// - un posible duplicado con otra identidad o una identidad ya registrada
 ///   con otro monto o CLABE se retiene sin abonar y se confirma
 ///   (`EN_REVISION`): devolverlo dejaría la reserva corta si el pago ya se
-///   abonó con la identidad equivocada. El operador lo resuelve (captura con
-///   `distinto_de`, o anulación de la captura errónea).
+///   abonó con la identidad equivocada. También una devolución repetida que
+///   dice devolver otra orden. El operador lo resuelve (captura con
+///   `distinto_de`, anulación de la captura errónea o descarte como
+///   duplicado).
 ///
 /// Si no se puede guardar el registro, el error se propaga y el proveedor
 /// reintenta: nunca se confirma sin registro.
