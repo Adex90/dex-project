@@ -754,8 +754,12 @@ async fn devolucion_de_orden(
         Err(e) if e.codigo() == outbound::CUENTA_CERRADA => {
             // Se descarta lo hecho; la orden queda marcada y la devolución, en cuarentena.
             drop(tx);
-            outbound::marcar_revision(pool, orden.id, &format!("devolución recibida, reverso imposible: {}", e.detalle()))
-                .await?;
+            outbound::marcar_revision(
+                pool,
+                orden.id,
+                &format!("devolución recibida, reverso imposible: {}", e.detalle()),
+            )
+            .await?;
             return Err(sin_orden(identidad, format!("la orden {rastreo} no se puede reembolsar: {}", e.detalle())));
         }
         Err(e) => return Err(e),
@@ -1128,7 +1132,8 @@ pub async fn corregir(pool: &PgPool, s: &SolicitudCorreccion) -> AppResult<Resul
             tx.commit().await?;
             return Ok(ResultadoCorreccion { correccion: previa, transaccion, idempotente: true });
         }
-        let (correccion, t) = corregir_en(&mut tx, &abono, monto, &motivo, s.operador_id, &s.clave_idempotencia).await?;
+        let (correccion, t) =
+            corregir_en(&mut tx, &abono, monto, &motivo, s.operador_id, &s.clave_idempotencia).await?;
         tx.commit().await?;
         tracing::warn!(spei = %abono.id, %monto, operador = %s.operador_id, "abono SPEI corregido");
         Ok(ResultadoCorreccion { correccion, transaccion: t, idempotente: false })

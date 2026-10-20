@@ -384,7 +384,11 @@ async fn captura_manual_con_otra_identidad_no_duplica(pool: PgPool) {
     let cuerpo = cuerpo_abono(&ana.cuenta_ifpe.clabe, "5000", "40012", "MBAN0100MANUAL", hoy_cdmx());
     for _ in 0..2 {
         let (s, r) = b.webhook("/api/v1/spei/webhook/inbound", cuerpo.clone()).await;
-        assert_eq!((s, &r["mensaje"], &r["estado"]), (StatusCode::OK, &json!("confirmar"), &json!("EN_REVISION")), "{r}");
+        assert_eq!(
+            (s, &r["mensaje"], &r["estado"]),
+            (StatusCode::OK, &json!("confirmar"), &json!("EN_REVISION")),
+            "{r}"
+        );
         assert_eq!(r["motivo"], "POSIBLE_DUPLICADO");
     }
     assert_eq!(saldo_ifpe(&pool, ana.cuenta_ifpe.id).await.0, d("5000"));
@@ -1035,7 +1039,14 @@ async fn contar_reversos(pool: &PgPool) -> i64 {
 
 /// Notificación de un SPEI entrante con tipo de pago y, si se indica, la
 /// clave de rastreo del pago que se devuelve.
-fn cuerpo_devolucion(clabe: &str, monto: &str, emisor: &str, rastreo: &str, tipo: i32, devuelto: Option<&str>) -> String {
+fn cuerpo_devolucion(
+    clabe: &str,
+    monto: &str,
+    emisor: &str,
+    rastreo: &str,
+    tipo: i32,
+    devuelto: Option<&str>,
+) -> String {
     let devuelto = devuelto.map(|r| format!(r#","claveRastreoDevolucion":"{r}""#)).unwrap_or_default();
     format!(
         r#"{{"fechaOperacion":{f},"institucionOrdenante":"{emisor}","claveRastreo":"{rastreo}","monto":{monto},
@@ -1106,7 +1117,11 @@ async fn rechazo_tardio_mientras_otro_reclamo_esta_en_vuelo(pool: PgPool) {
     let ana = cliente(&pool, &b.cfg, "Ana").await;
     depositar(&pool, &b.cfg, ana.cuenta_ifpe.id, "1000").await;
     let o = b.enviar_spei(&ana, EXTERNA_A, "100").await;
-    sqlx::query("UPDATE ifpe.spei_outbound SET intentos_envio = 2 WHERE id = $1").bind(o.id).execute(&pool).await.unwrap();
+    sqlx::query("UPDATE ifpe.spei_outbound SET intentos_envio = 2 WHERE id = $1")
+        .bind(o.id)
+        .execute(&pool)
+        .await
+        .unwrap();
     let tardio = Evento::RechazoRegistro { causa: 99, motivo: "clave de rastreo duplicada".into(), intentos_envio: 1 };
     let t = outbound::aplicar(&pool, &b.cfg.spei, o.id, &tardio).await.unwrap();
     assert_eq!(t.orden.estado, "PENDIENTE");
@@ -1191,7 +1206,8 @@ async fn revision_manual_se_resuelve_con_reembolso_del_operador(pool: PgPool) {
     assert_eq!(contar(&pool, "SELECT count(*) FROM ifpe.spei_resoluciones").await, 2);
     b.despachar(3).await;
     assert_eq!(b.orden(o.id).await.estado, "RECHAZADA");
-    let custodio: Decimal = outbound::conciliacion(&pool).await.unwrap().iter().map(|c| c.saldo_esperado_custodio).sum();
+    let custodio: Decimal =
+        outbound::conciliacion(&pool).await.unwrap().iter().map(|c| c.saldo_esperado_custodio).sum();
     assert_eq!(custodio, custodio_antes, "el dinero nunca salió del custodio");
     verificar_invariantes(&pool).await;
 }
@@ -1318,7 +1334,11 @@ async fn devolucion_sin_orden_va_a_cuarentena_y_se_confirma(pool: PgPool) {
     ];
     for cuerpo in casos.iter().chain(std::iter::once(&casos[0])) {
         let (s, r) = b.webhook("/api/v1/spei/webhook/inbound", cuerpo.clone()).await;
-        assert_eq!((s, &r["mensaje"], &r["estado"]), (StatusCode::OK, &json!("confirmar"), &json!("CUARENTENA")), "{r}");
+        assert_eq!(
+            (s, &r["mensaje"], &r["estado"]),
+            (StatusCode::OK, &json!("confirmar"), &json!("CUARENTENA")),
+            "{r}"
+        );
     }
     assert_eq!(
         contar(
@@ -1329,10 +1349,7 @@ async fn devolucion_sin_orden_va_a_cuarentena_y_se_confirma(pool: PgPool) {
         5,
         "cada entrega autenticada queda registrada"
     );
-    assert_eq!(
-        contar(&pool, "SELECT count(*) FROM ifpe.spei_cuarentena WHERE error LIKE '%NOEXISTE0001%'").await,
-        1
-    );
+    assert_eq!(contar(&pool, "SELECT count(*) FROM ifpe.spei_cuarentena WHERE error LIKE '%NOEXISTE0001%'").await, 1);
     assert_eq!(contar(&pool, "SELECT count(*) FROM ifpe.spei_inbound").await, recibidos);
     let o2 = b.orden(o.id).await;
     assert_eq!(o2.estado, "LIQUIDADA");
@@ -1547,7 +1564,8 @@ async fn webhooks_recurrentes_con_mismo_rastreo_se_abonan(pool: PgPool) {
         ("40646", "PAGODIARIO", hoy_cdmx()),
     ];
     for (emisor, rastreo, fecha) in pagos {
-        let (s, r) = b.webhook("/api/v1/spei/webhook/inbound", cuerpo_abono(clabe, "500", emisor, rastreo, fecha)).await;
+        let (s, r) =
+            b.webhook("/api/v1/spei/webhook/inbound", cuerpo_abono(clabe, "500", emisor, rastreo, fecha)).await;
         assert_eq!(
             (s, &r["mensaje"], &r["estado"], &r["idempotente"]),
             (StatusCode::OK, &json!("confirmar"), &json!("ABONADO"), &json!(false)),
@@ -1598,7 +1616,11 @@ async fn operador_confirma_pago_distinto(pool: PgPool) {
     assert_eq!((s, &r["error"]["codigo"]), (StatusCode::CONFLICT, &json!("SPEI_POSIBLE_DUPLICADO")), "{r}");
     assert!(r["error"]["mensaje"].as_str().unwrap_or_default().contains(&semana1), "{r}");
     let (s, r) = b
-        .llamar(&token, "/api/v1/operaciones/depositos", semana(hoy_cdmx(), json!({ "distinto_de": semana1, "motivo": "no" })))
+        .llamar(
+            &token,
+            "/api/v1/operaciones/depositos",
+            semana(hoy_cdmx(), json!({ "distinto_de": semana1, "motivo": "no" })),
+        )
         .await;
     assert_eq!(s, StatusCode::BAD_REQUEST, "motivo demasiado corto: {r}");
     let distinto = json!({ "distinto_de": semana1, "motivo": "nomina semanal, rastreo reutilizado" });
@@ -1640,10 +1662,11 @@ async fn deposito_anterior_a_0005(pool: &PgPool, cuenta_id: Uuid, monto: &str, c
         .await
         .unwrap();
     let mut tx = pool.begin().await.unwrap();
-    let reserva: Uuid = sqlx::query_scalar("SELECT id FROM ifpe.reserva_custodia WHERE activa ORDER BY creado_en LIMIT 1")
-        .fetch_one(&mut *tx)
-        .await
-        .unwrap();
+    let reserva: Uuid =
+        sqlx::query_scalar("SELECT id FROM ifpe.reserva_custodia WHERE activa ORDER BY creado_en LIMIT 1")
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap();
     sqlx::query("UPDATE ifpe.cuentas SET saldo_disponible = saldo_disponible + $2 WHERE id = $1")
         .bind(cuenta_id)
         .bind(d(monto))
@@ -1789,21 +1812,23 @@ async fn captura_equivocada_se_anula_y_libera_la_identidad(pool: PgPool) {
     let cuerpo2 = json!({ "motivo": "abonado a la CLABE equivocada", "clave_idempotencia": "anulacion-0003" });
     let (s, r) = b.llamar(&token, &anular(&erronea2), cuerpo2).await;
     assert_eq!(s, StatusCode::CREATED, "{r}");
-    let (s, r) = b.webhook(
-        "/api/v1/spei/webhook/inbound",
-        cuerpo_abono(&ana.cuenta_ifpe.clabe, "70", "40012", "MBAN02REAL", hoy_cdmx()),
-    )
-    .await;
+    let (s, r) = b
+        .webhook(
+            "/api/v1/spei/webhook/inbound",
+            cuerpo_abono(&ana.cuenta_ifpe.clabe, "70", "40012", "MBAN02REAL", hoy_cdmx()),
+        )
+        .await;
     assert_eq!((s, &r["mensaje"], &r["estado"]), (StatusCode::OK, &json!("confirmar"), &json!("ABONADO")), "{r}");
     assert_eq!(saldo_ifpe(&pool, ana.cuenta_ifpe.id).await.0, d("570"));
     assert_eq!(saldo_ifpe(&pool, beto.cuenta_ifpe.id).await.0, d("0"));
 
     // Lo que informó el proveedor no se anula.
-    let (s, r) = b.webhook(
-        "/api/v1/spei/webhook/inbound",
-        cuerpo_abono(&ana.cuenta_ifpe.clabe, "50", "40012", "MBAN01OTRO", hoy_cdmx()),
-    )
-    .await;
+    let (s, r) = b
+        .webhook(
+            "/api/v1/spei/webhook/inbound",
+            cuerpo_abono(&ana.cuenta_ifpe.clabe, "50", "40012", "MBAN01OTRO", hoy_cdmx()),
+        )
+        .await;
     assert_eq!(s, StatusCode::OK, "{r}");
     let del_proveedor = r["spei_id"].as_str().unwrap().to_owned();
     let otra = json!({ "motivo": "no es anulable por el operador", "clave_idempotencia": "anulacion-0002" });
@@ -1930,13 +1955,19 @@ async fn primer_registro_dias_despues_de_la_solicitud_se_encuentra(pool: PgPool)
     b.pasarela.programar(&destino, Comportamiento::TiempoAgotadoAlRegistrar { veces: 1, registra: true });
     let o = b.enviar_spei(&ana, &destino, "100").await;
     // Solicitada hace 8 días: el despachador estuvo caído desde entonces.
-    sqlx::query("ALTER TABLE ifpe.spei_outbound DISABLE TRIGGER trg_spei_outbound_proteger").execute(&pool).await.unwrap();
+    sqlx::query("ALTER TABLE ifpe.spei_outbound DISABLE TRIGGER trg_spei_outbound_proteger")
+        .execute(&pool)
+        .await
+        .unwrap();
     sqlx::query("UPDATE ifpe.spei_outbound SET fecha_solicitud = fecha_solicitud - 8 WHERE id = $1")
         .bind(o.id)
         .execute(&pool)
         .await
         .unwrap();
-    sqlx::query("ALTER TABLE ifpe.spei_outbound ENABLE TRIGGER trg_spei_outbound_proteger").execute(&pool).await.unwrap();
+    sqlx::query("ALTER TABLE ifpe.spei_outbound ENABLE TRIGGER trg_spei_outbound_proteger")
+        .execute(&pool)
+        .await
+        .unwrap();
     b.pasarela.fijar_fecha_operacion(fecha_operacion_simulada(hoy_cdmx()));
 
     b.despachar(1).await; // primer intento: agota el tiempo, pero queda registrada con fecha de hoy
@@ -2147,7 +2178,11 @@ async fn abono_legado_con_rastreo_solo_se_acota_y_el_retenido_se_descarta(pool: 
     // La semana del abono legado: posible duplicado, retenido.
     let esta_semana = cuerpo_abono(&clabe, "500", "90646", "PAGOSEMANAL", hoy_cdmx());
     let (s, r) = b.webhook(webhook, esta_semana.clone()).await;
-    assert_eq!((s, &r["estado"], &r["motivo"]), (StatusCode::OK, &json!("EN_REVISION"), &json!("POSIBLE_DUPLICADO")), "{r}");
+    assert_eq!(
+        (s, &r["estado"], &r["motivo"]),
+        (StatusCode::OK, &json!("EN_REVISION"), &json!("POSIBLE_DUPLICADO")),
+        "{r}"
+    );
     assert_eq!(saldo_ifpe(&pool, ana.cuenta_ifpe.id).await.0, d("1000"));
 
     let op = operador(&pool).await;
@@ -2166,7 +2201,9 @@ async fn abono_legado_con_rastreo_solo_se_acota_y_el_retenido_se_descarta(pool: 
     let (s, r) = b.llamar(&token, &ruta, otra).await;
     assert_eq!((s, &r["error"]["codigo"]), (StatusCode::CONFLICT, &json!("SPEI_YA_DESCARTADO")), "{r}");
     let desconocida = format!("/api/v1/operaciones/spei/en-revision/{}/descarte", Uuid::new_v4());
-    let (s, _) = b.llamar(&token, &desconocida, json!({ "motivo": "no existe esta", "clave_idempotencia": "d-3" })).await;
+    let (s, _) = b
+        .llamar(&token, &desconocida, json!({ "motivo": "no existe esta", "clave_idempotencia": "descarte-0003" }))
+        .await;
     assert_eq!(s, StatusCode::NOT_FOUND);
     assert_eq!(contar(&pool, "SELECT count(*) FROM ifpe.v_spei_en_revision").await, 0);
     // Un reintento del proveedor no lo devuelve a la cola.
@@ -2201,8 +2238,11 @@ async fn devolucion_a_una_cuenta_cerrada_va_a_cuarentena(pool: PgPool) {
     let (s, r) = b.webhook("/api/v1/spei/webhook/inbound", dev).await;
     assert_eq!((s, &r["mensaje"], &r["estado"]), (StatusCode::OK, &json!("confirmar"), &json!("CUARENTENA")), "{r}");
     assert_eq!(
-        contar(&pool, "SELECT count(*) FROM ifpe.spei_cuarentena WHERE error LIKE 'SPEI_DEVOLUCION_SIN_ORDEN%cerrada%'")
-            .await,
+        contar(
+            &pool,
+            "SELECT count(*) FROM ifpe.spei_cuarentena WHERE error LIKE 'SPEI_DEVOLUCION_SIN_ORDEN%cerrada%'"
+        )
+        .await,
         1
     );
     let o2 = b.orden(o.id).await;

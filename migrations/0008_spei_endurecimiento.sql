@@ -544,11 +544,14 @@ $$;
 CREATE TRIGGER trg_spei_outbound_registro BEFORE UPDATE OF registro_intentado_en ON ifpe.spei_outbound
     FOR EACH ROW EXECUTE FUNCTION ifpe.fn_spei_outbound_registro_monotono();
 
--- Órdenes que ya hablaron con el proveedor antes de 0008: conservador, como
--- la regla anterior (desde la creación; consulta hasta hoy + 5 días).
+-- Órdenes vivas que ya hablaron con el proveedor antes de 0008: conservador,
+-- como la regla anterior (desde la creación; consulta hasta hoy + 5 días).
+-- Las RECHAZADA/DEVUELTA no se tocan: ya no se registran ni se consultan, su
+-- estado final no admite transición y su reverso está ligado a la versión de
+-- la fila que lo creó (`trg_spei_outbound_ledger`).
 UPDATE ifpe.spei_outbound
    SET registro_intentado_en = greatest(now(), creado_en), registro_incierto_desde = creado_en
- WHERE intentos_envio > 0;
+ WHERE intentos_envio > 0 AND estado IN ('PENDIENTE', 'ENVIADA', 'LIQUIDADA');
 
 -- -----------------------------------------------------------------------------
 -- 11. Devoluciones de orden

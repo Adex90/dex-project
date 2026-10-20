@@ -657,9 +657,7 @@ pub async fn aplicar_en(tx: &mut Tx, cfg: &ConfigSpei, orden_id: Uuid, evento: &
         (
             "LIQUIDADA",
             Evento::SeguirVigilando | Evento::Incierto { .. } | Evento::NoRecibida { .. } | Evento::EnProceso { .. },
-        ) => {
-            Some(reprogramar(tx, &o, 6.0 * 3_600.0, None).await?)
-        }
+        ) => Some(reprogramar(tx, &o, 6.0 * 3_600.0, None).await?),
         // Repeticiones de un estado ya registrado: sin cambio.
         ("LIQUIDADA" | "DEVUELTA", Evento::Liquidada { .. } | Evento::Aceptada { .. }) => None,
         ("RECHAZADA" | "DEVUELTA", Evento::Rechazada { .. } | Evento::Devuelta { .. }) => None,
@@ -765,7 +763,10 @@ async fn reembolsar(tx: &mut Tx, o: &SpeiOutbound, estado: &str, causa: i16, mot
     let cuenta = ledger::bloquear_cuenta_ifpe(tx, o.cuenta_id).await?;
     if cuenta.estado == EstadoCuenta::Cerrada {
         tracing::error!(rastreo = %o.clave_rastreo, "reverso SPEI hacia una cuenta cerrada: requiere revisión manual");
-        return Err(AppError::negocio(CUENTA_CERRADA, "la cuenta de la orden está cerrada; el reverso requiere revisión"));
+        return Err(AppError::negocio(
+            CUENTA_CERRADA,
+            "la cuenta de la orden está cerrada; el reverso requiere revisión",
+        ));
     }
     let reserva_id: Uuid = sqlx::query_scalar("SELECT reserva_id FROM ifpe.transacciones WHERE id = $1")
         .bind(o.tx_retiro_id)
@@ -1043,7 +1044,8 @@ pub async fn reembolsar_revision(
             ));
         }
         let error_previo = o.ultimo_error.clone().unwrap_or_default();
-        let orden = reembolsar(&mut tx, &o, "RECHAZADA", 99, &format!("reembolso por revisión manual: {motivo}")).await?;
+        let orden =
+            reembolsar(&mut tx, &o, "RECHAZADA", 99, &format!("reembolso por revisión manual: {motivo}")).await?;
         let resolucion: Resolucion = sqlx::query_as(
             "INSERT INTO ifpe.spei_resoluciones \
              (spei_outbound_id, accion, motivo, error_previo, autorizado_por, clave_idempotencia) \

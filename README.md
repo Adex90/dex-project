@@ -57,9 +57,16 @@ IFPE vault and its custody reserve; the SOFOM never sees it.
   cannot be used are quarantined and returned (14), never answered with a 4xx.
   A return (`tipoPago` 0, 16, 17, 18, 23, 24, or any notification carrying
   `claveRastreoDevolucion`) is applied to its order, which is refunded once;
-  the database refuses to book a return as an ordinary credit. A return that
-  matches no order is quarantined and answered `confirmar` (`CUARENTENA`):
-  SPEI does not allow returning a return.
+  the database refuses to book a return as an ordinary credit, and requires
+  it to come back to the order's originating CLABE for the amount sent. A
+  return that matches no order, or whose reversal is impossible (closed
+  account: the order is flagged for manual review), is quarantined and
+  answered `confirmar` (`CUARENTENA`): SPEI does not allow returning a return.
+  An operator can enter a return by hand (`clave_rastreo_devolucion` on
+  `POST /api/v1/operaciones/depositos`) only for a settled order that the
+  provider, queried at that moment, reports as returned, and never for their
+  own order. A later notification with the same identity that names another
+  order is held for review, not confirmed as a repeat.
 - **No double credit:** a payment's identity is issuing participant + tracking
   key + operation date (Banxico makes the tracking key unique per participant
   per day). A unique index plus a per-identity advisory lock mean concurrent
@@ -73,8 +80,14 @@ IFPE vault and its custody reserve; the SOFOM never sees it.
   or CLABE, is held without crediting and answered `confirmar`
   (`EN_REVISION`); `GET /api/v1/spei/en-revision` (operator / auditor) lists
   what is still open. The operator resolves it by entering the payment with
-  `distinto_de` (the earlier transaction named in the 409) and a `motivo`, or by
-  voiding a wrong manual entry (below).
+  `distinto_de` (the earlier transaction named in the 409) and a `motivo`, by
+  voiding a wrong manual entry (below), or by discarding a held notification
+  that really is a duplicate:
+  `POST /api/v1/operaciones/spei/en-revision/{id}/descarte` (`motivo`,
+  `clave_idempotencia`; moves no money, logged in `ifpe.spei_descartes`).
+  Pre-0004 credits that kept only the bare tracking key match with the same
+  ±7-day window as everything else, so a payer who reuses a tracking key
+  every week is not held forever.
 - **Sending:** `POST /api/v1/spei/transfer`. The balance and the reserve go
   down at once (the money is committed to the order and cannot be spent
   twice), and the order is dispatched by a background worker. The worker
@@ -83,10 +96,21 @@ IFPE vault and its custody reserve; the SOFOM never sees it.
   tracking key" on a resend) the order goes to manual review. A first-attempt
   rejection is applied only if, under the order's lock, `intentos_envio` still
   matches the claim (no other dispatcher took the order after the lease
-  expired). The worker never resends when the provider's operating day may
-  have changed since the order was created (`SPEI_HORA_CORTE`, default 17:30
-  Mexico City, plus `SPEI_MARGEN_CORTE_SEG`): the provider rejects a repeated
-  tracking key only within the same day. Refunds happen
+  expired). Right before every `registrar` the worker re-checks its claim
+  against the live row (same state, same `intentos_envio`, not in review) and
+  renews the lease, and every gateway call is capped at 20 s, far below the
+  60 s lease: a slow batch's stale snapshot never registers an order that
+  another worker took over, that went to review or that an operator
+  refunded. The worker never resends when the provider's operating day may
+  have changed since the first call that might have registered the order
+  (`registro_incierto_desde`; `SPEI_HORA_CORTE`, default 17:30 Mexico City,
+  plus `SPEI_MARGEN_CORTE_SEG`): the provider rejects a repeated tracking key
+  only within the same day. A call that provably never reached the provider
+  (connection refused) does not count, so orders stuck behind a provider
+  outage are sent once it recovers, even after the cutoff. Status queries
+  cover every operating date any `registrar` call could have been given. A
+  second accepted registration of the same order (another provider id or
+  operating date) is logged as an incident and flagged for review. Refunds happen
   only on a first-attempt rejection, a cancellation or a return, exactly once
   (`spei-reverso:<order>`), even when the status webhook, the poller and an
   incoming return all report it. Settled orders are polled for returns during
@@ -331,6 +355,7 @@ the password is hashed, so a parallel burst cannot test more than 5 passwords.
 | POST | `/api/v1/operaciones/spei/recibidos/{id}/correccion` | operator: reverse a wrong SPEI credit |
 | POST | `/api/v1/operaciones/spei/recibidos/{id}/anulacion` | operator: void a wrong manual SPEI entry and free its identity |
 | POST | `/api/v1/operaciones/spei/enviados/{id}/reembolso` | operator: refund an order in manual review that the provider never received |
+| POST | `/api/v1/operaciones/spei/en-revision/{id}/descarte` | operator: discard a held SPEI notification as a duplicate (no money moves) |
 | POST | `/api/v1/operaciones/...` | operator: holds, KYC, AML alerts, capital |
 
 Full table in `backend/src/routes/mod.rs`.
