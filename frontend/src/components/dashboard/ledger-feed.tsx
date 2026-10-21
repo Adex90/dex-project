@@ -7,10 +7,9 @@ import {
   ArrowUpRight,
   ChevronRight,
   Link2,
+  Hourglass,
   Lock,
   ScrollText,
-  ShieldAlert,
-  ShieldCheck,
   Unlock,
   type LucideIcon,
 } from "lucide-react";
@@ -18,6 +17,7 @@ import {
 import { HashText, Money, formatDateTime } from "@/components/ui/data";
 import { Badge, Button, Card, CardHeader, Skeleton, cx, type Tone } from "@/components/ui/primitives";
 import type { TipoTxIfpe, TransaccionIfpe } from "@/lib/api/types";
+import { CLIENT_HOLD_LABELS } from "@/lib/aml";
 
 type Direction = "in" | "out" | "internal";
 
@@ -38,8 +38,9 @@ function describe(tx: TransaccionIfpe, accountId: string | null): Kind {
         : { label: "Transfer in", icon: ArrowLeftRight, tone: "verified", direction: "in" },
     TRASPASO_A_SOFOM: { label: "To fixed term", icon: Lock, tone: "accent", direction: "out" },
     RETORNO_DE_SOFOM: { label: "Contract matured", icon: Unlock, tone: "verified", direction: "in" },
-    RETENCION: { label: "Compliance hold", icon: ShieldAlert, tone: "warning", direction: "internal" },
-    LIBERACION_RETENCION: { label: "Hold released", icon: ShieldCheck, tone: "info", direction: "internal" },
+    // Neutral labels: a hold must never disclose why it exists (no tipping off).
+    RETENCION: { label: CLIENT_HOLD_LABELS.RETENCION, icon: Hourglass, tone: "warning", direction: "internal" },
+    LIBERACION_RETENCION: { label: CLIENT_HOLD_LABELS.LIBERACION_RETENCION, icon: Unlock, tone: "info", direction: "internal" },
   };
   return map[tx.tipo];
 }

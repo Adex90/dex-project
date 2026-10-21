@@ -5,10 +5,19 @@ import { useRouter } from "next/navigation";
 
 import { useSession } from "@/hooks/use-session";
 import { request } from "@/lib/api/client";
-import type { Cliente, EstatusKyc } from "@/lib/api/types";
+import type { Cliente, EstatusKyc, Rol } from "@/lib/api/types";
 
 export const DASHBOARD_PATH = "/dashboard";
 export const ONBOARDING_PATH = "/auth/onboarding";
+export const ADMIN_AML_PATH = "/admin/aml";
+
+/**
+ * Where staff with a console in this app belong: compliance officers and
+ * auditors go to the compliance console. Other roles have none (null).
+ */
+export function homeForStaff(role: Rol): string | null {
+  return role === "CUMPLIMIENTO" || role === "AUDITOR" ? ADMIN_AML_PATH : null;
+}
 
 /**
  * Where an account holder belongs: the dashboard once their identity is
@@ -36,9 +45,10 @@ export async function resolveClientHome(token: string, signal?: AbortSignal): Pr
 
 /**
  * For the sign-in and sign-up pages: sends a visitor who already holds a
- * valid client session to their home. A form that signs in calls `claim()`
- * before it starts and navigates by itself afterwards, so the form and this
- * redirect never race; `release()` hands control back if signing in fails.
+ * valid client session to their home, and a compliance session to the
+ * compliance console. A form that signs in calls `claim()` before it starts
+ * and navigates by itself afterwards, so the form and this redirect never
+ * race; `release()` hands control back if signing in fails.
  */
 export function useClientHomeRedirect() {
   const router = useRouter();
@@ -46,7 +56,13 @@ export function useClientHomeRedirect() {
   const claimed = useRef(false);
 
   useEffect(() => {
-    if (claimed.current || !valid || role !== "CLIENTE" || !token) return;
+    if (claimed.current || !valid || !role || !token) return;
+    const staffHome = homeForStaff(role);
+    if (staffHome) {
+      router.replace(staffHome);
+      return;
+    }
+    if (role !== "CLIENTE") return;
     const controller = new AbortController();
     resolveClientHome(token, controller.signal).then(
       (path) => {

@@ -9,6 +9,7 @@ import { Alert, Badge, Button, Card, CardHeader, Input, Skeleton, Stat } from "@
 import { ApiError } from "@/lib/api/client";
 import { api, newIdempotencyKey } from "@/lib/api/endpoints";
 import type { CuentaIfpe, EstadoReservaVista } from "@/lib/api/types";
+import { HOLD_COPY } from "@/lib/aml";
 import { addUnits, formatMoney, isZero, parseAmountInput } from "@/lib/decimal";
 
 function formatClabe(clabe: string): string {
@@ -62,9 +63,10 @@ export function VaultCard({
               <p className="mt-1 text-3xl font-semibold tracking-tight sm:text-4xl" data-testid="vault-available">
                 <Money value={account.saldo_disponible} currencyClassName="text-base" />
               </p>
+              {/* Neutral wording: a hold must never disclose why it exists (no tipping off). */}
               {!isZero(account.saldo_bloqueado) ? (
                 <p className="mt-1 text-xs text-warning">
-                  {formatMoney(account.saldo_bloqueado)} MXN on compliance hold (still fully backed)
+                  {formatMoney(account.saldo_bloqueado)} MXN {HOLD_COPY}
                 </p>
               ) : null}
             </div>
@@ -81,6 +83,7 @@ export function VaultCard({
                 hint="Matched 1:1 by cash in custody"
               />
             </dl>
+            {/* Only the disclosed legal freeze (CONGELADA) shows here: the preventive restriction arrives as ACTIVA. */}
             {account.estado !== "ACTIVA" ? (
               <Alert tone="warning" title={`Account ${account.estado.toLowerCase()}`}>
                 Outgoing movements are disabled.

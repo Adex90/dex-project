@@ -1,3 +1,4 @@
+import { GENERIC_UNAVAILABLE_MESSAGE } from "../aml";
 import { API_URL } from "../config";
 import { kycMessageInEnglish } from "../kyc";
 import type { ApiErrorBody } from "./types";
@@ -115,6 +116,26 @@ const MESSAGES: Record<string, string> = {
   SPEI_DUPLICADO: "That SPEI transfer was already credited.",
   LIQUIDEZ_MUTUOS: "The credit division cannot complete this right now without additional capital.",
   FECHA_VALOR: "This operation must be dated today.",
+  // A client whose account is restricted gets this one neutral message whatever
+  // the cause (no tipping off): it must not mention compliance, alerts or freezes.
+  OPERACION_NO_DISPONIBLE: GENERIC_UNAVAILABLE_MESSAGE,
+  // Staff only (operators and the compliance console).
+  RETENCION_PROTEGIDA: "Part of this balance can only be released by the compliance team.",
+  AML_ALERTA_CERRADA: "This alert is already closed.",
+  AML_ASIGNADA_A_OTRO: "Another compliance officer is reviewing this alert.",
+  AML_TRANSICION_INVALIDA: "This action is not available in the alert's current state. Refresh and try again.",
+  AML_AUTORESOLUCION: "You cannot act on alerts or restrictions that concern your own client record.",
+  AML_CUATRO_OJOS: "A second compliance officer must make this decision.",
+  AML_ALERTAS_ABIERTAS:
+    "Resolve or propose a resolution for this client's other high-risk alerts before lifting the restriction.",
+  AML_SOLICITUD_PENDIENTE: "There is already a pending request for this restriction.",
+  AML_SOLICITUD_NO_PENDIENTE: "This request has already been decided.",
+  AML_CONGELAMIENTO_NO_ACTIVO: "This restriction is no longer active.",
+  AML_SIN_RETENCIONES: "There are no held funds to release.",
+  AML_PROPUESTA_NO_PENDIENTE: "This proposal has already been decided.",
+  AML_CAMBIO_INVALIDO: "The proposed change is not valid for this rule or parameter.",
+  AML_DICTAMEN_INVALIDO: "Check the length and content of the text you entered.",
+  AML_FOLIO_REGISTRADO: "A UIF folio is already recorded for this alert.",
 };
 
 /**
