@@ -53,6 +53,25 @@ async fn cada_rol_solo_ve_lo_suyo(pool: PgPool) {
     assert!(denegado(ejecutar_como(&pool, Rol::Auditor, "UPDATE ifpe.cuentas SET saldo_disponible = 0").await));
     // Ningún rol puede borrar el ledger.
     assert!(denegado(ejecutar_como(&pool, Rol::Ifpe, "DELETE FROM ifpe.transacciones").await));
+
+    // PLD (0009): los roles transaccionales no tienen USAGE sobre `aml` (llegan
+    // al motor solo por las envolturas definer) ni leen la bandeja heredada.
+    for rol in [Rol::Ifpe, Rol::Spei, Rol::Puente, Rol::Sofom, Rol::Kyc, Rol::KycVerificador] {
+        for tabla in ["aml.alertas", "aml.congelamientos", "aml.bitacora"] {
+            let r = ejecutar_como(&pool, rol, &format!("SELECT 1 FROM {tabla}")).await;
+            assert!(denegado(r), "{} lee {tabla}", rol.nombre());
+        }
+    }
+    assert!(denegado(ejecutar_como(&pool, Rol::Kyc, "SELECT 1 FROM kyc.alertas_pld").await));
+    // Nadie fuera de las funciones definer cambia el estado de una cuenta.
+    assert!(denegado(ejecutar_como(&pool, Rol::Ifpe, "UPDATE ifpe.cuentas SET estado = 'ACTIVA'").await));
+    assert!(denegado(ejecutar_como(&pool, Rol::Puente, "UPDATE sofom.cuentas SET estado = 'ACTIVA'").await));
+    // Cumplimiento solo lee `aml` y ejecuta funciones: sin DML ni acceso al dinero.
+    assert!(denegado(
+        ejecutar_como(&pool, Rol::Aml, "INSERT INTO aml.alertas (cliente_id) VALUES (gen_random_uuid())").await
+    ));
+    assert!(denegado(ejecutar_como(&pool, Rol::Aml, "UPDATE ifpe.cuentas SET estado = 'ACTIVA'").await));
+    assert!(denegado(ejecutar_como(&pool, Rol::Aml, "SELECT 1 FROM ifpe.transacciones").await));
 }
 
 #[sqlx::test(migrations = "../migrations")]

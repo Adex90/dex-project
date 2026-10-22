@@ -199,7 +199,7 @@ async fn autorizacion_por_rol(pool: PgPool) {
     assert_eq!(s, StatusCode::UNAUTHORIZED);
     let (s, _) = api.llamar("GET", "/api/v1/tablero", Some("token-falso"), None).await;
     assert_eq!(s, StatusCode::UNAUTHORIZED);
-    for ruta in ["/api/v1/auditoria/ledger/ifpe", "/api/v1/operaciones/alertas", "/api/v1/operaciones/creditos"] {
+    for ruta in ["/api/v1/auditoria/ledger/ifpe", "/api/v1/aml/alertas", "/api/v1/operaciones/creditos"] {
         let (s, _) = api.llamar("GET", ruta, Some(&cliente), None).await;
         assert_eq!(s, StatusCode::FORBIDDEN, "{ruta}");
     }
@@ -330,9 +330,9 @@ async fn operador_deposita_por_spei_y_origina_credito(pool: PgPool) {
     assert_eq!(s, StatusCode::CREATED, "{c}");
     assert_eq!(c["credito"]["estado"], "VIGENTE");
 
-    let (s, alertas) = api.llamar("GET", "/api/v1/operaciones/alertas", Some(operador), None).await;
-    assert_eq!(s, StatusCode::OK);
-    assert!(alertas.as_array().unwrap().is_empty());
+    // El operador no tiene acceso a la consola PLD (solo CUMPLIMIENTO y AUDITOR).
+    let (s, _) = api.llamar("GET", "/api/v1/aml/alertas", Some(operador), None).await;
+    assert_eq!(s, StatusCode::FORBIDDEN);
     verificar_invariantes(&pool).await;
 }
 
@@ -381,7 +381,7 @@ async fn sesiones_revocables_y_rol_verificado(pool: PgPool) {
         .execute(&pool)
         .await
         .unwrap();
-    let (s, _) = api.llamar("GET", "/api/v1/operaciones/alertas", Some(&operador), None).await;
+    let (s, _) = api.llamar("GET", "/api/v1/operaciones/creditos", Some(&operador), None).await;
     assert_eq!(s, StatusCode::UNAUTHORIZED);
 }
 

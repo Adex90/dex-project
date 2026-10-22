@@ -10,7 +10,11 @@
 //! (calce, sobreasignación) y el constraint trigger diferido
 //! `trg_credito_fondeo_total` (fondeo completo al COMMIT).
 //!
-//! Orden de bloqueo: caja → contratos (por vencimiento, folio) → crédito.
+//! Orden de bloqueo: candado PLD del acreditado (su fila IFPE y luego el
+//! candado consultivo, `aml::bloquear_cliente_sofom`) → caja → contratos (por
+//! vencimiento, folio) → crédito. El desembolso y el cobro se evalúan en PLD
+//! antes de cualquier escritura; un desembolso bloqueado confirma sin crédito,
+//! asignaciones ni movimiento.
 
 use chrono::NaiveDate;
 use rust_decimal::Decimal;
@@ -20,15 +24,13 @@ use uuid::Uuid;
 
 use super::{bloquear_caja, buscar_tx_por_clave, insertar_tx_sofom, NuevaTxSofom};
 use crate::{
-    config::UmbralesPld,
+    aml::{self, Canal, Contraparte, Decision, Operacion},
+    config::ConfigAml,
     db::{self, Rol},
     dinero,
     error::{AppError, AppResult},
-    models::{
-        sofom::{AsignacionFondeo, ContratoMutuo, Credito, EstadoCredito, TipoTxSofom, TransaccionSofom},
-        Entidad,
-    },
-    pld::{self, EventoPld},
+    models::sofom::{AsignacionFondeo, ContratoMutuo, Credito, EstadoCredito, TipoTxSofom, TransaccionSofom},
+    pld,
     spei::clabe,
 };
 
@@ -51,7 +53,9 @@ pub struct ResultadoCredito {
     pub idempotente: bool,
 }
 
-pub async fn originar(pool: &PgPool, umbrales: &UmbralesPld, s: &SolicitudCredito) -> AppResult<ResultadoCredito> {
+/// Los umbrales PLD viven en la base de datos (`aml.reglas_riesgo`); el
+/// parámetro de configuración se conserva para que los llamadores no cambien.
+pub async fn originar(pool: &PgPool, _aml: &ConfigAml, s: &SolicitudCredito) -> AppResult<ResultadoCredito> {
     let principal = dinero::validar_monto(s.principal)?;
     if s.tasa_anual < Decimal::ZERO || s.tasa_anual >= Decimal::ONE || s.tasa_anual.normalize().scale() > 6 {
         return Err(AppError::validacion("tasa_anual debe estar en [0, 1) con máximo 6 decimales"));
@@ -65,16 +69,14 @@ pub async fn originar(pool: &PgPool, umbrales: &UmbralesPld, s: &SolicitudCredit
     if s.destino.as_deref().is_some_and(|d| d.chars().count() > 200) {
         return Err(AppError::validacion("destino admite como máximo 200 caracteres"));
     }
-    db::con_reintentos(|| originar_tx(pool, umbrales, s, principal)).await
+    db::con_reintentos(|| originar_tx(pool, s, principal)).await
 }
 
-async fn originar_tx(
-    pool: &PgPool,
-    umbrales: &UmbralesPld,
-    s: &SolicitudCredito,
-    principal: Decimal,
-) -> AppResult<ResultadoCredito> {
+async fn originar_tx(pool: &PgPool, s: &SolicitudCredito, principal: Decimal) -> AppResult<ResultadoCredito> {
     let mut tx = db::begin(pool, Rol::Sofom).await?;
+    // Primer candado: la fila IFPE del acreditado y su candado PLD, antes de la
+    // caja (orden global; un congelamiento concurrente se serializa aquí).
+    aml::bloquear_cliente_sofom(&mut tx, s.acreditado_id).await?;
     let caja = bloquear_caja(&mut tx).await?;
 
     if let Some(previa) = buscar_tx_por_clave(&mut tx, &s.clave_idempotencia).await? {
@@ -106,6 +108,26 @@ async fn originar_tx(
 
     let perfil = pld::cargar_perfil(&mut tx, s.acreditado_id).await?;
     perfil.exigir_operable()?;
+
+    // PLD antes de crear el crédito (la única activación EN_FONDEO → VIGENTE
+    // ocurre en esta misma transacción): un BLOQUEAR confirma sin crédito,
+    // asignaciones ni desembolso.
+    let desembolso_id = Uuid::new_v4();
+    let d = aml::evaluar(
+        &mut tx,
+        &Operacion {
+            cliente_id: s.acreditado_id,
+            canal: Canal::DesembolsoCredito,
+            monto: principal,
+            transaccion_id: desembolso_id,
+            clave: &s.clave_idempotencia,
+            contraparte: Contraparte { cuenta: Some(s.clabe_destino.clone()), ..Default::default() },
+        },
+    )
+    .await?;
+    if d.decision == Decision::Bloquear {
+        return aml::confirmar_bloqueo(tx, &d).await;
+    }
 
     // Fecha valor: hoy según la base de datos (trg_credito_fecha_valor la exige).
     let hoy: NaiveDate = sqlx::query_scalar("SELECT current_date").fetch_one(&mut *tx).await?;
@@ -191,7 +213,7 @@ async fn originar_tx(
     let desembolso = insertar_tx_sofom(
         &mut tx,
         NuevaTxSofom {
-            id: Uuid::new_v4(),
+            id: desembolso_id,
             tipo: TipoTxSofom::DesembolsoCredito,
             cuenta: None,
             contrato: None,
@@ -204,15 +226,6 @@ async fn originar_tx(
         },
     )
     .await?;
-    let evento = EventoPld {
-        entidad: Entidad::Sofom,
-        cliente: &perfil,
-        transaccion_id: desembolso.id,
-        operacion: "DESEMBOLSO_CREDITO",
-        monto: principal,
-        cuenta_deposito: None,
-    };
-    pld::evaluar(&mut tx, &evento, umbrales).await?;
     // Al COMMIT, trg_credito_fondeo_total verifica Σ asignaciones == principal.
     tx.commit().await?;
     Ok(ResultadoCredito { credito, asignaciones, desembolso, idempotente: false })
@@ -253,6 +266,14 @@ pub async fn pagar(pool: &PgPool, p: &PagoCredito) -> AppResult<ResultadoPago> {
 
 async fn pagar_tx(pool: &PgPool, p: &PagoCredito, principal: Decimal, total: Decimal) -> AppResult<ResultadoPago> {
     let mut tx = db::begin(pool, Rol::Sofom).await?;
+    // Candado PLD del acreditado antes de la caja (orden global). Sin candado
+    // sobre el crédito todavía: `acreditado_id` es inmutable.
+    let acreditado: Uuid = sqlx::query_scalar("SELECT acreditado_id FROM sofom.creditos WHERE id = $1")
+        .bind(p.credito_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| AppError::no_encontrado("crédito no encontrado"))?;
+    aml::bloquear_cliente_sofom(&mut tx, acreditado).await?;
     let caja = bloquear_caja(&mut tx).await?;
     let credito: Credito = sqlx::query_as("SELECT * FROM sofom.creditos WHERE id = $1 FOR NO KEY UPDATE")
         .bind(p.credito_id)
@@ -293,6 +314,23 @@ async fn pagar_tx(pool: &PgPool, p: &PagoCredito, principal: Decimal, total: Dec
         credito.estado
     };
 
+    // PLD antes de escribir. Un cobro es una ENTRADA: nunca se bloquea y la
+    // SOFOM nunca retiene; un patrón crítico congela al acreditado dentro de
+    // la evaluación.
+    let cobro_id = Uuid::new_v4();
+    aml::evaluar(
+        &mut tx,
+        &Operacion {
+            cliente_id: credito.acreditado_id,
+            canal: Canal::CobroCredito,
+            monto: total,
+            transaccion_id: cobro_id,
+            clave: &p.clave_idempotencia,
+            contraparte: Contraparte::default(),
+        },
+    )
+    .await?;
+
     sqlx::query("UPDATE sofom.caja SET saldo = saldo + $1 WHERE id = $2")
         .bind(total)
         .bind(caja.id)
@@ -310,7 +348,7 @@ async fn pagar_tx(pool: &PgPool, p: &PagoCredito, principal: Decimal, total: Dec
     let cobro = insertar_tx_sofom(
         &mut tx,
         NuevaTxSofom {
-            id: Uuid::new_v4(),
+            id: cobro_id,
             tipo: TipoTxSofom::CobroCredito,
             cuenta: None,
             contrato: None,

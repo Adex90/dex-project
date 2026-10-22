@@ -17,6 +17,7 @@ use chrono::NaiveDate;
 use rust_decimal::Decimal;
 use sqlx::PgPool;
 use synthetic_capital::{
+    aml::monitoreo::{self, Ciclo},
     bootstrap,
     config::Config,
     db,
@@ -29,7 +30,10 @@ use synthetic_capital::{
         ine, rfc, DatosRegistro, EnvioVerificacion, Registro,
     },
     ledger::{hash, Movimiento},
-    models::{kyc::TipoPersona, sofom::ContratoMutuo},
+    models::{
+        kyc::{RolUsuario, TipoPersona},
+        sofom::ContratoMutuo,
+    },
     sofom::puente,
     spei::{
         inbound::{self, Origen, SiNoAcreditable},
@@ -432,4 +436,182 @@ pub async fn cuentas_vacias(pool: &PgPool, cfg: &Config, n: usize) {
             .await
             .unwrap();
     }
+}
+
+// -----------------------------------------------------------------------------
+// PLD/FT (esquema aml, migración 0009)
+// -----------------------------------------------------------------------------
+
+/// Contraseña de los oficiales y auditores de prueba.
+pub const PASSWORD_INTERNO: &str = "oficial-de-pruebas-123";
+
+async fn usuario_interno(pool: &PgPool, email: String, rol: RolUsuario) -> (Uuid, String) {
+    bootstrap::asegurar_usuario_interno(pool, &email, PASSWORD_INTERNO, rol).await.unwrap();
+    let id: Uuid = sqlx::query_scalar("SELECT id FROM kyc.clientes WHERE lower(email) = $1")
+        .bind(&email)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    (id, email)
+}
+
+/// Oficial de cumplimiento `<nombre>@cumplimiento.mx`.
+pub async fn oficial(pool: &PgPool, nombre: &str) -> (Uuid, String) {
+    usuario_interno(pool, format!("{}@cumplimiento.mx", nombre.to_lowercase()), RolUsuario::Cumplimiento).await
+}
+
+/// Auditor `<nombre>@auditoria.mx` (solo lectura en la consola PLD).
+pub async fn auditor(pool: &PgPool, nombre: &str) -> (Uuid, String) {
+    usuario_interno(pool, format!("{}@auditoria.mx", nombre.to_lowercase()), RolUsuario::Auditor).await
+}
+
+/// Tres SPEI de 145,000 (el ataque de la TAREA 4): el tercero congela al
+/// cliente y retiene el patrón.
+pub async fn congelar_por_estructuracion(pool: &PgPool, cfg: &Config, cuenta_id: Uuid) {
+    for _ in 0..3 {
+        depositar(pool, cfg, cuenta_id, "145000").await;
+    }
+    let cliente: Uuid = sqlx::query_scalar("SELECT cliente_id FROM ifpe.cuentas WHERE id = $1")
+        .bind(cuenta_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    assert!(congelamiento_activo(pool, cliente).await.is_some(), "la estructuración no congeló al cliente");
+}
+
+/// `(regla_codigo, nivel_riesgo, estado, decision, ocurrencias)` por folio.
+pub async fn alertas_de(pool: &PgPool, cliente: Uuid) -> Vec<(String, String, String, String, i32)> {
+    sqlx::query_as(
+        "SELECT regla_codigo, nivel_riesgo::text, estado::text, decision, ocurrencias FROM aml.alertas \
+          WHERE cliente_id = $1 ORDER BY folio",
+    )
+    .bind(cliente)
+    .fetch_all(pool)
+    .await
+    .unwrap()
+}
+
+/// `(id, origen, intentos_bloqueados)` del congelamiento ACTIVO del cliente.
+pub async fn congelamiento_activo(pool: &PgPool, cliente: Uuid) -> Option<(Uuid, String, i32)> {
+    sqlx::query_as(
+        "SELECT id, origen, intentos_bloqueados FROM aml.congelamientos WHERE cliente_id = $1 AND estado = 'ACTIVO'",
+    )
+    .bind(cliente)
+    .fetch_optional(pool)
+    .await
+    .unwrap()
+}
+
+/// Estado real de la cuenta IFPE (el cliente ve `ACTIVA` aunque esté congelada).
+pub async fn estado_cuenta(pool: &PgPool, cuenta_id: Uuid) -> String {
+    sqlx::query_scalar("SELECT estado::text FROM ifpe.cuentas WHERE id = $1")
+        .bind(cuenta_id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+/// Eventos de la bitácora PLD de un cliente, en orden.
+pub async fn eventos_bitacora(pool: &PgPool, cliente: Uuid) -> Vec<String> {
+    sqlx::query_scalar("SELECT evento FROM aml.bitacora WHERE cliente_id = $1 ORDER BY id")
+        .bind(cliente)
+        .fetch_all(pool)
+        .await
+        .unwrap()
+}
+
+/// Un ciclo del monitoreo por lotes con el reloj de la base de datos.
+pub async fn ciclo_aml(pool: &PgPool, cfg: &Config) -> Ciclo {
+    monitoreo::ciclo(pool, &cfg.pld).await.unwrap()
+}
+
+/// Invariantes PLD que deben cumplirse después de cualquier secuencia.
+pub async fn verificar_invariantes_aml(pool: &PgPool) {
+    // 1. Espejo: cuenta CONGELADO_PREVENTIVO <=> congelamiento ACTIVO.
+    let sin_congelamiento: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM ifpe.cuentas c WHERE c.estado = 'CONGELADO_PREVENTIVO' \
+            AND NOT EXISTS (SELECT 1 FROM aml.congelamientos f WHERE f.cliente_id = c.cliente_id AND f.estado = 'ACTIVO')",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(sin_congelamiento, 0, "cuentas CONGELADO_PREVENTIVO sin congelamiento ACTIVO");
+    let sin_estado: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM aml.congelamientos f JOIN ifpe.cuentas c ON c.cliente_id = f.cliente_id \
+          WHERE f.estado = 'ACTIVO' AND c.estado NOT IN ('CONGELADO_PREVENTIVO', 'CONGELADA', 'CERRADA')",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(sin_estado, 0, "congelamientos ACTIVO con la cuenta operable");
+    // 2. Las retenciones PLD vigentes caben en el saldo bloqueado.
+    let descubiertas: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM ifpe.cuentas c \
+          WHERE c.saldo_bloqueado < (SELECT coalesce(sum(r.monto), 0) FROM aml.retenciones r \
+                                      WHERE r.cuenta_id = c.id AND r.estado = 'VIGENTE')",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(descubiertas, 0, "retenciones PLD vigentes mayores que el saldo bloqueado");
+    // 3. Bitácora íntegra.
+    let (valido, error): (bool, Option<String>) =
+        sqlx::query_as("SELECT valido, primer_error FROM aml.verificar_bitacora()").fetch_one(pool).await.unwrap();
+    assert!(valido, "bitácora PLD inválida: {error:?}");
+    // 4. Todo renglón ret:/lib: del ledger tiene su vínculo en aml.retenciones.
+    let huerfanos: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM ifpe.transacciones t \
+          WHERE (t.clave_idempotencia LIKE 'ret:%' \
+                 AND NOT EXISTS (SELECT 1 FROM aml.retenciones r WHERE r.tx_retencion_id = t.id)) \
+             OR (t.clave_idempotencia LIKE 'lib:%' \
+                 AND NOT EXISTS (SELECT 1 FROM aml.retenciones r WHERE r.tx_liberacion_id = t.id))",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(huerfanos, 0, "movimientos ret:/lib: sin vínculo en aml.retenciones");
+}
+
+/// Como [`depositar`], con el origen indicado (webhook, captura del operador o demo).
+pub async fn depositar_por(pool: &PgPool, cfg: &Config, cuenta_id: Uuid, monto: &str, origen: Origen) -> Movimiento {
+    let clabe: String = sqlx::query_scalar("SELECT clabe FROM ifpe.cuentas WHERE id = $1")
+        .bind(cuenta_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    let rastreo = format!("PRUEBA{}", &Uuid::new_v4().simple().to_string()[..20]);
+    let r =
+        inbound::abonar(pool, &cfg.pld, &cfg.spei, &abono(&clabe, monto, &rastreo), origen, SiNoAcreditable::Rechazar)
+            .await
+            .unwrap();
+    Movimiento { transaccion: r.transaccion.expect("abonado"), idempotente: r.idempotente }
+}
+
+/// `(canal, resultado, origen, nivel)` de las evaluaciones del cliente, en orden.
+pub async fn evaluaciones_de(pool: &PgPool, cliente: Uuid) -> Vec<(String, String, String, Option<String>)> {
+    sqlx::query_as(
+        "SELECT canal, resultado, origen, nivel::text FROM aml.evaluaciones WHERE cliente_id = $1 \
+          ORDER BY creado_en, id",
+    )
+    .bind(cliente)
+    .fetch_all(pool)
+    .await
+    .unwrap()
+}
+
+/// `(ultima_secuencia, ultimo_hash)` de la cabeza del ledger IFPE.
+pub async fn cabeza_ifpe(pool: &PgPool) -> (i64, String) {
+    sqlx::query_as("SELECT ultima_secuencia, ultimo_hash::text FROM ifpe.ledger_cabeza").fetch_one(pool).await.unwrap()
+}
+
+/// Ejecuta `sql` (una o varias sentencias) con el rol indicado y confirma;
+/// devuelve el texto del error si algo falla (también los triggers diferidos
+/// que disparan al confirmar).
+pub async fn como(pool: &PgPool, rol: db::Rol, sql: &str) -> Result<(), String> {
+    let mut tx = db::begin(pool, rol).await.unwrap();
+    if let Err(e) = sqlx::raw_sql(sql).execute(&mut *tx).await {
+        tx.rollback().await.unwrap();
+        return Err(e.to_string());
+    }
+    tx.commit().await.map_err(|e| e.to_string())
 }

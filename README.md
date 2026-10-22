@@ -243,6 +243,93 @@ credential photograph.
   a generic `DESTINO_NO_ACREDITABLE`, so another customer's KYC or
   blocked-list status is never revealed.
 
+## AML/CFT monitoring (PLD/FT, migration `0009`)
+
+Transaction monitoring for the Disposiciones de PLD/FT, in its own `aml`
+schema. **The database is the only scorer:** `aml.evaluar_operacion` computes
+the score from the ledger itself, so a client or a buggy route cannot pass a
+verdict. Rust only passes the facts of the operation it is about to write.
+
+- **Every money path is evaluated before it writes**, per client and across
+  every channel: incoming SPEI (webhook, operator capture, demo), internal
+  transfers in and out, outgoing SPEI, mutuum investment, credit disbursement
+  and repayment. A per-client lock (the IFPE account row, then an advisory
+  lock) is taken before any window query, so concurrent deposits see each
+  other. A ledger row that somehow arrives without an evaluation gets a
+  `DIFERIDA` marker and a `COBERTURA` notification; the worker scores it.
+- **Rules** live in `aml.reglas_riesgo` (versioned, rows immutable) and the
+  thresholds in `aml.parametros`. Inline (windows up to 24 h): R01 relevant
+  operation (quarterly register, not an alert), R02 fragmentation, R03
+  high-risk client, R04 out of profile, R05 structuring, R07 daily volume, R08
+  frequency, R11 rapid pass-through; modifiers for PEP, high-risk geography,
+  risk tier and new accounts; R09 Blocked Persons List. Batch worker: R20 slow
+  structuring (7 and 30 days), R21 monthly volume vs declared income, R22/R23
+  fan-in and fan-out, R24 48-hour pass-through, R25 circular flows between
+  clients, R26/R27 one payer or one beneficiary shared by several clients.
+  Score = primary points + modifiers (capped at 100): <30 BAJO, 30–59 MEDIO,
+  60–84 ALTO, ≥85 CRITICO. Changing a rule or a parameter (including the
+  observation-mode kill switch) is a proposal that a second officer approves.
+- **Freeze semantics.** An automatic freeze needs a CRITICO score, a fired
+  rule allowed to freeze, and observation mode off; profile factors alone
+  never freeze. A freeze is per client: the IFPE account goes to
+  `CONGELADO_PREVENTIVO`, mirrored one-to-one by an `ACTIVO` row in
+  `aml.congelamientos` (checked at COMMIT). A database guard then rejects
+  every outgoing movement (transfer, SPEI, mutuum, credit disbursement) even
+  if the backend skipped its checks. A blocked attempt commits the
+  evaluation, the alert and the freeze **without any ledger row**. Incoming
+  money is never refused: it is credited and then held (`RETENCION`, so the
+  100% reserve and the shadow balances are unchanged), covering the pattern
+  funds; every later credit to a frozen client is held in full. Refunds,
+  maturities and operator corrections still work. SPEI orders of a frozen
+  client that were never sent are not dispatched.
+- **Four-eyes.** One officer may tighten (take, escalate, confirm, freeze).
+  Unfreezing, releasing holds and approving a false positive while the client
+  is frozen need a second officer, enforced in the database
+  (`SC_AML_CUATRO_OJOS`), as is acting on one's own client record
+  (`SC_AML_AUTORESOLUCION`). An unfreeze either releases the holds or keeps
+  them for a later, separate release request. A false positive sets a
+  suppression watermark, so the reviewed movements do not re-freeze the client.
+- **No tipping off.** A frozen client gets one constant error for every
+  blocked operation (`422 OPERACION_NO_DISPONIBLE`, the same bytes whatever
+  the reason), keeps seeing `"estado": "ACTIVA"`, and sees a hold only as a
+  neutral "Retención temporal". `/yo`, `/tablero` and `/auth/registro` no
+  longer return the risk tier or PEP flag. Senders to a frozen client see a
+  normal success. Client roles have no access to the `aml` schema at all.
+- **Deadlines and audit.** Alerts carry the UIF reporting deadline (60 days,
+  24 h when urgent). `aml.bitacora` is append-only with a canonical hash per
+  row, sealed by the worker in chained batches; `GET
+  /api/v1/aml/bitacora/verificacion` recomputes everything. Every case-file
+  view is logged.
+- **Batch worker** (`AML_MONITOREO_INTERVALO_SEG`, default 300 s, 0 disables;
+  `AML_MONITOREO_LOTE` ledger rows per cycle): one instance at a time (a
+  lease in `aml.monitoreo_estado`), it scans the clients that moved since its
+  ledger watermark with the batch and network rules, re-scores `DIFERIDA`
+  markers, raises SLA and UIF-deadline notifications, seals the audit log and
+  delivers the notification outbox to the log (`target: "aml"`, codes and
+  folios only).
+- **Roles.** `CUMPLIMIENTO` (compliance officer) has the console;
+  `AUDITOR` reads it; `OPERADOR` and `CLIENTE` get 403. The database repeats
+  the role check in every function. Officer POSTs take a
+  `clave_idempotencia` (201 when performed, 200 on a replay, 409 when the key
+  was used for something else).
+
+| Method | Route (`/api/v1/aml/...`) | Access |
+|---|---|---|
+| GET | `resumen`, `alertas` (filters, cursor, change polling) | officer, auditor |
+| GET | `alertas/{id}` (case file), `clientes/{id}` (client review) | officer, auditor (logged) |
+| POST | `alertas/{id}/resolver` (TOMAR, LIBERAR, ESCALAR, CONFIRMAR, FALSO_POSITIVO) | officer |
+| POST | `alertas/{id}/reporte-uif` (UIF/SITI folio, once) | officer |
+| POST | `clientes/{id}/congelar` (manual freeze) | officer |
+| GET | `congelamientos`, `solicitudes`, `notificaciones`, `relevantes` | officer, auditor |
+| POST | `congelamientos/{id}/solicitudes` (unfreeze or release request) | officer |
+| POST | `solicitudes/{id}/decision` | a second officer |
+| GET | `reglas`, `propuestas` | officer, auditor |
+| POST | `propuestas`, `propuestas/{id}/decision` | officer; a second officer decides |
+| GET | `bitacora/verificacion` | officer, auditor |
+
+The legacy `kyc.alertas_pld` is now read-only history: open alerts were copied
+into `aml.alertas` and `GET /api/v1/operaciones/alertas` was removed.
+
 ## Layout
 
 ```
@@ -272,11 +359,14 @@ Tests (need a user with `CREATEDB` and `CREATEROLE`):
 
 ```bash
 cd backend && DATABASE_URL=postgres://synthetic:synthetic@localhost:5432/synthetic_capital cargo test
+# one test binary at a time, e.g. the AML/PLD suite on its own:
+cd backend && DATABASE_URL=... cargo test --test aml
 # SQL invariants: run on an empty, freshly migrated database (everything is rolled back).
 psql "$EMPTY_DATABASE_URL" -f tests/db/0001_invariantes.sql
 psql "$EMPTY_DATABASE_URL" -f tests/db/0006_kyc.sql
 psql "$EMPTY_DATABASE_URL" -f tests/db/0007_kyc.sql
 psql "$EMPTY_DATABASE_URL" -f tests/db/0008_spei.sql
+psql "$EMPTY_DATABASE_URL" -f tests/db/0009_aml.sql
 cd frontend && npm test && npm run build
 FRONTEND_URL=http://localhost:3000 node e2e/smoke.mjs   # needs backend (MODO_DEMO=true) + next start
 ```
@@ -290,7 +380,14 @@ the owner and serve as a login that can act only through the `sc_*` roles:
 ```sql
 CREATE ROLE sc_app LOGIN PASSWORD '...' NOINHERIT;
 GRANT sc_ifpe, sc_sofom, sc_puente, sc_auditor, sc_kyc, sc_kyc_verificador, sc_spei TO sc_app;
+-- Compliance console (/api/v1/aml) and the AML batch worker. Money paths do
+-- not need it: they reach the engine through SECURITY DEFINER wrappers.
+GRANT sc_aml TO sc_app;
 ```
+
+**Deploying migration 0009 (AML/PLD):** drain every instance running a
+pre-0009 binary before applying it. 0009 revokes INSERT on `kyc.alertas_pld`,
+so an old binary would fail every money transaction that raises an alert.
 
 ```bash
 DATABASE_URL_PROPIETARIO=postgres://owner:...@db/synthetic_capital   # migrations + bootstrap only
@@ -364,6 +461,17 @@ the password is hashed, so a parallel burst cannot test more than 5 passwords.
 | POST | `/api/v1/operaciones/spei/recibidos/{id}/anulacion` | operator: void a wrong manual SPEI entry and free its identity |
 | POST | `/api/v1/operaciones/spei/enviados/{id}/reembolso` | operator: refund an order in manual review that the provider never received |
 | POST | `/api/v1/operaciones/spei/en-revision/{id}/descarte` | operator: discard a held SPEI notification as a duplicate (no money moves) |
-| POST | `/api/v1/operaciones/...` | operator: holds, KYC, AML alerts, capital |
+| POST | `/api/v1/operaciones/...` | operator: holds, KYC, capital |
+| GET/POST | `/api/v1/aml/...` | compliance officer (auditor read-only): AML/PLD console, see above |
 
 Full table in `backend/src/routes/mod.rs`.
+
+**Roles.** `CLIENTE` (own account), `OPERADOR` (back office: SPEI entries,
+holds, KYC review, loans; **no AML access**), `AUDITOR` (Proof of Reserve and
+ledger audit; read-only on `/api/v1/aml`) and `CUMPLIMIENTO` (compliance
+officer: the AML/PLD console under `/api/v1/aml`). Unfreezing a client,
+releasing AML holds and changing risk rules need a second officer (four-eyes,
+enforced in the database), so staff at least two `CUMPLIMIENTO` users.
+Internal users are provisioned by the schema owner, like operators; with
+`MODO_DEMO=true`, `BOOTSTRAP_CUMPLIMIENTO_EMAILS` / `_PASSWORD` create demo
+officers on startup.

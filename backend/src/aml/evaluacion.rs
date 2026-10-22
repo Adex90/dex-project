@@ -83,14 +83,9 @@ pub async fn retener(tx: &mut Tx, d: &Dictamen) -> AppResult<TransaccionIfpe> {
     if d.decision != Decision::Retener {
         return Err(AppError::Integridad(format!("evaluación {}: retención sin decisión RETENER", d.evaluacion_id)));
     }
-    let id: Uuid = sqlx::query_scalar("SELECT ifpe.aml_retener($1)")
-        .bind(d.evaluacion_id)
-        .fetch_one(&mut **tx)
-        .await?;
-    let t: TransaccionIfpe = sqlx::query_as("SELECT * FROM ifpe.transacciones WHERE id = $1")
-        .bind(id)
-        .fetch_one(&mut **tx)
-        .await?;
+    let id: Uuid = sqlx::query_scalar("SELECT ifpe.aml_retener($1)").bind(d.evaluacion_id).fetch_one(&mut **tx).await?;
+    let t: TransaccionIfpe =
+        sqlx::query_as("SELECT * FROM ifpe.transacciones WHERE id = $1").bind(id).fetch_one(&mut **tx).await?;
     let recalculado = hash::hash_ifpe(&t);
     if recalculado != t.tx_hash {
         return Err(AppError::Integridad(format!(
@@ -105,10 +100,7 @@ pub async fn retener(tx: &mut Tx, d: &Dictamen) -> AppResult<TransaccionIfpe> {
 /// `bloquear_caja` (bloquea la fila IFPE del acreditado y luego el candado
 /// consultivo PLD del cliente; orden global de candados, `ledger` 1–2).
 pub async fn bloquear_cliente_sofom(tx: &mut Tx, cliente_id: Uuid) -> AppResult<()> {
-    sqlx::query("SELECT sofom.aml_bloquear_cliente($1)")
-        .bind(cliente_id)
-        .execute(&mut **tx)
-        .await?;
+    sqlx::query("SELECT sofom.aml_bloquear_cliente($1)").bind(cliente_id).execute(&mut **tx).await?;
     Ok(())
 }
 

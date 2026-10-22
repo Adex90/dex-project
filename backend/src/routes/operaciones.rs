@@ -1,4 +1,5 @@
-//! Rutas de operador: SPEI entrante, retenciones, KYC, PLD y crédito.
+//! Rutas de operador: SPEI entrante, retenciones, KYC y crédito. El operador
+//! no tiene acceso a PLD: la consola de cumplimiento vive en `/api/v1/aml`.
 
 use axum::{
     extract::State,
@@ -17,7 +18,7 @@ use crate::{
     kyc::{self, DictamenKyc},
     ledger::{self, Movimiento},
     models::{
-        kyc::{AlertaPld, Cliente},
+        kyc::Cliente,
         sofom::{Credito, TransaccionSofom},
     },
     routes::extraccion::{Json, Path, Query},
@@ -43,7 +44,6 @@ pub fn rutas() -> Router<AppState> {
         .route("/operaciones/retenciones", post(retencion))
         .route("/operaciones/kyc/pendientes", get(kyc_pendientes))
         .route("/operaciones/kyc/{cliente_id}", post(dictamen_kyc))
-        .route("/operaciones/alertas", get(alertas))
         .route("/operaciones/creditos", get(listar_creditos).post(originar_credito))
         .route("/operaciones/creditos/{id}/pagos", post(pagar_credito))
         .route("/operaciones/creditos/{id}/castigo", post(castigar_credito))
@@ -231,11 +231,6 @@ async fn kyc_pendientes(
 #[derive(Deserialize)]
 struct Limite {
     limite: Option<i64>,
-}
-
-async fn alertas(State(e): State<AppState>, u: Usuario, Query(q): Query<Limite>) -> AppResult<Json<Vec<AlertaPld>>> {
-    u.exigir_operador()?;
-    Ok(Json(kyc::alertas_abiertas(&e.pool, q.limite.unwrap_or(100)).await?))
 }
 
 async fn listar_creditos(

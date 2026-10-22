@@ -5,7 +5,7 @@
 //! | GET  | `/salud` | público |
 //! | POST | `/api/v1/auth/registro` | público |
 //! | POST | `/api/v1/auth/login` | público |
-//! | GET  | `/api/v1/yo` | cliente |
+//! | GET  | `/api/v1/yo` | cualquier rol (sin nivel de riesgo PLD) |
 //! | GET  | `/api/v1/kyc/expediente` | cliente: estado del onboarding |
 //! | POST | `/api/v1/kyc/perfil` | cliente: datos personales (paso 1) |
 //! | POST | `/api/v1/kyc/verificar` | cliente: INE + selfie (pasos 2 y 3) |
@@ -36,7 +36,6 @@
 //! | POST | `/api/v1/operaciones/retenciones` | operador |
 //! | GET  | `/api/v1/operaciones/kyc/pendientes` | operador |
 //! | POST | `/api/v1/operaciones/kyc/{cliente_id}` | operador |
-//! | GET  | `/api/v1/operaciones/alertas` | operador |
 //! | GET/POST | `/api/v1/operaciones/creditos` | operador |
 //! | POST | `/api/v1/operaciones/creditos/{id}/pagos` | operador |
 //! | POST | `/api/v1/operaciones/capital` | operador |
@@ -48,7 +47,25 @@
 //! | POST | `/api/v1/operaciones/spei/recibidos/{id}/anulacion` | operador: anula una captura manual errónea |
 //! | POST | `/api/v1/operaciones/spei/enviados/{id}/reembolso` | operador: reembolsa una orden en revisión que el proveedor no tiene |
 //! | POST | `/api/v1/operaciones/spei/en-revision/{id}/descarte` | operador: descarta como duplicado una notificación retenida |
+//! | GET  | `/api/v1/aml/resumen` | cumplimiento / auditor: contadores de la consola PLD |
+//! | GET  | `/api/v1/aml/alertas` | cumplimiento / auditor: bandeja de alertas PLD (filtros, cursor, sondeo) |
+//! | GET  | `/api/v1/aml/alertas/{id}` | cumplimiento / auditor: expediente de la alerta (queda en la bitácora) |
+//! | POST | `/api/v1/aml/alertas/{id}/resolver` | cumplimiento: tomar, liberar, escalar, confirmar o falso positivo |
+//! | POST | `/api/v1/aml/alertas/{id}/reporte-uif` | cumplimiento: folio UIF de una alerta confirmada |
+//! | GET  | `/api/v1/aml/clientes/{id}` | cumplimiento / auditor: revisión PLD del cliente (queda en la bitácora) |
+//! | POST | `/api/v1/aml/clientes/{id}/congelar` | cumplimiento: congelamiento preventivo manual |
+//! | GET  | `/api/v1/aml/congelamientos` | cumplimiento / auditor: congelamientos (ACTIVO por omisión) |
+//! | POST | `/api/v1/aml/congelamientos/{id}/solicitudes` | cumplimiento: pide levantar o liberar retenciones (cuatro ojos) |
+//! | GET  | `/api/v1/aml/solicitudes` | cumplimiento / auditor: cola de cuatro ojos |
+//! | POST | `/api/v1/aml/solicitudes/{id}/decision` | cumplimiento, distinto del solicitante: aprueba o rechaza |
+//! | GET  | `/api/v1/aml/notificaciones` | cumplimiento / auditor: bandeja de salida de avisos PLD |
+//! | GET  | `/api/v1/aml/reglas` | cumplimiento / auditor: parámetros, matriz de riesgo y propuestas pendientes |
+//! | GET/POST | `/api/v1/aml/propuestas` | cumplimiento / auditor (GET); cumplimiento propone cambios (POST) |
+//! | POST | `/api/v1/aml/propuestas/{id}/decision` | cumplimiento, distinto del proponente: aprueba o rechaza |
+//! | GET  | `/api/v1/aml/relevantes` | cumplimiento / auditor: registro trimestral de operaciones relevantes |
+//! | GET  | `/api/v1/aml/bitacora/verificacion` | cumplimiento / auditor: verifica hashes y sellos de la bitácora PLD |
 
+mod aml;
 mod auth;
 mod extraccion;
 mod ifpe;
@@ -93,7 +110,8 @@ pub fn router(estado: AppState) -> Router {
         .merge(sofom::rutas())
         .merge(reserva::rutas())
         .merge(operaciones::rutas())
-        .merge(spei::rutas());
+        .merge(spei::rutas())
+        .merge(aml::rutas());
 
     let limites = &estado.config.http;
     let peticion = Duration::from_secs(limites.peticion_seg);

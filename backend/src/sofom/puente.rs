@@ -18,9 +18,11 @@
 //! El rol `sc_puente` no tiene privilegios sobre `sofom.creditos` ni
 //! `sofom.asignaciones_fondeo`: este módulo no puede originar préstamos.
 //!
-//! Orden de bloqueo (común a todo el sistema): cuenta IFPE → reserva → cuenta
-//! SOFOM → caja → contrato → [estado_reserva → cabeza IFPE → cabeza SOFOM].
-//! Por eso el movimiento IFPE se inserta siempre antes que los de la SOFOM.
+//! Orden de bloqueo (común a todo el sistema): cuenta IFPE → candado PLD del
+//! cliente → reserva → cuenta SOFOM → caja → contrato → [estado_reserva →
+//! cabeza IFPE → cabeza SOFOM]. Por eso el movimiento IFPE se inserta siempre
+//! antes que los de la SOFOM. La inversión se evalúa en PLD (el TRASPASO IFPE
+//! es el movimiento evaluado) antes de cualquier escritura.
 
 use chrono::{Days, NaiveDate};
 use rust_decimal::Decimal;
@@ -30,7 +32,8 @@ use uuid::Uuid;
 
 use super::{bloquear_caja, insertar_tx_sofom, tasas, NuevaTxSofom};
 use crate::{
-    config::UmbralesPld,
+    aml::{self, Canal, Contraparte, Decision, Operacion},
+    config::ConfigAml,
     db::{self, Rol, Tx},
     dinero,
     error::{AppError, AppResult},
@@ -38,9 +41,9 @@ use crate::{
     models::{
         ifpe::{TipoTxIfpe, TransaccionIfpe},
         sofom::{ContratoMutuo, CuentaSofom, EstadoMutuo, TipoTxSofom, TransaccionSofom},
-        Entidad, EstadoCuenta,
+        EstadoCuenta,
     },
-    pld::{self, EventoPld},
+    pld,
 };
 
 pub const VERSION_CONDICIONES: &str = "SC-MUTUO-v1";
@@ -178,21 +181,17 @@ pub struct ResultadoMutuo {
     pub idempotente: bool,
 }
 
-pub async fn invertir(pool: &PgPool, umbrales: &UmbralesPld, s: &SolicitudMutuo) -> AppResult<ResultadoMutuo> {
+/// Los umbrales PLD viven en la base de datos (`aml.reglas_riesgo`); el
+/// parámetro de configuración se conserva para que los llamadores no cambien.
+pub async fn invertir(pool: &PgPool, _aml: &ConfigAml, s: &SolicitudMutuo) -> AppResult<ResultadoMutuo> {
     let monto = dinero::validar_monto(s.monto)?;
     let tasa = tasas::tasa_para(s.plazo_dias).ok_or_else(|| {
         AppError::validacion(format!("plazo de {} días no admitido; consulta GET /api/v1/sofom/tasas", s.plazo_dias))
     })?;
-    db::con_reintentos(|| invertir_tx(pool, umbrales, s, monto, tasa)).await
+    db::con_reintentos(|| invertir_tx(pool, s, monto, tasa)).await
 }
 
-async fn invertir_tx(
-    pool: &PgPool,
-    umbrales: &UmbralesPld,
-    s: &SolicitudMutuo,
-    monto: Decimal,
-    tasa: Decimal,
-) -> AppResult<ResultadoMutuo> {
+async fn invertir_tx(pool: &PgPool, s: &SolicitudMutuo, monto: Decimal, tasa: Decimal) -> AppResult<ResultadoMutuo> {
     let mut tx = db::begin(pool, Rol::Puente).await?;
 
     // 1. Cuenta IFPE de origen (primer lock).
@@ -217,10 +216,29 @@ async fn invertir_tx(
     // 3. Reglas de negocio.
     let perfil = pld::cargar_perfil(&mut tx, s.cliente_id).await?;
     perfil.exigir_operable()?;
-    ledger::exigir_debitable(&cuenta_ifpe)?;
+    ledger::exigir_debitable_salvo_aml(&cuenta_ifpe)?;
     ledger::exigir_saldo(&cuenta_ifpe, monto)?;
 
-    // 4. Resto de locks en orden global.
+    // 4. PLD antes de cualquier escritura y del resto de los candados: un
+    // BLOQUEAR confirma sin TRASPASO, sin cuenta SOFOM nueva y sin contrato.
+    let tx_ifpe_id = Uuid::new_v4();
+    let d = aml::evaluar(
+        &mut tx,
+        &Operacion {
+            cliente_id: s.cliente_id,
+            canal: Canal::InversionMutuo,
+            monto,
+            transaccion_id: tx_ifpe_id,
+            clave: &s.clave_idempotencia,
+            contraparte: Contraparte::default(),
+        },
+    )
+    .await?;
+    if d.decision == Decision::Bloquear {
+        return aml::confirmar_bloqueo(tx, &d).await;
+    }
+
+    // 5. Resto de locks en orden global.
     let reserva = ledger::bloquear_reserva(&mut tx).await?;
     sqlx::query("INSERT INTO sofom.cuentas (cliente_id) VALUES ($1) ON CONFLICT (cliente_id, moneda) DO NOTHING")
         .bind(s.cliente_id)
@@ -238,12 +256,11 @@ async fn invertir_tx(
 
     // Fecha valor: la de la base de datos (el trigger trg_mutuo_fecha_valor la exige).
     let fecha_inicio: NaiveDate = sqlx::query_scalar("SELECT current_date").fetch_one(&mut *tx).await?;
-    let tx_ifpe_id = Uuid::new_v4();
     let tx_sofom_id = Uuid::new_v4();
     let contrato_id = Uuid::new_v4();
     let concepto = concepto_aportacion(s.plazo_dias);
 
-    // 5. IFPE: el pasivo y la reserva bajan juntos; el efectivo sale a la SOFOM.
+    // 6. IFPE: el pasivo y la reserva bajan juntos; el efectivo sale a la SOFOM.
     sqlx::query("UPDATE ifpe.cuentas SET saldo_disponible = saldo_disponible - $1 WHERE id = $2")
         .bind(monto)
         .bind(cuenta_ifpe.id)
@@ -271,7 +288,7 @@ async fn invertir_tx(
     )
     .await?;
 
-    // 6. SOFOM: saldo bloqueado a plazo + efectivo en caja + contrato.
+    // 7. SOFOM: saldo bloqueado a plazo + efectivo en caja + contrato.
     sqlx::query("UPDATE sofom.cuentas SET saldo_bloqueado = saldo_bloqueado + $1 WHERE id = $2")
         .bind(monto)
         .bind(cuenta_sofom.id)
@@ -322,15 +339,6 @@ async fn invertir_tx(
     )
     .await?;
 
-    let evento = EventoPld {
-        entidad: Entidad::Sofom,
-        cliente: &perfil,
-        transaccion_id: tx_sofom.id,
-        operacion: "APORTACION_MUTUO",
-        monto,
-        cuenta_deposito: None,
-    };
-    pld::evaluar(&mut tx, &evento, umbrales).await?;
     tx.commit().await?;
 
     Ok(ResultadoMutuo {

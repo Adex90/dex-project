@@ -15,10 +15,13 @@
 //!    cuenta; si no puede recibir (inexistente, cancelada, cliente bloqueado o
 //!    sin KYC) el pago se registra DEVUELTO con su causa Banxico y no toca
 //!    saldos: el proveedor regresa el dinero al emisor;
-//! 4. si puede recibir: saldo del cliente y reserva en custodia suben juntos,
-//!    se inserta el DEPOSITO (con su `tx_hash`) y el registro ABONADO ligado a
-//!    él, se evalúan reglas PLD y COMMIT. La base de datos verifica al COMMIT
-//!    la reserva del 100%, la sombra del ledger y la liga SPEI <-> DEPOSITO.
+//! 4. si puede recibir: se evalúa PLD antes de abonar (`aml::evaluar`, antes
+//!    del candado de la reserva); saldo del cliente y reserva en custodia suben
+//!    juntos, se inserta el DEPOSITO (con su `tx_hash`) y el registro ABONADO
+//!    ligado a él; si corresponde, el abono se retiene (RETENCION neutra en la
+//!    misma transacción; un pago entrante nunca se rechaza) y COMMIT. La base
+//!    de datos verifica al COMMIT la reserva del 100%, la sombra del ledger y
+//!    la liga SPEI <-> DEPOSITO.
 //!
 //! Además:
 //! - una **devolución de una orden nuestra** (cualquier tipo de pago de
@@ -60,12 +63,13 @@ use super::{
     validar_monto_spei, CausaDevolucion, IdentidadSpei,
 };
 use crate::{
-    config::{ConfigSpei, UmbralesPld},
+    aml::{self, Canal, Contraparte, Decision, Operacion},
+    config::{ConfigAml, ConfigSpei},
     db::{self, Rol, Tx},
     error::{AppError, AppResult},
     ledger,
-    models::{ifpe::TransaccionIfpe, Entidad, EstadoCuenta},
-    pld::{self, EventoPld},
+    models::{ifpe::TransaccionIfpe, EstadoCuenta},
+    pld,
 };
 
 /// Registro de `ifpe.spei_inbound`.
@@ -352,16 +356,18 @@ pub fn interpretar_notificacion(cuerpo: &[u8]) -> AppResult<Abono> {
 // Abono
 // -----------------------------------------------------------------------------
 
+/// Los umbrales PLD viven en la base de datos (`aml.reglas_riesgo`); el
+/// parámetro de configuración se conserva para que los llamadores no cambien.
 pub async fn abonar(
     pool: &PgPool,
-    umbrales: &UmbralesPld,
+    _aml: &ConfigAml,
     cfg: &ConfigSpei,
     abono: &Abono,
     origen: Origen,
     si_no_acreditable: SiNoAcreditable,
 ) -> AppResult<ResultadoAbono> {
     validar_monto_spei(abono.monto)?;
-    db::con_reintentos(|| abonar_tx(pool, umbrales, cfg, abono, origen, si_no_acreditable, None)).await
+    db::con_reintentos(|| abonar_tx(pool, cfg, abono, origen, si_no_acreditable, None)).await
 }
 
 /// Captura del operador de un pago que la búsqueda de posibles duplicados
@@ -371,7 +377,7 @@ pub async fn abonar(
 /// exige que el abono previo sea de la misma cuenta, monto y clave de rastreo.
 pub async fn abonar_pago_distinto(
     pool: &PgPool,
-    umbrales: &UmbralesPld,
+    _aml: &ConfigAml,
     cfg: &ConfigSpei,
     abono: &Abono,
     operador_id: Uuid,
@@ -384,7 +390,7 @@ pub async fn abonar_pago_distinto(
     }
     let distinto = PagoDistinto { transaccion_id: distinto.transaccion_id, motivo: motivo.to_owned() };
     db::con_reintentos(|| {
-        abonar_tx(pool, umbrales, cfg, abono, Origen::Operador(operador_id), SiNoAcreditable::Rechazar, Some(&distinto))
+        abonar_tx(pool, cfg, abono, Origen::Operador(operador_id), SiNoAcreditable::Rechazar, Some(&distinto))
     })
     .await
 }
@@ -435,7 +441,6 @@ async fn bloquear_identidad(tx: &mut Tx, identidad: &str) -> AppResult<()> {
 
 async fn abonar_tx(
     pool: &PgPool,
-    umbrales: &UmbralesPld,
     cfg: &ConfigSpei,
     abono: &Abono,
     origen: Origen,
@@ -472,34 +477,51 @@ async fn abonar_tx(
     let nuevo_es_webhook = matches!(origen, Origen::Webhook);
     exigir_sin_duplicado(&mut tx, abono, cuenta_id, &identidad, nuevo_es_webhook, distinto.map(|d| d.transaccion_id))
         .await?;
-    let reserva = ledger::bloquear_reserva(&mut tx).await?;
-    let concepto = concepto_ledger(abono);
     // Igual que `ifpe.referencia_abono_spei`: el reemplazo de un registro
     // anulado lleva el id del anulado (su DEPOSITO ya tiene la identidad sola).
     let referencia = match vinculos.reemplaza_a {
         Some(anulado) => format!("{identidad}/{anulado}"),
         None => identidad.clone(),
     };
+    let clave = format!("spei:{referencia}");
+    let deposito_id = Uuid::new_v4();
+    // PLD antes del candado de la reserva (la calificación queda fuera de la
+    // ventana del candado de la cabeza IFPE). Un pago entrante nunca se
+    // rechaza: a lo más se retiene después de abonarlo.
+    let d = aml::evaluar(
+        &mut tx,
+        &Operacion {
+            cliente_id: perfil.id,
+            canal: Canal::de_origen_spei(origen),
+            monto: abono.monto,
+            transaccion_id: deposito_id,
+            clave: &clave,
+            contraparte: Contraparte {
+                nombre: abono.nombre_ordenante.clone(),
+                cuenta: abono.cuenta_ordenante.clone(),
+                rfc_curp: abono.rfc_curp_ordenante.clone(),
+                cliente_id: None,
+            },
+        },
+    )
+    .await?;
+    let reserva = ledger::bloquear_reserva(&mut tx).await?;
+    let concepto = concepto_ledger(abono);
     let t = ledger::abonar_efectivo(
         &mut tx,
+        deposito_id,
         cuenta_id,
         reserva.id,
         abono.monto,
         Some(&concepto),
         Some(&referencia),
-        &format!("spei:{referencia}"),
+        &clave,
     )
     .await?;
     let spei = insertar(&mut tx, abono, origen, vinculos, Some(cuenta_id), Some(t.id), None).await?;
-    let evento = EventoPld {
-        entidad: Entidad::Ifpe,
-        cliente: &perfil,
-        transaccion_id: t.id,
-        operacion: "DEPOSITO",
-        monto: abono.monto,
-        cuenta_deposito: Some(cuenta_id),
-    };
-    pld::evaluar(&mut tx, &evento, umbrales).await?;
+    if d.decision == Decision::Retener {
+        aml::retener(&mut tx, &d).await?;
+    }
     tx.commit().await?;
     tracing::info!(%identidad, monto = %abono.monto, cuenta = %cuenta_id, "SPEI recibido abonado");
     Ok(ResultadoAbono { spei, transaccion: Some(t), idempotente: false })
@@ -795,7 +817,7 @@ async fn devolucion_de_orden(
 pub async fn capturar_devolucion(
     pool: &PgPool,
     pasarela: &dyn Pasarela,
-    umbrales: &UmbralesPld,
+    _aml: &ConfigAml,
     cfg: &ConfigSpei,
     abono: &Abono,
     operador_id: Uuid,
@@ -836,7 +858,7 @@ pub async fn capturar_devolucion(
             }
         }
     }
-    db::con_reintentos(|| abonar_tx(pool, umbrales, cfg, abono, origen, SiNoAcreditable::Rechazar, None)).await
+    db::con_reintentos(|| abonar_tx(pool, cfg, abono, origen, SiNoAcreditable::Rechazar, None)).await
 }
 
 /// Busca un abono que muy probablemente sea el mismo pago con otra identidad:
@@ -1181,6 +1203,7 @@ async fn corregir_en(
     let concepto: String = concepto.chars().take(140).collect();
     let t = ledger::cargar_efectivo(
         tx,
+        Uuid::new_v4(),
         cuenta_id,
         reserva_id,
         monto,

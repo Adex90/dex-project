@@ -257,16 +257,28 @@ async fn kyc_pendiente_no_opera(pool: PgPool) {
     assert_eq!(err.codigo(), "KYC_NO_VERIFICADO");
 }
 
+/// R01 (operación relevante) es un renglón del registro trimestral, no una
+/// alerta; R02 (fraccionamiento) abre una alerta ALTO sin congelar.
 #[sqlx::test(migrations = "../migrations")]
-async fn alertas_pld_relevante_y_fraccionamiento(pool: PgPool) {
+async fn alertas_aml_relevante_y_fraccionamiento(pool: PgPool) {
     let cfg = preparar(&pool).await;
     let ana = cliente(&pool, &cfg, "Ana").await;
     depositar(&pool, &cfg, ana.cuenta_ifpe.id, "150000").await; // R01
     depositar(&pool, &cfg, ana.cuenta_ifpe.id, "80000").await;
     depositar(&pool, &cfg, ana.cuenta_ifpe.id, "80000").await; // R02: 160,000 en 24 h
-    let reglas: Vec<String> =
-        sqlx::query_scalar("SELECT regla FROM kyc.alertas_pld ORDER BY folio").fetch_all(&pool).await.unwrap();
-    assert_eq!(reglas, ["R01_OPERACION_RELEVANTE", "R02_FRACCIONAMIENTO"]);
+    let alertas: Vec<(String, String, Decimal)> =
+        sqlx::query_as("SELECT regla_codigo, nivel_riesgo::text, puntaje FROM aml.alertas ORDER BY folio")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert_eq!(alertas, [("R02_FRACCIONAMIENTO".to_owned(), "ALTO".to_owned(), Decimal::new(6500, 2))]);
+    let relevantes: (i64, Option<Decimal>) =
+        sqlx::query_as("SELECT count(*), sum(monto) FROM aml.operaciones_relevantes").fetch_one(&pool).await.unwrap();
+    assert_eq!(relevantes, (1, Some(Decimal::from(150_000))));
+    let congelamientos: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM aml.congelamientos").fetch_one(&pool).await.unwrap();
+    assert_eq!(congelamientos, 0);
+    verificar_invariantes(&pool).await;
 }
 
 /// Si alguien altera un movimiento saltándose los triggers (p. ej. con acceso

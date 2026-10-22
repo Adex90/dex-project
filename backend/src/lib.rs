@@ -6,12 +6,14 @@
 //! - [`sofom`]: puente IFPE -> contratos de mutuo y originación de crédito con calce de plazos.
 //! - [`crypto::merkle`]: árbol Merkle de sumas para Proof of Reserve.
 //! - [`reserva`]: cortes de Proof of Reserve y pruebas de inclusión por cliente.
+//! - [`aml`]: monitoreo PLD/FT en línea (el esquema `aml` califica; Rust pasa hechos).
 //! - [`routes`]: API HTTP (Axum).
 //!
 //! Las reglas de negocio inviolables se hacen cumplir dos veces: aquí, con
 //! errores claros, y en la base de datos (triggers, CHECKs y privilegios por
 //! rol), que es la última palabra.
 
+pub mod aml;
 pub mod auth;
 pub mod bootstrap;
 pub mod config;

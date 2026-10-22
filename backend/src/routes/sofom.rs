@@ -87,7 +87,8 @@ async fn liquidar(
     let solicitante = match u.rol {
         RolUsuario::Cliente => Some(u.cliente_id),
         RolUsuario::Operador => None,
-        RolUsuario::Auditor => return Err(AppError::Prohibido),
+        // Un oficial de cumplimiento no mueve dinero (solo la consola PLD).
+        RolUsuario::Auditor | RolUsuario::Cumplimiento => return Err(AppError::Prohibido),
     };
     let r = puente::liquidar(&e.pool, id, solicitante).await?;
     Ok((status_de(r.idempotente), Json(r)))

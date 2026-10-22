@@ -2,17 +2,46 @@
 //!
 //! Cada operación:
 //! 1. abre una transacción con el rol `sc_ifpe` ([`db::begin`]);
-//! 2. bloquea las filas involucradas con `SELECT ... FOR NO KEY UPDATE` en un orden
-//!    global fijo (cuentas por id → reserva → [estado_reserva y cabeza del
-//!    ledger, que toman los triggers]) para evitar deadlocks;
+//! 2. bloquea las filas involucradas con `SELECT ... FOR NO KEY UPDATE` en el
+//!    orden global fijo de abajo para evitar deadlocks;
 //! 3. comprueba la idempotencia *después* de bloquear, de modo que dos
 //!    peticiones con la misma clave se serializan y la segunda ve la primera;
 //! 4. mueve saldos y, si entra o sale efectivo, la reserva en custodia por el
 //!    mismo monto (si no, el trigger diferido `SC_RESERVA_100` aborta el COMMIT);
 //! 5. inserta el movimiento en el ledger y verifica que el `tx_hash` que
 //!    calculó la base de datos coincide con el recalculado en Rust;
-//! 6. evalúa reglas PLD y hace COMMIT. Cualquier error antes del COMMIT
-//!    descarta la transacción completa (ROLLBACK al soltar `Tx`).
+//! 6. evalúa PLD con `aml::evaluar` antes de escribir (después de los candados
+//!    de cuentas y de las validaciones, antes del candado de la reserva y de
+//!    cualquier UPDATE o INSERT) y hace COMMIT. Cualquier error antes del
+//!    COMMIT descarta la transacción completa (ROLLBACK al soltar `Tx`). Un
+//!    BLOQUEAR de PLD es la única excepción: `aml::confirmar_bloqueo` confirma
+//!    la evaluación, la alerta y el congelamiento **sin** renglones del ledger
+//!    y responde `OPERACION_NO_DISPONIBLE`.
+//!
+//! Orden global de candados (todos los caminos del dinero, IFPE y SOFOM):
+//!
+//! 0. candados propios del camino que preceden a las cuentas: el candado
+//!    consultivo de identidad del pago SPEI (`spei-inbound:<identidad>`, solo
+//!    entradas); el candado de idempotencia del oficial (`aml:accion:<clave>`)
+//!    y la fila de `kyc.clientes` `FOR NO KEY UPDATE` (solo funciones de los
+//!    oficiales y el trigger de la Lista de Personas Bloqueadas). Los caminos
+//!    del dinero nunca bloquean `kyc.clientes` más fuerte que el `KEY SHARE`
+//!    de las llaves foráneas, que no choca con `FOR NO KEY UPDATE`;
+//! 1. filas de `ifpe.cuentas`, por id ascendente;
+//! 2. candados consultivos PLD por cliente (`aml:cliente:<id>`, los toma
+//!    `aml.bloquear_cliente` justo después de volver a bloquear la fila IFPE de
+//!    ese cliente). En una transferencia ambas filas ya están tomadas, así que
+//!    tomar origen y luego destino no forma ciclos;
+//! 3. reserva en custodia (`ifpe.reserva_custodia`);
+//! 4. cuenta SOFOM;
+//! 5. caja de la SOFOM;
+//! 6. contrato o crédito;
+//! 7. [`estado_reserva`, cabeza IFPE, cabeza SOFOM], que toman los triggers.
+//!    La bitácora PLD no tiene cabeza (se sella por lotes).
+//!
+//! Toda escritura PLD de un camino del dinero ocurre bajo 1–2. La única
+//! posterior a 3–7 es la retención (`aml.aplicar_retencion`), que toca la
+//! fila IFPE y la cabeza IFPE que la transacción ya tiene.
 
 pub mod hash;
 
@@ -22,16 +51,17 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::{
-    config::UmbralesPld,
+    aml::{self, Canal, Contraparte, Decision, Operacion},
+    config::ConfigAml,
     db::{self, Rol, Tx},
     dinero,
     error::{AppError, AppResult},
     models::{
         ifpe::{CuentaIfpe, ReservaCustodia, TipoTxIfpe, TransaccionIfpe},
         kyc::EstatusKyc,
-        Entidad, EstadoCuenta,
+        EstadoCuenta,
     },
-    pld::{self, EventoPld},
+    pld,
     spei::clabe,
 };
 
@@ -157,6 +187,20 @@ pub(crate) fn exigir_debitable(cuenta: &CuentaIfpe) -> AppResult<()> {
         EstadoCuenta::Activa => Ok(()),
         EstadoCuenta::Congelada => Err(AppError::negocio("CUENTA_CONGELADA", "la cuenta IFPE está congelada")),
         EstadoCuenta::Cerrada => Err(AppError::negocio("CUENTA_CERRADA", "la cuenta IFPE está cerrada")),
+        // Congelamiento preventivo PLD: mismo error constante que la guardia
+        // de la base de datos (sin aviso al cliente).
+        EstadoCuenta::CongeladoPreventivo => Err(AppError::OperacionNoDisponible),
+    }
+}
+
+/// Como [`exigir_debitable`], pero deja pasar el congelamiento preventivo: los
+/// caminos de salida que evalúan PLD deben llegar a `aml::evaluar`, que
+/// registra el intento (evaluación BLOQUEADA, `intentos_bloqueados + 1`,
+/// bitácora `OPERACION_BLOQUEADA`) antes de confirmar sin ledger.
+pub(crate) fn exigir_debitable_salvo_aml(cuenta: &CuentaIfpe) -> AppResult<()> {
+    match cuenta.estado {
+        EstadoCuenta::CongeladoPreventivo => Ok(()),
+        _ => exigir_debitable(cuenta),
     }
 }
 
@@ -178,11 +222,13 @@ pub(crate) fn exigir_saldo(cuenta: &CuentaIfpe, monto: Decimal) -> AppResult<()>
 }
 
 /// Entra efectivo: el saldo disponible de la cuenta y la reserva en custodia
-/// suben juntos y se registra el DEPOSITO. La cuenta y la reserva deben estar
-/// bloqueadas por el llamador (orden cuentas -> reserva).
+/// suben juntos y se registra el DEPOSITO con el `id` indicado (el que se
+/// evaluó en PLD, si aplica). La cuenta y la reserva deben estar bloqueadas
+/// por el llamador (orden cuentas -> reserva).
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn abonar_efectivo(
     tx: &mut Tx,
+    id: Uuid,
     cuenta_id: Uuid,
     reserva_id: Uuid,
     monto: Decimal,
@@ -204,7 +250,7 @@ pub(crate) async fn abonar_efectivo(
     insertar_tx_ifpe(
         tx,
         NuevaTxIfpe {
-            id: Uuid::new_v4(),
+            id,
             tipo: TipoTxIfpe::Deposito,
             origen: None,
             destino: Some(cuenta_id),
@@ -224,6 +270,7 @@ pub(crate) async fn abonar_efectivo(
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn cargar_efectivo(
     tx: &mut Tx,
+    id: Uuid,
     cuenta_id: Uuid,
     reserva_id: Uuid,
     monto: Decimal,
@@ -244,7 +291,7 @@ pub(crate) async fn cargar_efectivo(
     insertar_tx_ifpe(
         tx,
         NuevaTxIfpe {
-            id: Uuid::new_v4(),
+            id,
             tipo: TipoTxIfpe::Retiro,
             origen: Some(cuenta_id),
             destino: None,
@@ -288,21 +335,18 @@ pub struct Transferencia {
     pub clave_idempotencia: String,
 }
 
-pub async fn transferir(pool: &PgPool, umbrales: &UmbralesPld, t: &Transferencia) -> AppResult<Movimiento> {
+/// Los umbrales PLD viven en la base de datos (`aml.reglas_riesgo`); el
+/// parámetro de configuración se conserva para que los llamadores no cambien.
+pub async fn transferir(pool: &PgPool, _aml: &ConfigAml, t: &Transferencia) -> AppResult<Movimiento> {
     let monto = dinero::validar_monto(t.monto)?;
     validar_texto("concepto", t.concepto.as_deref(), 140)?;
     if !clabe::es_valida(&t.clabe_destino) {
         return Err(AppError::validacion("CLABE destino inválida"));
     }
-    db::con_reintentos(|| transferir_tx(pool, umbrales, t, monto)).await
+    db::con_reintentos(|| transferir_tx(pool, t, monto)).await
 }
 
-async fn transferir_tx(
-    pool: &PgPool,
-    umbrales: &UmbralesPld,
-    t: &Transferencia,
-    monto: Decimal,
-) -> AppResult<Movimiento> {
+async fn transferir_tx(pool: &PgPool, t: &Transferencia, monto: Decimal) -> AppResult<Movimiento> {
     let mut tx = db::begin(pool, Rol::Ifpe).await?;
     let origen_id = id_cuenta_ifpe_de_cliente(&mut tx, t.cliente_origen_id).await?;
     // Cualquier CLABE activa de la cuenta (la principal o una de STP).
@@ -351,9 +395,50 @@ async fn transferir_tx(
             "la cuenta destino no puede recibir esta transferencia",
         ));
     }
-    exigir_debitable(&origen)?;
+    exigir_debitable_salvo_aml(&origen)?;
+    // Acepta el congelamiento preventivo: una transferencia a un cliente
+    // congelado se acredita (y se retiene) sin que el ordenante lo note.
     exigir_acreditable(&destino)?;
     exigir_saldo(&origen, monto)?;
+
+    // PLD antes de escribir: primero la salida del ordenante (puede bloquear),
+    // luego la entrada del beneficiario (nunca bloquea; puede retener).
+    let mov_id = Uuid::new_v4();
+    let salida = aml::evaluar(
+        &mut tx,
+        &Operacion {
+            cliente_id: origen.cliente_id,
+            canal: Canal::TransferenciaEnviada,
+            monto,
+            transaccion_id: mov_id,
+            clave: &t.clave_idempotencia,
+            contraparte: Contraparte {
+                cuenta: Some(t.clabe_destino.clone()),
+                cliente_id: Some(destino.cliente_id),
+                ..Default::default()
+            },
+        },
+    )
+    .await?;
+    if salida.decision == Decision::Bloquear {
+        return aml::confirmar_bloqueo(tx, &salida).await;
+    }
+    let entrada = aml::evaluar(
+        &mut tx,
+        &Operacion {
+            cliente_id: destino.cliente_id,
+            canal: Canal::TransferenciaRecibida,
+            monto,
+            transaccion_id: mov_id,
+            clave: &t.clave_idempotencia,
+            contraparte: Contraparte {
+                cuenta: Some(origen.clabe.clone()),
+                cliente_id: Some(origen.cliente_id),
+                ..Default::default()
+            },
+        },
+    )
+    .await?;
 
     sqlx::query("UPDATE ifpe.cuentas SET saldo_disponible = saldo_disponible - $1 WHERE id = $2")
         .bind(monto)
@@ -368,7 +453,7 @@ async fn transferir_tx(
     let mov = insertar_tx_ifpe(
         &mut tx,
         NuevaTxIfpe {
-            id: Uuid::new_v4(),
+            id: mov_id,
             tipo: TipoTxIfpe::Transferencia,
             origen: Some(origen.id),
             destino: Some(destino.id),
@@ -381,15 +466,9 @@ async fn transferir_tx(
         },
     )
     .await?;
-    let evento = EventoPld {
-        entidad: Entidad::Ifpe,
-        cliente: &perfil,
-        transaccion_id: mov.id,
-        operacion: "TRANSFERENCIA",
-        monto,
-        cuenta_deposito: None,
-    };
-    pld::evaluar(&mut tx, &evento, umbrales).await?;
+    if entrada.decision == Decision::Retener {
+        aml::retener(&mut tx, &entrada).await?;
+    }
     tx.commit().await?;
     Ok(Movimiento { transaccion: mov, idempotente: false })
 }

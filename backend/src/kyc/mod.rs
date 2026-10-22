@@ -1,4 +1,5 @@
-//! Identidad: alta de clientes, expediente KYC biométrico y bandeja PLD.
+//! Identidad: alta de clientes y expediente KYC biométrico. La bandeja PLD
+//! vive en `crate::aml` (consola de cumplimiento).
 //!
 //! El alta crea, en una sola transacción, el cliente, sus credenciales y su
 //! cuenta en la bóveda IFPE. El rol `sc_kyc` solo puede insertar las columnas
@@ -35,7 +36,7 @@ use crate::{
     db::{self, Rol},
     dinero,
     error::{AppError, AppResult},
-    models::kyc::{AlertaPld, Cliente, TipoPersona},
+    models::kyc::{Cliente, TipoPersona},
     spei::{self, clabe},
 };
 
@@ -230,20 +231,6 @@ pub async fn perfil(pool: &PgPool, cliente_id: Uuid) -> AppResult<Cliente> {
         .ok_or_else(|| AppError::no_encontrado("cliente no encontrado"))?;
     tx.commit().await?;
     Ok(cliente)
-}
-
-pub async fn alertas_abiertas(pool: &PgPool, limite: i64) -> AppResult<Vec<AlertaPld>> {
-    let mut tx = db::begin_lectura(pool, Rol::Kyc).await?;
-    let alertas = sqlx::query_as(
-        "SELECT * FROM kyc.alertas_pld WHERE estado IN ('ABIERTA', 'EN_REVISION') \
-         ORDER BY CASE nivel_riesgo WHEN 'CRITICO' THEN 0 WHEN 'ALTO' THEN 1 WHEN 'MEDIO' THEN 2 ELSE 3 END, creado_en \
-         LIMIT $1",
-    )
-    .bind(limite.clamp(1, 500))
-    .fetch_all(&mut *tx)
-    .await?;
-    tx.commit().await?;
-    Ok(alertas)
 }
 
 /// Respuesta del envío de INE + selfie.

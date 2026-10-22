@@ -4,10 +4,13 @@
 //! - Liquidación de mutuos vencidos (regreso de principal + interés a la IFPE)
 //!   y marcado de créditos vencidos.
 //! - Despacho de órdenes SPEI salientes (registro y consulta con el proveedor).
+//! - Monitoreo PLD por lotes ([`aml::monitoreo`]): reglas de 7 y 30 días y de
+//!   redes entre clientes, reevaluación de marcas diferidas, plazos de
+//!   cumplimiento, sellado de la bitácora y entrega de notificaciones.
 
 use std::time::Duration;
 
-use crate::{reserva, sofom, spei, state::AppState};
+use crate::{aml, reserva, sofom, spei, state::AppState};
 
 pub fn lanzar(estado: AppState) {
     let (corte_seg, liquidacion_seg) = (estado.config.corte_intervalo_seg, estado.config.liquidacion_intervalo_seg);
@@ -43,6 +46,26 @@ pub fn lanzar(estado: AppState) {
                     Ok(_) => {}
                     Err(err) => {
                         tracing::error!(codigo = err.codigo(), error = %err.detalle(), "falló el despacho SPEI")
+                    }
+                }
+            }
+        });
+    }
+    let aml_seg = estado.config.pld.monitoreo_intervalo_seg;
+    if aml_seg > 0 {
+        let e = estado.clone();
+        tokio::spawn(async move {
+            let mut intervalo = tokio::time::interval(Duration::from_secs(aml_seg));
+            intervalo.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                intervalo.tick().await;
+                match aml::monitoreo::ciclo(&e.pool, &e.config.pld).await {
+                    Ok(c) if c.alertas_lote + c.alertas_redes > 0 || c.errores > 0 => {
+                        tracing::info!(target: "aml", ?c, "ciclo de monitoreo")
+                    }
+                    Ok(_) => {}
+                    Err(err) => {
+                        tracing::error!(target: "aml", codigo = err.codigo(), error = %err.detalle(), "falló el ciclo de monitoreo AML")
                     }
                 }
             }

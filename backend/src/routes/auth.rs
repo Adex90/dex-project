@@ -11,7 +11,7 @@ use crate::{
     error::AppResult,
     kyc::{self, CuentaAbierta, DatosRegistro},
     ledger,
-    models::{ifpe::CuentaIfpe, kyc::Cliente},
+    models::{ifpe::CuentaIfpe, kyc::ClienteVista},
     reserva::{self, EstadoReservaVista},
     routes::extraccion::Json,
     sofom::{self, Posicion},
@@ -26,10 +26,12 @@ pub fn rutas() -> Router<AppState> {
         .route("/tablero", get(tablero))
 }
 
+/// Las proyecciones del propio cliente usan [`ClienteVista`]: sin nivel de
+/// riesgo PLD ni marca PEP (sin aviso al cliente).
 #[derive(Serialize)]
 struct RespuestaRegistro {
     sesion: Sesion,
-    cliente: Cliente,
+    cliente: ClienteVista,
     cuenta_ifpe: CuentaAbierta,
 }
 
@@ -40,7 +42,7 @@ async fn registro(
     let r = kyc::registrar(&e.pool, &e.config.clabe_prefijo, datos).await?;
     let (token, expira_en) = e.jwt.emitir(r.cliente.id, crate::models::kyc::RolUsuario::Cliente)?;
     let sesion = Sesion { token, expira_en, cliente_id: r.cliente.id, rol: crate::models::kyc::RolUsuario::Cliente };
-    Ok((StatusCode::CREATED, Json(RespuestaRegistro { sesion, cliente: r.cliente, cuenta_ifpe: r.cuenta_ifpe })))
+    Ok((StatusCode::CREATED, Json(RespuestaRegistro { sesion, cliente: r.cliente.into(), cuenta_ifpe: r.cuenta_ifpe })))
 }
 
 #[derive(Deserialize)]
@@ -54,15 +56,15 @@ async fn login(State(e): State<AppState>, Json(c): Json<Credenciales>) -> AppRes
     Ok(Json(auth::iniciar_sesion(&e, &c.email, &c.password).await?))
 }
 
-async fn yo(State(e): State<AppState>, u: Usuario) -> AppResult<Json<Cliente>> {
-    Ok(Json(kyc::perfil(&e.pool, u.cliente_id).await?))
+async fn yo(State(e): State<AppState>, u: Usuario) -> AppResult<Json<ClienteVista>> {
+    Ok(Json(kyc::perfil(&e.pool, u.cliente_id).await?.into()))
 }
 
 /// Resumen para el dashboard. Cada sección se lee en su propia transacción
 /// con su propio rol: el aislamiento IFPE/SOFOM se mantiene incluso al leer.
 #[derive(Serialize)]
 struct Tablero {
-    cliente: Cliente,
+    cliente: ClienteVista,
     boveda: Option<CuentaIfpe>,
     inversion: Posicion,
     reserva: EstadoReservaVista,
@@ -76,5 +78,5 @@ async fn tablero(State(e): State<AppState>, u: Usuario) -> AppResult<Json<Tabler
         sofom::posicion_de_cliente(&e.pool, u.cliente_id),
         reserva::estado_actual(&e.pool),
     )?;
-    Ok(Json(Tablero { cliente, boveda, inversion, reserva }))
+    Ok(Json(Tablero { cliente: cliente.into(), boveda, inversion, reserva }))
 }

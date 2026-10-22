@@ -62,12 +62,13 @@ use super::{
     texto_spei, validar_monto_spei,
 };
 use crate::{
-    config::{ConfigSpei, UmbralesPld},
+    aml::{self, Canal, Contraparte, Decision, Operacion},
+    config::{ConfigAml, ConfigSpei},
     db::{self, Rol, Tx},
     error::{AppError, AppResult},
     ledger,
-    models::{ifpe::TransaccionIfpe, Entidad, EstadoCuenta},
-    pld::{self, EventoPld},
+    models::{ifpe::TransaccionIfpe, EstadoCuenta},
+    pld,
 };
 
 /// Registro de `ifpe.spei_outbound`.
@@ -260,19 +261,20 @@ async fn ordenante(tx: &mut Tx, cliente_id: Uuid) -> AppResult<Ordenante> {
     })
 }
 
+/// Los umbrales PLD viven en la base de datos (`aml.reglas_riesgo`); el
+/// parámetro de configuración se conserva para que los llamadores no cambien.
 pub async fn solicitar(
     pool: &PgPool,
-    umbrales: &UmbralesPld,
+    _aml: &ConfigAml,
     cfg: &ConfigSpei,
     s: &SolicitudSpei,
 ) -> AppResult<ResultadoOrden> {
     let v = validar(s)?;
-    db::con_reintentos(|| solicitar_tx(pool, umbrales, cfg, s, &v)).await
+    db::con_reintentos(|| solicitar_tx(pool, cfg, s, &v)).await
 }
 
 async fn solicitar_tx(
     pool: &PgPool,
-    umbrales: &UmbralesPld,
     cfg: &ConfigSpei,
     s: &SolicitudSpei,
     v: &SolicitudValida,
@@ -323,13 +325,39 @@ async fn solicitar_tx(
     }
     let perfil = pld::cargar_perfil(&mut tx, cuenta.cliente_id).await?;
     perfil.exigir_operable()?;
-    ledger::exigir_debitable(&cuenta)?;
+    ledger::exigir_debitable_salvo_aml(&cuenta)?;
     ledger::exigir_saldo(&cuenta, v.monto)?;
+
+    // PLD antes de cualquier escritura (y antes del candado de la reserva, del
+    // consecutivo de rastreo y de la orden): un BLOQUEAR confirma sin RETIRO
+    // ni orden.
+    let retiro_id = Uuid::new_v4();
+    let d = aml::evaluar(
+        &mut tx,
+        &Operacion {
+            cliente_id: cuenta.cliente_id,
+            canal: Canal::SpeiEnviado,
+            monto: v.monto,
+            transaccion_id: retiro_id,
+            clave: &s.clave_idempotencia,
+            contraparte: Contraparte {
+                nombre: Some(nombre.clone()),
+                cuenta: Some(v.clabe.as_str().into()),
+                rfc_curp: rfc.clone(),
+                cliente_id: None,
+            },
+        },
+    )
+    .await?;
+    if d.decision == Decision::Bloquear {
+        return aml::confirmar_bloqueo(tx, &d).await;
+    }
     let reserva = ledger::bloquear_reserva(&mut tx).await?;
 
     // Pasivo y reserva bajan juntos: el dinero queda comprometido en la orden.
     let t = ledger::cargar_efectivo(
         &mut tx,
+        retiro_id,
         cuenta.id,
         reserva.id,
         v.monto,
@@ -371,15 +399,6 @@ async fn solicitar_tx(
     .bind(t.id)
     .fetch_one(&mut *tx)
     .await?;
-    let evento = EventoPld {
-        entidad: Entidad::Ifpe,
-        cliente: &perfil,
-        transaccion_id: t.id,
-        operacion: "RETIRO",
-        monto: v.monto,
-        cuenta_deposito: None,
-    };
-    pld::evaluar(&mut tx, &evento, umbrales).await?;
     tx.commit().await?;
     tracing::info!(rastreo = %orden.clave_rastreo, monto = %orden.monto, banco = %orden.banco_receptor, "orden SPEI registrada");
     Ok(ResultadoOrden { orden, transaccion: t, idempotente: false })
@@ -780,6 +799,7 @@ async fn reembolsar(tx: &mut Tx, o: &SpeiOutbound, estado: &str, causa: i16, mot
     let concepto = format!("Devolución SPEI {}: {}", o.clave_rastreo, motivo);
     let t = ledger::abonar_efectivo(
         tx,
+        Uuid::new_v4(),
         o.cuenta_id,
         reserva_id,
         o.monto,
@@ -1112,7 +1132,11 @@ async fn con_limite<T>(
 /// resultado.
 pub async fn despachar(pool: &PgPool, pasarela: &dyn Pasarela, cfg: &ConfigSpei) -> AppResult<Despacho> {
     let mut tx = db::begin(pool, Rol::Spei).await?;
-    let reclamadas: Vec<SpeiOutbound> = sqlx::query_as(
+    // Las órdenes nunca intentadas de un cliente con congelamiento preventivo
+    // no se reclaman (`aml::evaluacion::FILTRO_DESPACHO`): el trigger que las
+    // retiene las omitiría sin avanzar `proximo_intento_en` y acapararían el
+    // LIMIT del lote.
+    let sql = format!(
         "UPDATE ifpe.spei_outbound \
             SET proximo_intento_en = now() + make_interval(secs => $2), \
                 intentos_envio = intentos_envio + CASE WHEN estado = 'PENDIENTE' THEN 1 ELSE 0 END \
@@ -1120,14 +1144,17 @@ pub async fn despachar(pool: &PgPool, pasarela: &dyn Pasarela, cfg: &ConfigSpei)
                         WHERE proximo_intento_en <= now() \
                           AND (estado IN ('PENDIENTE', 'ENVIADA') \
                                OR (estado = 'LIQUIDADA' AND liquidada_en > now() - make_interval(days => $3))) \
+                          {} \
                         ORDER BY proximo_intento_en LIMIT $1 FOR UPDATE SKIP LOCKED) \
          RETURNING *",
-    )
-    .bind(cfg.lote)
-    .bind(ARRENDAMIENTO_SEG)
-    .bind(cfg.ventana_devolucion_dias)
-    .fetch_all(&mut *tx)
-    .await?;
+        aml::evaluacion::FILTRO_DESPACHO
+    );
+    let reclamadas: Vec<SpeiOutbound> = sqlx::query_as(&sql)
+        .bind(cfg.lote)
+        .bind(ARRENDAMIENTO_SEG)
+        .bind(cfg.ventana_devolucion_dias)
+        .fetch_all(&mut *tx)
+        .await?;
     tx.commit().await?;
     // Las más antiguas primero (RETURNING no garantiza orden).
     let mut reclamadas = reclamadas;
