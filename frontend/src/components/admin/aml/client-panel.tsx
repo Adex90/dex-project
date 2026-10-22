@@ -1,6 +1,6 @@
 "use client";
 
-import { LockKeyhole, UserRound } from "lucide-react";
+import { FileSearch, LockKeyhole, UserRound } from "lucide-react";
 
 import { Facts, MxTime, Section } from "@/components/admin/aml/parts";
 import { Money, formatDate } from "@/components/ui/data";
@@ -32,11 +32,14 @@ export function ClientPanel({
   cliente,
   cuentas,
   onFreezeClient,
+  onOpenReview,
 }: {
   cliente: ClienteAml;
   cuentas: CuentasAml;
   /** Opens the manual-freeze dialog; absent when the client is already restricted or the viewer cannot act. */
   onFreezeClient?: () => void;
+  /** Opens the full client review (aggregates, orders, contracts, every alert and restriction). */
+  onOpenReview?: () => void;
 }) {
   const d = cliente.domicilio;
   const address = [d.municipio, d.estado ? (entidadName(d.estado) ?? d.estado) : null, d.codigo_postal].filter(Boolean).join(", ");
@@ -47,11 +50,21 @@ export function ClientPanel({
       title="Client"
       icon={<UserRound className="size-3.5" aria-hidden />}
       action={
-        onFreezeClient ? (
-          <Button variant="danger" size="sm" onClick={onFreezeClient}>
-            <LockKeyhole className="size-3.5" aria-hidden />
-            Freeze client
-          </Button>
+        onFreezeClient || onOpenReview ? (
+          <span className="flex flex-wrap items-center justify-end gap-2">
+            {onOpenReview ? (
+              <Button variant="ghost" size="sm" onClick={onOpenReview}>
+                <FileSearch className="size-3.5" aria-hidden />
+                Open client review
+              </Button>
+            ) : null}
+            {onFreezeClient ? (
+              <Button variant="danger" size="sm" onClick={onFreezeClient}>
+                <LockKeyhole className="size-3.5" aria-hidden />
+                Freeze client
+              </Button>
+            ) : null}
+          </span>
         ) : null
       }
     >

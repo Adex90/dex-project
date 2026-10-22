@@ -86,6 +86,61 @@ function DirectionIcon({ m }: { m: MovimientoAml }) {
   );
 }
 
+/** Ledger movements of a client (staff view): time, channel, direction, amount, counterparty key and the "Held" marker. */
+export function MovementsTable({ movimientos, caption }: { movimientos: MovimientoAml[]; caption: string }) {
+  return (
+    <div className="overflow-x-auto rounded-lg border border-border">
+      <table className="w-full min-w-[640px] text-left text-xs">
+        <caption className="sr-only">{caption}</caption>
+        <thead>
+          <tr className="border-b border-border bg-surface-2/60 text-[11px] text-muted">
+            <th scope="col" className="py-1.5 pr-3 pl-3 font-medium">Time</th>
+            <th scope="col" className="py-1.5 pr-3 font-medium">Channel</th>
+            <th scope="col" className="py-1.5 pr-3 font-medium">Direction</th>
+            <th scope="col" className="py-1.5 pr-3 text-right font-medium">Amount</th>
+            <th scope="col" className="py-1.5 pr-3 font-medium">Counterparty</th>
+            <th scope="col" className="py-1.5 pr-3 font-medium">
+              <span className="sr-only">Held</span>
+            </th>
+          </tr>
+        </thead>
+        <tbody>
+          {movimientos.map((m) => {
+            const counterparty = describeCounterpartyKey(m.contraparte);
+            return (
+              <tr key={`${m.entidad}:${m.transaccion_id}:${m.sentido}`} className="border-b border-border/60 last:border-b-0">
+                <td className="py-1.5 pr-3 pl-3 text-ink-2">
+                  <MxTime at={m.creado_en} />
+                </td>
+                <td className="py-1.5 pr-3">{CHANNEL_LABEL[m.canal]}</td>
+                <td className="py-1.5 pr-3">
+                  <span className="inline-flex items-center gap-1">
+                    <DirectionIcon m={m} />
+                    {DIRECTION_LABEL[m.sentido]}
+                  </span>
+                </td>
+                <td className={cx("py-1.5 pr-3 text-right font-semibold", m.sentido === "ENTRADA" && "text-verified")}>
+                  <Money value={m.monto} sign={m.sentido === "ENTRADA" ? "+" : "-"} />
+                </td>
+                <td className="max-w-[220px] truncate py-1.5 pr-3 font-mono text-[11px]" title={m.contraparte ?? undefined}>
+                  {counterparty ? (
+                    <>
+                      <span className="font-sans text-muted">{counterparty.label}</span> {counterparty.value}
+                    </>
+                  ) : (
+                    <span className="text-muted">—</span>
+                  )}
+                </td>
+                <td className="py-1.5 pr-3">{m.retenido ? <Badge tone="warning">Held</Badge> : null}</td>
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
 /** The operation that raised the alert and the client's movements in its pattern. */
 export function TransactionContext({ detalle }: { detalle: DetalleAlertaAml }) {
   const details = describeDetails(detalle.alerta.detalles);
@@ -99,54 +154,7 @@ export function TransactionContext({ detalle }: { detalle: DetalleAlertaAml }) {
         {movimientos.length === 0 ? (
           <p className="text-xs text-muted">No ledger movements are linked to this alert.</p>
         ) : (
-          <div className="overflow-x-auto rounded-lg border border-border">
-            <table className="w-full min-w-[640px] text-left text-xs">
-              <thead>
-                <tr className="border-b border-border bg-surface-2/60 text-[11px] text-muted">
-                  <th scope="col" className="py-1.5 pr-3 pl-3 font-medium">Time</th>
-                  <th scope="col" className="py-1.5 pr-3 font-medium">Channel</th>
-                  <th scope="col" className="py-1.5 pr-3 font-medium">Direction</th>
-                  <th scope="col" className="py-1.5 pr-3 text-right font-medium">Amount</th>
-                  <th scope="col" className="py-1.5 pr-3 font-medium">Counterparty</th>
-                  <th scope="col" className="py-1.5 pr-3 font-medium">
-                    <span className="sr-only">Held</span>
-                  </th>
-                </tr>
-              </thead>
-              <tbody>
-                {movimientos.map((m) => {
-                  const counterparty = describeCounterpartyKey(m.contraparte);
-                  return (
-                    <tr key={`${m.entidad}:${m.transaccion_id}:${m.sentido}`} className="border-b border-border/60 last:border-b-0">
-                      <td className="py-1.5 pr-3 pl-3 text-ink-2">
-                        <MxTime at={m.creado_en} />
-                      </td>
-                      <td className="py-1.5 pr-3">{CHANNEL_LABEL[m.canal]}</td>
-                      <td className="py-1.5 pr-3">
-                        <span className="inline-flex items-center gap-1">
-                          <DirectionIcon m={m} />
-                          {DIRECTION_LABEL[m.sentido]}
-                        </span>
-                      </td>
-                      <td className={cx("py-1.5 pr-3 text-right font-semibold", m.sentido === "ENTRADA" && "text-verified")}>
-                        <Money value={m.monto} sign={m.sentido === "ENTRADA" ? "+" : "-"} />
-                      </td>
-                      <td className="max-w-[220px] truncate py-1.5 pr-3 font-mono text-[11px]" title={m.contraparte ?? undefined}>
-                        {counterparty ? (
-                          <>
-                            <span className="font-sans text-muted">{counterparty.label}</span> {counterparty.value}
-                          </>
-                        ) : (
-                          <span className="text-muted">—</span>
-                        )}
-                      </td>
-                      <td className="py-1.5 pr-3">{m.retenido ? <Badge tone="warning">Held</Badge> : null}</td>
-                    </tr>
-                  );
-                })}
-              </tbody>
-            </table>
-          </div>
+          <MovementsTable movimientos={movimientos} caption="Ledger movements in the alert's pattern" />
         )}
       </div>
     </Section>

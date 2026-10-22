@@ -35,4 +35,10 @@ pub enum EstadoCuenta {
     Activa,
     Congelada,
     Cerrada,
+    /// Congelamiento preventivo PLD (solo `ifpe.cuentas`, espejo de un
+    /// congelamiento ACTIVO en `aml.congelamientos`). Se lee y escribe en la
+    /// base de datos como `CONGELADO_PREVENTIVO`, pero **toda** proyección JSON
+    /// lo muestra como `ACTIVA`: el cliente nunca debe enterarse (sin aviso).
+    #[serde(rename(serialize = "ACTIVA", deserialize = "CONGELADO_PREVENTIVO"))]
+    CongeladoPreventivo,
 }

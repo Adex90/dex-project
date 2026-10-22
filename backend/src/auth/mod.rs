@@ -37,7 +37,24 @@ impl Usuario {
     pub fn exigir_operador_o_auditor(&self) -> AppResult<()> {
         match self.rol {
             RolUsuario::Operador | RolUsuario::Auditor => Ok(()),
-            RolUsuario::Cliente => Err(AppError::Prohibido),
+            RolUsuario::Cliente | RolUsuario::Cumplimiento => Err(AppError::Prohibido),
+        }
+    }
+
+    /// Acciones de la consola PLD: solo el oficial de cumplimiento. La base de
+    /// datos lo repite (`aml.exigir_oficial`, `SC_AML_NO_AUTORIZADO`).
+    pub fn exigir_cumplimiento(&self) -> AppResult<()> {
+        match self.rol {
+            RolUsuario::Cumplimiento => Ok(()),
+            _ => Err(AppError::Prohibido),
+        }
+    }
+
+    /// Lectura de la consola PLD: oficial de cumplimiento o auditor.
+    pub fn exigir_cumplimiento_o_auditor(&self) -> AppResult<()> {
+        match self.rol {
+            RolUsuario::Cumplimiento | RolUsuario::Auditor => Ok(()),
+            RolUsuario::Cliente | RolUsuario::Operador => Err(AppError::Prohibido),
         }
     }
 
@@ -56,6 +73,7 @@ impl Usuario {
             RolUsuario::Cliente => "cli",
             RolUsuario::Operador => "op",
             RolUsuario::Auditor => "aud",
+            RolUsuario::Cumplimiento => "cum",
         };
         Ok(format!("{prefijo}:{}:{clave}", self.cliente_id))
     }

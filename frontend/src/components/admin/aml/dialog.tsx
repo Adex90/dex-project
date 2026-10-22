@@ -9,8 +9,29 @@ import { cx } from "@/components/ui/primitives";
 const FOCUSABLE =
   'a[href], button:not([disabled]), input:not([disabled]):not([type="hidden"]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])';
 
-/** Dialogs open at once (a confirmation on top of the case file): the page scroll stays locked until the last closes. */
-let openDialogs = 0;
+/**
+ * Open dialogs, innermost last (a confirmation on top of the case file). Esc
+ * closes only the topmost one, even when focus was lost (e.g. the button that
+ * opened a confirmation unmounted after the action); the page scroll stays
+ * locked until the last one closes.
+ */
+const stack: { panel: () => HTMLElement | null; close: () => void }[] = [];
+
+function onDocumentKeyDown(event: globalThis.KeyboardEvent) {
+  const top = stack[stack.length - 1];
+  if (!top || event.defaultPrevented) return;
+  if (event.key === "Escape") {
+    event.preventDefault();
+    top.close();
+    return;
+  }
+  // Tab with focus outside the topmost dialog (the panel's own handler traps it inside): bring it back.
+  const panel = top.panel();
+  if (event.key === "Tab" && panel && !(document.activeElement instanceof Node && panel.contains(document.activeElement))) {
+    event.preventDefault();
+    (panel.querySelector<HTMLElement>(FOCUSABLE) ?? panel).focus();
+  }
+}
 
 /**
  * Modal dialog (`variant="modal"`, centered) or side drawer (`variant="drawer"`):
@@ -60,24 +81,34 @@ export function Dialog({
     const panel = panelRef.current;
     const first = panel?.querySelector<HTMLElement>("[data-autofocus]") ?? panel?.querySelector<HTMLElement>(FOCUSABLE);
     (first ?? panel)?.focus();
-    openDialogs += 1;
-    document.body.style.overflow = "hidden";
+    const entry = {
+      panel: () => panelRef.current,
+      close: () => {
+        if (!busyRef.current) closeRef.current();
+      },
+    };
+    stack.push(entry);
+    if (stack.length === 1) {
+      document.addEventListener("keydown", onDocumentKeyDown);
+      document.body.style.overflow = "hidden";
+    }
     return () => {
-      openDialogs -= 1;
-      if (openDialogs === 0) document.body.style.overflow = "";
+      const index = stack.indexOf(entry);
+      if (index >= 0) stack.splice(index, 1);
+      if (stack.length === 0) {
+        document.removeEventListener("keydown", onDocumentKeyDown);
+        document.body.style.overflow = "";
+      }
+      // The opener may be gone (a form that closed after its action): fall back to the dialog underneath.
       if (opener?.isConnected) opener.focus();
+      else stack[stack.length - 1]?.panel()?.focus();
     };
   }, [open, mounted]);
 
   if (!open || !mounted) return null;
 
+  // Esc is handled at the document level (topmost dialog only); this traps Tab inside the panel.
   const onKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
-    if (event.key === "Escape") {
-      // Only the topmost dialog handles it: events from a nested dialog's portal bubble through this one.
-      event.stopPropagation();
-      if (!busyRef.current) closeRef.current();
-      return;
-    }
     if (event.key !== "Tab" || !panelRef.current) return;
     event.stopPropagation();
     const items = Array.from(panelRef.current.querySelectorAll<HTMLElement>(FOCUSABLE)).filter(

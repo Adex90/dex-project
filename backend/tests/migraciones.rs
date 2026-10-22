@@ -10,6 +10,7 @@ const M0005: &str = include_str!("../../migrations/0005_spei_integration.sql");
 const M0006: &str = include_str!("../../migrations/0006_kyc_biometricos.sql");
 const M0007: &str = include_str!("../../migrations/0007_kyc_endurecimiento.sql");
 const M0008: &str = include_str!("../../migrations/0008_spei_endurecimiento.sql");
+const M0009: &str = include_str!("../../migrations/0009_aml_pld.sql");
 
 /// Depósito como lo registraba el código anterior a 0004: clave
 /// `spei:<rastreo>` y la clave de rastreo tal cual en `referencia_externa`.
@@ -294,4 +295,141 @@ async fn migracion_0008_sobre_ordenes_spei_existentes(pool: PgPool) {
             .await
             .unwrap();
     assert_eq!(intacta, (None, None), "una orden reembolsada no se actualiza");
+}
+
+/// 0009 migra la bandeja PLD heredada: las alertas abiertas INUSUAL e
+/// INTERNA_PREOCUPANTE pasan a `aml.alertas` (origen LEGADO; una regla
+/// desconocida va a R00_LEGADO), las RELEVANTE con movimiento van al registro
+/// trimestral (con su folio si ya se reportaron) y las cerradas se quedan como
+/// historia. `kyc.alertas_pld` queda de solo lectura, nadie se congela
+/// retroactivamente (una cuenta CONGELADA no se toca) y el monitoreo por lotes
+/// empieza en las cabezas del ledger.
+#[sqlx::test(migrations = false)]
+async fn migracion_0009_sobre_alertas_heredadas(pool: PgPool) {
+    for m in [M0001, M0002, M0003] {
+        sqlx::raw_sql(m).execute(&pool).await.unwrap();
+    }
+    sqlx::raw_sql(
+        "INSERT INTO kyc.clientes (id, tipo_persona, nombre, apellido_paterno, email, estatus_kyc, kyc_verificado_en, nivel_riesgo_pld) \
+           VALUES ('a0000000-0000-0000-0000-00000000000a', 'FISICA', 'Ludwig', 'von Mises', 'ludwig@example.mx', 'VERIFICADO', now(), 'BAJO'); \
+         INSERT INTO ifpe.reserva_custodia (id, institucion, tipo, numero_cuenta) \
+           VALUES ('e0000000-0000-0000-0000-00000000000e', 'Banco de México', 'BANXICO', 'SC-RES-001'); \
+         INSERT INTO ifpe.cuentas (id, cliente_id, clabe) \
+           VALUES ('1a000000-0000-0000-0000-00000000001a', 'a0000000-0000-0000-0000-00000000000a', '646180157000000017');",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::raw_sql(M0004).execute(&pool).await.unwrap();
+    deposito_heredado_con(&pool, "spei:40012:20261001:RELEVANTE1", "40012:20261001:RELEVANTE1").await;
+    for m in [M0005, M0006, M0007, M0008] {
+        sqlx::raw_sql(m).execute(&pool).await.unwrap();
+    }
+    let deposito: uuid::Uuid = sqlx::query_scalar(
+        "SELECT id FROM ifpe.transacciones WHERE clave_idempotencia = 'spei:40012:20261001:RELEVANTE1'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    // Orden de autoridad sobre la cuenta y la bandeja como la dejaba el código anterior.
+    sqlx::query("UPDATE ifpe.cuentas SET estado = 'CONGELADA' WHERE id = '1a000000-0000-0000-0000-00000000001a'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO kyc.alertas_pld (cliente_id, entidad, tipo_operacion, regla, nivel_riesgo, puntaje, monto, descripcion, \
+                                      estado, analista, dictamen, transaccion_id, folio_uif, reportada_uif_en) VALUES \
+         ('a0000000-0000-0000-0000-00000000000a', 'IFPE', 'INUSUAL', 'R02_FRACCIONAMIENTO', 'ALTO', 50, 80000, \
+          'fraccionamiento', 'ABIERTA', NULL, NULL, NULL, NULL, NULL), \
+         ('a0000000-0000-0000-0000-00000000000a', 'IFPE', 'INTERNA_PREOCUPANTE', 'R04_FUERA_DE_PERFIL', 'MEDIO', 30, 90000, \
+          'fuera de perfil', 'EN_REVISION', 'analista.uno', NULL, NULL, NULL, NULL), \
+         ('a0000000-0000-0000-0000-00000000000a', 'IFPE', 'INUSUAL', 'R03_CLIENTE_RIESGO_ALTO', 'ALTO', 35, 60000, \
+          'riesgo alto', 'DESCARTADA', 'analista.dos', 'sin hallazgos', NULL, NULL, NULL), \
+         ('a0000000-0000-0000-0000-00000000000a', 'IFPE', 'RELEVANTE', 'R01_OPERACION_RELEVANTE', 'BAJO', 0, 100, \
+          'relevante', 'REPORTADA_UIF', NULL, 'reportada en el trimestre', $1, 'UIF-REL-0001', now()), \
+         ('a0000000-0000-0000-0000-00000000000a', 'IFPE', 'RELEVANTE', 'R01_OPERACION_RELEVANTE', 'BAJO', 0, 150000, \
+          'relevante sin movimiento', 'ABIERTA', NULL, NULL, NULL, NULL, NULL), \
+         ('a0000000-0000-0000-0000-00000000000a', 'IFPE', 'INUSUAL', 'R99_DESCONOCIDA', 'MEDIO', 40, 1000, \
+          'regla retirada', 'ABIERTA', NULL, NULL, NULL, NULL, NULL)",
+    )
+    .bind(deposito)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    sqlx::raw_sql(M0009).execute(&pool).await.expect("0009 debe aplicarse sobre la bandeja PLD heredada");
+
+    let alertas: Vec<(String, String, String, String, Option<String>, bool)> = sqlx::query_as(
+        "SELECT regla_codigo, estado::text, origen, tipo_reporte, legado_analista, alerta_pld_id IS NOT NULL \
+           FROM aml.alertas ORDER BY folio",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        alertas,
+        vec![
+            ("R02_FRACCIONAMIENTO".into(), "PENDIENTE".into(), "LEGADO".into(), "INUSUAL".into(), None, true),
+            (
+                "R04_FUERA_DE_PERFIL".into(),
+                "EN_REVISION".into(),
+                "LEGADO".into(),
+                "INTERNA_PREOCUPANTE".into(),
+                Some("analista.uno".into()),
+                true
+            ),
+            ("R00_LEGADO".into(), "PENDIENTE".into(), "LEGADO".into(), "INUSUAL".into(), None, true),
+        ]
+    );
+    let relevantes: Vec<(uuid::Uuid, Option<String>, bool)> = sqlx::query_as(
+        "SELECT transaccion_id, reporte_folio, reportada_en IS NOT NULL FROM aml.operaciones_relevantes",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(relevantes, vec![(deposito, Some("UIF-REL-0001".into()), true)]);
+    let datos: serde_json::Value = sqlx::query_scalar(
+        "SELECT datos FROM aml.bitacora WHERE evento = 'MIGRACION_0009' AND actor_tipo = 'MIGRACION'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(datos["alertas_copiadas"], 3, "{datos}");
+    assert_eq!(datos["relevantes"], 1, "{datos}");
+    assert_eq!(datos["relevantes_sin_transaccion"], 1, "{datos}");
+    assert_eq!(datos["historicas_cerradas"], 2, "{datos}");
+
+    // La bandeja heredada es de solo lectura, incluso para el dueño del esquema.
+    let e = sqlx::query(
+        "INSERT INTO kyc.alertas_pld (cliente_id, entidad, tipo_operacion, regla, nivel_riesgo, descripcion) \
+         VALUES ('a0000000-0000-0000-0000-00000000000a', 'IFPE', 'INUSUAL', 'R02_FRACCIONAMIENTO', 'ALTO', 'nueva')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap_err();
+    assert!(e.to_string().contains("SC_PLD_LEGADO_INMUTABLE"), "{e}");
+
+    // Nada retroactivo: la cuenta CONGELADA sigue igual, sin congelamientos PLD,
+    // y las marcas del monitoreo están en las cabezas del ledger.
+    let estado: String =
+        sqlx::query_scalar("SELECT estado FROM ifpe.cuentas WHERE id = '1a000000-0000-0000-0000-00000000001a'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(estado, "CONGELADA");
+    let congelamientos: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM aml.congelamientos").fetch_one(&pool).await.unwrap();
+    assert_eq!(congelamientos, 0);
+    let marcas: (bool, bool) = sqlx::query_as(
+        "SELECT m.ultima_secuencia_ifpe = (SELECT ultima_secuencia FROM ifpe.ledger_cabeza), \
+                m.ultima_secuencia_sofom = (SELECT ultima_secuencia FROM sofom.ledger_cabeza) \
+           FROM aml.monitoreo_estado m",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(marcas, (true, true));
+    let ultima: i64 =
+        sqlx::query_scalar("SELECT ultima_secuencia_ifpe FROM aml.monitoreo_estado").fetch_one(&pool).await.unwrap();
+    assert!(ultima > 0, "el ledger heredado tiene movimientos");
 }

@@ -42,6 +42,10 @@ pub enum AppError {
     Conflicto { codigo: String, mensaje: String },
     #[error("{0}")]
     Bloqueado(String),
+    /// Operación rechazada por PLD (congelamiento preventivo, puntaje crítico o guardia de la base
+    /// de datos). Mensaje constante: nunca incluye el texto del trigger ni el motivo.
+    #[error("la operación no está disponible en este momento; si necesitas ayuda, contacta a soporte")]
+    OperacionNoDisponible,
     /// Error de protocolo: ruta o método inexistente, tipo de contenido,
     /// cuerpo demasiado grande o demasiado lento.
     #[error("{mensaje}")]
@@ -97,6 +101,7 @@ impl AppError {
             Self::Validacion(_) => "VALIDACION",
             Self::Negocio { codigo, .. } | Self::Conflicto { codigo, .. } => codigo,
             Self::Bloqueado(_) => "BLOQUEADO",
+            Self::OperacionNoDisponible => "OPERACION_NO_DISPONIBLE",
             Self::Peticion { codigo, .. } => codigo,
             Self::Reintentable => "REINTENTAR",
             Self::Integridad(_) => "INTEGRIDAD",
@@ -110,7 +115,7 @@ impl AppError {
             Self::Prohibido => StatusCode::FORBIDDEN,
             Self::NoEncontrado(_) => StatusCode::NOT_FOUND,
             Self::Validacion(_) => StatusCode::BAD_REQUEST,
-            Self::Negocio { .. } => StatusCode::UNPROCESSABLE_ENTITY,
+            Self::Negocio { .. } | Self::OperacionNoDisponible => StatusCode::UNPROCESSABLE_ENTITY,
             Self::Conflicto { .. } => StatusCode::CONFLICT,
             Self::Bloqueado(_) => StatusCode::LOCKED,
             Self::Peticion { status, .. } => *status,
@@ -156,7 +161,34 @@ fn es_invariante(codigo: &str) -> bool {
             | "SPEI_TRANSICION"
             | "RETORNO_SIN_CONTRATO"
             | "MUTUO_TITULAR"
+            | "AML_ESPEJO"
+            | "AML_AISLAMIENTO"
+            | "AML_PARAMETRO_INVALIDO"
+            | "AML_CLAVE_RESERVADA"
+            | "AML_EVALUACION_INCOHERENTE"
+            | "AML_EVALUACION_HUERFANA"
+            | "AML_RETENCION_FALTANTE"
+            | "AML_REGLA_SIN_APROBACION"
+            | "AML_LEVANTAMIENTO_SIN_APROBACION"
+            | "AML_LIBERACION_SIN_APROBACION"
     ) || codigo.ends_with("_INMUTABLE")
+}
+
+/// Reglas de la consola PLD que describen un conflicto con el estado actual
+/// (otra persona actuó primero, la solicitud ya se decidió...): 409.
+fn es_conflicto_aml(codigo: &str) -> bool {
+    matches!(
+        codigo,
+        "CLAVE_IDEMPOTENCIA_REUTILIZADA"
+            | "AML_ALERTA_CERRADA"
+            | "AML_ASIGNADA_A_OTRO"
+            | "AML_SOLICITUD_PENDIENTE"
+            | "AML_SOLICITUD_NO_PENDIENTE"
+            | "AML_ALERTAS_ABIERTAS"
+            | "AML_CONGELAMIENTO_NO_ACTIVO"
+            | "AML_SIN_RETENCIONES"
+            | "AML_PROPUESTA_NO_PENDIENTE"
+    )
 }
 
 /// Traduce un error de PostgreSQL a un error de dominio. `None` = error interno.
@@ -166,8 +198,18 @@ fn traducir_error_bd(codigo_sql: &str, mensaje: &str, restriccion: &str) -> Opti
         let (codigo, detalle) = resto.split_once(':').unwrap_or((resto, ""));
         let detalle = detalle.trim();
         let detalle = if detalle.is_empty() { mensaje } else { detalle };
+        if codigo == "OPERACION_NO_DISPONIBLE" {
+            tracing::warn!(target: "aml", "débito rechazado por la guardia PLD de la base de datos");
+            return Some(AppError::OperacionNoDisponible); // ignora `detalle` a propósito (sin aviso)
+        }
         if es_invariante(codigo) {
             return Some(AppError::Integridad(format!("SC_{codigo}: {detalle}")));
+        }
+        match codigo {
+            "AML_NO_AUTORIZADO" => return Some(AppError::Prohibido),
+            "AML_NO_ENCONTRADO" => return Some(AppError::no_encontrado(detalle)),
+            c if es_conflicto_aml(c) => return Some(AppError::conflicto(c, detalle)),
+            _ => {}
         }
         // El backend valida antes de escribir: que la base de datos tenga que
         // rechazar la operación merece quedar registrado.
@@ -357,5 +399,36 @@ mod pruebas {
         );
         assert_eq!(traducir_error_bd("23505", "dup", "ux_perfiles_curp").unwrap().codigo(), "IDENTIDAD_EN_USO");
         assert!(matches!(traducir_error_bd("40P01", "deadlock", ""), Some(AppError::Reintentable)));
+    }
+
+    #[test]
+    fn traduce_codigos_aml() {
+        let e = traducir_error_bd("23514", "SC_OPERACION_NO_DISPONIBLE: alerta PLD por estructuración", "").unwrap();
+        assert_eq!(e.codigo(), "OPERACION_NO_DISPONIBLE");
+        assert_eq!(e.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(
+            e.to_string(),
+            "la operación no está disponible en este momento; si necesitas ayuda, contacta a soporte"
+        );
+        assert!(!e.to_string().contains("PLD") && !e.to_string().contains("alerta"));
+
+        let e = traducir_error_bd("P0001", "SC_AML_NO_AUTORIZADO: se requiere un oficial", "").unwrap();
+        assert_eq!(e.status(), StatusCode::FORBIDDEN);
+        let e = traducir_error_bd("P0001", "SC_AML_NO_ENCONTRADO: la alerta no existe", "").unwrap();
+        assert_eq!(e.status(), StatusCode::NOT_FOUND);
+        let e = traducir_error_bd("P0001", "SC_AML_ASIGNADA_A_OTRO: la alerta la revisa otro oficial", "").unwrap();
+        assert_eq!((e.status(), e.codigo()), (StatusCode::CONFLICT, "AML_ASIGNADA_A_OTRO"));
+        let e = traducir_error_bd("P0001", "SC_CLAVE_IDEMPOTENCIA_REUTILIZADA: otra acción", "").unwrap();
+        assert_eq!((e.status(), e.codigo()), (StatusCode::CONFLICT, "CLAVE_IDEMPOTENCIA_REUTILIZADA"));
+        let e = traducir_error_bd("P0001", "SC_AML_CUATRO_OJOS: otro oficial debe aprobar", "").unwrap();
+        assert_eq!((e.status(), e.codigo()), (StatusCode::UNPROCESSABLE_ENTITY, "AML_CUATRO_OJOS"));
+        for mensaje in ["SC_AML_ESPEJO: descuadre", "SC_PLD_LEGADO_INMUTABLE: histórico", "SC_AML_AISLAMIENTO: x"] {
+            let e = traducir_error_bd("P0001", mensaje, "").unwrap();
+            assert_eq!(e.codigo(), "INTEGRIDAD", "{mensaje}");
+        }
+        let e = traducir_error_bd("P0001", "SC_RETENCION_PROTEGIDA: la retención no puede liberarse", "").unwrap();
+        assert_eq!((e.status(), e.codigo()), (StatusCode::UNPROCESSABLE_ENTITY, "RETENCION_PROTEGIDA"));
+        let e = traducir_error_bd("23514", "SC_CUENTA_CONGELADA: la cuenta IFPE está congelada", "").unwrap();
+        assert_eq!(e.codigo(), "CUENTA_CONGELADA");
     }
 }

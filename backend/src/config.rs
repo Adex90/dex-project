@@ -23,7 +23,7 @@ pub struct Config {
     pub migrar_al_inicio: bool,
     /// Prefijo de las CLABEs propias: banco (3) + plaza (3) [+ hasta 4 dígitos].
     pub clabe_prefijo: String,
-    pub pld: UmbralesPld,
+    pub pld: ConfigAml,
     /// Periodicidad de cortes automáticos de Proof of Reserve (0 = desactivado).
     pub corte_intervalo_seg: u64,
     /// Antigüedad mínima del último corte para que la petición de prueba de
@@ -152,23 +152,26 @@ impl Default for LimitesHttp {
     }
 }
 
-/// Umbrales del monitoreo transaccional PLD/FT (MXN).
+/// Monitoreo PLD/FT. Los umbrales y reglas viven en la base de datos (aml.reglas_riesgo,
+/// aml.parametros) y solo cambian con aprobación de cuatro ojos; aquí solo hay operación.
 #[derive(Debug, Clone)]
-pub struct UmbralesPld {
-    /// Operación relevante (y base para detectar fraccionamiento en 24 h).
-    pub relevante: Decimal,
-    /// Operación inusual para clientes de riesgo ALTO.
-    pub riesgo_alto: Decimal,
-    /// Múltiplo del ingreso mensual declarado que dispara alerta de perfil.
-    pub multiplo_perfil: Decimal,
+pub struct ConfigAml {
+    /// Periodicidad del ciclo de monitoreo por lotes (0 = desactivado).
+    pub monitoreo_intervalo_seg: u64,
+    /// Movimientos del ledger (IFPE + SOFOM) que revisa cada ciclo.
+    pub monitoreo_lote: i64,
+    /// Solo MODO_DEMO: oficiales de cumplimiento creados al arrancar.
+    pub bootstrap_emails: Vec<String>,
+    pub bootstrap_password: Option<String>,
 }
 
-impl Default for UmbralesPld {
+impl Default for ConfigAml {
     fn default() -> Self {
         Self {
-            relevante: Decimal::new(150_000, 0),
-            riesgo_alto: Decimal::new(50_000, 0),
-            multiplo_perfil: Decimal::new(3, 0),
+            monitoreo_intervalo_seg: 300,
+            monitoreo_lote: 5_000,
+            bootstrap_emails: Vec::new(),
+            bootstrap_password: None,
         }
     }
 }
@@ -217,7 +220,13 @@ impl Config {
         validar_secreto_jwt(&jwt_secret)?;
         let clabe_prefijo = var("CLABE_PREFIJO").unwrap_or_else(|| "999180".into());
         crate::spei::clabe::validar_prefijo(&clabe_prefijo).map_err(|e| anyhow::anyhow!("CLABE_PREFIJO: {e}"))?;
-        let defecto = UmbralesPld::default();
+        for nombre in ["PLD_UMBRAL_RELEVANTE", "PLD_UMBRAL_RIESGO_ALTO", "PLD_MULTIPLO_PERFIL"] {
+            if var(nombre).is_some() {
+                tracing::warn!(
+                    "{nombre} ya no se usa: los umbrales PLD viven en aml.reglas_riesgo y cambian con aprobación de cuatro ojos"
+                );
+            }
+        }
         Ok(Self {
             database_url: var("DATABASE_URL").context("DATABASE_URL es obligatoria")?,
             database_url_propietario: var("DATABASE_URL_PROPIETARIO"),
@@ -229,10 +238,13 @@ impl Config {
             modo_demo,
             migrar_al_inicio: var_o("MIGRAR_AL_INICIO", true)?,
             clabe_prefijo,
-            pld: UmbralesPld {
-                relevante: var_o("PLD_UMBRAL_RELEVANTE", defecto.relevante)?,
-                riesgo_alto: var_o("PLD_UMBRAL_RIESGO_ALTO", defecto.riesgo_alto)?,
-                multiplo_perfil: var_o("PLD_MULTIPLO_PERFIL", defecto.multiplo_perfil)?,
+            pld: ConfigAml {
+                monitoreo_intervalo_seg: var_o("AML_MONITOREO_INTERVALO_SEG", 300)?,
+                monitoreo_lote: var_o("AML_MONITOREO_LOTE", 5_000_i64)?.clamp(100, 100_000),
+                bootstrap_emails: var("BOOTSTRAP_CUMPLIMIENTO_EMAILS")
+                    .map(|v| v.split(',').map(str::trim).filter(|e| !e.is_empty()).map(String::from).collect())
+                    .unwrap_or_default(),
+                bootstrap_password: var("BOOTSTRAP_CUMPLIMIENTO_PASSWORD"),
             },
             corte_intervalo_seg: var_o("CORTE_INTERVALO_SEG", 300)?,
             corte_min_intervalo_seg: var_o("CORTE_MIN_INTERVALO_SEG", 60)?,
@@ -335,7 +347,7 @@ impl Config {
             modo_demo: true,
             migrar_al_inicio: false,
             clabe_prefijo: "999180".into(),
-            pld: UmbralesPld::default(),
+            pld: ConfigAml { monitoreo_intervalo_seg: 0, ..ConfigAml::default() },
             corte_intervalo_seg: 0,
             corte_min_intervalo_seg: 0,
             liquidacion_intervalo_seg: 0,

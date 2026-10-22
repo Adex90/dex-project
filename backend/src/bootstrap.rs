@@ -2,18 +2,29 @@
 //!
 //! Se ejecutan con el usuario dueño del esquema (sin `SET ROLE`) porque crean
 //! infraestructura que ningún rol transaccional puede crear: cuentas de
-//! reserva en custodia, caja de la SOFOM y el operador inicial. Ninguna mueve
-//! saldos: las cuentas nacen en cero.
+//! reserva en custodia, caja de la SOFOM, el operador inicial y (solo en
+//! MODO_DEMO) los oficiales de cumplimiento. Ninguna mueve saldos: las cuentas
+//! nacen en cero.
 
 use sqlx::PgPool;
 
-use crate::{auth::password, config::Config, db, error::AppResult};
+use crate::{auth::password, config::Config, db, error::AppResult, models::kyc::RolUsuario};
 
 pub async fn ejecutar(pool: &PgPool, cfg: &Config) -> AppResult<()> {
     verificar_codificacion(pool).await?;
     asegurar_infraestructura(pool, cfg).await?;
     if let (Some(email), Some(pw)) = (&cfg.operador_email, &cfg.operador_password) {
         asegurar_operador(pool, email, pw).await?;
+    }
+    if cfg.modo_demo {
+        if let Some(pw) = &cfg.pld.bootstrap_password {
+            for email in &cfg.pld.bootstrap_emails {
+                asegurar_usuario_interno(pool, email, pw, RolUsuario::Cumplimiento).await?;
+            }
+        }
+    } else if !cfg.pld.bootstrap_emails.is_empty() || cfg.pld.bootstrap_password.is_some() {
+        // En producción el DBA da de alta a los oficiales como dueño del esquema.
+        tracing::warn!("BOOTSTRAP_CUMPLIMIENTO_* solo se usa con MODO_DEMO; se ignora");
     }
     Ok(())
 }
@@ -71,6 +82,13 @@ pub async fn asegurar_infraestructura(pool: &PgPool, cfg: &Config) -> AppResult<
 /// Crea (o deja intacto) un operador. Solo el dueño del esquema puede asignar
 /// `rol = 'OPERADOR'`: `sc_kyc` no tiene privilegio sobre esa columna.
 pub async fn asegurar_operador(pool: &PgPool, email: &str, pw: &str) -> AppResult<()> {
+    asegurar_usuario_interno(pool, email, pw, RolUsuario::Operador).await
+}
+
+/// Crea (o deja intacta) una persona interna con el rol indicado (operador,
+/// auditor u oficial de cumplimiento). Mismas reglas que [`asegurar_operador`]:
+/// solo el dueño del esquema fija `kyc.credenciales.rol`.
+pub async fn asegurar_usuario_interno(pool: &PgPool, email: &str, pw: &str, rol: RolUsuario) -> AppResult<()> {
     password::validar_politica(pw)?;
     let email = email.trim().to_lowercase();
     let existe: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM kyc.clientes WHERE lower(email) = $1)")
@@ -80,21 +98,31 @@ pub async fn asegurar_operador(pool: &PgPool, email: &str, pw: &str) -> AppResul
     if existe {
         return Ok(());
     }
+    let nombre = match rol {
+        RolUsuario::Operador => "Operador",
+        RolUsuario::Auditor => "Auditoría",
+        RolUsuario::Cumplimiento => "Cumplimiento",
+        RolUsuario::Cliente => {
+            return Err(anyhow::anyhow!("asegurar_usuario_interno no da de alta clientes").into());
+        }
+    };
     let hash = password::hashear(pw.to_owned()).await?;
     let mut tx = db::begin_administrativa(pool).await?;
     let id: uuid::Uuid = sqlx::query_scalar(
         "INSERT INTO kyc.clientes (tipo_persona, nombre, apellido_paterno, email, estatus_kyc, kyc_verificado_en, nivel_riesgo_pld) \
-         VALUES ('FISICA', 'Operador', 'Synthetic Capital', $1, 'VERIFICADO', now(), 'BAJO') RETURNING id",
+         VALUES ('FISICA', $2, 'Synthetic Capital', $1, 'VERIFICADO', now(), 'BAJO') RETURNING id",
     )
     .bind(&email)
+    .bind(nombre)
     .fetch_one(&mut *tx)
     .await?;
-    sqlx::query("INSERT INTO kyc.credenciales (cliente_id, password_hash, rol) VALUES ($1, $2, 'OPERADOR')")
+    sqlx::query("INSERT INTO kyc.credenciales (cliente_id, password_hash, rol) VALUES ($1, $2, $3)")
         .bind(id)
         .bind(&hash)
+        .bind(rol)
         .execute(&mut *tx)
         .await?;
     tx.commit().await?;
-    tracing::info!(%email, "operador inicial creado");
+    tracing::info!(%email, ?rol, "usuario interno creado");
     Ok(())
 }
