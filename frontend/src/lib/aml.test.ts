@@ -32,6 +32,9 @@ import {
   filtersToQuery,
   formatScore,
   isComplianceRole,
+  isRuleCode,
+  isStaleStateError,
+  isUuid,
   levelFromScore,
   levelTone,
   matchesFilters,
@@ -39,6 +42,7 @@ import {
   mergeFeed,
   nextPollCursor,
   nextPollDelay,
+  retriesFeedLoad,
   slaRemaining,
   sortAlerts,
   strongestEvaluation,
@@ -155,7 +159,7 @@ test("mergeFeed keeps the newest copy of each alert and reports what changed", (
 
   const aNewer = { ...a, estado: "EN_REVISION" as const, actualizado_en: "2026-10-21T15:00:00.100001+00:00" };
   const bOlder = { ...b, estado: "CONFIRMADO" as const, actualizado_en: "2026-10-21T14:59:59+00:00" };
-  const bSame = { ...b, nivel_riesgo: "CRITICO" as const };
+  const bSame = { ...b };
   const c = alert();
   const cAgain = { ...c, ocurrencias: 2, actualizado_en: "2026-10-21T15:01:00+00:00" };
 
@@ -170,6 +174,25 @@ test("mergeFeed keeps the newest copy of each alert and reports what changed", (
   assert.equal(prev[0], a);
   assert.deepEqual(mergeFeed([], []), { alertas: [], nuevas: [], actualizadas: [] });
   assert.equal(compareInstants("2026-10-21T15:00:00.1+00:00", "2026-10-21T15:00:00.099999+00:00"), 1);
+});
+
+test("mergeFeed refreshes a re-delivered row whose embedded restriction changed under the same actualizado_en (e2e#1)", () => {
+  // A row on screen still shows the restriction ACTIVO; the poll overlap
+  // re-delivers it with the restriction LEVANTADO and the same marker.
+  const restricted = alert({
+    congelamiento: { id: "f0000000-0000-4000-8000-000000000001", folio: 3, estado: "ACTIVO", confirmado: false, sla_vence_en: "2026-10-24T15:00:00+00:00" },
+  });
+  const lifted = { ...restricted, congelamiento: { ...restricted.congelamiento!, estado: "LEVANTADO" as const } };
+  const merged = mergeFeed([restricted], [lifted]);
+  assert.equal(merged.alertas[0]!.congelamiento!.estado, "LEVANTADO", "the fresher copy replaces the stale one");
+  assert.deepEqual(merged.actualizadas, [restricted.id]);
+  // The same copy again changes nothing and is not reported (no highlight on every poll).
+  const again = mergeFeed(merged.alertas, [{ ...lifted }]);
+  assert.equal(again.alertas[0], merged.alertas[0]);
+  assert.deepEqual(again.actualizadas, []);
+  // An older copy never overwrites a newer one, whatever it carries.
+  const older = { ...restricted, actualizado_en: "2026-10-21T14:00:00+00:00" };
+  assert.equal(mergeFeed(merged.alertas, [older]).alertas[0]!.congelamiento!.estado, "LEVANTADO");
 });
 
 test("matchesFilters by state, level, rule and assignee", () => {
@@ -224,6 +247,36 @@ test("filtersToQuery and filtersFromSearch round-trip through the URL", () => {
     asignada: null,
   });
   assert.deepEqual(filtersFromSearch(new URLSearchParams("estado=BOGUS")).estados, ["PENDIENTE", "EN_REVISION"]);
+});
+
+test("deep links: a rule code or alert id the API would reject is dropped, not sent (e2e#5)", () => {
+  // routes/aml.rs accepts ?regla= of 1-40 characters [A-Za-z0-9_] and 400s anything else.
+  assert.equal(filtersFromSearch(new URLSearchParams("regla=R05-ESTRUCTURACION")).regla, null);
+  assert.equal(filtersFromSearch(new URLSearchParams(`regla=${"R".repeat(41)}`)).regla, null);
+  assert.equal(filtersFromSearch(new URLSearchParams(`regla=${"R".repeat(40)}`)).regla, "R".repeat(40));
+  assert.equal(filtersFromSearch(new URLSearchParams("regla=R05_ESTRUCTURACION")).regla, "R05_ESTRUCTURACION");
+  assert.equal(filtersToQuery({ ...defaultFilters(), regla: "R05 ESTRUCTURACION" }).regla, undefined);
+  assert.equal(isRuleCode("R30_CONGELAMIENTO_MANUAL"), true);
+  assert.equal(isRuleCode(""), false);
+  assert.equal(isRuleCode("R05;DROP"), false);
+  // Only a UUID is looked up as ?alerta=; anything else is "Alert not found" without a request.
+  assert.equal(isUuid("a0000000-0000-4000-8000-000000000001"), true);
+  assert.equal(isUuid("A0000000-0000-4000-8000-00000000000F"), true);
+  assert.equal(isUuid("not-a-uuid"), false);
+  assert.equal(isUuid("a0000000-0000-4000-8000-000000000001x"), false);
+  // A page load the API rejected as invalid is not retried on every cycle.
+  assert.deepEqual([400, 403, 404, 422].map(retriesFeedLoad), [false, false, false, false]);
+  assert.deepEqual([0, 408, 429, 500, 503].map(retriesFeedLoad), [true, true, true, true, true]);
+});
+
+test("isStaleStateError: a 409 or an invalid transition means the record changed; a reused key does not (e2e#2)", () => {
+  for (const code of ["AML_ASIGNADA_A_OTRO", "AML_ALERTA_CERRADA", "AML_SOLICITUD_NO_PENDIENTE", "AML_CONGELAMIENTO_NO_ACTIVO"]) {
+    assert.equal(isStaleStateError(409, code), true, code);
+  }
+  assert.equal(isStaleStateError(422, "AML_TRANSICION_INVALIDA"), true);
+  assert.equal(isStaleStateError(409, "CLAVE_IDEMPOTENCIA_REUTILIZADA"), false);
+  assert.equal(isStaleStateError(422, "AML_DICTAMEN_INVALIDO"), false);
+  assert.equal(isStaleStateError(500, "INTEGRIDAD"), false);
 });
 
 test("nextPollCursor overlaps the previous poll by 60 s; nextPollDelay backs off to 60 s", () => {

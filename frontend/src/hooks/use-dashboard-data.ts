@@ -5,6 +5,7 @@ import { useRouter } from "next/navigation";
 
 import { ApiError } from "@/lib/api/client";
 import { POLL_INTERVAL_MS } from "@/lib/config";
+import { EXPIRED_LOGIN_PATH } from "@/lib/session";
 import { useAuthStore } from "@/store/auth";
 import { useDashboardStore } from "@/store/dashboard";
 
@@ -24,8 +25,8 @@ export function useDashboardData(token: string | null) {
       await refreshStore(token);
     } catch (error) {
       if (error instanceof ApiError && error.isUnauthorized) {
-        useAuthStore.getState().logout();
-        router.replace("/auth/login?expired=1");
+        useAuthStore.getState().expire();
+        router.replace(EXPIRED_LOGIN_PATH);
       }
     }
   }, [token, refreshStore, router]);

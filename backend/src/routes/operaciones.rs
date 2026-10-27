@@ -18,7 +18,7 @@ use crate::{
     kyc::{self, DictamenKyc},
     ledger::{self, Movimiento},
     models::{
-        kyc::Cliente,
+        kyc::ClienteVista,
         sofom::{Credito, TransaccionSofom},
     },
     routes::extraccion::{Json, Path, Query},
@@ -206,7 +206,7 @@ async fn dictamen_kyc(
     u: Usuario,
     Path(cliente_id): Path<Uuid>,
     Json(d): Json<DictamenKyc>,
-) -> AppResult<Json<Cliente>> {
+) -> AppResult<Json<ClienteVista>> {
     u.exigir_operador()?;
     Ok(Json(kyc::dictaminar(&e.pool, u.cliente_id, cliente_id, &d).await?))
 }

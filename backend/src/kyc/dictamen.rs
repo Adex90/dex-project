@@ -5,6 +5,14 @@
 //! del cliente y, para verificar, exige un resultado biométrico con prueba de
 //! vida, documento válido, identidad coincidente y score >= umbral de revisión.
 //! Un operador no puede verificar a quien el proveedor no pudo identificar.
+//!
+//! El operador no tiene acceso a PLD: la respuesta es la proyección
+//! [`ClienteVista`] (sin nivel de riesgo, fecha de evaluación ni PEP), así que
+//! un dictamen no revela si cumplimiento confirmó una operación sospechosa. El
+//! nivel de riesgo que fija el operador solo baja si el cliente no está bajo
+//! revisión de PLD; si lo está, la base de datos conserva el nivel sin error
+//! (un error delataría el caso) y deja el intento en `aml.bitacora`
+//! (`trg_clientes_zz_aml_riesgo`, migración 0009).
 
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
@@ -16,7 +24,7 @@ use super::expediente::{self, EstadoKyc, Expediente};
 use crate::{
     db::{self, Rol},
     error::{AppError, AppResult},
-    models::kyc::{Cliente, NivelRiesgo},
+    models::kyc::{Cliente, ClienteVista, NivelRiesgo},
 };
 
 #[derive(Debug, Clone, Deserialize)]
@@ -33,13 +41,19 @@ pub struct DictamenKyc {
     /// dictamen no se aplica a un envío que nadie revisó.
     #[serde(default)]
     pub verificacion_id: Option<Uuid>,
+    /// Nivel de riesgo PLD (asignación del onboarding). No baja mientras el
+    /// cliente está bajo revisión de PLD (ver el encabezado del módulo).
     #[serde(default)]
     pub nivel_riesgo_pld: Option<NivelRiesgo>,
     #[serde(default)]
     pub nivel_cuenta: Option<i16>,
 }
 
-pub async fn dictaminar(pool: &PgPool, operador_id: Uuid, cliente_id: Uuid, d: &DictamenKyc) -> AppResult<Cliente> {
+pub async fn dictaminar(pool: &PgPool, operador_id: Uuid, cliente_id: Uuid, d: &DictamenKyc) -> AppResult<ClienteVista> {
+    if d.estatus_kyc.is_none() && d.nivel_riesgo_pld.is_none() && d.nivel_cuenta.is_none() {
+        // Un dictamen vacío no cambia nada: no sirve como lectura del cliente.
+        return Err(AppError::validacion("el dictamen debe indicar estatus_kyc, nivel_riesgo_pld o nivel_cuenta"));
+    }
     if d.nivel_cuenta.is_some_and(|n| !(1..=4).contains(&n)) {
         return Err(AppError::validacion("nivel_cuenta debe estar entre 1 y 4"));
     }
@@ -114,7 +128,7 @@ pub async fn dictaminar(pool: &PgPool, operador_id: Uuid, cliente_id: Uuid, d: &
         .ok_or_else(|| AppError::no_encontrado("cliente no encontrado"))?;
     tx.commit().await?;
     tracing::info!(operador = %operador_id, cliente = %cliente_id, estado = ?d.estatus_kyc, "dictamen KYC");
-    Ok(cliente)
+    Ok(cliente.into())
 }
 
 /// Expediente en espera de un operador, con el resultado del proveedor.

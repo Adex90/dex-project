@@ -19,15 +19,18 @@ export function UifFolioForm({
   alerta,
   token,
   onDone,
+  onStale,
 }: {
   alerta: AlertaAml;
   token: string;
   onDone: (message: string, result: ReporteUifAml) => void;
+  /** The API refused because the alert changed (409): the case file reloads. */
+  onStale?: (message: string) => void;
 }) {
   const [folio, setFolio] = useState("");
   const [fecha, setFecha] = useState(() => mexicoCityDate(new Date()));
   const [touched, setTouched] = useState(false);
-  const { busy, error, run } = useSubmit();
+  const { busy, error, run } = useSubmit({ onStale });
   const problem = validateUifFolio(folio, fecha, alerta);
 
   const submit = async () => {

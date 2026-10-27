@@ -111,7 +111,7 @@ pub fn router(estado: AppState) -> Router {
         .merge(reserva::rutas())
         .merge(operaciones::rutas())
         .merge(spei::rutas())
-        .merge(aml::rutas());
+        .merge(aml::rutas(estado.clone()));
 
     let limites = &estado.config.http;
     let peticion = Duration::from_secs(limites.peticion_seg);

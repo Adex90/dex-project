@@ -98,6 +98,11 @@ where
     type Rejection = AppError;
 
     async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+        // Ya validado por una capa de la ruta en esta misma petición (las
+        // extensiones solo las escribe el servidor, nunca el cliente).
+        if let Some(u) = parts.extensions.get::<Usuario>() {
+            return Ok(*u);
+        }
         let estado = AppState::from_ref(state);
         let token = parts
             .headers

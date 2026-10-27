@@ -55,16 +55,19 @@ function DecisionDialog({
   token,
   onClose,
   onDone,
+  onStale,
 }: {
   solicitud: SolicitudAml;
   aprobar: boolean;
   token: string;
   onClose: () => void;
   onDone: (message: string, result: DecisionLevantamientoAml) => void;
+  /** The request was decided or withdrawn meanwhile (409): the queue refreshes under the dialog. */
+  onStale?: (message: string) => void;
 }) {
   const [comentario, setComentario] = useState("");
   const [touched, setTouched] = useState(false);
-  const { busy, error, run } = useSubmit();
+  const { busy, error, run } = useSubmit({ onStale });
   const problem = validateNarrative(comentario, COMENTARIO_MIN, COMENTARIO_MAX);
 
   const submit = async () => {
@@ -140,6 +143,7 @@ export function ApprovalsQueue({
   token,
   onOpenAlert,
   onChanged,
+  onStale,
 }: {
   requests: SolicitudAml[] | null;
   /** ACTIVO restrictions, for the review deadline of each request. */
@@ -151,6 +155,8 @@ export function ApprovalsQueue({
   token: string;
   onOpenAlert: (id: Uuid) => void;
   onChanged: (message: string, alerts: AlertaAml[]) => void;
+  /** A decision found the request already decided or withdrawn (409): refresh the queue. */
+  onStale?: () => void;
 }) {
   const now = useNow();
   const [deciding, setDeciding] = useState<{ solicitud: SolicitudAml; aprobar: boolean } | null>(null);
@@ -280,6 +286,7 @@ export function ApprovalsQueue({
             setDeciding(null);
             onChanged(message, result.alertas_resueltas);
           }}
+          onStale={onStale ? () => onStale() : undefined}
         />
       ) : null}
     </div>

@@ -5,6 +5,7 @@ import { createJSONStorage, persist } from "zustand/middleware";
 
 import { api } from "@/lib/api/endpoints";
 import type { RegistroInput, RegistroRespuesta, Rol, Sesion } from "@/lib/api/types";
+import { isSessionUsable } from "@/lib/session";
 
 /**
  * Session state. The JWT is kept in sessionStorage (cleared when the tab
@@ -16,9 +17,14 @@ interface AuthState {
   clientId: string | null;
   role: Rol | null;
   email: string | null;
+  /** The last session ended by expiry or by a 401, not by signing out (see `guardRedirect`). Not persisted. */
+  expired: boolean;
   login: (email: string, password: string) => Promise<Sesion>;
   register: (input: RegistroInput) => Promise<RegistroRespuesta>;
+  /** Signing out. */
   logout: () => void;
+  /** The session expired or the API answered 401: same as logout, but the sign-in page says why. */
+  expire: () => void;
 }
 
 const EMPTY = { token: null, expiresAt: null, clientId: null, role: null, email: null } as const;
@@ -27,6 +33,7 @@ export const useAuthStore = create<AuthState>()(
   persist(
     (set) => ({
       ...EMPTY,
+      expired: false,
 
       login: async (email, password) => {
         const session = await api.login(email.trim(), password);
@@ -36,6 +43,7 @@ export const useAuthStore = create<AuthState>()(
           clientId: session.cliente_id,
           role: session.rol,
           email: email.trim().toLowerCase(),
+          expired: false,
         });
         return session;
       },
@@ -48,11 +56,13 @@ export const useAuthStore = create<AuthState>()(
           clientId: result.sesion.cliente_id,
           role: result.sesion.rol,
           email: result.cliente.email,
+          expired: false,
         });
         return result;
       },
 
-      logout: () => set({ ...EMPTY }),
+      logout: () => set({ ...EMPTY, expired: false }),
+      expire: () => set({ ...EMPTY, expired: true }),
     }),
     {
       name: "synthetic-capital-session",
@@ -63,5 +73,5 @@ export const useAuthStore = create<AuthState>()(
 );
 
 export function isSessionValid(state: Pick<AuthState, "token" | "expiresAt">, now = Date.now()): boolean {
-  return Boolean(state.token && state.expiresAt && new Date(state.expiresAt).getTime() > now);
+  return isSessionUsable(state, now);
 }

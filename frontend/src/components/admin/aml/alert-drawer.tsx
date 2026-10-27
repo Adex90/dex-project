@@ -35,8 +35,10 @@ import {
   canAct,
   canRecordUifFolio,
   isOpen,
+  isUuid,
   type Thresholds,
 } from "@/lib/aml";
+import { EXPIRED_LOGIN_PATH } from "@/lib/session";
 import { useAuthStore } from "@/store/auth";
 
 /** Header of the case file: everything the feed row says, in full. */
@@ -205,7 +207,12 @@ function OtherAlerts({ alertas, onOpen }: { alertas: AlertaAml[]; onOpen: (id: U
 
 /**
  * The case file (`?alerta=<id>`): loads GET /aml/alertas/{id} on open, which
- * the backend logs as a consultation, and again after every action. Composes
+ * the backend logs as a consultation, and again after every action and after
+ * an action the API refused because the alert changed meanwhile (409, e.g.
+ * another officer took it): the refreshed file then shows the new assignee or
+ * state with the conflict message, instead of offering the same doomed
+ * action. An id that is not a UUID shows "Alert not found" without a request
+ * (a mistyped deep link). Composes
  * the score breakdown, transaction context, client and restriction panels,
  * the resolution form, the client's other alerts and the history.
  */
@@ -233,9 +240,14 @@ export function AlertDrawer({
   const now = useNow();
   const [detalle, setDetalle] = useState<DetalleAlertaAml | null>(null);
   const [error, setError] = useState<unknown>(null);
-  const [loading, setLoading] = useState(true);
+  const [loading, setLoading] = useState(() => isUuid(alertId));
   const [reloadKey, setReloadKey] = useState(0);
   const [notice, setNotice] = useState<string | null>(null);
+  // The last action found the alert changed: its message, shown over the reloaded file.
+  const [conflict, setConflict] = useState<string | null>(null);
+  // Remounts the forms after a conflict (fresh state and idempotency keys for the new situation).
+  const [formsKey, setFormsKey] = useState(0);
+  const validId = isUuid(alertId);
   const [freezing, setFreezing] = useState(false);
   const [reviewing, setReviewing] = useState(false);
   const [shownId, setShownId] = useState(alertId);
@@ -246,11 +258,16 @@ export function AlertDrawer({
     setDetalle(null);
     setError(null);
     setNotice(null);
+    setConflict(null);
     setFreezing(false);
     setReviewing(false);
   }
 
   useEffect(() => {
+    if (!validId) {
+      setLoading(false);
+      return;
+    }
     const controller = new AbortController();
     setLoading(true);
     api.amlAlert(token, alertId, controller.signal).then(
@@ -262,8 +279,8 @@ export function AlertDrawer({
       (e: unknown) => {
         if (controller.signal.aborted) return;
         if (e instanceof ApiError && e.isUnauthorized) {
-          useAuthStore.getState().logout();
-          router.replace("/auth/login?expired=1");
+          useAuthStore.getState().expire();
+          router.replace(EXPIRED_LOGIN_PATH);
           return;
         }
         setError(e);
@@ -271,19 +288,28 @@ export function AlertDrawer({
       },
     );
     return () => controller.abort();
-  }, [alertId, token, reloadKey, router]);
+  }, [alertId, validId, token, reloadKey, router]);
 
   const done = (message: string, alerts: AlertaAml[]) => {
     setNotice(message);
+    setConflict(null);
     setReloadKey((k) => k + 1);
     onChanged(alerts);
+  };
+  const stale = (message: string) => {
+    setNotice(null);
+    setConflict(message);
+    setFreezing(false);
+    setFormsKey((k) => k + 1);
+    setReloadKey((k) => k + 1);
+    onChanged([]);
   };
 
   const a = detalle?.alerta ?? null;
   const freeze = detalle?.congelamiento ?? null;
   const restricted = freeze?.estado === "ACTIVO";
   const mayFreeze = Boolean(detalle && canAct(role) && detalle.cliente.id !== me && !restricted);
-  const notFound = error instanceof ApiError && error.status === 404;
+  const notFound = !validId || (error instanceof ApiError && error.status === 404);
 
   return (
     <Dialog
@@ -305,7 +331,14 @@ export function AlertDrawer({
             <Alert tone="success">{notice}</Alert>
           </div>
         ) : null}
-        {error ? (
+        {conflict ? (
+          <div className="px-5 pt-4">
+            <Alert tone="warning" title="The alert changed">
+              {conflict} The case file was refreshed.
+            </Alert>
+          </div>
+        ) : null}
+        {error || notFound ? (
           <div className="px-5 pt-4">
             <Alert tone={detalle ? "warning" : "error"} title={notFound ? "Alert not found" : detalle ? "Showing the last data received" : "Could not load the case file"}>
               {notFound ? "This alert does not exist or is no longer available." : describeError(error)}{" "}
@@ -340,10 +373,18 @@ export function AlertDrawer({
               onOpenReview={() => setReviewing(true)}
             />
             {freeze ? (
-              <FreezePanel congelamiento={freeze} role={role} me={me} token={token} onChanged={(message) => done(message, [])} />
+              <FreezePanel
+                key={`freeze:${formsKey}`}
+                congelamiento={freeze}
+                role={role}
+                me={me}
+                token={token}
+                onChanged={(message) => done(message, [])}
+                onStale={stale}
+              />
             ) : null}
             <ResolutionForm
-              key={a.id}
+              key={`${a.id}:${formsKey}`}
               alerta={a}
               role={role}
               me={me}
@@ -351,9 +392,16 @@ export function AlertDrawer({
               restricted={restricted}
               pendingRequest={restricted ? (freeze?.solicitud_pendiente ?? null) : null}
               onDone={(message, result) => done(message, [result.alerta])}
+              onStale={stale}
             />
             {canRecordUifFolio(role, me, a) ? (
-              <UifFolioForm key={`uif:${a.id}`} alerta={a} token={token} onDone={(message, result) => done(message, [result.alerta])} />
+              <UifFolioForm
+                key={`uif:${a.id}:${formsKey}`}
+                alerta={a}
+                token={token}
+                onDone={(message, result) => done(message, [result.alerta])}
+                onStale={stale}
+              />
             ) : null}
             <OtherAlerts alertas={detalle.otras_alertas} onOpen={onOpenAlert} />
             <HistoryTimeline historial={detalle.historial} me={me} />
@@ -386,6 +434,7 @@ export function AlertDrawer({
             setFreezing(false);
             done(message, alerts);
           }}
+          onStale={stale}
         />
       ) : null}
     </Dialog>

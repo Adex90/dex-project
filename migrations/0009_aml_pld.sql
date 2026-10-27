@@ -58,6 +58,13 @@ BEGIN
         CREATE ROLE sc_aml NOLOGIN;
     END IF;
     EXECUTE format('GRANT sc_aml TO %I', current_user);
+    -- Verificación externa de la bitácora (un auditor de base de datos): solo
+    -- ejecuta aml.verificar_bitacora. sc_auditor no toca aml porque lo usan
+    -- rutas del cliente (/tablero, /reserva/prueba).
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'sc_auditor_pld') THEN
+        CREATE ROLE sc_auditor_pld NOLOGIN;
+    END IF;
+    EXECUTE format('GRANT sc_auditor_pld TO %I', current_user);
 END
 $$;
 
@@ -107,6 +114,30 @@ REVOKE SELECT, UPDATE ON kyc.alertas_pld FROM sc_kyc;
 REVOKE SELECT ON kyc.alertas_pld FROM sc_kyc_verificador;
 -- `sofom.cuentas` conserva su CHECK de 0001 (ACTIVA|CONGELADA|CERRADA): el
 -- congelamiento preventivo vive solo en la cuenta IFPE.
+
+-- Retenciones y liberaciones del operador (POST /operaciones/retenciones). En
+-- el ledger del cliente tienen la misma forma que las de PLD: clave neutra
+-- 'ret:<id>' / 'lib:<id>' y concepto "Retención temporal" / "Liberación de
+-- retención" (antes llevaban 'op:<operador>:<clave>' y el texto del operador,
+-- así que una retención 'ret:' delataba que era de cumplimiento). Aquí quedan
+-- la clave de idempotencia del operador y su motivo; solo inserción.
+CREATE TABLE ifpe.retenciones_operador (
+    id                 UUID PRIMARY KEY,
+    clave_idempotencia TEXT NOT NULL UNIQUE CHECK (length(clave_idempotencia) BETWEEN 1 AND 200),
+    tipo               TEXT NOT NULL CHECK (tipo IN ('RETENCION', 'LIBERACION_RETENCION')),
+    cuenta_id          UUID NOT NULL REFERENCES ifpe.cuentas (id) ON DELETE RESTRICT,
+    monto              NUMERIC(18, 8) NOT NULL CHECK (monto > 0),
+    motivo             TEXT NOT NULL CHECK (length(btrim(motivo)) BETWEEN 1 AND 140),
+    transaccion_id     UUID NOT NULL UNIQUE REFERENCES ifpe.transacciones (id) ON DELETE RESTRICT,
+    creado_en          TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()
+);
+CREATE INDEX ix_ifpe_retenciones_operador_cuenta ON ifpe.retenciones_operador (cuenta_id, creado_en);
+CREATE TRIGGER trg_ifpe_retenciones_operador_inmutable BEFORE UPDATE OR DELETE ON ifpe.retenciones_operador
+    FOR EACH ROW EXECUTE FUNCTION nucleo.fn_ledger_inmutable();
+CREATE TRIGGER trg_ifpe_retenciones_operador_no_truncate BEFORE TRUNCATE ON ifpe.retenciones_operador
+    FOR EACH STATEMENT EXECUTE FUNCTION nucleo.fn_ledger_inmutable();
+REVOKE ALL ON ifpe.retenciones_operador FROM PUBLIC;
+GRANT SELECT, INSERT ON ifpe.retenciones_operador TO sc_ifpe;
 
 -- -----------------------------------------------------------------------------
 -- 3. Tablas (orden de llaves foráneas; las circulares se agregan al final)
@@ -512,7 +543,7 @@ CREATE TABLE aml.bitacora (
                          'LEVANTAMIENTO_SOLICITADO', 'LEVANTAMIENTO_APROBADO', 'LEVANTAMIENTO_RECHAZADO',
                          'LEVANTAMIENTO_ANULADO', 'OPERACION_BLOQUEADA', 'CARGO_EN_CUENTA_CONGELADA',
                          'EVALUACION_DIFERIDA', 'EVALUACION_FALLIDA', 'CONSULTA_EXPEDIENTE', 'RIESGO_CLIENTE_ELEVADO',
-                         'PROPUESTA_CREADA', 'PROPUESTA_APROBADA', 'PROPUESTA_RECHAZADA', 'REGLA_VERSION_NUEVA',
+                         'RIESGO_CLIENTE_REDUCIDO', 'RIESGO_CLIENTE_REDUCCION_DENEGADA', 'PROPUESTA_CREADA', 'PROPUESTA_APROBADA', 'PROPUESTA_RECHAZADA', 'REGLA_VERSION_NUEVA',
                          'REGLA_DESACTIVADA', 'PARAMETROS_VERSION_NUEVA', 'MIGRACION_0009')),
     objeto           TEXT NOT NULL CHECK (objeto IN ('ALERTA', 'CONGELAMIENTO', 'RETENCION', 'SOLICITUD', 'PROPUESTA',
                                                      'REGLA', 'PARAMETROS', 'EVALUACION', 'OPERACION', 'CLIENTE',
@@ -1243,15 +1274,21 @@ AS $$
       FROM aml.evaluaciones e WHERE e.id = p_id
 $$;
 
--- Contadores de la barra de resumen.
-CREATE FUNCTION aml.resumen() RETURNS JSONB
+-- Contadores de la barra de resumen. Sin los registros cuyo sujeto es el
+-- propio lector (p_actor): un oficial o auditor nunca ve, ni contados, sus
+-- alertas, congelamientos, solicitudes ni avisos (sin aviso al sujeto).
+CREATE FUNCTION aml.resumen(p_actor UUID DEFAULT NULL) RETURNS JSONB
 LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, pg_temp
 AS $$
     WITH par AS (SELECT * FROM aml.parametros_vigentes()),
          ahora AS (SELECT clock_timestamp() AS t),
-         abiertas AS (SELECT nivel_riesgo, estado FROM aml.alertas WHERE estado IN ('PENDIENTE', 'EN_REVISION')),
+         abiertas AS (SELECT nivel_riesgo, estado FROM aml.alertas
+                       WHERE estado IN ('PENDIENTE', 'EN_REVISION') AND cliente_id IS DISTINCT FROM p_actor),
          plazos AS (SELECT a.fecha_limite_reporte FROM aml.alertas a
-                     WHERE a.estado IN ('PENDIENTE', 'EN_REVISION') OR (a.estado = 'CONFIRMADO' AND a.folio_uif IS NULL))
+                     WHERE (a.estado IN ('PENDIENTE', 'EN_REVISION') OR (a.estado = 'CONFIRMADO' AND a.folio_uif IS NULL))
+                       AND a.cliente_id IS DISTINCT FROM p_actor),
+         activos AS (SELECT f.id, f.sla_vence_en FROM aml.congelamientos f
+                      WHERE f.estado = 'ACTIVO' AND f.cliente_id IS DISTINCT FROM p_actor)
     SELECT jsonb_build_object(
         'pendientes', (SELECT count(*) FROM abiertas WHERE estado = 'PENDIENTE'),
         'en_revision', (SELECT count(*) FROM abiertas WHERE estado = 'EN_REVISION'),
@@ -1261,12 +1298,14 @@ AS $$
             'ALTO', (SELECT count(*) FROM abiertas WHERE nivel_riesgo = 'ALTO'),
             'CRITICO', (SELECT count(*) FROM abiertas WHERE nivel_riesgo = 'CRITICO')),
         'criticas_abiertas', (SELECT count(*) FROM abiertas WHERE nivel_riesgo = 'CRITICO'),
-        'congelamientos_activos', (SELECT count(*) FROM aml.congelamientos WHERE estado = 'ACTIVO'),
-        'solicitudes_pendientes', (SELECT count(*) FROM aml.solicitudes_levantamiento WHERE estado = 'PENDIENTE'),
+        'congelamientos_activos', (SELECT count(*) FROM activos),
+        'solicitudes_pendientes', (SELECT count(*) FROM aml.solicitudes_levantamiento s
+                                     JOIN aml.congelamientos f ON f.id = s.congelamiento_id
+                                    WHERE s.estado = 'PENDIENTE' AND f.cliente_id IS DISTINCT FROM p_actor),
         'propuestas_pendientes', (SELECT count(*) FROM aml.propuestas_cambio WHERE estado = 'PENDIENTE'),
         'sla_congelamiento_vencidos', (
-            SELECT count(*) FROM aml.congelamientos f, ahora
-             WHERE f.estado = 'ACTIVO' AND f.sla_vence_en < ahora.t
+            SELECT count(*) FROM activos f, ahora
+             WHERE f.sla_vence_en < ahora.t
                AND NOT EXISTS (SELECT 1 FROM aml.solicitudes_levantamiento s
                                 WHERE s.congelamiento_id = f.id AND s.estado = 'PENDIENTE')),
         'reportes_por_vencer', (
@@ -1274,7 +1313,8 @@ AS $$
              WHERE plazos.fecha_limite_reporte >= ahora.t
                AND plazos.fecha_limite_reporte <= ahora.t + par.dias_aviso_plazo * interval '1 day'),
         'reportes_vencidos', (SELECT count(*) FROM plazos, ahora WHERE plazos.fecha_limite_reporte < ahora.t),
-        'notificaciones_sin_entregar', (SELECT count(*) FROM aml.notificaciones WHERE entregada_en IS NULL),
+        'notificaciones_sin_entregar', (SELECT count(*) FROM aml.notificaciones
+                                         WHERE entregada_en IS NULL AND cliente_id IS DISTINCT FROM p_actor),
         'modo_observacion', (SELECT modo_observacion FROM par),
         'ultimo_ciclo_en', (SELECT ultimo_ciclo_en FROM aml.monitoreo_estado WHERE id),
         'servidor_en', (SELECT t FROM ahora))
@@ -2631,6 +2671,25 @@ $$;
 CREATE TRIGGER trg_aml_congelamientos_bitacora AFTER INSERT OR UPDATE ON aml.congelamientos
     FOR EACH ROW EXECUTE FUNCTION aml.fn_bitacora_congelamiento();
 
+-- Marca de cambio de la bandeja: aml.alerta_json incrusta el estado del
+-- congelamiento ligado (estado, confirmado, vencimiento del SLA), así que un
+-- cambio de esos datos toca actualizado_en de sus alertas (también las
+-- cerradas: fn_proteger_alerta lo admite) y el sondeo de la consola las vuelve
+-- a enviar. Sin esto, una consola abierta seguía mostrando "restringido"
+-- después de un levantamiento aprobado.
+CREATE FUNCTION aml.fn_congelamiento_toca_alertas() RETURNS trigger
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp
+AS $$
+BEGIN
+    UPDATE aml.alertas SET actualizado_en = clock_timestamp() WHERE congelamiento_id = NEW.id;
+    RETURN NULL;
+END
+$$;
+CREATE TRIGGER trg_aml_congelamientos_toca_alertas AFTER UPDATE ON aml.congelamientos
+    FOR EACH ROW WHEN ((OLD.estado, OLD.confirmado, OLD.sla_vence_en) IS DISTINCT FROM
+                       (NEW.estado, NEW.confirmado, NEW.sla_vence_en))
+    EXECUTE FUNCTION aml.fn_congelamiento_toca_alertas();
+
 CREATE FUNCTION aml.fn_bitacora_retencion() RETURNS trigger
 LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp
 AS $$
@@ -2973,8 +3032,10 @@ CREATE CONSTRAINT TRIGGER trg_ifpe_tx_zz_aml_retencion
     WHEN ((NEW.tipo = 'DEPOSITO' AND NEW.clave_idempotencia LIKE 'spei:%') OR NEW.tipo = 'TRANSFERENCIA')
     EXECUTE FUNCTION aml.fn_retencion_exigida();
 
--- 8.4 Claves reservadas 'ret:' y 'lib:': solo las retenciones PLD, ligadas a
--- su registro de esta misma transacción.
+-- 8.4 Claves reservadas 'ret:' y 'lib:': solo retenciones registradas en esta
+-- misma transacción, de PLD (aml.retenciones) o del operador
+-- (ifpe.retenciones_operador), siempre con el concepto neutro. Las dos tienen
+-- la misma forma en el ledger del cliente.
 CREATE FUNCTION aml.fn_clave_reservada() RETURNS trigger
 LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp
 AS $$
@@ -2987,19 +3048,28 @@ BEGIN
         v_id := substr(NEW.clave_idempotencia, 5)::uuid;
     END IF;
     IF starts_with(NEW.clave_idempotencia, 'ret:') THEN
-        IF v_id IS NOT NULL AND NEW.tipo = 'RETENCION' AND EXISTS (
-               SELECT 1 FROM aml.retenciones r
-                WHERE r.id = v_id AND r.tx_retencion_id = NEW.id AND r.cuenta_id = NEW.cuenta_origen_id
-                  AND r.monto = NEW.monto AND r.xmin = v_xmin) THEN
+        IF v_id IS NOT NULL AND NEW.tipo = 'RETENCION' AND NEW.concepto IS NOT DISTINCT FROM 'Retención temporal'
+           AND (EXISTS (SELECT 1 FROM aml.retenciones r
+                         WHERE r.id = v_id AND r.tx_retencion_id = NEW.id AND r.cuenta_id = NEW.cuenta_origen_id
+                           AND r.monto = NEW.monto AND r.xmin = v_xmin)
+                OR EXISTS (SELECT 1 FROM ifpe.retenciones_operador o
+                            WHERE o.id = v_id AND o.transaccion_id = NEW.id AND o.tipo = 'RETENCION'
+                              AND o.cuenta_id = NEW.cuenta_origen_id AND NEW.cuenta_destino_id = NEW.cuenta_origen_id
+                              AND o.monto = NEW.monto AND o.xmin = v_xmin)) THEN
             RETURN NULL;
         END IF;
-    ELSIF v_id IS NOT NULL AND NEW.tipo = 'LIBERACION_RETENCION' AND EXISTS (
-               SELECT 1 FROM aml.retenciones r
-                WHERE r.id = v_id AND r.tx_liberacion_id = NEW.id AND r.cuenta_id = NEW.cuenta_origen_id
-                  AND r.monto = NEW.monto AND r.estado = 'LIBERADA' AND r.xmin = v_xmin) THEN
+    ELSIF v_id IS NOT NULL AND NEW.tipo = 'LIBERACION_RETENCION'
+          AND NEW.concepto IS NOT DISTINCT FROM 'Liberación de retención'
+          AND (EXISTS (SELECT 1 FROM aml.retenciones r
+                        WHERE r.id = v_id AND r.tx_liberacion_id = NEW.id AND r.cuenta_id = NEW.cuenta_origen_id
+                          AND r.monto = NEW.monto AND r.estado = 'LIBERADA' AND r.xmin = v_xmin)
+               OR EXISTS (SELECT 1 FROM ifpe.retenciones_operador o
+                           WHERE o.id = v_id AND o.transaccion_id = NEW.id AND o.tipo = 'LIBERACION_RETENCION'
+                             AND o.cuenta_id = NEW.cuenta_origen_id AND NEW.cuenta_destino_id = NEW.cuenta_origen_id
+                             AND o.monto = NEW.monto AND o.xmin = v_xmin)) THEN
         RETURN NULL;
     END IF;
-    RAISE EXCEPTION 'SC_AML_CLAVE_RESERVADA: la clave % está reservada para retenciones de cumplimiento', NEW.clave_idempotencia;
+    RAISE EXCEPTION 'SC_AML_CLAVE_RESERVADA: la clave % está reservada para retenciones registradas', NEW.clave_idempotencia;
 END
 $$;
 CREATE CONSTRAINT TRIGGER trg_ifpe_tx_zz_aml_clave
@@ -3238,6 +3308,141 @@ $$;
 CREATE TRIGGER trg_clientes_aml_lista_bloqueadas AFTER UPDATE OF en_lista_bloqueadas ON kyc.clientes
     FOR EACH ROW WHEN (NEW.en_lista_bloqueadas AND NOT OLD.en_lista_bloqueadas)
     EXECUTE FUNCTION aml.fn_lista_bloqueadas();
+
+-- 8.x Nivel de riesgo PLD del cliente (kyc.clientes.nivel_riesgo_pld).
+-- Es una entrada de la calificación (R03, bandas por nivel, M03) y CONFIRMAR lo
+-- sube a ALTO. Fuera de las funciones de cumplimiento (rol sc_aml) y del dueño
+-- del esquema, nadie lo baja mientras el cliente está bajo revisión de PLD: una
+-- alerta abierta o confirmada, o un congelamiento activo. El intento no falla
+-- (un error le diría al operador que hay un caso de cumplimiento): el nivel se
+-- conserva y la bitácora registra RIESGO_CLIENTE_REDUCCION_DENEGADA. Todo otro
+-- cambio de nivel fuera de cumplimiento queda en la bitácora
+-- (RIESGO_CLIENTE_ELEVADO / RIESGO_CLIENTE_REDUCIDO, con el operador del
+-- dictamen como actor; CONFIRMAR deja su propio RIESGO_CLIENTE_ELEVADO).
+CREATE FUNCTION aml.rango_nivel_cliente(p TEXT) RETURNS INTEGER
+LANGUAGE sql IMMUTABLE SECURITY DEFINER SET search_path = pg_catalog, pg_temp
+AS $$ SELECT CASE p WHEN 'BAJO' THEN 1 WHEN 'MEDIO' THEN 2 WHEN 'ALTO' THEN 3 END $$;
+
+CREATE FUNCTION aml.cliente_bajo_revision(p_cliente UUID) RETURNS BOOLEAN
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, pg_temp
+AS $$
+    SELECT EXISTS (SELECT 1 FROM aml.alertas
+                    WHERE cliente_id = p_cliente AND estado IN ('PENDIENTE', 'EN_REVISION', 'CONFIRMADO'))
+        OR aml.cliente_congelado(p_cliente)
+$$;
+
+-- Actor de un cambio hecho por el dictamen KYC: el operador que la
+-- transacción declaró (sc.operador_id), solo si de verdad es un OPERADOR.
+-- Fuera de sc_kyc_verificador, NULL (sistema; el renglón conserva el rol y el
+-- usuario de la base de datos).
+CREATE FUNCTION aml.operador_de_sesion() RETURNS UUID
+LANGUAGE plpgsql STABLE SECURITY DEFINER SET search_path = pg_catalog, pg_temp
+AS $$
+DECLARE
+    v_texto TEXT := current_setting('sc.operador_id', true);
+    v_id    UUID;
+BEGIN
+    IF current_setting('role') <> 'sc_kyc_verificador'
+       OR v_texto IS NULL OR v_texto !~ '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$' THEN
+        RETURN NULL;
+    END IF;
+    v_id := v_texto::uuid;
+    IF EXISTS (SELECT 1 FROM kyc.credenciales WHERE cliente_id = v_id AND rol = 'OPERADOR') THEN
+        RETURN v_id;
+    END IF;
+    RETURN NULL;
+END
+$$;
+
+-- Renglón de bitácora del cambio de nivel con el operador de la sesión como
+-- actor, sin pisar el actor de la transacción (un trigger no es punto de
+-- entrada: si corre dentro de una función de cumplimiento, el actor sigue).
+CREATE FUNCTION aml.registrar_cambio_nivel(p_evento TEXT, p_cliente UUID, p_anterior TEXT, p_nuevo TEXT)
+RETURNS void
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp
+AS $$
+DECLARE
+    v_actor TEXT := current_setting('aml.actor', true);
+BEGIN
+    PERFORM set_config('aml.actor', coalesce(aml.operador_de_sesion()::text, ''), true);
+    PERFORM aml.registrar_bitacora(p_evento, 'CLIENTE', p_cliente::text, p_cliente, NULL, NULL, NULL, NULL, p_anterior,
+        p_nuevo, NULL, jsonb_build_object('rol_bd', current_setting('role')));
+    PERFORM set_config('aml.actor', coalesce(v_actor, ''), true);
+END
+$$;
+
+-- BEFORE UPDATE: protege el nivel y, si lo único que cambia es el nivel (o su
+-- fecha de evaluación), conserva actualizado_en. ClienteVista (/yo, /tablero,
+-- /auth/registro) sirve actualizado_en: si CONFIRMAR lo moviera, el cliente
+-- vería la hora exacta de la decisión de cumplimiento. El nombre ordena
+-- después de trg_clientes_actualizado_en (0001), que ya lo fijó en now().
+CREATE FUNCTION aml.fn_cliente_riesgo() RETURNS trigger
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp
+AS $$
+BEGIN
+    IF NEW.nivel_riesgo_pld IS DISTINCT FROM OLD.nivel_riesgo_pld
+       AND current_setting('role') NOT IN ('none', 'sc_aml')
+       AND aml.rango_nivel_cliente(NEW.nivel_riesgo_pld) < aml.rango_nivel_cliente(OLD.nivel_riesgo_pld)
+       AND aml.cliente_bajo_revision(NEW.id) THEN
+        PERFORM aml.registrar_cambio_nivel('RIESGO_CLIENTE_REDUCCION_DENEGADA', NEW.id, OLD.nivel_riesgo_pld,
+            NEW.nivel_riesgo_pld);
+        NEW.nivel_riesgo_pld := OLD.nivel_riesgo_pld;
+        NEW.riesgo_evaluado_en := OLD.riesgo_evaluado_en;
+    END IF;
+    IF (to_jsonb(NEW) - ARRAY['nivel_riesgo_pld', 'riesgo_evaluado_en', 'actualizado_en'])
+       = (to_jsonb(OLD) - ARRAY['nivel_riesgo_pld', 'riesgo_evaluado_en', 'actualizado_en']) THEN
+        NEW.actualizado_en := OLD.actualizado_en;
+    END IF;
+    RETURN NEW;
+END
+$$;
+CREATE TRIGGER trg_clientes_zz_aml_riesgo BEFORE UPDATE ON kyc.clientes
+    FOR EACH ROW EXECUTE FUNCTION aml.fn_cliente_riesgo();
+
+-- AFTER UPDATE: bitácora de los cambios de nivel hechos fuera de cumplimiento
+-- (rol de la base de datos y usuario de la sesión quedan en el renglón) y
+-- marca de cambio de las alertas del cliente: aml.alerta_json incrusta su
+-- nivel, PEP y nombre, así que el sondeo de la consola debe volver a enviarlas.
+CREATE FUNCTION aml.fn_cliente_cambiado() RETURNS trigger
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp
+AS $$
+BEGIN
+    IF NEW.nivel_riesgo_pld IS DISTINCT FROM OLD.nivel_riesgo_pld AND current_setting('role') <> 'sc_aml' THEN
+        PERFORM aml.registrar_cambio_nivel(
+            CASE WHEN aml.rango_nivel_cliente(NEW.nivel_riesgo_pld) > aml.rango_nivel_cliente(OLD.nivel_riesgo_pld)
+                 THEN 'RIESGO_CLIENTE_ELEVADO' ELSE 'RIESGO_CLIENTE_REDUCIDO' END,
+            NEW.id, OLD.nivel_riesgo_pld, NEW.nivel_riesgo_pld);
+    END IF;
+    UPDATE aml.alertas SET actualizado_en = clock_timestamp() WHERE cliente_id = NEW.id;
+    RETURN NULL;
+END
+$$;
+CREATE TRIGGER trg_clientes_zz_aml_cambio AFTER UPDATE ON kyc.clientes
+    FOR EACH ROW WHEN (OLD.nivel_riesgo_pld IS DISTINCT FROM NEW.nivel_riesgo_pld OR OLD.es_pep IS DISTINCT FROM NEW.es_pep
+                       OR (OLD.nombre, OLD.apellido_paterno, OLD.apellido_materno)
+                          IS DISTINCT FROM (NEW.nombre, NEW.apellido_paterno, NEW.apellido_materno))
+    EXECUTE FUNCTION aml.fn_cliente_cambiado();
+
+-- 8.y El congelamiento preventivo no deja huella en la proyección del
+-- cliente: /ifpe/cuenta y /tablero sirven ifpe.cuentas.actualizado_en, y un
+-- cambio de estado sin movimiento del ledger lo movía a la hora exacta del
+-- congelamiento o del levantamiento. Si lo único que cambia es el estado entre
+-- ACTIVA y CONGELADO_PREVENTIVO, se conserva. El nombre ordena después de
+-- trg_ifpe_cuentas_actualizado_en (0001).
+CREATE FUNCTION aml.fn_cuenta_estado_discreto() RETURNS trigger
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp
+AS $$
+BEGIN
+    IF OLD.estado IN ('ACTIVA', 'CONGELADO_PREVENTIVO') AND NEW.estado IN ('ACTIVA', 'CONGELADO_PREVENTIVO')
+       AND (to_jsonb(NEW) - ARRAY['estado', 'actualizado_en']) = (to_jsonb(OLD) - ARRAY['estado', 'actualizado_en']) THEN
+        NEW.actualizado_en := OLD.actualizado_en;
+    END IF;
+    RETURN NEW;
+END
+$$;
+CREATE TRIGGER trg_ifpe_cuentas_zz_aml_actualizado BEFORE UPDATE OF estado ON ifpe.cuentas
+    FOR EACH ROW WHEN (OLD.estado IS DISTINCT FROM NEW.estado)
+    EXECUTE FUNCTION aml.fn_cuenta_estado_discreto();
 
 -- -----------------------------------------------------------------------------
 -- 9. Envolturas en los esquemas transaccionales (hechos de la operación, nunca
@@ -4074,7 +4279,9 @@ BEGIN
     PERFORM aml.fijar_actor(p_actor);
     PERFORM aml.exigir_lector(p_actor);
     SELECT * INTO a FROM aml.alertas WHERE id = p_alerta;
-    IF a.id IS NULL THEN
+    -- Un oficial o auditor nunca ve un expediente del que es sujeto: la misma
+    -- respuesta que una alerta inexistente (sin aviso al sujeto).
+    IF a.id IS NULL OR a.cliente_id = p_actor THEN
         RAISE EXCEPTION 'SC_AML_NO_ENCONTRADO: la alerta % no existe', p_alerta;
     END IF;
     v_cong := coalesce((SELECT id FROM aml.congelamientos WHERE cliente_id = a.cliente_id AND estado = 'ACTIVO'),
@@ -4119,7 +4326,8 @@ DECLARE
 BEGIN
     PERFORM aml.fijar_actor(p_actor);
     PERFORM aml.exigir_lector(p_actor);
-    IF NOT EXISTS (SELECT 1 FROM kyc.clientes WHERE id = p_cliente) THEN
+    -- Nadie revisa su propio expediente (misma respuesta que un cliente inexistente).
+    IF p_cliente = p_actor OR NOT EXISTS (SELECT 1 FROM kyc.clientes WHERE id = p_cliente) THEN
         RAISE EXCEPTION 'SC_AML_NO_ENCONTRADO: el cliente % no existe', p_cliente;
     END IF;
     PERFORM aml.registrar_bitacora('CONSULTA_EXPEDIENTE', 'CLIENTE', p_cliente::text, p_cliente, NULL, NULL, NULL, NULL,
@@ -4163,8 +4371,9 @@ BEGIN
 END
 $$;
 
--- Retenciones y liberaciones del ledger creadas en una transacción de sc_aml,
--- para que el backend verifique su tx_hash (sc_aml no tiene USAGE en ifpe).
+-- Retenciones y liberaciones de PLD del ledger creadas en una transacción de
+-- sc_aml, para que el backend verifique su tx_hash (sc_aml no tiene USAGE en
+-- ifpe). Solo las ligadas a aml.retenciones (no las del operador).
 CREATE FUNCTION aml.movimientos_ledger(p_ids UUID[]) RETURNS SETOF ifpe.transacciones
 LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, pg_temp
 AS $$
@@ -4175,7 +4384,7 @@ AS $$
 $$;
 
 -- -----------------------------------------------------------------------------
--- 11. Monitoreo por lotes (EXECUTE: sc_aml; verificar_bitacora también sc_auditor)
+-- 11. Monitoreo por lotes (EXECUTE: sc_aml; verificar_bitacora también sc_auditor_pld)
 -- -----------------------------------------------------------------------------
 -- Turno de una sola instancia (arrendamiento con ficha) y marcas de agua del
 -- ledger. Solo quien tiene la ficha vigente renueva, fija el rango del ciclo,
@@ -5151,16 +5360,19 @@ GRANT EXECUTE ON FUNCTION ifpe.aml_cliente_congelado(UUID) TO sc_spei;
 GRANT EXECUTE ON FUNCTION sofom.aml_bloquear_cliente(UUID) TO sc_sofom;
 GRANT EXECUTE ON FUNCTION sofom.aml_evaluar(UUID, TEXT, TEXT, NUMERIC, UUID, TEXT, JSONB) TO sc_sofom;
 
--- sc_aml (consola y monitoreo) y sc_auditor: lectura de aml; ningún DML.
-GRANT USAGE ON SCHEMA aml TO sc_aml, sc_auditor;
-GRANT SELECT ON ALL TABLES IN SCHEMA aml TO sc_aml, sc_auditor;
+-- sc_aml (consola y monitoreo): lectura de aml; ningún DML. sc_auditor no
+-- recibe nada en aml: lo usan rutas del cliente (/tablero, /reserva/prueba),
+-- así que un error en ellas no puede serializar datos de PLD (§4.3). El
+-- AUDITOR de la consola lee por sc_aml, con aml.exigir_lector.
+GRANT USAGE ON SCHEMA aml TO sc_aml;
+GRANT SELECT ON ALL TABLES IN SCHEMA aml TO sc_aml;
 
 -- Constructores JSON (errata E4: persona_json).
 GRANT EXECUTE ON FUNCTION aml.persona_json(UUID), aml.alerta_json(UUID), aml.congelamiento_json(UUID),
                           aml.solicitud_json(UUID), aml.retencion_json(UUID), aml.cliente_json(UUID),
                           aml.cuentas_json(UUID), aml.regla_json(UUID), aml.parametros_json(), aml.propuesta_json(UUID),
-                          aml.evaluacion_json(UUID), aml.resumen()
-    TO sc_aml, sc_auditor;
+                          aml.evaluacion_json(UUID), aml.resumen(UUID)
+    TO sc_aml;
 -- Errata E5: cada transacción de lectura de la consola valida el rol del actor.
 GRANT EXECUTE ON FUNCTION aml.exigir_lector(UUID) TO sc_aml;
 -- Funciones de los oficiales.
@@ -5185,4 +5397,6 @@ GRANT EXECUTE ON FUNCTION aml.monitoreo_tomar_turno(INTEGER), aml.monitoreo_reno
                           aml.marcar_notificacion(BIGINT), aml.sellar_bitacora(), aml.verificar_bitacora(BIGINT),
                           aml.registrar_verificacion_bitacora()
     TO sc_aml;
-GRANT EXECUTE ON FUNCTION aml.verificar_bitacora(BIGINT) TO sc_auditor;
+-- Verificador externo de la bitácora: solo la verificación completa.
+GRANT USAGE ON SCHEMA aml TO sc_auditor_pld;
+GRANT EXECUTE ON FUNCTION aml.verificar_bitacora(BIGINT) TO sc_auditor_pld;

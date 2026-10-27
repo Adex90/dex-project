@@ -3061,6 +3061,403 @@ async fn retencion_solo_en_su_transaccion(pool: PgPool) {
 }
 
 // -----------------------------------------------------------------------------
+// Revisión de PLD, parte 2: autorización, sin aviso y consola
+// -----------------------------------------------------------------------------
+
+/// Cuerpo de la respuesta de una ruta del cliente tal cual (bytes).
+async fn bytes_de(api: &Api, ruta: &str, token: &str) -> Vec<u8> {
+    let (s, cuerpo) = api.llamar_crudo("GET", ruta, Some(token), None).await;
+    assert_eq!(s, StatusCode::OK, "{ruta}: {}", String::from_utf8_lossy(&cuerpo));
+    cuerpo
+}
+
+/// TOMAR y CONFIRMAR una alerta (HTTP, un solo oficial).
+async fn confirmar_por_http(api: &Api, token: &str, alerta: &str) -> Value {
+    let ruta = format!("/api/v1/aml/alertas/{alerta}/resolver");
+    let (s, v) = api.post(&ruta, token, json!({ "accion": "TOMAR", "clave_idempotencia": clave_api() })).await;
+    assert_eq!(s, StatusCode::CREATED, "{v}");
+    let (s, v) = api
+        .post(&ruta, token, json!({ "accion": "CONFIRMAR", "dictamen": DICTAMEN, "clave_idempotencia": clave_api() }))
+        .await;
+    assert_eq!(s, StatusCode::CREATED, "{v}");
+    v
+}
+
+/// authz#2 y authz#4: congelar, levantar y CONFIRMAR no cambian ni un byte de
+/// lo que ve el cliente. `actualizado_en` de la cuenta (/ifpe/cuenta,
+/// /tablero) y del cliente (/yo, /tablero) se movía a la hora exacta de la
+/// acción de cumplimiento, sin ningún movimiento del ledger que lo explicara.
+#[sqlx::test(migrations = "../migrations")]
+async fn cumplimiento_no_deja_huella_en_las_lecturas_del_cliente(pool: PgPool) {
+    let (api, cfg) = api(&pool).await;
+    let ana = cliente(&pool, &cfg, "Ana").await;
+    depositar(&pool, &cfg, ana.cuenta_ifpe.id, "1000").await;
+    let tok_ana = token_cliente(&api, "Ana").await;
+    let (_, c1) = token_oficial(&api, &pool, "Uno").await;
+    let (_, c2) = token_oficial(&api, &pool, "Dos").await;
+    let tablero = |v: Value| json!({ "cliente": v["cliente"], "boveda": v["boveda"] });
+    let cuenta_antes = bytes_de(&api, "/api/v1/ifpe/cuenta", &tok_ana).await;
+    let yo_antes = bytes_de(&api, "/api/v1/yo", &tok_ana).await;
+    let (_, t) = api.get("/api/v1/tablero", &tok_ana).await;
+    let tablero_antes = tablero(t);
+
+    // Congelamiento manual: la cuenta queda CONGELADO_PREVENTIVO.
+    let (s, v) = api
+        .post(
+            &format!("/api/v1/aml/clientes/{}/congelar", ana.cliente.id),
+            &c1,
+            json!({ "motivo": MOTIVO, "clave_idempotencia": clave_api() }),
+        )
+        .await;
+    assert_eq!(s, StatusCode::CREATED, "{v}");
+    let congelamiento = v["congelamiento"]["id"].as_str().unwrap().to_string();
+    let alerta = v["alerta"]["id"].as_str().unwrap().to_string();
+    assert_eq!(estado_cuenta(&pool, ana.cuenta_ifpe.id).await, "CONGELADO_PREVENTIVO");
+    assert_eq!(bytes_de(&api, "/api/v1/ifpe/cuenta", &tok_ana).await, cuenta_antes, "el congelamiento no se ve en /ifpe/cuenta");
+
+    // CONFIRMAR sube a Ana a riesgo ALTO.
+    confirmar_por_http(&api, &c1, &alerta).await;
+    let nivel: String = sqlx::query_scalar("SELECT nivel_riesgo_pld FROM kyc.clientes WHERE id = $1")
+        .bind(ana.cliente.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(nivel, "ALTO");
+    assert_eq!(bytes_de(&api, "/api/v1/yo", &tok_ana).await, yo_antes, "CONFIRMAR no se ve en /yo");
+
+    // Levantamiento con cuatro ojos.
+    let (s, v) = api
+        .post(
+            &format!("/api/v1/aml/congelamientos/{congelamiento}/solicitudes"),
+            &c1,
+            json!({ "tipo": "LEVANTAR_Y_LIBERAR", "justificacion": JUSTIFICACION, "clave_idempotencia": clave_api() }),
+        )
+        .await;
+    assert_eq!(s, StatusCode::CREATED, "{v}");
+    let solicitud = v["solicitud"]["id"].as_str().unwrap().to_string();
+    let (s, v) = api
+        .post(
+            &format!("/api/v1/aml/solicitudes/{solicitud}/decision"),
+            &c2,
+            json!({ "aprobar": true, "comentario": "Revisado el expediente completo.", "clave_idempotencia": clave_api() }),
+        )
+        .await;
+    assert_eq!(s, StatusCode::CREATED, "{v}");
+    assert_eq!(estado_cuenta(&pool, ana.cuenta_ifpe.id).await, "ACTIVA");
+
+    assert_eq!(bytes_de(&api, "/api/v1/ifpe/cuenta", &tok_ana).await, cuenta_antes, "ni el levantamiento");
+    assert_eq!(bytes_de(&api, "/api/v1/yo", &tok_ana).await, yo_antes);
+    let (_, t) = api.get("/api/v1/tablero", &tok_ana).await;
+    assert_eq!(tablero(t), tablero_antes, "/tablero (cliente y bóveda) idéntico");
+    // Un movimiento del ledger sí se ve.
+    depositar(&pool, &cfg, ana.cuenta_ifpe.id, "1").await;
+    assert_ne!(bytes_de(&api, "/api/v1/ifpe/cuenta", &tok_ana).await, cuenta_antes);
+
+    verificar_invariantes(&pool).await;
+    verificar_invariantes_aml(&pool).await;
+}
+
+/// authz#1 y authz#3: el operador (dictamen KYC) no lee el nivel de riesgo ni
+/// la hora de CONFIRMAR, no usa un dictamen vacío como lectura y no baja el
+/// nivel que subió cumplimiento; el intento queda en la bitácora.
+#[sqlx::test(migrations = "../migrations")]
+async fn operador_no_lee_ni_baja_el_nivel_de_riesgo(pool: PgPool) {
+    let (api, cfg) = api(&pool).await;
+    let ana = cliente(&pool, &cfg, "Ana").await;
+    let beto = cliente(&pool, &cfg, "Beto").await;
+    let operador = api.token("operador@synthetic.mx", "operador-de-pruebas-123").await;
+    let operador_id = operador_id(&pool).await;
+    let (_, c1) = token_oficial(&api, &pool, "Uno").await;
+    let (s, v) = api
+        .post(
+            &format!("/api/v1/aml/clientes/{}/congelar", ana.cliente.id),
+            &c1,
+            json!({ "motivo": MOTIVO, "clave_idempotencia": clave_api() }),
+        )
+        .await;
+    assert_eq!(s, StatusCode::CREATED, "{v}");
+    confirmar_por_http(&api, &c1, v["alerta"]["id"].as_str().unwrap()).await;
+    let nivel = |id: Uuid| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_as::<_, (String, Option<chrono::DateTime<chrono::Utc>>)>(
+                "SELECT nivel_riesgo_pld, riesgo_evaluado_en FROM kyc.clientes WHERE id = $1",
+            )
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+        }
+    };
+    let (n, evaluado) = nivel(ana.cliente.id).await;
+    assert_eq!(n, "ALTO");
+
+    // Un dictamen vacío (o sin nada que dictaminar) ya no sirve de lectura.
+    let ruta_ana = format!("/api/v1/operaciones/kyc/{}", ana.cliente.id);
+    for cuerpo in [json!({}), json!({ "motivo": "solo quiero ver el expediente" })] {
+        let (s, v) = api.post(&ruta_ana, &operador, cuerpo).await;
+        assert_eq!((s, error(&v)), (StatusCode::BAD_REQUEST, "VALIDACION"), "{v}");
+    }
+    // Bajar a BAJO: la respuesta no dice nada del nivel y el nivel no baja.
+    let (s, v) = api.post(&ruta_ana, &operador, json!({ "nivel_riesgo_pld": "BAJO" })).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    for campo in ["nivel_riesgo_pld", "riesgo_evaluado_en", "es_pep"] {
+        assert!(v.get(campo).is_none(), "el dictamen devuelve {campo}: {v}");
+    }
+    assert_eq!(nivel(ana.cliente.id).await, (n, evaluado), "el nivel y su fecha no cambian");
+    let (actor, rol_bd): (Option<Uuid>, String) = sqlx::query_as(
+        "SELECT actor_id, rol_bd FROM aml.bitacora WHERE cliente_id = $1 AND evento = 'RIESGO_CLIENTE_REDUCCION_DENEGADA'",
+    )
+    .bind(ana.cliente.id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!((actor, rol_bd.as_str()), (Some(operador_id), "sc_kyc_verificador"));
+
+    // Sin revisión de PLD, la asignación del onboarding sigue funcionando.
+    let (s, v) =
+        api.post(&format!("/api/v1/operaciones/kyc/{}", beto.cliente.id), &operador, json!({ "nivel_riesgo_pld": "BAJO" })).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert_eq!(nivel(beto.cliente.id).await.0, "BAJO");
+    assert_eq!(
+        contar(
+            &pool,
+            &format!(
+                "SELECT count(*) FROM aml.bitacora WHERE cliente_id = '{}' AND evento = 'RIESGO_CLIENTE_REDUCIDO' \
+                 AND actor_id = '{operador_id}'",
+                beto.cliente.id
+            )
+        )
+        .await,
+        1
+    );
+
+    verificar_invariantes(&pool).await;
+    verificar_invariantes_aml(&pool).await;
+}
+
+/// authz#5: un oficial que es sujeto de un expediente (INTERNA_PREOCUPANTE)
+/// no ve su alerta, su congelamiento, la solicitud de cuatro ojos, los avisos
+/// ni los contadores que lo delatan; otro oficial sí.
+#[sqlx::test(migrations = "../migrations")]
+async fn oficial_sujeto_no_ve_su_expediente(pool: PgPool) {
+    let (api, cfg) = api(&pool).await;
+    // Dario tiene bóveda (y KYC) y luego pasa a oficial de cumplimiento.
+    let dario = cliente(&pool, &cfg, "Dario").await;
+    como_dueno(&pool, &format!("UPDATE kyc.credenciales SET rol = 'CUMPLIMIENTO' WHERE cliente_id = '{}'", dario.cliente.id))
+        .await
+        .unwrap();
+    let tok_dario = token_cliente(&api, "Dario").await;
+    let (_, c1) = token_oficial(&api, &pool, "Uno").await;
+    let (s, v) = api
+        .post(
+            &format!("/api/v1/aml/clientes/{}/congelar", dario.cliente.id),
+            &c1,
+            json!({ "motivo": MOTIVO, "clave_idempotencia": clave_api() }),
+        )
+        .await;
+    assert_eq!(s, StatusCode::CREATED, "{v}");
+    assert_eq!(v["alerta"]["tipo_reporte"], "INTERNA_PREOCUPANTE");
+    let alerta = v["alerta"]["id"].as_str().unwrap().to_string();
+    // Uno propone el falso positivo: nace la solicitud de levantamiento.
+    let ruta = format!("/api/v1/aml/alertas/{alerta}/resolver");
+    let (s, _) = api.post(&ruta, &c1, json!({ "accion": "TOMAR", "clave_idempotencia": clave_api() })).await;
+    assert_eq!(s, StatusCode::CREATED);
+    let (s, v) = api
+        .post(&ruta, &c1, json!({ "accion": "FALSO_POSITIVO", "dictamen": DICTAMEN, "clave_idempotencia": clave_api() }))
+        .await;
+    assert_eq!(s, StatusCode::CREATED, "{v}");
+    assert_eq!(v["solicitud"]["estado"], "PENDIENTE");
+    let id = dario.cliente.id.to_string();
+    let de_dario = |v: &Value, lista: &str, campo: &str| -> usize {
+        v[lista]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|x| x[campo]["id"].as_str() == Some(id.as_str()) || x[campo].as_str() == Some(id.as_str()))
+            .count()
+    };
+    let lecturas = [
+        ("/api/v1/aml/alertas?estado=TODOS".to_string(), "alertas", "cliente"),
+        (format!("/api/v1/aml/alertas?cliente_id={id}&estado=TODOS"), "alertas", "cliente"),
+        ("/api/v1/aml/alertas?actualizadas_desde=2000-01-01T00:00:00Z".to_string(), "alertas", "cliente"),
+        ("/api/v1/aml/congelamientos?estado=TODOS".to_string(), "congelamientos", "cliente"),
+        (format!("/api/v1/aml/congelamientos?cliente_id={id}"), "congelamientos", "cliente"),
+        ("/api/v1/aml/solicitudes?estado=TODOS".to_string(), "solicitudes", "cliente"),
+        ("/api/v1/aml/notificaciones".to_string(), "notificaciones", "cliente_id"),
+    ];
+    for (ruta, lista, campo) in &lecturas {
+        let (s, v) = api.get(ruta, &c1).await;
+        assert_eq!(s, StatusCode::OK, "{ruta}: {v}");
+        assert!(de_dario(&v, lista, campo) > 0, "otro oficial ve el expediente en {ruta}: {v}");
+        let (s, v) = api.get(ruta, &tok_dario).await;
+        assert_eq!(s, StatusCode::OK, "{ruta}: {v}");
+        assert_eq!(de_dario(&v, lista, campo), 0, "el sujeto se ve en {ruta}: {v}");
+    }
+    for ruta in [format!("/api/v1/aml/alertas/{alerta}"), format!("/api/v1/aml/clientes/{id}")] {
+        let (s, v) = api.get(&ruta, &tok_dario).await;
+        assert_eq!((s, error(&v)), (StatusCode::NOT_FOUND, "NO_ENCONTRADO"), "{ruta}: {v}");
+        let (s, v) = api.get(&ruta, &c1).await;
+        assert_eq!(s, StatusCode::OK, "{ruta}: {v}");
+    }
+    let (_, r1) = api.get("/api/v1/aml/resumen", &c1).await;
+    let (_, rd) = api.get("/api/v1/aml/resumen", &tok_dario).await;
+    assert_eq!((r1["congelamientos_activos"].as_i64(), r1["en_revision"].as_i64()), (Some(1), Some(1)), "{r1}");
+    assert_eq!(r1["solicitudes_pendientes"].as_i64(), Some(1), "{r1}");
+    assert_eq!(
+        (rd["congelamientos_activos"].as_i64(), rd["en_revision"].as_i64(), rd["solicitudes_pendientes"].as_i64()),
+        (Some(0), Some(0), Some(0)),
+        "{rd}"
+    );
+    // Una consulta rechazada no deja CONSULTA_EXPEDIENTE del sujeto.
+    assert_eq!(
+        contar(
+            &pool,
+            &format!("SELECT count(*) FROM aml.bitacora WHERE evento = 'CONSULTA_EXPEDIENTE' AND actor_id = '{id}'")
+        )
+        .await,
+        0
+    );
+
+    verificar_invariantes(&pool).await;
+    verificar_invariantes_aml(&pool).await;
+}
+
+/// authz#10: CLIENTE y OPERADOR reciben 403 en toda ruta de la consola aunque
+/// la ruta, la query o el cuerpo estén mal formados (el rol se exige antes de
+/// leerlos), y AUDITOR en todo POST. authz#9: una transacción `sc_auditor` (la
+/// que usan /tablero y /reserva/prueba) no llega al esquema `aml`.
+#[sqlx::test(migrations = "../migrations")]
+async fn rol_antes_que_la_peticion(pool: PgPool) {
+    let (api, cfg) = api(&pool).await;
+    cliente(&pool, &cfg, "Ana").await;
+    let tok_ana = token_cliente(&api, "Ana").await;
+    let operador = api.token("operador@synthetic.mx", "operador-de-pruebas-123").await;
+    let (_, aud_email) = auditor(&pool, "Auditora").await;
+    let aud = api.token(&aud_email, PASSWORD_INTERNO).await;
+    let (_, c1) = token_oficial(&api, &pool, "Uno").await;
+    let id = Uuid::new_v4();
+    let malformadas: Vec<(&str, String, Option<Value>)> = vec![
+        ("GET", "/api/v1/aml/alertas?campo_desconocido=1".into(), None),
+        ("GET", "/api/v1/aml/alertas?limite=abc".into(), None),
+        ("GET", "/api/v1/aml/alertas/no-es-uuid".into(), None),
+        ("GET", "/api/v1/aml/clientes/no-es-uuid".into(), None),
+        ("GET", "/api/v1/aml/congelamientos?estado=x&otro=1".into(), None),
+        ("POST", format!("/api/v1/aml/alertas/{id}/resolver"), Some(json!({}))),
+        ("POST", format!("/api/v1/aml/alertas/{id}/resolver"), None),
+        ("POST", "/api/v1/aml/alertas/no-es-uuid/resolver".into(), Some(json!({ "accion": "TOMAR" }))),
+        ("POST", format!("/api/v1/aml/clientes/{id}/congelar"), Some(json!({ "x": 1 }))),
+        ("POST", "/api/v1/aml/propuestas".into(), Some(json!({ "tipo": 7 }))),
+        ("POST", format!("/api/v1/aml/solicitudes/{id}/decision"), Some(json!([]))),
+    ];
+    for (metodo, ruta, cuerpo) in &malformadas {
+        for token in [&tok_ana, &operador] {
+            let (s, v) = api.llamar(metodo, ruta, Some(token), cuerpo.clone()).await;
+            assert_eq!((s, error(&v)), (StatusCode::FORBIDDEN, "PROHIBIDO"), "{metodo} {ruta}: {v}");
+        }
+        if *metodo == "POST" {
+            let (s, v) = api.llamar(metodo, ruta, Some(&aud), cuerpo.clone()).await;
+            assert_eq!((s, error(&v)), (StatusCode::FORBIDDEN, "PROHIBIDO"), "AUDITOR {metodo} {ruta}: {v}");
+        }
+        let (s, _) = api.llamar(metodo, ruta, None, cuerpo.clone()).await;
+        assert_eq!(s, StatusCode::UNAUTHORIZED, "sin token {metodo} {ruta}");
+        // Quien sí tiene el rol recibe la validación de siempre.
+        let token = if *metodo == "GET" { &aud } else { &c1 };
+        let (s, v) = api.llamar(metodo, ruta, Some(token), cuerpo.clone()).await;
+        assert!(s.is_client_error() && s != StatusCode::FORBIDDEN && s != StatusCode::UNAUTHORIZED, "{metodo} {ruta}: {s} {v}");
+    }
+    for sql in ["SELECT 1 FROM aml.alertas", "SELECT aml.resumen(NULL)", "SELECT * FROM aml.verificar_bitacora(1)"] {
+        let r = como(&pool, Rol::Auditor, sql).await;
+        assert!(matches!(&r, Err(e) if e.contains("permission denied for schema aml")), "{sql}: {r:?}");
+    }
+
+    verificar_invariantes(&pool).await;
+    verificar_invariantes_aml(&pool).await;
+}
+
+/// e2e#1: el sondeo de la consola (`actualizadas_desde`) vuelve a enviar una
+/// alerta abierta cuando su congelamiento se levanta, con el estado nuevo
+/// incrustado. Antes, la alerta no cambiaba y una consola abierta mostraba
+/// "restringido" para siempre.
+#[sqlx::test(migrations = "../migrations")]
+async fn sondeo_reenvia_la_alerta_al_levantar_su_congelamiento(pool: PgPool) {
+    let (api, cfg) = api(&pool).await;
+    let frec = cliente(&pool, &cfg, "Frec").await;
+    for _ in 0..16 {
+        depositar(&pool, &cfg, frec.cuenta_ifpe.id, "100").await;
+    }
+    let r08 = alerta_de(&pool, frec.cliente.id, "R08_FRECUENCIA").await;
+    let (_, c1) = token_oficial(&api, &pool, "Uno").await;
+    let (_, c2) = token_oficial(&api, &pool, "Dos").await;
+    let (s, v) = api
+        .post(
+            &format!("/api/v1/aml/clientes/{}/congelar", frec.cliente.id),
+            &c1,
+            json!({ "motivo": MOTIVO, "alerta_id": r08, "clave_idempotencia": clave_api() }),
+        )
+        .await;
+    assert_eq!(s, StatusCode::CREATED, "{v}");
+    let congelamiento = v["congelamiento"]["id"].as_str().unwrap().to_string();
+    let (s, v) = api
+        .post(
+            &format!("/api/v1/aml/congelamientos/{congelamiento}/solicitudes"),
+            &c1,
+            json!({ "tipo": "LEVANTAR_Y_LIBERAR", "justificacion": JUSTIFICACION, "clave_idempotencia": clave_api() }),
+        )
+        .await;
+    assert_eq!(s, StatusCode::CREATED, "{v}");
+    let solicitud = v["solicitud"]["id"].as_str().unwrap().to_string();
+    let (_, pagina) = api.get(&format!("/api/v1/aml/alertas?cliente_id={}", frec.cliente.id), &c2).await;
+    let fila = pagina["alertas"].as_array().unwrap().iter().find(|a| a["id"] == json!(r08)).unwrap().clone();
+    assert_eq!((fila["estado"].as_str(), fila["congelamiento"]["estado"].as_str()), (Some("PENDIENTE"), Some("ACTIVO")));
+    let servidor_en = pagina["servidor_en"].as_str().unwrap().to_string();
+
+    let (s, v) = api
+        .post(
+            &format!("/api/v1/aml/solicitudes/{solicitud}/decision"),
+            &c2,
+            json!({ "aprobar": true, "comentario": "Explicación documentada; procede.", "clave_idempotencia": clave_api() }),
+        )
+        .await;
+    assert_eq!(s, StatusCode::CREATED, "{v}");
+    let (s, sondeo) =
+        api.get(&format!("/api/v1/aml/alertas?actualizadas_desde={}", servidor_en.replace('+', "%2B")), &c2).await;
+    assert_eq!(s, StatusCode::OK, "{sondeo}");
+    let fila = sondeo["alertas"].as_array().unwrap().iter().find(|a| a["id"] == json!(r08)).cloned();
+    let fila = fila.unwrap_or_else(|| panic!("el sondeo no reenvía la alerta tras el levantamiento: {sondeo}"));
+    assert_eq!((fila["estado"].as_str(), fila["congelamiento"]["estado"].as_str()), (Some("PENDIENTE"), Some("LEVANTADO")));
+    assert!(fila["actualizado_en"].as_str().unwrap() >= servidor_en.as_str(), "{fila}");
+
+    verificar_invariantes(&pool).await;
+    verificar_invariantes_aml(&pool).await;
+}
+
+/// e2e#4: los oficiales que crea el arranque (MODO_DEMO) tienen nombres
+/// distintos, así que la consola distingue al solicitante del aprobador.
+#[sqlx::test(migrations = "../migrations")]
+async fn oficiales_de_arranque_con_nombres_distintos(pool: PgPool) {
+    let mut cfg = preparar(&pool).await;
+    cfg.modo_demo = true;
+    cfg.pld.bootstrap_emails = vec!["oficial1@cumplimiento.mx".into(), "oficial2@cumplimiento.mx".into()];
+    cfg.pld.bootstrap_password = Some(PASSWORD_INTERNO.into());
+    bootstrap::ejecutar(&pool, &cfg).await.unwrap();
+    let nombres: Vec<String> = sqlx::query_scalar(
+        "SELECT btrim(concat_ws(' ', c.nombre, c.apellido_paterno, c.apellido_materno)) FROM kyc.clientes c \
+         JOIN kyc.credenciales cr ON cr.cliente_id = c.id WHERE cr.rol = 'CUMPLIMIENTO' ORDER BY c.email",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(nombres, ["Cumplimiento oficial1", "Cumplimiento oficial2"]);
+    // Un segundo arranque no los toca.
+    bootstrap::ejecutar(&pool, &cfg).await.unwrap();
+    assert_eq!(contar(&pool, "SELECT count(*) FROM kyc.credenciales WHERE rol = 'CUMPLIMIENTO'").await, 2);
+
+    verificar_invariantes(&pool).await;
+    verificar_invariantes_aml(&pool).await;
+}
+
+// -----------------------------------------------------------------------------
 // §3.3: escaneo del código fuente
 // -----------------------------------------------------------------------------
 

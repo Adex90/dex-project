@@ -15,6 +15,7 @@ import { ApiError, describeError } from "@/lib/api/client";
 import { api } from "@/lib/api/endpoints";
 import type { AgregadoAml, RevisionClienteAml, Rol, Uuid } from "@/lib/api/types";
 import { FREEZE_ORIGIN_LABEL, FREEZE_STATE_LABEL } from "@/lib/aml";
+import { EXPIRED_LOGIN_PATH } from "@/lib/session";
 import { useAuthStore } from "@/store/auth";
 
 const CREDIT_STATE_LABEL: Record<RevisionClienteAml["creditos"][number]["estado"], string> = {
@@ -102,8 +103,8 @@ export function ClientReviewDrawer({
       (e: unknown) => {
         if (controller.signal.aborted) return;
         if (e instanceof ApiError && e.isUnauthorized) {
-          useAuthStore.getState().logout();
-          router.replace("/auth/login?expired=1");
+          useAuthStore.getState().expire();
+          router.replace(EXPIRED_LOGIN_PATH);
           return;
         }
         setError(e);

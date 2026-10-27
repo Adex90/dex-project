@@ -126,6 +126,7 @@ export function ResolutionForm({
   restricted,
   pendingRequest,
   onDone,
+  onStale,
 }: {
   alerta: AlertaAml;
   role: Rol | null;
@@ -136,9 +137,11 @@ export function ResolutionForm({
   /** Its pending four-eyes request, if any (a false-positive proposal joins it). */
   pendingRequest: SolicitudAml | null;
   onDone: (message: string, result: ResolucionAlertaAml) => void;
+  /** The API refused because the alert changed (409): the case file reloads and shows this message. */
+  onStale?: (message: string) => void;
 }) {
-  const quick = useSubmit();
-  const decide = useSubmit();
+  const quick = useSubmit({ onStale });
+  const decide = useSubmit({ onStale });
   const [decision, setDecision] = useState<Decision | null>(null);
   const [dictamen, setDictamen] = useState("");
   const [tipoReporte, setTipoReporte] = useState<TipoReporteAml>(alerta.tipo_reporte);

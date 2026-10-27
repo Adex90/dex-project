@@ -35,6 +35,7 @@ import { ApiError, describeError } from "@/lib/api/client";
 import { api } from "@/lib/api/endpoints";
 import type { ResultadoVerificacion, SolicitudVerificacion, VistaExpediente } from "@/lib/api/types";
 import { parseCurp, todayInMexicoCity } from "@/lib/kyc";
+import { EXPIRED_LOGIN_PATH } from "@/lib/session";
 
 /** How often the status page asks for news while a file is in review. */
 const REVIEW_POLL_MS = 10_000;
@@ -63,7 +64,7 @@ function outcomeUnknown(error: unknown): boolean {
  */
 export default function OnboardingPage() {
   const router = useRouter();
-  const { hydrated, valid, token, role, email, logout } = useSession({ redirect: true });
+  const { hydrated, valid, token, role, email, logout, expire: endExpiredSession } = useSession({ redirect: true });
   const [file, setFile] = useState<VistaExpediente | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [step, setStep] = useState<Step>(1);
@@ -83,9 +84,9 @@ export default function OnboardingPage() {
   const focusPending = useRef(false);
 
   const expire = useCallback(() => {
-    logout();
-    router.replace("/auth/login?expired=1");
-  }, [logout, router]);
+    endExpiredSession();
+    router.replace(EXPIRED_LOGIN_PATH);
+  }, [endExpiredSession, router]);
 
   const signOut = () => {
     logout();

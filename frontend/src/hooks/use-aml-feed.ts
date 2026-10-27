@@ -13,8 +13,10 @@ import {
   mergeFeed,
   nextPollCursor,
   nextPollDelay,
+  retriesFeedLoad,
   type AlertFilters,
 } from "@/lib/aml";
+import { EXPIRED_LOGIN_PATH } from "@/lib/session";
 import { useAuthStore } from "@/store/auth";
 
 export type ConsoleTab = "alertas" | "aprobaciones" | "congelamientos";
@@ -150,6 +152,9 @@ export function useAmlFeed({
     let inReviewLoaded = false;
     let cursor: string | null = null; // servidor_en of the last complete poll
     let pageKey: string | null = null; // filters whose first page is loaded
+    // Filters whose first page the API rejected as invalid (400, 404, 422): it would fail the
+    // same way on every cycle, so it is not retried until the filters change or Refresh is pressed.
+    let rejectedKey: string | null = null;
     const controllers = new Set<AbortController>();
     const currentKey = () => JSON.stringify(filtersToQuery(filtersRef.current));
 
@@ -181,8 +186,8 @@ export function useAmlFeed({
         alive = false;
         abortAll();
         clearTimer();
-        useAuthStore.getState().logout();
-        router.replace("/auth/login?expired=1");
+        useAuthStore.getState().expire();
+        router.replace(EXPIRED_LOGIN_PATH);
         return true;
       }
       setError(e);
@@ -246,7 +251,7 @@ export function useAmlFeed({
       if (!options.skipAlerts) {
         if (cursor) jobs.push(pollAlerts(cursor));
         // The first page of these filters failed earlier: retry it with the poll.
-        if (pageKey !== currentKey()) jobs.push(loadFirstPage());
+        if (pageKey !== currentKey() && rejectedKey !== currentKey()) jobs.push(loadFirstPage());
       }
       if (currentTab === "aprobaciones") {
         jobs.push(fetchWith((signal) => api.amlRequests(auth, { limite: 200 }, signal)).then((r) => alive && setRequests(r.solicitudes)));
@@ -289,9 +294,15 @@ export function useAmlFeed({
     /** Page mode: the newest alerts of the current filters. */
     async function loadFirstPage() {
       const key = currentKey();
-      const page = await fetchWith((signal) =>
-        api.amlAlerts(auth, { ...filtersToQuery(filtersRef.current), limite: FEED_PAGE_SIZE }, signal),
-      );
+      let page;
+      try {
+        page = await fetchWith((signal) =>
+          api.amlAlerts(auth, { ...filtersToQuery(filtersRef.current), limite: FEED_PAGE_SIZE }, signal),
+        );
+      } catch (e) {
+        if (e instanceof ApiError && !retriesFeedLoad(e.status)) rejectedKey = key;
+        throw e;
+      }
       if (!alive || currentKey() !== key) return;
       // Whatever waited behind the pill is shown with the new page.
       rowsRef.current = mergeFeed(mergeFeed(rowsRef.current, pendingRef.current).alertas, page.alertas).alertas;
@@ -347,7 +358,10 @@ export function useAmlFeed({
     };
 
     engineRef.current = {
-      refresh: () => void tick(),
+      refresh: () => {
+        rejectedKey = null;
+        void tick();
+      },
       reload: () => void reload(),
       loadMore: () => void loadMore(),
     };

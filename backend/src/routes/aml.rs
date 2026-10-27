@@ -21,15 +21,21 @@
 //! | GET  | `/aml/relevantes` | cumplimiento / auditor: registro trimestral de operaciones relevantes |
 //! | GET  | `/aml/bitacora/verificacion` | cumplimiento / auditor: recalcula hashes y sellos de la bitácora |
 //!
-//! CLIENTE y OPERADOR reciben 403 en toda ruta y AUDITOR en todo POST; la base
-//! de datos repite la comprobación de rol (`aml.exigir_lector`,
-//! `aml.exigir_oficial`, `SC_AML_NO_AUTORIZADO`). Todo POST lleva
+//! CLIENTE y OPERADOR reciben 403 en toda ruta y AUDITOR en todo POST. El rol
+//! se comprueba en una capa de las rutas ([`exigir_rol`]) **antes** de leer la
+//! ruta, la query o el cuerpo: quien no es de cumplimiento recibe 403 aunque la
+//! petición esté mal formada, así que no puede explorar el esquema de las
+//! peticiones ni las validaciones de la consola. Cada handler lo repite y la
+//! base de datos también (`aml.exigir_lector`, `aml.exigir_oficial`,
+//! `SC_AML_NO_AUTORIZADO`). Todo POST lleva
 //! `clave_idempotencia`: 201 si la acción la realizó esta petición, 200 si es
 //! una repetición idempotente (el cuerpo siempre trae `idempotente`).
 
 use axum::{
-    extract::State,
-    http::StatusCode,
+    extract::{Request, State},
+    http::{Method, StatusCode},
+    middleware::{self, Next},
+    response::Response,
     routing::{get, post},
     Router,
 };
@@ -51,7 +57,7 @@ use crate::{
     state::AppState,
 };
 
-pub fn rutas() -> Router<AppState> {
+pub fn rutas(estado: AppState) -> Router<AppState> {
     Router::new()
         .route("/aml/resumen", get(resumen))
         .route("/aml/alertas", get(alertas))
@@ -70,6 +76,22 @@ pub fn rutas() -> Router<AppState> {
         .route("/aml/propuestas/{id}/decision", post(decidir_propuesta))
         .route("/aml/relevantes", get(relevantes))
         .route("/aml/bitacora/verificacion", get(verificar_bitacora))
+        .route_layer(middleware::from_fn_with_state(estado, exigir_rol))
+}
+
+/// Capa de las rutas de la consola: autentica y exige el rol antes que
+/// cualquier extractor del handler (ruta, query, cuerpo). GET: cumplimiento o
+/// auditor; cualquier otro método: cumplimiento. El `Usuario` validado viaja en
+/// las extensiones de la petición, así que el handler no vuelve a consultar la
+/// base de datos para extraerlo.
+async fn exigir_rol(u: Usuario, mut req: Request, next: Next) -> Result<Response, AppError> {
+    if req.method() == Method::GET || req.method() == Method::HEAD {
+        u.exigir_cumplimiento_o_auditor()?;
+    } else {
+        u.exigir_cumplimiento()?;
+    }
+    req.extensions_mut().insert(u);
+    Ok(next.run(req).await)
 }
 
 /// Respuesta de una acción de oficial: 201 si la realizó esta petición, 200

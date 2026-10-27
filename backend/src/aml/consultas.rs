@@ -5,6 +5,13 @@
 //! transacción es `aml.exigir_lector(actor)` con el usuario del JWT, así que
 //! incluso los listados que son un SELECT simple repiten en la base de datos
 //! la comprobación de rol (`SC_AML_NO_AUTORIZADO` → 403).
+//!
+//! **Nadie ve los registros de los que es sujeto.** Un oficial o auditor con
+//! su propio expediente (alertas INTERNA_PREOCUPANTE) no ve sus alertas,
+//! congelamientos, solicitudes, avisos ni operaciones relevantes: cada listado
+//! excluye `cliente_id = actor`, `aml.resumen(actor)` no los cuenta y
+//! `aml.consultar_alerta` / `aml.consultar_cliente` responden 404, como si no
+//! existieran.
 
 use chrono::{DateTime, Utc};
 use serde_json::{json, Value};
@@ -51,11 +58,12 @@ async fn abrir_lectura(pool: &PgPool, u: &Usuario) -> AppResult<Tx> {
     Ok(tx)
 }
 
-/// Contadores de la barra de resumen (`aml.resumen()`).
+/// Contadores de la barra de resumen (`aml.resumen(actor)`, sin los registros
+/// del propio lector).
 pub async fn resumen(pool: &PgPool, u: &Usuario) -> AppResult<Value> {
     u.exigir_cumplimiento_o_auditor()?;
     let mut tx = abrir_lectura(pool, u).await?;
-    let r: Value = sqlx::query_scalar("SELECT aml.resumen()").fetch_one(&mut *tx).await?;
+    let r: Value = sqlx::query_scalar("SELECT aml.resumen($1)").bind(u.cliente_id).fetch_one(&mut *tx).await?;
     tx.commit().await?;
     Ok(r)
 }
@@ -74,7 +82,8 @@ pub async fn alertas(pool: &PgPool, u: &Usuario, f: &FiltroAlertas) -> AppResult
     });
     let filas: Vec<(Value, i64)> = sqlx::query_as(
         "SELECT aml.alerta_json(a.id), a.folio FROM aml.alertas a \
-          WHERE (cardinality($1::text[]) = 0 OR a.estado::text = ANY ($1)) \
+          WHERE a.cliente_id <> $6 \
+            AND (cardinality($1::text[]) = 0 OR a.estado::text = ANY ($1)) \
             AND (cardinality($2::text[]) = 0 OR a.nivel_riesgo::text = ANY ($2)) \
             AND ($3::text IS NULL OR a.regla_codigo = $3) \
             AND ($4::uuid IS NULL OR a.cliente_id = $4) \
@@ -152,7 +161,8 @@ pub async fn congelamientos(
     let mut tx = abrir_lectura(pool, u).await?;
     let filas: Vec<(Value, i64)> = sqlx::query_as(
         "SELECT aml.congelamiento_json(f.id), f.folio FROM aml.congelamientos f \
-          WHERE ($1::text IS NULL OR f.estado = $1) \
+          WHERE f.cliente_id <> $5 \
+            AND ($1::text IS NULL OR f.estado = $1) \
             AND ($2::uuid IS NULL OR f.cliente_id = $2) \
             AND ($3::bigint IS NULL OR f.folio < $3) \
           ORDER BY f.folio DESC LIMIT $4",
@@ -161,6 +171,7 @@ pub async fn congelamientos(
     .bind(cliente_id)
     .bind(antes_de_folio)
     .bind(limite)
+    .bind(u.cliente_id)
     .fetch_all(&mut *tx)
     .await?;
     tx.commit().await?;
@@ -180,13 +191,15 @@ pub async fn solicitudes(pool: &PgPool, u: &Usuario, estado: Option<&str>, limit
     let mut tx = abrir_lectura(pool, u).await?;
     let filas: Vec<Value> = sqlx::query_scalar(
         "SELECT aml.solicitud_json(s.id) FROM aml.solicitudes_levantamiento s \
-          WHERE ($1::text IS NULL OR s.estado = $1) \
+           JOIN aml.congelamientos f ON f.id = s.congelamiento_id \
+          WHERE f.cliente_id <> $3 AND ($1::text IS NULL OR s.estado = $1) \
           ORDER BY CASE WHEN $1::text = 'PENDIENTE' THEN s.solicitada_en END ASC, \
                    s.decidida_en DESC NULLS FIRST, s.folio DESC \
           LIMIT $2",
     )
     .bind(estado)
     .bind(limite)
+    .bind(u.cliente_id)
     .fetch_all(&mut *tx)
     .await?;
     tx.commit().await?;
@@ -205,10 +218,12 @@ pub async fn notificaciones(pool: &PgPool, u: &Usuario, despues_de: Option<i64>,
                     'cliente_id', n.cliente_id, 'alerta_id', n.alerta_id, 'congelamiento_id', n.congelamiento_id, \
                     'solicitud_id', n.solicitud_id, 'propuesta_id', n.propuesta_id, 'resumen', n.resumen, \
                     'entregada_en', n.entregada_en), n.id \
-           FROM aml.notificaciones n WHERE n.id > $1 ORDER BY n.id LIMIT $2",
+           FROM aml.notificaciones n \
+          WHERE n.id > $1 AND n.cliente_id IS DISTINCT FROM $3 ORDER BY n.id LIMIT $2",
     )
     .bind(despues_de.unwrap_or(0))
     .bind(limite)
+    .bind(u.cliente_id)
     .fetch_all(&mut *tx)
     .await?;
     tx.commit().await?;
@@ -276,12 +291,14 @@ pub async fn relevantes(
                     'reporte_folio', r.reporte_folio, 'reportada_en', to_char(r.reportada_en, 'YYYY-MM-DD')), \
                 to_jsonb(r.creado_en) \
            FROM aml.operaciones_relevantes r \
-          WHERE ($1::text IS NULL OR r.trimestre = $1) AND ($2::timestamptz IS NULL OR r.creado_en < $2) \
+          WHERE r.cliente_id <> $4 \
+            AND ($1::text IS NULL OR r.trimestre = $1) AND ($2::timestamptz IS NULL OR r.creado_en < $2) \
           ORDER BY r.creado_en DESC, r.id DESC LIMIT $3",
     )
     .bind(trimestre)
     .bind(antes_de)
     .bind(limite)
+    .bind(u.cliente_id)
     .fetch_all(&mut *tx)
     .await?;
     tx.commit().await?;

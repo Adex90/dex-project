@@ -249,7 +249,14 @@ export function sortAlerts(rows: AlertaAml[]): AlertaAml[] {
   );
 }
 
-/** De-duplicates by id keeping the greater actualizado_en (Date.parse); reports new and updated ids. */
+/**
+ * De-duplicates by id keeping the greater actualizado_en (Date.parse); reports
+ * new and updated ids. A copy with the same actualizado_en but different
+ * content also replaces the old one: `incoming` always comes from a later
+ * response, and a row re-delivered inside the poll overlap may carry fresher
+ * embedded data (the restriction or the client) than the copy on screen.
+ * Identical copies change nothing and are not reported.
+ */
 export function mergeFeed(
   prev: AlertaAml[],
   incoming: AlertaAml[],
@@ -265,7 +272,10 @@ export function mergeFeed(
       index.set(a.id, alertas.length);
       alertas.push(a);
       nuevas.push(a.id);
-    } else if (compareInstants(a.actualizado_en, alertas[i]!.actualizado_en) > 0) {
+      continue;
+    }
+    const order = compareInstants(a.actualizado_en, alertas[i]!.actualizado_en);
+    if (order > 0 || (order === 0 && JSON.stringify(a) !== JSON.stringify(alertas[i]))) {
       alertas[i] = a;
       if (known.has(a.id)) actualizadas.add(a.id);
     }
@@ -301,7 +311,19 @@ function sameList(a: readonly string[], b: readonly string[]): boolean {
   return a.length === b.length && a.every((v, i) => v === b[i]);
 }
 
-const RULE_CODE_MAX = 64;
+/** Rule codes the API accepts in `?regla=` (routes/aml.rs ConsultaAlertas::validar). */
+const RULE_CODE = /^[A-Za-z0-9_]{1,40}$/;
+
+export function isRuleCode(value: string): boolean {
+  return RULE_CODE.test(value);
+}
+
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/** A path id the API can parse (anything else answers 400 before any lookup). */
+export function isUuid(value: string): boolean {
+  return UUID.test(value);
+}
 
 export function matchesFilters(a: AlertaAml, f: AlertFilters, me: Uuid): boolean {
   if (f.estados.length > 0 && !f.estados.includes(a.estado)) return false;
@@ -316,16 +338,20 @@ export function matchesFilters(a: AlertaAml, f: AlertFilters, me: Uuid): boolean
 export function filtersToQuery(f: AlertFilters): AlertFilterQuery {
   const estados = canonical(f.estados, ALERT_STATES);
   const niveles = canonical(f.niveles, LEVELS);
-  const regla = f.regla?.trim().slice(0, RULE_CODE_MAX);
+  const regla = f.regla?.trim();
   return {
     estado: estados.length === 0 ? "TODOS" : sameList(estados, DEFAULT_STATES) ? undefined : estados.join(","),
     nivel: niveles.length > 0 ? niveles.join(",") : undefined,
-    regla: regla ? regla : undefined,
+    regla: regla && isRuleCode(regla) ? regla : undefined,
     asignada: f.asignada ?? undefined,
   };
 }
 
-/** Inverse of `filtersToQuery`; unknown values are ignored. */
+/**
+ * Inverse of `filtersToQuery`; unknown values are ignored, including a rule
+ * code the API would reject (a shared link with `?regla=R05-X` shows every
+ * rule instead of an error the console would retry forever).
+ */
 export function filtersFromSearch(p: URLSearchParams): AlertFilters {
   const rawStates = p.get("estado")?.trim() ?? "";
   let estados: EstadoAlertaAml[];
@@ -336,12 +362,12 @@ export function filtersFromSearch(p: URLSearchParams): AlertFilters {
     estados = parsed.length > 0 ? parsed : [...DEFAULT_STATES];
   }
   const niveles = canonical((p.get("nivel") ?? "").split(","), LEVELS);
-  const regla = p.get("regla")?.trim().slice(0, RULE_CODE_MAX);
+  const regla = p.get("regla")?.trim();
   const asignada = p.get("asignada");
   return {
     estados,
     niveles,
-    regla: regla ? regla : null,
+    regla: regla && isRuleCode(regla) ? regla : null,
     asignada: asignada === "yo" || asignada === "nadie" ? asignada : null,
   };
 }
@@ -363,6 +389,25 @@ export function matchesSearch(a: AlertaAml, text: string): boolean {
 /** Poll cursor: the previous response's `servidor_en` minus POLL_OVERLAP_MS. */
 export function nextPollCursor(servidorEn: IsoDateTime): IsoDateTime {
   return new Date(Date.parse(servidorEn) - POLL_OVERLAP_MS).toISOString();
+}
+
+/**
+ * Whether the feed should retry a failed load on its next cycle: network
+ * errors, timeouts, rate limits and server errors may pass on retry; a request
+ * the API rejected as invalid (400, 404, 422) fails the same way every time.
+ */
+export function retriesFeedLoad(status: number): boolean {
+  return status === 0 || status === 408 || status === 429 || status >= 500;
+}
+
+/**
+ * An action the API refused because the record changed under the officer
+ * (taken by someone else, already closed or decided, restriction no longer
+ * active...): the form must reload the record instead of offering the same
+ * doomed action again. A reused idempotency key is not a state change.
+ */
+export function isStaleStateError(status: number, code: string): boolean {
+  return (status === 409 && code !== "CLAVE_IDEMPOTENCIA_REUTILIZADA") || code === "AML_TRANSICION_INVALIDA";
 }
 
 /** min(POLL_INTERVAL_MS × 2^failures, MAX_BACKOFF_MS): 10 s, 20 s, 40 s, 60 s… */
@@ -764,6 +809,8 @@ export const EVENT_LABEL: Record<string, string> = {
   EVALUACION_FALLIDA: "Scoring failed",
   CONSULTA_EXPEDIENTE: "Case file viewed",
   RIESGO_CLIENTE_ELEVADO: "Client risk tier raised",
+  RIESGO_CLIENTE_REDUCIDO: "Client risk tier lowered",
+  RIESGO_CLIENTE_REDUCCION_DENEGADA: "Risk tier lowering refused (client under review)",
   PROPUESTA_CREADA: "Change proposed",
   PROPUESTA_APROBADA: "Change approved",
   PROPUESTA_RECHAZADA: "Change rejected",

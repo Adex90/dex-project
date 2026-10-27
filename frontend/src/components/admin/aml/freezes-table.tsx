@@ -157,6 +157,7 @@ export function FreezeDrawer({
   onClose,
   onOpenAlert,
   onChanged,
+  onStale,
 }: {
   congelamiento: CongelamientoAml;
   role: Rol | null;
@@ -166,6 +167,8 @@ export function FreezeDrawer({
   onClose: () => void;
   onOpenAlert: (id: Uuid) => void;
   onChanged: (message: string) => void;
+  /** A request found the restriction changed (409): refresh the list it comes from. */
+  onStale?: (message: string) => void;
 }) {
   return (
     <Dialog
@@ -180,7 +183,15 @@ export function FreezeDrawer({
           <Alert tone="success">{notice}</Alert>
         </div>
       ) : null}
-      <FreezePanel congelamiento={congelamiento} role={role} me={me} token={token} onChanged={onChanged} onOpenAlert={onOpenAlert} />
+      <FreezePanel
+        congelamiento={congelamiento}
+        role={role}
+        me={me}
+        token={token}
+        onChanged={onChanged}
+        onStale={onStale}
+        onOpenAlert={onOpenAlert}
+      />
     </Dialog>
   );
 }

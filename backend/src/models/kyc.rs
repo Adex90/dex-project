@@ -80,9 +80,12 @@ pub struct Cliente {
 }
 
 /// Proyección de [`Cliente`] para el propio cliente (`/yo`, `/tablero`,
-/// `/auth/registro`): sin `nivel_riesgo_pld`, `es_pep` ni `riesgo_evaluado_en`.
-/// Un dictamen de cumplimiento sube el nivel de riesgo; mostrarlo revelaría la
-/// existencia de una alerta (las Disposiciones prohíben avisar al cliente).
+/// `/auth/registro`) y para el operador (respuesta del dictamen KYC): sin
+/// `nivel_riesgo_pld`, `es_pep` ni `riesgo_evaluado_en`. Un dictamen de
+/// cumplimiento sube el nivel de riesgo; mostrarlo revelaría la existencia de
+/// una alerta (las Disposiciones prohíben avisar al cliente, y el operador no
+/// tiene acceso a PLD). `actualizado_en` no se mueve cuando solo cambia el
+/// nivel (`trg_clientes_zz_aml_riesgo`, migración 0009).
 #[derive(Debug, Clone, Serialize)]
 pub struct ClienteVista {
     pub id: Uuid,

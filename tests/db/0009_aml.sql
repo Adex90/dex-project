@@ -344,11 +344,14 @@ SELECT pg_temp.exigir('Catálogo: hay funciones en aml y las cinco envolturas',
   (SELECT count(*) FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace WHERE n.nspname = 'aml') > 50
   AND (SELECT count(*) FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
         WHERE n.nspname IN ('ifpe', 'sofom') AND p.proname LIKE 'aml\_%') = 5);
-SELECT pg_temp.exigir('Catálogo: sin USAGE en aml para los seis roles transaccionales; sí para sc_aml y sc_auditor',
+-- authz#9: sc_auditor sirve rutas del cliente (/tablero, /reserva/prueba): sin
+-- USAGE en aml. El verificador externo de la bitácora es sc_auditor_pld.
+SELECT pg_temp.exigir('Catálogo: sin USAGE en aml para los seis roles transaccionales ni sc_auditor; sí para sc_aml y sc_auditor_pld',
   NOT has_schema_privilege('sc_ifpe', 'aml', 'USAGE') AND NOT has_schema_privilege('sc_spei', 'aml', 'USAGE')
   AND NOT has_schema_privilege('sc_puente', 'aml', 'USAGE') AND NOT has_schema_privilege('sc_sofom', 'aml', 'USAGE')
   AND NOT has_schema_privilege('sc_kyc', 'aml', 'USAGE') AND NOT has_schema_privilege('sc_kyc_verificador', 'aml', 'USAGE')
-  AND has_schema_privilege('sc_aml', 'aml', 'USAGE') AND has_schema_privilege('sc_auditor', 'aml', 'USAGE'));
+  AND NOT has_schema_privilege('sc_auditor', 'aml', 'USAGE')
+  AND has_schema_privilege('sc_aml', 'aml', 'USAGE') AND has_schema_privilege('sc_auditor_pld', 'aml', 'USAGE'));
 SELECT pg_temp.exigir('Catálogo: sc_aml sin USAGE en ifpe, sofom, kyc ni nucleo',
   NOT has_schema_privilege('sc_aml', 'ifpe', 'USAGE') AND NOT has_schema_privilege('sc_aml', 'sofom', 'USAGE')
   AND NOT has_schema_privilege('sc_aml', 'kyc', 'USAGE') AND NOT has_schema_privilege('sc_aml', 'nucleo', 'USAGE'));
@@ -359,11 +362,25 @@ SELECT pg_temp.exigir('Catálogo: sc_aml sin INSERT, UPDATE ni DELETE en ninguna
                       OR has_table_privilege('sc_aml', c.oid, 'DELETE')
                       OR has_any_column_privilege('sc_aml', c.oid, 'INSERT')
                       OR has_any_column_privilege('sc_aml', c.oid, 'UPDATE'))));
-SELECT pg_temp.exigir('Catálogo: sc_aml y sc_auditor leen todas las tablas de aml (incluida la vista heredada)',
+SELECT pg_temp.exigir('Catálogo: sc_aml lee todas las tablas de aml (incluida la vista heredada); sc_auditor y sc_auditor_pld ninguna',
   NOT EXISTS (SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
                WHERE n.nspname = 'aml' AND c.relkind IN ('r', 'v')
-                 AND NOT (has_table_privilege('sc_aml', c.oid, 'SELECT') AND has_table_privilege('sc_auditor', c.oid, 'SELECT')))
+                 AND NOT (has_table_privilege('sc_aml', c.oid, 'SELECT')
+                          AND NOT has_table_privilege('sc_auditor', c.oid, 'SELECT')
+                          AND NOT has_table_privilege('sc_auditor_pld', c.oid, 'SELECT')))
   AND has_table_privilege('sc_aml', 'aml.v_historial_pld', 'SELECT'));
+SELECT pg_temp.exigir('Catálogo: sc_auditor no ejecuta ninguna función de aml (ni los constructores JSON); sc_auditor_pld solo verificar_bitacora',
+  NOT EXISTS (SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+               WHERE n.nspname = 'aml' AND has_function_privilege('sc_auditor', p.oid, 'EXECUTE'))
+  AND (SELECT array_agg(p.oid::regprocedure::text) FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+        WHERE n.nspname = 'aml' AND has_function_privilege('sc_auditor_pld', p.oid, 'EXECUTE'))
+      = ARRAY['aml.verificar_bitacora(bigint)']);
+SELECT pg_temp.debe_fallar('Catálogo: una transacción sc_auditor (rutas del cliente) no lee aml.alertas', ARRAY[
+  'SET LOCAL ROLE sc_auditor', 'SELECT 1 FROM aml.alertas'
+], 'permission denied for schema aml');
+SELECT pg_temp.debe_fallar('Catálogo: una transacción sc_auditor no ejecuta aml.alerta_json', ARRAY[
+  'SET LOCAL ROLE sc_auditor', 'SELECT aml.alerta_json(gen_random_uuid())'
+], 'permission denied for schema aml');
 SELECT pg_temp.exigir('Catálogo: sc_ifpe ya no cambia ifpe.cuentas.estado',
   NOT has_column_privilege('sc_ifpe', 'ifpe.cuentas', 'estado', 'UPDATE')
   AND has_column_privilege('sc_ifpe', 'ifpe.cuentas', 'saldo_disponible', 'UPDATE'));
@@ -405,8 +422,8 @@ SELECT pg_temp.exigir('Catálogo: sc_aml no ejecuta el motor ni las funciones so
   AND NOT has_function_privilege('sc_aml', 'aml.liberar_retencion(uuid, uuid)', 'EXECUTE')
   AND has_function_privilege('sc_aml', 'aml.exigir_lector(uuid)', 'EXECUTE')
   AND has_function_privilege('sc_aml', 'aml.persona_json(uuid)', 'EXECUTE')
-  AND has_function_privilege('sc_auditor', 'aml.verificar_bitacora(bigint)', 'EXECUTE')
-  AND NOT has_function_privilege('sc_auditor', 'aml.resolver_alerta(uuid, uuid, text, text, text, boolean, boolean, text, text)', 'EXECUTE'));
+  AND has_function_privilege('sc_auditor_pld', 'aml.verificar_bitacora(bigint)', 'EXECUTE')
+  AND NOT has_function_privilege('sc_auditor_pld', 'aml.resolver_alerta(uuid, uuid, text, text, text, boolean, boolean, text, text)', 'EXECUTE'));
 -- robustness#5: nadie escucha 'aml_eventos'; un NOTIFY serializaría los COMMIT
 -- de los caminos del dinero que alertan o congelan.
 SELECT pg_temp.exigir('Catálogo: sin pg_notify en aml ni triggers AFTER INSERT en la bandeja de notificaciones',
@@ -1948,11 +1965,14 @@ SELECT pg_temp.exigir('Verificación: la consulta por omisión solo rehace lo po
      FROM aml.verificar_bitacora())
   AND (SELECT valido AND desde_sello = 1 AND filas_verificadas = filas FROM aml.verificar_bitacora(1)));
 SELECT pg_temp.debe_fallar('Verificación: inmutable', ARRAY['DELETE FROM aml.verificaciones_bitacora'], 'SC_LEDGER_INMUTABLE');
-SELECT pg_temp.debe_pasar('Sellado: sc_auditor verifica la bitácora', ARRAY[
-  'SET LOCAL ROLE sc_auditor',
+SELECT pg_temp.debe_pasar('Sellado: sc_auditor_pld verifica la bitácora', ARRAY[
+  'SET LOCAL ROLE sc_auditor_pld',
   $q$DO $d$ BEGIN IF NOT (SELECT valido FROM aml.verificar_bitacora(1)) THEN RAISE EXCEPTION 'inválida'; END IF; END $d$$q$,
   'RESET ROLE'
 ]);
+SELECT pg_temp.debe_fallar('Sellado: sc_auditor (rutas del cliente) ya no llega a la bitácora', ARRAY[
+  'SET LOCAL ROLE sc_auditor', 'SELECT * FROM aml.verificar_bitacora(1)'
+], 'permission denied for schema aml');
 
 -- -----------------------------------------------------------------------------
 -- 15. Regresiones de la revisión de PLD (cada prueba falla sin su corrección)
@@ -2321,6 +2341,194 @@ SELECT pg_temp.exigir('ALTO/PEP: dos abonos de 95,000 alertan sin congelar ni re
   NOT aml.cliente_congelado(pg_temp.c('PepViejo'))
   AND NOT EXISTS (SELECT 1 FROM aml.retenciones WHERE cliente_id = pg_temp.c('PepViejo'))
   AND NOT EXISTS (SELECT 1 FROM aml.alertas WHERE cliente_id = pg_temp.c('PepViejo') AND regla_codigo = 'R05_ESTRUCTURACION'));
+
+-- -----------------------------------------------------------------------------
+-- 16. Regresiones de la revisión de PLD, parte 2: autorización, sin aviso y
+--     marca de cambio de la consola (cada prueba falla sin su corrección)
+-- -----------------------------------------------------------------------------
+-- Toda la suite corre en una transacción: now() no avanza. Para ver si un
+-- trigger movió actualizado_en, se fecha antes al pasado con los triggers de
+-- 0001 desactivados (como dueño).
+CREATE FUNCTION pg_temp.fechar_actualizado(p_tabla TEXT, p_trigger TEXT, p_id UUID) RETURNS void
+LANGUAGE plpgsql AS $$
+BEGIN
+    SET CONSTRAINTS ALL IMMEDIATE; -- ALTER TABLE no admite eventos diferidos pendientes
+    SET CONSTRAINTS ALL DEFERRED;
+    EXECUTE format('ALTER TABLE %s DISABLE TRIGGER %I', p_tabla, p_trigger);
+    IF p_tabla = 'kyc.clientes' THEN
+        ALTER TABLE kyc.clientes DISABLE TRIGGER trg_clientes_zz_aml_riesgo;
+    END IF;
+    EXECUTE format($q$UPDATE %s SET actualizado_en = '2026-01-01 00:00:00+00' WHERE id = %L$q$, p_tabla, p_id);
+    IF p_tabla = 'kyc.clientes' THEN
+        ALTER TABLE kyc.clientes ENABLE TRIGGER trg_clientes_zz_aml_riesgo;
+    END IF;
+    EXECUTE format('ALTER TABLE %s ENABLE TRIGGER %I', p_tabla, p_trigger);
+END
+$$;
+-- El dictamen KYC del operador (backend/src/kyc/dictamen.rs) sobre el nivel.
+CREATE FUNCTION pg_temp.dictamen_nivel(p_cliente TEXT, p_nivel TEXT) RETURNS TEXT[]
+LANGUAGE sql STABLE AS $$
+    SELECT ARRAY['SET LOCAL ROLE sc_kyc_verificador',
+                 $q$SELECT set_config('sc.operador_id', '0f000000-0000-0000-0000-0000000000f0', true)$q$,
+                 format($q$UPDATE kyc.clientes SET nivel_riesgo_pld = coalesce(%L, nivel_riesgo_pld),
+                                  riesgo_evaluado_en = now(), nivel_cuenta = nivel_cuenta WHERE id = %L$q$,
+                        p_nivel, pg_temp.c(p_cliente)),
+                 'RESET ROLE']
+$$;
+
+-- authz#2: congelar y levantar no mueven ifpe.cuentas.actualizado_en (lo sirven
+-- /ifpe/cuenta y /tablero sin ningún movimiento del ledger que lo explique).
+SELECT pg_temp.cliente('Phi');
+SELECT pg_temp.fechar_actualizado('ifpe.cuentas', 'trg_ifpe_cuentas_actualizado_en', pg_temp.cta('Phi'));
+INSERT INTO r SELECT 'phi-congelar', pg_temp.como_aml(format(
+    $q$SELECT aml.congelar_manual(%L, %L, 'Instrucción de autoridad recibida por oficio para el cliente Phi.', NULL,
+                                  'cum:o1:phi-congelar')$q$, pg_temp.c('Oficial1'), pg_temp.c('Phi')));
+SELECT pg_temp.exigir('authz#2: el congelamiento no mueve actualizado_en de la cuenta',
+  (SELECT estado = 'CONGELADO_PREVENTIVO' AND actualizado_en = '2026-01-01 00:00:00+00' FROM ifpe.cuentas
+    WHERE id = pg_temp.cta('Phi')));
+INSERT INTO r SELECT 'phi-tomar', pg_temp.como_aml(pg_temp.resolver('Oficial1', 'Phi', 'R30_CONGELAMIENTO_MANUAL', 'TOMAR',
+                                                                    NULL, 'cum:o1:phi-tomar'));
+INSERT INTO r SELECT 'phi-fp', pg_temp.como_aml(pg_temp.resolver('Oficial1', 'Phi', 'R30_CONGELAMIENTO_MANUAL',
+    'FALSO_POSITIVO', 'El oficio fue revocado por la autoridad; procede levantar.', 'cum:o1:phi-fp',
+    FALSE, FALSE, 'LEVANTAR_CONSERVANDO_RETENCIONES'));
+INSERT INTO r SELECT 'phi-decide', pg_temp.como_aml(format(
+    $q$SELECT aml.decidir_levantamiento(%L, %L, TRUE, 'Oficio revocado; se levanta.', 'cum:o2:phi-decide')$q$,
+    pg_temp.c('Oficial2'), (SELECT v -> 'solicitud' ->> 'id' FROM r WHERE k = 'phi-fp')));
+SELECT pg_temp.exigir('authz#2: el levantamiento tampoco mueve actualizado_en de la cuenta',
+  (SELECT v -> 'congelamiento' ->> 'estado' = 'LEVANTADO' FROM r WHERE k = 'phi-decide')
+  AND (SELECT estado = 'ACTIVA' AND actualizado_en = '2026-01-01 00:00:00+00' FROM ifpe.cuentas
+        WHERE id = pg_temp.cta('Phi')));
+SELECT pg_temp.debe_pasar('authz#2: un cambio de saldo sí mueve actualizado_en (un movimiento visible)', ARRAY[
+  format('SELECT * FROM pg_temp.deposito_spei(%L, 10)', pg_temp.cta('Phi')),
+  format($q$DO $d$ BEGIN IF (SELECT actualizado_en FROM ifpe.cuentas WHERE id = %L) <> now() THEN
+            RAISE EXCEPTION 'actualizado_en no se movió'; END IF; END $d$$q$, pg_temp.cta('Phi'))
+]);
+
+-- authz#4 y authz#1: CONFIRMAR sube el nivel sin mover kyc.clientes.actualizado_en
+-- (ClienteVista lo sirve en /yo y /tablero); después, el operador no lo baja.
+SELECT pg_temp.cliente('Chi');
+SELECT pg_temp.fechar_actualizado('kyc.clientes', 'trg_clientes_actualizado_en', pg_temp.c('Chi'));
+INSERT INTO r SELECT 'chi-congelar', pg_temp.como_aml(format(
+    $q$SELECT aml.congelar_manual(%L, %L, 'Coincidencia con un reporte de autoridad sobre el cliente Chi.', NULL,
+                                  'cum:o1:chi-congelar')$q$, pg_temp.c('Oficial1'), pg_temp.c('Chi')));
+INSERT INTO r SELECT 'chi-tomar', pg_temp.como_aml(pg_temp.resolver('Oficial2', 'Chi', 'R30_CONGELAMIENTO_MANUAL', 'TOMAR',
+                                                                    NULL, 'cum:o2:chi-tomar'));
+INSERT INTO r SELECT 'chi-confirmar', pg_temp.como_aml(pg_temp.resolver('Oficial2', 'Chi', 'R30_CONGELAMIENTO_MANUAL',
+    'CONFIRMAR', 'Operaciones sin justificación económica; se reporta a la UIF.', 'cum:o2:chi-confirmar'));
+SELECT pg_temp.exigir('authz#4: CONFIRMAR sube el nivel a ALTO y no mueve actualizado_en del cliente',
+  (SELECT nivel_riesgo_pld = 'ALTO' AND riesgo_evaluado_en IS NOT NULL AND actualizado_en = '2026-01-01 00:00:00+00'
+     FROM kyc.clientes WHERE id = pg_temp.c('Chi'))
+  AND (SELECT count(*) = 1 FROM aml.bitacora WHERE cliente_id = pg_temp.c('Chi') AND evento = 'RIESGO_CLIENTE_ELEVADO'
+          AND actor_id = pg_temp.c('Oficial2')));
+SELECT pg_temp.debe_pasar('authz#1: el dictamen del operador que baja el nivel de un cliente con alerta confirmada no falla',
+  pg_temp.dictamen_nivel('Chi', 'BAJO'));
+SELECT pg_temp.exigir('authz#1: ... pero el nivel sigue ALTO y la bitácora registra el intento con el operador',
+  (SELECT nivel_riesgo_pld = 'ALTO' AND actualizado_en = '2026-01-01 00:00:00+00' FROM kyc.clientes
+    WHERE id = pg_temp.c('Chi'))
+  AND (SELECT riesgo_evaluado_en FROM kyc.clientes WHERE id = pg_temp.c('Chi'))
+      = (SELECT ocurrido_en::timestamptz FROM aml.bitacora WHERE cliente_id = pg_temp.c('Chi')
+          AND evento = 'RIESGO_CLIENTE_ELEVADO') - ((SELECT ocurrido_en FROM aml.bitacora WHERE cliente_id = pg_temp.c('Chi')
+          AND evento = 'RIESGO_CLIENTE_ELEVADO') - now())
+  AND (SELECT count(*) = 1 FROM aml.bitacora WHERE cliente_id = pg_temp.c('Chi')
+          AND evento = 'RIESGO_CLIENTE_REDUCCION_DENEGADA' AND estado_anterior = 'ALTO' AND estado_nuevo = 'BAJO'
+          AND actor_id = '0f000000-0000-0000-0000-0000000000f0' AND actor_tipo = 'OPERADOR'
+          AND rol_bd = 'sc_kyc_verificador'));
+SELECT pg_temp.exigir('authz#1: de los roles de la aplicación solo sc_kyc_verificador (el dictamen) actualiza el nivel',
+  has_column_privilege('sc_kyc_verificador', 'kyc.clientes', 'nivel_riesgo_pld', 'UPDATE')
+  AND NOT EXISTS (SELECT 1 FROM unnest(ARRAY['sc_kyc', 'sc_ifpe', 'sc_spei', 'sc_puente', 'sc_sofom', 'sc_auditor', 'sc_aml']) r
+                   WHERE has_column_privilege(r, 'kyc.clientes', 'nivel_riesgo_pld', 'UPDATE')));
+
+-- authz#1: una alerta abierta (sin congelamiento) también protege el nivel;
+-- sin revisión de PLD el operador sí lo baja y lo sube, y queda en la bitácora.
+SELECT pg_temp.cliente(n) FROM unnest(ARRAY['Ome', 'Psi']) n;
+SELECT pg_temp.paso('Ome', 'DEPOSITO', 120000, NULL, 'PERMITIR', 0, 'BAJO');
+SELECT pg_temp.paso('Ome', 'DEPOSITO', 115000, NULL, 'PERMITIR', 65, 'ALTO');
+SELECT pg_temp.debe_pasar('authz#1: el operador intenta bajar a BAJO a un cliente con una alerta abierta',
+  pg_temp.dictamen_nivel('Ome', 'BAJO'));
+SELECT pg_temp.exigir('authz#1: con una alerta abierta el nivel no baja',
+  (SELECT nivel_riesgo_pld = 'MEDIO' FROM kyc.clientes WHERE id = pg_temp.c('Ome'))
+  AND EXISTS (SELECT 1 FROM aml.bitacora WHERE cliente_id = pg_temp.c('Ome') AND evento = 'RIESGO_CLIENTE_REDUCCION_DENEGADA'));
+SELECT pg_temp.debe_pasar('authz#1: sin revisión de PLD el operador baja el nivel (asignación del onboarding)',
+  pg_temp.dictamen_nivel('Psi', 'BAJO'));
+SELECT pg_temp.debe_pasar('authz#1: y lo sube', pg_temp.dictamen_nivel('Psi', 'ALTO'));
+SELECT pg_temp.exigir('authz#1: los cambios del operador quedan en la bitácora, con el operador como actor',
+  (SELECT nivel_riesgo_pld = 'ALTO' FROM kyc.clientes WHERE id = pg_temp.c('Psi'))
+  AND (SELECT array_agg(evento || ' ' || estado_anterior || '>' || estado_nuevo ORDER BY id) FROM aml.bitacora
+        WHERE cliente_id = pg_temp.c('Psi') AND actor_id = '0f000000-0000-0000-0000-0000000000f0'
+          AND actor_tipo = 'OPERADOR' AND rol_bd = 'sc_kyc_verificador')
+      = ARRAY['RIESGO_CLIENTE_REDUCIDO MEDIO>BAJO', 'RIESGO_CLIENTE_ELEVADO BAJO>ALTO']);
+SELECT pg_temp.debe_pasar('authz#1: el dueño del esquema (DBA) sí baja un nivel protegido, con su renglón en la bitácora', ARRAY[
+  format($q$UPDATE kyc.clientes SET nivel_riesgo_pld = 'BAJO' WHERE id = %L$q$, pg_temp.c('Ome')),
+  format($q$DO $d$ BEGIN IF NOT EXISTS (SELECT 1 FROM aml.bitacora WHERE cliente_id = %L AND evento = 'RIESGO_CLIENTE_REDUCIDO'
+            AND actor_id IS NULL AND rol_bd = 'none') THEN RAISE EXCEPTION 'sin bitácora'; END IF; END $d$$q$, pg_temp.c('Ome')),
+  format($q$UPDATE kyc.clientes SET nivel_riesgo_pld = 'MEDIO' WHERE id = %L$q$, pg_temp.c('Ome'))
+]);
+
+-- authz#5: un oficial que es sujeto de una alerta (INTERNA_PREOCUPANTE) no ve su
+-- expediente, ni su revisión, ni sus registros en el resumen.
+SELECT pg_temp.oficial('OfSujeto');
+INSERT INTO ifpe.cuentas (cliente_id, clabe) VALUES (pg_temp.c('OfSujeto'), pg_temp.clabe(nextval('pg_temp.cuentas_seq')::int));
+INSERT INTO r SELECT 'resumen-antes', pg_temp.como_aml('SELECT aml.resumen()');
+INSERT INTO r SELECT 'sujeto-congelar', pg_temp.como_aml(format(
+    $q$SELECT aml.congelar_manual(%L, %L, 'Indicios de operaciones del propio personal sin justificación.', NULL,
+                                  'cum:o1:sujeto')$q$, pg_temp.c('Oficial1'), pg_temp.c('OfSujeto')));
+SELECT pg_temp.exigir('authz#5: la alerta del oficial es INTERNA_PREOCUPANTE y él sigue siendo lector',
+  (SELECT v -> 'alerta' ->> 'tipo_reporte' = 'INTERNA_PREOCUPANTE' FROM r WHERE k = 'sujeto-congelar')
+  AND pg_temp.como_aml(format('SELECT to_jsonb(aml.exigir_lector(%L))', pg_temp.c('OfSujeto'))) = '"CUMPLIMIENTO"');
+SELECT pg_temp.debe_fallar('authz#5: el sujeto no abre su expediente (igual que una alerta inexistente)', ARRAY[
+  'SET LOCAL ROLE sc_aml',
+  format('SELECT aml.consultar_alerta(%L, %L)', pg_temp.c('OfSujeto'), pg_temp.alerta('OfSujeto', 'R30_CONGELAMIENTO_MANUAL'))
+], 'SC_AML_NO_ENCONTRADO');
+SELECT pg_temp.debe_fallar('authz#5: el sujeto no abre su propia revisión de cliente', ARRAY[
+  'SET LOCAL ROLE sc_aml', format('SELECT aml.consultar_cliente(%L, %L)', pg_temp.c('OfSujeto'), pg_temp.c('OfSujeto'))
+], 'SC_AML_NO_ENCONTRADO');
+SELECT pg_temp.exigir('authz#5: otro oficial sí los abre',
+  pg_temp.como_aml(format('SELECT aml.consultar_alerta(%L, %L)', pg_temp.c('Oficial2'),
+                          pg_temp.alerta('OfSujeto', 'R30_CONGELAMIENTO_MANUAL'))) -> 'alerta' ->> 'estado' = 'PENDIENTE'
+  AND pg_temp.como_aml(format('SELECT aml.consultar_cliente(%L, %L)', pg_temp.c('Oficial2'), pg_temp.c('OfSujeto')))
+      -> 'congelamientos' -> 0 ->> 'estado' = 'ACTIVO');
+SELECT pg_temp.exigir('authz#5: el resumen del sujeto no cuenta su alerta ni su congelamiento; el de otro sí',
+  (pg_temp.como_aml(format('SELECT aml.resumen(%L)', pg_temp.c('OfSujeto'))) ->> 'congelamientos_activos')::int
+      = ((SELECT v FROM r WHERE k = 'resumen-antes') ->> 'congelamientos_activos')::int
+  AND (pg_temp.como_aml(format('SELECT aml.resumen(%L)', pg_temp.c('OfSujeto'))) ->> 'pendientes')::int
+      = ((SELECT v FROM r WHERE k = 'resumen-antes') ->> 'pendientes')::int
+  AND (pg_temp.como_aml(format('SELECT aml.resumen(%L)', pg_temp.c('Oficial2'))) ->> 'congelamientos_activos')::int
+      = ((SELECT v FROM r WHERE k = 'resumen-antes') ->> 'congelamientos_activos')::int + 1
+  AND (pg_temp.como_aml(format('SELECT aml.resumen(%L)', pg_temp.c('Oficial2'))) ->> 'pendientes')::int
+      = ((SELECT v FROM r WHERE k = 'resumen-antes') ->> 'pendientes')::int + 1);
+
+-- e2e#1: una alerta abierta ligada a un congelamiento se vuelve a enviar al
+-- sondeo de la consola cuando el congelamiento se levanta (su actualizado_en
+-- se mueve aunque la alerta no cambie), y cuando cambia el nivel del cliente.
+SELECT pg_temp.cliente('Frec');
+DO $$ BEGIN FOR i IN 1..16 LOOP PERFORM pg_temp.deposito_spei(pg_temp.cta('Frec'), 100); END LOOP; END $$;
+SELECT pg_temp.exigir('e2e#1: dieciséis abonos pequeños dejan una alerta R08 MEDIO abierta',
+  (SELECT estado = 'PENDIENTE' AND nivel_riesgo = 'MEDIO' FROM aml.alertas
+    WHERE id = pg_temp.alerta('Frec', 'R08_FRECUENCIA')));
+INSERT INTO r SELECT 'frec-congelar', pg_temp.como_aml(format(
+    $q$SELECT aml.congelar_manual(%L, %L, 'Frecuencia inusual de abonos pequeños sin explicación del cliente.', %L,
+                                  'cum:o1:frec-congelar')$q$, pg_temp.c('Oficial1'), pg_temp.c('Frec'),
+    pg_temp.alerta('Frec', 'R08_FRECUENCIA')));
+INSERT INTO r SELECT 'frec-solicitar', pg_temp.como_aml(format(
+    $q$SELECT aml.solicitar_levantamiento(%L, %L, 'LEVANTAR_Y_LIBERAR', 'La frecuencia se explica por domiciliaciones documentadas.',
+                                          'cum:o1:frec-solicitar')$q$, pg_temp.c('Oficial1'),
+    (SELECT v -> 'congelamiento' ->> 'id' FROM r WHERE k = 'frec-congelar')));
+INSERT INTO r SELECT 'frec-antes', to_jsonb(actualizado_en) FROM aml.alertas WHERE id = pg_temp.alerta('Frec', 'R08_FRECUENCIA');
+INSERT INTO r SELECT 'frec-decide', pg_temp.como_aml(format(
+    $q$SELECT aml.decidir_levantamiento(%L, %L, TRUE, 'Explicación documentada; se levanta.', 'cum:o2:frec-decide')$q$,
+    pg_temp.c('Oficial2'), (SELECT v -> 'solicitud' ->> 'id' FROM r WHERE k = 'frec-solicitar')));
+SELECT pg_temp.exigir('e2e#1: tras el levantamiento la alerta sigue abierta, incrusta LEVANTADO y su marca de cambio avanzó',
+  (SELECT a.estado = 'PENDIENTE' AND aml.alerta_json(a.id) -> 'congelamiento' ->> 'estado' = 'LEVANTADO'
+          AND a.actualizado_en > (SELECT (v #>> '{}')::timestamptz FROM r WHERE k = 'frec-antes')
+          AND (aml.alerta_json(a.id) ->> 'actualizado_en')::timestamptz = a.actualizado_en
+     FROM aml.alertas a WHERE a.id = pg_temp.alerta('Frec', 'R08_FRECUENCIA')));
+INSERT INTO r SELECT 'frec-antes-nivel', to_jsonb(actualizado_en) FROM aml.alertas
+ WHERE id = pg_temp.alerta('Frec', 'R08_FRECUENCIA');
+SELECT pg_temp.debe_pasar('e2e#1: el operador sube el nivel del cliente', pg_temp.dictamen_nivel('Frec', 'ALTO'));
+SELECT pg_temp.exigir('e2e#1: un cambio de nivel del cliente también mueve la marca de cambio de sus alertas',
+  (SELECT a.actualizado_en > (SELECT (v #>> '{}')::timestamptz FROM r WHERE k = 'frec-antes-nivel')
+          AND aml.alerta_json(a.id) -> 'cliente' ->> 'nivel_riesgo_pld' = 'ALTO'
+     FROM aml.alertas a WHERE a.id = pg_temp.alerta('Frec', 'R08_FRECUENCIA')));
 
 -- -----------------------------------------------------------------------------
 -- 14. Reserva del 100% al final (antes de alterar la bitácora)

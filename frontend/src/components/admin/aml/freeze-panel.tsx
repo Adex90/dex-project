@@ -29,17 +29,20 @@ export function UnfreezeRequestDialog({
   token,
   onClose,
   onDone,
+  onStale,
 }: {
   congelamiento: CongelamientoAml;
   token: string;
   onClose: () => void;
   onDone: (message: string) => void;
+  /** The API refused because the restriction changed (409): the caller reloads it. */
+  onStale?: (message: string) => void;
 }) {
   const release = congelamiento.estado === "LEVANTADO";
   const [tipo, setTipo] = useState<TipoSolicitudAml>(release ? "LIBERAR_RETENCIONES" : "LEVANTAR_Y_LIBERAR");
   const [justificacion, setJustificacion] = useState("");
   const [touched, setTouched] = useState(false);
-  const { busy, error, run } = useSubmit();
+  const { busy, error, run } = useSubmit({ onStale });
   const problem = validateNarrative(justificacion, DICTAMEN_MIN, DICTAMEN_MAX);
 
   const submit = async () => {
@@ -134,6 +137,7 @@ export function ManualFreezeDialog({
   alerta,
   onClose,
   onDone,
+  onStale,
 }: {
   token: string;
   cliente: { id: Uuid; nombre_completo: string };
@@ -141,10 +145,12 @@ export function ManualFreezeDialog({
   alerta: Pick<AlertaAml, "id" | "folio"> | null;
   onClose: () => void;
   onDone: (message: string, alerts: AlertaAml[]) => void;
+  /** The API refused because the alert changed (409): the caller reloads it. */
+  onStale?: (message: string) => void;
 }) {
   const [motivo, setMotivo] = useState("");
   const [touched, setTouched] = useState(false);
-  const { busy, error, run } = useSubmit();
+  const { busy, error, run } = useSubmit({ onStale });
   const problem = validateNarrative(motivo, DICTAMEN_MIN, DICTAMEN_MAX);
 
   const submit = async () => {
@@ -222,6 +228,7 @@ export function FreezePanel({
   me,
   token,
   onChanged,
+  onStale,
   onOpenAlert,
 }: {
   congelamiento: CongelamientoAml;
@@ -230,6 +237,8 @@ export function FreezePanel({
   token: string;
   /** After a request was created: refetch the case file, the queue and the summary. */
   onChanged: (message: string) => void;
+  /** The API refused because the restriction changed (409): refetch it. */
+  onStale?: (message: string) => void;
   /** Opens the alert that caused the restriction (Frozen clients tab). */
   onOpenAlert?: (id: Uuid) => void;
 }) {
@@ -373,6 +382,7 @@ export function FreezePanel({
             setDialog(false);
             onChanged(message);
           }}
+          onStale={onStale}
         />
       ) : null}
     </Section>

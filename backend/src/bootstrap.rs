@@ -88,6 +88,11 @@ pub async fn asegurar_operador(pool: &PgPool, email: &str, pw: &str) -> AppResul
 /// Crea (o deja intacta) una persona interna con el rol indicado (operador,
 /// auditor u oficial de cumplimiento). Mismas reglas que [`asegurar_operador`]:
 /// solo el dueño del esquema fija `kyc.credenciales.rol`.
+///
+/// El nombre visible es el rol y la parte local del email ("Cumplimiento
+/// oficial1"): en la consola, el solicitante, el proponente y el aprobador de
+/// una decisión de cuatro ojos deben distinguirse (un auditor verifica la
+/// segregación de funciones por esos nombres).
 pub async fn asegurar_usuario_interno(pool: &PgPool, email: &str, pw: &str, rol: RolUsuario) -> AppResult<()> {
     password::validar_politica(pw)?;
     let email = email.trim().to_lowercase();
@@ -106,14 +111,16 @@ pub async fn asegurar_usuario_interno(pool: &PgPool, email: &str, pw: &str, rol:
             return Err(anyhow::anyhow!("asegurar_usuario_interno no da de alta clientes").into());
         }
     };
+    let apellido = nombre_visible(&email);
     let hash = password::hashear(pw.to_owned()).await?;
     let mut tx = db::begin_administrativa(pool).await?;
     let id: uuid::Uuid = sqlx::query_scalar(
         "INSERT INTO kyc.clientes (tipo_persona, nombre, apellido_paterno, email, estatus_kyc, kyc_verificado_en, nivel_riesgo_pld) \
-         VALUES ('FISICA', $2, 'Synthetic Capital', $1, 'VERIFICADO', now(), 'BAJO') RETURNING id",
+         VALUES ('FISICA', $2, $3, $1, 'VERIFICADO', now(), 'BAJO') RETURNING id",
     )
     .bind(&email)
     .bind(nombre)
+    .bind(&apellido)
     .fetch_one(&mut *tx)
     .await?;
     sqlx::query("INSERT INTO kyc.credenciales (cliente_id, password_hash, rol) VALUES ($1, $2, $3)")
@@ -125,4 +132,28 @@ pub async fn asegurar_usuario_interno(pool: &PgPool, email: &str, pw: &str, rol:
     tx.commit().await?;
     tracing::info!(%email, ?rol, "usuario interno creado");
     Ok(())
+}
+
+/// Parte local del email (hasta 60 caracteres), que distingue a cada persona
+/// interna en la consola; "Synthetic Capital" si el email no la tiene.
+fn nombre_visible(email: &str) -> String {
+    let local: String = email.split('@').next().unwrap_or_default().trim().chars().take(60).collect();
+    if local.is_empty() {
+        "Synthetic Capital".to_owned()
+    } else {
+        local
+    }
+}
+
+#[cfg(test)]
+mod pruebas {
+    use super::nombre_visible;
+
+    #[test]
+    fn nombre_visible_distingue_por_email() {
+        assert_eq!(nombre_visible("oficial1@cumplimiento.mx"), "oficial1");
+        assert_ne!(nombre_visible("oficial1@cumplimiento.mx"), nombre_visible("oficial2@cumplimiento.mx"));
+        assert_eq!(nombre_visible("@x.mx"), "Synthetic Capital");
+        assert_eq!(nombre_visible(&format!("{}@x.mx", "a".repeat(80))).chars().count(), 60);
+    }
 }

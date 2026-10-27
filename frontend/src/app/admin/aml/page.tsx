@@ -13,10 +13,11 @@ import { SummaryBar } from "@/components/admin/aml/summary-bar";
 import { Alert, Badge, Button, Card, Skeleton, cx } from "@/components/ui/primitives";
 import { useAmlFeed, type ConsoleTab, type FreezeListState } from "@/hooks/use-aml-feed";
 import { useSession } from "@/hooks/use-session";
-import { describeError } from "@/lib/api/client";
+import { ApiError, describeError } from "@/lib/api/client";
 import { api } from "@/lib/api/endpoints";
 import type { AlertaAml, CongelamientoAml, ParametrosAml, Uuid } from "@/lib/api/types";
 import {
+  defaultFilters,
   filtersFromSearch,
   filtersToQuery,
   matchesFilters,
@@ -226,12 +227,22 @@ function AmlConsole() {
 
       {notice ? <Alert tone="success">{notice}</Alert> : null}
       {feed.error && feed.rows.length === 0 && !feed.loading ? (
-        <Alert tone="error" title="Could not load the console">
-          {describeError(feed.error)}{" "}
-          <Button variant="ghost" size="sm" onClick={refresh}>
-            Retry
-          </Button>
-        </Alert>
+        feed.error instanceof ApiError && feed.error.status === 400 ? (
+          // The API's validation text is Spanish and this request would fail the same way again.
+          <Alert tone="error" title="Could not load the console">
+            This link has filters the console cannot apply.{" "}
+            <Button variant="ghost" size="sm" onClick={() => setFilters(defaultFilters())}>
+              Clear filters
+            </Button>
+          </Alert>
+        ) : (
+          <Alert tone="error" title="Could not load the console">
+            {describeError(feed.error)}{" "}
+            <Button variant="ghost" size="sm" onClick={refresh}>
+              Retry
+            </Button>
+          </Alert>
+        )
       ) : null}
       {feed.error && feed.rows.length > 0 ? (
         <Alert tone="warning">Showing the last data received. {describeError(feed.error)}</Alert>
@@ -273,6 +284,7 @@ function AmlConsole() {
               setNotice(message);
               afterPost(alerts);
             }}
+            onStale={refresh}
           />
         </TabPanel>
 
@@ -305,6 +317,7 @@ function AmlConsole() {
             setFreezeNotice(message);
             afterPost([]);
           }}
+          onStale={() => refresh()}
         />
       ) : null}
 
