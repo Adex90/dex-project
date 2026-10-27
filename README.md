@@ -505,7 +505,16 @@ psql "$EMPTY_DATABASE_URL" -f tests/db/0008_spei.sql
 psql "$EMPTY_DATABASE_URL" -f tests/db/0009_aml.sql
 cd frontend && npm test && npm run build
 FRONTEND_URL=http://localhost:3000 node e2e/smoke.mjs   # needs backend (MODO_DEMO=true) + next start
+# AML/PLD console against the real stack (structuring -> freeze -> four-eyes unfreeze, roles, no tipping off):
+cd frontend && e2e/aml-stack.sh start && node e2e/aml.mjs; e2e/aml-stack.sh stop
 ```
+
+The browser tests need Playwright and Chromium (`NODE_PATH` pointing at a
+global `playwright` install, `PLAYWRIGHT_BROWSERS_PATH` at its browsers).
+`e2e/aml-stack.sh start` creates a fresh database (`DB`, default `sc_e2e_aml`,
+through the `PGHOST`/`PGUSER`/`PGPASSWORD` variables), starts the backend with
+`MODO_DEMO` and two compliance officers, an operator and an auditor, and serves
+the frontend with `next start`; `stop` kills both by PID and drops the database.
 
 ### Production database users
 
