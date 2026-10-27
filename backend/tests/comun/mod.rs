@@ -135,7 +135,8 @@ impl IdentidadPrueba {
         let (paterno, materno) = ("Prueba", Some("Sintética"));
         let curp = curp::construir(nombre, paterno, materno, fecha, Sexo::M, "DF", (n % 10) as u8);
         let rfc = rfc::construir_desde_curp(&curp, &format!("{:02}", n % 100));
-        let clave_elector = ine::construir_clave_elector(nombre, paterno, materno, fecha, 9, Sexo::M, (n % 1000) as u16);
+        let clave_elector =
+            ine::construir_clave_elector(nombre, paterno, materno, fecha, 9, Sexo::M, (n % 1000) as u16);
         Self {
             nombres: nombre.to_owned(),
             apellido_paterno: paterno.to_owned(),
@@ -178,7 +179,10 @@ impl IdentidadPrueba {
                 frente: imagen_jpeg(self.semilla, 1),
                 reverso: imagen_jpeg(self.semilla, 2),
             },
-            selfie: Selfie { frames: (3..6).map(|i| imagen_jpeg(self.semilla, i)).collect(), reto: Some("PARPADEA".into()) },
+            selfie: Selfie {
+                frames: (3..6).map(|i| imagen_jpeg(self.semilla, i)).collect(),
+                reto: Some("PARPADEA".into()),
+            },
             consentimiento_biometrico: true,
         }
     }

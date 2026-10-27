@@ -40,8 +40,8 @@ use crate::{
     spei::{self, clabe},
 };
 
-pub use dictamen::{dictaminar, DictamenKyc};
 use biometria::{Entrega, ProveedorBiometrico, SolicitudProveedor};
+pub use dictamen::{dictaminar, DictamenKyc};
 use expediente::{EstadoKyc, IdentidadPropia, OrigenEnvio, SolicitudVerificacion};
 use verificacion::ResultadoVerificacion;
 
@@ -283,8 +283,14 @@ pub async fn verificar_identidad(
         .verificacion_en_curso
         .ok_or_else(|| AppError::Interno(anyhow::anyhow!("envío sin id de verificación")))?;
     let mut en_vuelo = EnvioEnVuelo { pool: pool.clone(), cliente_id, verificacion_id, activo: true };
-    let solicitud = SolicitudProveedor { verificacion_id, cliente_id, identidad: IdentidadPropia::de(&enviado)?, imagenes };
-    let pendiente = EnvioVerificacion { verificacion_id, estado_kyc: enviado.estado_kyc, intentos: enviado.intentos, resultado: None };
+    let solicitud =
+        SolicitudProveedor { verificacion_id, cliente_id, identidad: IdentidadPropia::de(&enviado)?, imagenes };
+    let pendiente = EnvioVerificacion {
+        verificacion_id,
+        estado_kyc: enviado.estado_kyc,
+        intentos: enviado.intentos,
+        resultado: None,
+    };
     let falla = |motivo: String| async move {
         let devuelto = verificacion::reembolsar_intento(pool, cliente_id, verificacion_id, &motivo).await?;
         Err::<EnvioVerificacion, AppError>(AppError::peticion(
@@ -298,17 +304,24 @@ pub async fn verificar_identidad(
         ))
     };
     match proveedor.verificar(&solicitud).await {
-        Ok(Entrega::Inmediata { cuerpo, firma }) => match verificacion::procesar(pool, cfg, Some(&firma), &cuerpo).await {
-            Ok(r) => {
-                en_vuelo.activo = false;
-                Ok(EnvioVerificacion { estado_kyc: r.estado_kyc, intentos: r.intentos, resultado: Some(r), ..pendiente })
+        Ok(Entrega::Inmediata { cuerpo, firma }) => {
+            match verificacion::procesar(pool, cfg, Some(&firma), &cuerpo).await {
+                Ok(r) => {
+                    en_vuelo.activo = false;
+                    Ok(EnvioVerificacion {
+                        estado_kyc: r.estado_kyc,
+                        intentos: r.intentos,
+                        resultado: Some(r),
+                        ..pendiente
+                    })
+                }
+                Err(e) => {
+                    en_vuelo.activo = false;
+                    tracing::error!(cliente = %cliente_id, error = %e, "no se pudo procesar el resultado del proveedor");
+                    falla(format!("resultado no procesable: {}", e.codigo())).await
+                }
             }
-            Err(e) => {
-                en_vuelo.activo = false;
-                tracing::error!(cliente = %cliente_id, error = %e, "no se pudo procesar el resultado del proveedor");
-                falla(format!("resultado no procesable: {}", e.codigo())).await
-            }
-        },
+        }
         // El resultado llegará por el webhook.
         Ok(Entrega::Pendiente) => {
             en_vuelo.activo = false;

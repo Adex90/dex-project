@@ -103,7 +103,11 @@ pub const SIMILITUD_EN_REVISION: &str = "la similitud facial entre la selfie y l
 impl Evaluacion {
     pub fn detalles(&self) -> Vec<Detalle> {
         let d = |tipo: &str, m: &String| Detalle { tipo: tipo.to_owned(), mensaje: m.clone() };
-        self.errores.iter().map(|m| d("ERROR", m)).chain(self.advertencias.iter().map(|m| d("ADVERTENCIA", m))).collect()
+        self.errores
+            .iter()
+            .map(|m| d("ERROR", m))
+            .chain(self.advertencias.iter().map(|m| d("ADVERTENCIA", m)))
+            .collect()
     }
 }
 
@@ -245,12 +249,14 @@ pub async fn procesar(
     let firma = cabecera.unwrap_or_default().chars().take(512).collect::<String>();
 
     let mut tx = db::begin(pool, Rol::KycVerificador).await?;
-    let e: expediente::Expediente =
-        sqlx::query_as(&format!("SELECT {} FROM kyc.kyc_perfiles WHERE cliente_id = $1 FOR UPDATE", expediente::COLUMNAS))
-            .bind(r.cliente_id)
-            .fetch_optional(&mut *tx)
-            .await?
-            .ok_or_else(|| AppError::no_encontrado("expediente KYC no encontrado"))?;
+    let e: expediente::Expediente = sqlx::query_as(&format!(
+        "SELECT {} FROM kyc.kyc_perfiles WHERE cliente_id = $1 FOR UPDATE",
+        expediente::COLUMNAS
+    ))
+    .bind(r.cliente_id)
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or_else(|| AppError::no_encontrado("expediente KYC no encontrado"))?;
     let u = umbrales(&mut tx).await?;
 
     // Repetición del mismo resultado (el proveedor reintenta su webhook).
@@ -332,7 +338,12 @@ pub async fn procesar(
         Resultado::Revision => (None, None),
         Resultado::Rechazado if agotado => (
             Some(EstadoKyc::Rechazado),
-            Some(format!("intentos agotados: {}", ev.errores.first().map_or("", String::as_str)).chars().take(500).collect()),
+            Some(
+                format!("intentos agotados: {}", ev.errores.first().map_or("", String::as_str))
+                    .chars()
+                    .take(500)
+                    .collect(),
+            ),
         ),
         Resultado::Rechazado => (Some(EstadoKyc::Pendiente), None),
     };
@@ -374,7 +385,12 @@ pub async fn procesar(
 /// resultado que no se pudo procesar): el expediente vuelve a PENDIENTE y la
 /// base de datos devuelve el intento, solo si ese envío no tiene resultado.
 /// Si el expediente ya cambió (otro proceso registró el resultado), no hace nada.
-pub async fn reembolsar_intento(pool: &PgPool, cliente_id: Uuid, verificacion_id: Uuid, motivo: &str) -> AppResult<bool> {
+pub async fn reembolsar_intento(
+    pool: &PgPool,
+    cliente_id: Uuid,
+    verificacion_id: Uuid,
+    motivo: &str,
+) -> AppResult<bool> {
     let mut tx = db::begin(pool, Rol::KycVerificador).await?;
     sqlx::query("SELECT set_config('sc.reembolsar_intento', 'si', true)").execute(&mut *tx).await?;
     let n = sqlx::query(
@@ -443,8 +459,11 @@ mod pruebas {
         }
     }
 
-    const U: Umbrales =
-        Umbrales { umbral_score_minimo: Decimal::from_parts(85, 0, 0, false, 2), umbral_revision: Decimal::from_parts(70, 0, 0, false, 2), max_intentos: 3 };
+    const U: Umbrales = Umbrales {
+        umbral_score_minimo: Decimal::from_parts(85, 0, 0, false, 2),
+        umbral_revision: Decimal::from_parts(70, 0, 0, false, 2),
+        max_intentos: 3,
+    };
 
     fn hoy() -> NaiveDate {
         NaiveDate::from_ymd_opt(2026, 10, 13).unwrap()
@@ -487,7 +506,8 @@ mod pruebas {
     fn entidad_de_la_clave_distinta_va_a_revision() {
         let mut id = identidad();
         // Misma fecha y sexo, entidad 14 (Jalisco) contra CURP de la CDMX.
-        id.clave_elector = ine::construir_clave_elector("Ludwig", "Von Mises", None, id.fecha_nacimiento, 14, Sexo::H, 1);
+        id.clave_elector =
+            ine::construir_clave_elector("Ludwig", "Von Mises", None, id.fecha_nacimiento, 14, Sexo::H, 1);
         let mut r = resultado(Some(d("0.99")));
         r.documento.ocr = Some(ine::ocr_de(&id.como_declarada()));
         let e = evaluar(&r, &id, Some(&evidencia()), &U, hoy());

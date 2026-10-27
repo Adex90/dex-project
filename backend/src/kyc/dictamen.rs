@@ -49,7 +49,12 @@ pub struct DictamenKyc {
     pub nivel_cuenta: Option<i16>,
 }
 
-pub async fn dictaminar(pool: &PgPool, operador_id: Uuid, cliente_id: Uuid, d: &DictamenKyc) -> AppResult<ClienteVista> {
+pub async fn dictaminar(
+    pool: &PgPool,
+    operador_id: Uuid,
+    cliente_id: Uuid,
+    d: &DictamenKyc,
+) -> AppResult<ClienteVista> {
     if d.estatus_kyc.is_none() && d.nivel_riesgo_pld.is_none() && d.nivel_cuenta.is_none() {
         // Un dictamen vacío no cambia nada: no sirve como lectura del cliente.
         return Err(AppError::validacion("el dictamen debe indicar estatus_kyc, nivel_riesgo_pld o nivel_cuenta"));
@@ -93,10 +98,11 @@ pub async fn dictaminar(pool: &PgPool, operador_id: Uuid, cliente_id: Uuid, d: &
         .await?
         .rows_affected();
         if n == 0 {
-            let existe: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM kyc.kyc_perfiles WHERE cliente_id = $1)")
-                .bind(cliente_id)
-                .fetch_one(&mut *tx)
-                .await?;
+            let existe: bool =
+                sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM kyc.kyc_perfiles WHERE cliente_id = $1)")
+                    .bind(cliente_id)
+                    .fetch_one(&mut *tx)
+                    .await?;
             return Err(if existe {
                 AppError::conflicto(
                     "KYC_DICTAMEN_DESACTUALIZADO",

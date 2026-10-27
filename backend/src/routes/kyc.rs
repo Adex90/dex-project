@@ -80,7 +80,8 @@ async fn verificar(
         ip,
         user_agent: cabeceras.get(header::USER_AGENT).and_then(|v| v.to_str().ok()).map(str::to_owned),
     };
-    let mut r = kyc::verificar_identidad(&e.pool, &e.config.kyc, e.biometria.as_ref(), u.cliente_id, &s, &origen).await?;
+    let mut r =
+        kyc::verificar_identidad(&e.pool, &e.config.kyc, e.biometria.as_ref(), u.cliente_id, &s, &origen).await?;
     let status = if r.resultado.is_some() { StatusCode::OK } else { StatusCode::ACCEPTED };
     // El score exacto no se muestra al cliente: serviría para ajustar una
     // suplantación hasta pasar el umbral. Lo ven cumplimiento y la bitácora.

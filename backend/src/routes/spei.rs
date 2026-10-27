@@ -102,31 +102,37 @@ async fn webhook_inbound(
             })));
         }
     };
-    let r: ResultadoAbono =
-        match inbound::abonar(&e.pool, &e.config.pld, &e.config.spei, &abono, Origen::Webhook, SiNoAcreditable::Devolver)
-            .await
-        {
-            Ok(r) => r,
-            Err(err) if err.codigo() == inbound::DEVOLUCION_SIN_ORDEN => {
-                inbound::cuarentena(&e.pool, "ABONO", &cuerpo, &format!("{}: {err}", err.codigo())).await?;
-                return Ok(Json(json!({
-                    "mensaje": "confirmar",
-                    "estado": "CUARENTENA",
-                    "identidad": abono.identidad.canonica(),
-                })));
-            }
-            Err(err) if err.codigo() == inbound::POSIBLE_DUPLICADO || err.codigo() == inbound::IDENTIDAD_REUTILIZADA => {
-                let tipo = err.codigo().trim_start_matches("SPEI_").to_owned();
-                inbound::retener(&e.pool, &tipo, &abono, &cuerpo, &format!("{}: {err}", err.codigo())).await?;
-                return Ok(Json(json!({
-                    "mensaje": "confirmar",
-                    "estado": "EN_REVISION",
-                    "motivo": tipo,
-                    "identidad": abono.identidad.canonica(),
-                })));
-            }
-            Err(err) => return Err(err),
-        };
+    let r: ResultadoAbono = match inbound::abonar(
+        &e.pool,
+        &e.config.pld,
+        &e.config.spei,
+        &abono,
+        Origen::Webhook,
+        SiNoAcreditable::Devolver,
+    )
+    .await
+    {
+        Ok(r) => r,
+        Err(err) if err.codigo() == inbound::DEVOLUCION_SIN_ORDEN => {
+            inbound::cuarentena(&e.pool, "ABONO", &cuerpo, &format!("{}: {err}", err.codigo())).await?;
+            return Ok(Json(json!({
+                "mensaje": "confirmar",
+                "estado": "CUARENTENA",
+                "identidad": abono.identidad.canonica(),
+            })));
+        }
+        Err(err) if err.codigo() == inbound::POSIBLE_DUPLICADO || err.codigo() == inbound::IDENTIDAD_REUTILIZADA => {
+            let tipo = err.codigo().trim_start_matches("SPEI_").to_owned();
+            inbound::retener(&e.pool, &tipo, &abono, &cuerpo, &format!("{}: {err}", err.codigo())).await?;
+            return Ok(Json(json!({
+                "mensaje": "confirmar",
+                "estado": "EN_REVISION",
+                "motivo": tipo,
+                "identidad": abono.identidad.canonica(),
+            })));
+        }
+        Err(err) => return Err(err),
+    };
     Ok(Json(r.respuesta_proveedor()))
 }
 

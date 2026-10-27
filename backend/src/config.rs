@@ -315,7 +315,9 @@ impl Config {
                     webhook_secretos.push(hex::encode(aleatorio));
                 }
                 let score = |nombre: &str| -> anyhow::Result<Option<Decimal>> {
-                    let v: Option<Decimal> = var(nombre).map(|v| v.parse()).transpose()
+                    let v: Option<Decimal> = var(nombre)
+                        .map(|v| v.parse())
+                        .transpose()
                         .map_err(|e| anyhow::anyhow!("{nombre} inválida: {e}"))?;
                     if v.is_some_and(|s| s < Decimal::new(5, 1) || s >= Decimal::ONE) {
                         bail!("{nombre} debe estar entre 0.5 y 0.9999");
@@ -327,7 +329,9 @@ impl Config {
                     tolerancia_firma_seg: var_o("KYC_TOLERANCIA_FIRMA_SEG", 300)?,
                     score_minimo: score("KYC_SCORE_MINIMO")?,
                     score_revision: score("KYC_SCORE_REVISION")?,
-                    max_intentos: var("KYC_MAX_INTENTOS").map(|v| v.parse::<i16>()).transpose()
+                    max_intentos: var("KYC_MAX_INTENTOS")
+                        .map(|v| v.parse::<i16>())
+                        .transpose()
                         .map_err(|e| anyhow::anyhow!("KYC_MAX_INTENTOS inválida: {e}"))?,
                 }
             },

@@ -255,8 +255,7 @@ async fn barrer_rango(
     // 2. Clientes en cuarentena: se reintentan con el reloj del servidor; un
     // barrido exitoso los saca (aml.barrer_cliente borra su registro de fallos).
     let mut tx = db::begin(pool, Rol::Aml).await?;
-    let en_cuarentena: Vec<Uuid> =
-        sqlx::query_scalar("SELECT aml.monitoreo_cuarentena()").fetch_all(&mut *tx).await?;
+    let en_cuarentena: Vec<Uuid> = sqlx::query_scalar("SELECT aml.monitoreo_cuarentena()").fetch_all(&mut *tx).await?;
     tx.commit().await?;
     for cliente in en_cuarentena {
         match barrer_cliente(pool, cliente, ahora, &[]).await {

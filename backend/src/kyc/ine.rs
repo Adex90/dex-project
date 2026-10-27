@@ -117,7 +117,8 @@ pub fn validar_credencial(c: &CredencialDeclarada<'_>, curp: &Curp, hoy: NaiveDa
                 errores.push("el sexo de la clave de elector no coincide con el de la CURP".to_owned());
             }
             if curp::clave_inegi(curp.entidad()).is_some_and(|n| n != clave.entidad()) {
-                advertencias.push("la entidad de nacimiento de la clave de elector no coincide con la de la CURP".to_owned());
+                advertencias
+                    .push("la entidad de nacimiento de la clave de elector no coincide con la de la CURP".to_owned());
             }
         }
     }
@@ -192,7 +193,8 @@ pub mod mrz {
     }
 
     pub fn leer(lineas: &[String]) -> Result<Td1, ErrorMrz> {
-        let valida = |l: &String| l.len() == 30 && l.bytes().all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'<');
+        let valida =
+            |l: &String| l.len() == 30 && l.bytes().all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'<');
         if lineas.len() != 3 || !lineas.iter().all(valida) {
             return Err(ErrorMrz::Formato);
         }
@@ -495,14 +497,16 @@ mod pruebas {
         assert_eq!(validar_credencial(&cred, &curp, hoy()), (vec![], vec![]));
         let vencida = CredencialDeclarada { emision: 2014, vigencia: 2024, ..cred };
         assert_eq!(validar_credencial(&vencida, &curp, hoy()).0.len(), 1);
-        let otra_fecha = construir_clave_elector("A", "B", None, NaiveDate::from_ymd_opt(1953, 11, 14).unwrap(), 27, Sexo::H, 1);
+        let otra_fecha =
+            construir_clave_elector("A", "B", None, NaiveDate::from_ymd_opt(1953, 11, 14).unwrap(), 27, Sexo::H, 1);
         let ajena = CredencialDeclarada { clave_elector: &otra_fecha, ..cred };
         assert_eq!(validar_credencial(&ajena, &curp, hoy()).0.len(), 1);
         let otra_entidad = construir_clave_elector("A", "B", None, curp.fecha_nacimiento(), 9, Sexo::H, 1);
         let otra = CredencialDeclarada { clave_elector: &otra_entidad, ..cred };
-        assert_eq!(validar_credencial(&otra, &curp, hoy()), (vec![], vec![
-            "la entidad de nacimiento de la clave de elector no coincide con la de la CURP".to_owned()
-        ]));
+        assert_eq!(
+            validar_credencial(&otra, &curp, hoy()),
+            (vec![], vec!["la entidad de nacimiento de la clave de elector no coincide con la de la CURP".to_owned()])
+        );
     }
 
     fn declarada<'a>(curp: &'a Curp, clave: &'a str) -> IdentidadDeclarada<'a> {

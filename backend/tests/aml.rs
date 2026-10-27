@@ -387,7 +387,12 @@ async fn envejecer_movimientos(pool: &PgPool, esquema: &str, ids: &[Uuid], horas
 /// Levantamiento de cuatro ojos con varias alertas abiertas: `c1` toma y
 /// propone FALSO_POSITIVO en cada una (la primera crea la solicitud) y `c2`
 /// aprueba. Devuelve la respuesta de la aprobación.
-async fn levantar_alertas_con_cuatro_ojos(pool: &PgPool, c1: &Usuario, c2: &Usuario, alertas: &[Uuid]) -> AppResult<Value> {
+async fn levantar_alertas_con_cuatro_ojos(
+    pool: &PgPool,
+    c1: &Usuario,
+    c2: &Usuario,
+    alertas: &[Uuid],
+) -> AppResult<Value> {
     let mut solicitud = None;
     for alerta in alertas {
         for (accion, dictamen) in [(AccionResolucion::Tomar, None), (AccionResolucion::FalsoPositivo, Some(DICTAMEN))] {
@@ -504,7 +509,8 @@ async fn calibracion_sin_regresiones(pool: PgPool) {
     envejecer_cuenta(&pool, deudor.cuenta_ifpe.id, 400).await;
     let ahorros = depositar(&pool, &cfg, deudor.cuenta_ifpe.id, "280000").await;
     envejecer_movimientos(&pool, "ifpe", &[ahorros.transaccion.id], 72).await;
-    let credito_deudor = credito::originar(&pool, &cfg.pld, &solicitud_credito(deudor.cliente.id, "200000")).await.unwrap();
+    let credito_deudor =
+        credito::originar(&pool, &cfg.pld, &solicitud_credito(deudor.cliente.id, "200000")).await.unwrap();
     credito::pagar(
         &pool,
         &credito::PagoCredito {
@@ -2828,7 +2834,8 @@ async fn evidencia_nueva_retira_propuesta_de_falso_positivo(pool: PgPool) {
         clave_idempotencia: clave_api(),
     };
     let solicitud = solicitud.unwrap();
-    let e = oficial::decidir_levantamiento(&pool, &c2, solicitud, &decision("Revisado el expediente.")).await.unwrap_err();
+    let e =
+        oficial::decidir_levantamiento(&pool, &c2, solicitud, &decision("Revisado el expediente.")).await.unwrap_err();
     assert_eq!(e.codigo(), "AML_ALERTAS_ABIERTAS");
     assert_eq!(retenido(&pool, ana.cuenta_ifpe.id).await, d("733000"));
     assert!(congelamiento_activo(&pool, ana.cliente.id).await.is_some());
@@ -2902,7 +2909,10 @@ async fn monitoreo_aisla_cliente_fallido_y_no_bloquea(pool: PgPool) {
         .await
         .unwrap();
     let marca = || async {
-        sqlx::query_scalar::<_, i64>("SELECT ultima_secuencia_ifpe FROM aml.monitoreo_estado").fetch_one(&pool).await.unwrap()
+        sqlx::query_scalar::<_, i64>("SELECT ultima_secuencia_ifpe FROM aml.monitoreo_estado")
+            .fetch_one(&pool)
+            .await
+            .unwrap()
     };
     let inicial = marca().await;
     for ciclo in 1..=3 {
@@ -2992,13 +3002,12 @@ async fn despacho_retiene_orden_no_recibida_de_congelado(pool: PgPool) {
     vencer_ordenes(&pool).await;
     let d = outbound::despachar(&pool, &pasarela, &cfg.spei).await.unwrap();
     assert_eq!(d.reclamadas, 1, "{d:?}");
-    let estado: (String, i32, Option<chrono::DateTime<chrono::Utc>>) = sqlx::query_as(
-        "SELECT estado, intentos_envio, registro_incierto_desde FROM ifpe.spei_outbound WHERE id = $1",
-    )
-    .bind(orden.id)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
+    let estado: (String, i32, Option<chrono::DateTime<chrono::Utc>>) =
+        sqlx::query_as("SELECT estado, intentos_envio, registro_incierto_desde FROM ifpe.spei_outbound WHERE id = $1")
+            .bind(orden.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
     assert_eq!((estado.0.as_str(), estado.1, estado.2), ("PENDIENTE", 1, None));
     congelar_manual(&pool, &c1, ana.cliente.id).await;
     vencer_ordenes(&pool).await;
@@ -3113,7 +3122,11 @@ async fn cumplimiento_no_deja_huella_en_las_lecturas_del_cliente(pool: PgPool) {
     let congelamiento = v["congelamiento"]["id"].as_str().unwrap().to_string();
     let alerta = v["alerta"]["id"].as_str().unwrap().to_string();
     assert_eq!(estado_cuenta(&pool, ana.cuenta_ifpe.id).await, "CONGELADO_PREVENTIVO");
-    assert_eq!(bytes_de(&api, "/api/v1/ifpe/cuenta", &tok_ana).await, cuenta_antes, "el congelamiento no se ve en /ifpe/cuenta");
+    assert_eq!(
+        bytes_de(&api, "/api/v1/ifpe/cuenta", &tok_ana).await,
+        cuenta_antes,
+        "el congelamiento no se ve en /ifpe/cuenta"
+    );
 
     // CONFIRMAR sube a Ana a riesgo ALTO.
     confirmar_por_http(&api, &c1, &alerta).await;
@@ -3215,8 +3228,9 @@ async fn operador_no_lee_ni_baja_el_nivel_de_riesgo(pool: PgPool) {
     assert_eq!((actor, rol_bd.as_str()), (Some(operador_id), "sc_kyc_verificador"));
 
     // Sin revisión de PLD, la asignación del onboarding sigue funcionando.
-    let (s, v) =
-        api.post(&format!("/api/v1/operaciones/kyc/{}", beto.cliente.id), &operador, json!({ "nivel_riesgo_pld": "BAJO" })).await;
+    let (s, v) = api
+        .post(&format!("/api/v1/operaciones/kyc/{}", beto.cliente.id), &operador, json!({ "nivel_riesgo_pld": "BAJO" }))
+        .await;
     assert_eq!(s, StatusCode::OK, "{v}");
     assert_eq!(nivel(beto.cliente.id).await.0, "BAJO");
     assert_eq!(
@@ -3244,9 +3258,12 @@ async fn oficial_sujeto_no_ve_su_expediente(pool: PgPool) {
     let (api, cfg) = api(&pool).await;
     // Dario tiene bóveda (y KYC) y luego pasa a oficial de cumplimiento.
     let dario = cliente(&pool, &cfg, "Dario").await;
-    como_dueno(&pool, &format!("UPDATE kyc.credenciales SET rol = 'CUMPLIMIENTO' WHERE cliente_id = '{}'", dario.cliente.id))
-        .await
-        .unwrap();
+    como_dueno(
+        &pool,
+        &format!("UPDATE kyc.credenciales SET rol = 'CUMPLIMIENTO' WHERE cliente_id = '{}'", dario.cliente.id),
+    )
+    .await
+    .unwrap();
     let tok_dario = token_cliente(&api, "Dario").await;
     let (_, c1) = token_oficial(&api, &pool, "Uno").await;
     let (s, v) = api
@@ -3264,7 +3281,11 @@ async fn oficial_sujeto_no_ve_su_expediente(pool: PgPool) {
     let (s, _) = api.post(&ruta, &c1, json!({ "accion": "TOMAR", "clave_idempotencia": clave_api() })).await;
     assert_eq!(s, StatusCode::CREATED);
     let (s, v) = api
-        .post(&ruta, &c1, json!({ "accion": "FALSO_POSITIVO", "dictamen": DICTAMEN, "clave_idempotencia": clave_api() }))
+        .post(
+            &ruta,
+            &c1,
+            json!({ "accion": "FALSO_POSITIVO", "dictamen": DICTAMEN, "clave_idempotencia": clave_api() }),
+        )
         .await;
     assert_eq!(s, StatusCode::CREATED, "{v}");
     assert_eq!(v["solicitud"]["estado"], "PENDIENTE");
@@ -3364,7 +3385,10 @@ async fn rol_antes_que_la_peticion(pool: PgPool) {
         // Quien sí tiene el rol recibe la validación de siempre.
         let token = if *metodo == "GET" { &aud } else { &c1 };
         let (s, v) = api.llamar(metodo, ruta, Some(token), cuerpo.clone()).await;
-        assert!(s.is_client_error() && s != StatusCode::FORBIDDEN && s != StatusCode::UNAUTHORIZED, "{metodo} {ruta}: {s} {v}");
+        assert!(
+            s.is_client_error() && s != StatusCode::FORBIDDEN && s != StatusCode::UNAUTHORIZED,
+            "{metodo} {ruta}: {s} {v}"
+        );
     }
     for sql in ["SELECT 1 FROM aml.alertas", "SELECT aml.resumen(NULL)", "SELECT * FROM aml.verificar_bitacora(1)"] {
         let r = como(&pool, Rol::Auditor, sql).await;
@@ -3409,7 +3433,10 @@ async fn sondeo_reenvia_la_alerta_al_levantar_su_congelamiento(pool: PgPool) {
     let solicitud = v["solicitud"]["id"].as_str().unwrap().to_string();
     let (_, pagina) = api.get(&format!("/api/v1/aml/alertas?cliente_id={}", frec.cliente.id), &c2).await;
     let fila = pagina["alertas"].as_array().unwrap().iter().find(|a| a["id"] == json!(r08)).unwrap().clone();
-    assert_eq!((fila["estado"].as_str(), fila["congelamiento"]["estado"].as_str()), (Some("PENDIENTE"), Some("ACTIVO")));
+    assert_eq!(
+        (fila["estado"].as_str(), fila["congelamiento"]["estado"].as_str()),
+        (Some("PENDIENTE"), Some("ACTIVO"))
+    );
     let servidor_en = pagina["servidor_en"].as_str().unwrap().to_string();
 
     let (s, v) = api
@@ -3425,7 +3452,10 @@ async fn sondeo_reenvia_la_alerta_al_levantar_su_congelamiento(pool: PgPool) {
     assert_eq!(s, StatusCode::OK, "{sondeo}");
     let fila = sondeo["alertas"].as_array().unwrap().iter().find(|a| a["id"] == json!(r08)).cloned();
     let fila = fila.unwrap_or_else(|| panic!("el sondeo no reenvía la alerta tras el levantamiento: {sondeo}"));
-    assert_eq!((fila["estado"].as_str(), fila["congelamiento"]["estado"].as_str()), (Some("PENDIENTE"), Some("LEVANTADO")));
+    assert_eq!(
+        (fila["estado"].as_str(), fila["congelamiento"]["estado"].as_str()),
+        (Some("PENDIENTE"), Some("LEVANTADO"))
+    );
     assert!(fila["actualizado_en"].as_str().unwrap() >= servidor_en.as_str(), "{fila}");
 
     verificar_invariantes(&pool).await;
@@ -3468,19 +3498,26 @@ async fn retencion_del_operador_igual_a_la_de_pld(pool: PgPool) {
     let operador_id = operador_id(&pool).await;
     const MOTIVO_OPERADOR: &str = "Embargo ordenado por el juzgado tercero de lo civil";
     let clave_ret = clave_api();
-    let retener = |monto: &str, liberar: bool, motivo: &str, clave: &str| {
-        json!({ "cuenta_id": beto.cuenta_ifpe.id, "monto": monto, "motivo": motivo, "liberar": liberar, "clave_idempotencia": clave })
-    };
-    let (s, ret) = api.post("/api/v1/operaciones/retenciones", &operador, retener("300", false, MOTIVO_OPERADOR, &clave_ret)).await;
+    let retener = |monto: &str, liberar: bool, motivo: &str, clave: &str| json!({ "cuenta_id": beto.cuenta_ifpe.id, "monto": monto, "motivo": motivo, "liberar": liberar, "clave_idempotencia": clave });
+    let (s, ret) = api
+        .post("/api/v1/operaciones/retenciones", &operador, retener("300", false, MOTIVO_OPERADOR, &clave_ret))
+        .await;
     assert_eq!(s, StatusCode::CREATED, "{ret}");
     // Repetición idempotente, y la misma clave para otra cosa: 409.
-    let (s, otra) = api.post("/api/v1/operaciones/retenciones", &operador, retener("300", false, MOTIVO_OPERADOR, &clave_ret)).await;
+    let (s, otra) = api
+        .post("/api/v1/operaciones/retenciones", &operador, retener("300", false, MOTIVO_OPERADOR, &clave_ret))
+        .await;
     assert_eq!((s, &otra["transaccion"]["id"]), (StatusCode::OK, &ret["transaccion"]["id"]), "{otra}");
-    for cuerpo in [retener("300", false, "Otro motivo cualquiera", &clave_ret), retener("301", false, MOTIVO_OPERADOR, &clave_ret)] {
+    for cuerpo in [
+        retener("300", false, "Otro motivo cualquiera", &clave_ret),
+        retener("301", false, MOTIVO_OPERADOR, &clave_ret),
+    ] {
         let (s, v) = api.post("/api/v1/operaciones/retenciones", &operador, cuerpo).await;
         assert_eq!((s, error(&v)), (StatusCode::CONFLICT, "CLAVE_IDEMPOTENCIA_REUTILIZADA"), "{v}");
     }
-    let (s, lib) = api.post("/api/v1/operaciones/retenciones", &operador, retener("100", true, "Levantamiento parcial", &clave_api())).await;
+    let (s, lib) = api
+        .post("/api/v1/operaciones/retenciones", &operador, retener("100", true, "Levantamiento parcial", &clave_api()))
+        .await;
     assert_eq!(s, StatusCode::CREATED, "{lib}");
     assert_eq!(saldo_ifpe(&pool, beto.cuenta_ifpe.id).await, (d("800"), d("200")));
 
@@ -3499,19 +3536,21 @@ async fn retencion_del_operador_igual_a_la_de_pld(pool: PgPool) {
     assert_eq!(pld[0]["concepto"], "Retención temporal");
     let liberacion = de_tipo(&movs_beto, "LIBERACION_RETENCION");
     assert_eq!(liberacion.len(), 1, "{movs_beto}");
-    assert_eq!((liberacion[0]["clave"].as_str(), liberacion[0]["concepto"].as_str()), (Some("lib:<uuid>"), Some("Liberación de retención")));
+    assert_eq!(
+        (liberacion[0]["clave"].as_str(), liberacion[0]["concepto"].as_str()),
+        (Some("lib:<uuid>"), Some("Liberación de retención"))
+    );
     let texto = movs_beto.to_string();
     for rastro in ["op:", &operador_id.to_string(), MOTIVO_OPERADOR, "Levantamiento parcial", &clave_ret] {
         assert!(!texto.contains(rastro), "/ifpe/movimientos del cliente contiene «{rastro}»: {texto}");
     }
     // El motivo y la clave del operador quedan en su registro interno.
-    let (motivo, clave): (String, String) = sqlx::query_as(
-        "SELECT motivo, clave_idempotencia FROM ifpe.retenciones_operador WHERE transaccion_id = $1",
-    )
-    .bind(Uuid::parse_str(ret["transaccion"]["id"].as_str().unwrap()).unwrap())
-    .fetch_one(&pool)
-    .await
-    .unwrap();
+    let (motivo, clave): (String, String) =
+        sqlx::query_as("SELECT motivo, clave_idempotencia FROM ifpe.retenciones_operador WHERE transaccion_id = $1")
+            .bind(Uuid::parse_str(ret["transaccion"]["id"].as_str().unwrap()).unwrap())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
     assert_eq!((motivo.as_str(), clave), (MOTIVO_OPERADOR, format!("op:{operador_id}:{clave_ret}")));
 
     // Una clave ret: sin registro, o con un concepto que no es el neutro, no entra al ledger.

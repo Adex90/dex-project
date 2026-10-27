@@ -86,7 +86,8 @@ impl Api {
     }
 
     async fn webhook(&self, cuerpo: &[u8], firma: Option<&str>) -> (StatusCode, Value) {
-        let mut req = Request::builder().method("POST").uri("/api/v1/kyc/webhook").header("content-type", "application/json");
+        let mut req =
+            Request::builder().method("POST").uri("/api/v1/kyc/webhook").header("content-type", "application/json");
         if let Some(f) = firma {
             req = req.header("x-kyc-firma", f);
         }
@@ -121,7 +122,10 @@ async fn registrar_http(api: &Api, nombre: &str) -> (String, Uuid) {
 
 async fn operador(pool: &PgPool) -> Uuid {
     bootstrap::asegurar_operador(pool, "cumplimiento@synthetic.mx", "operador-de-pruebas-123").await.unwrap();
-    sqlx::query_scalar("SELECT id FROM kyc.clientes WHERE email = 'cumplimiento@synthetic.mx'").fetch_one(pool).await.unwrap()
+    sqlx::query_scalar("SELECT id FROM kyc.clientes WHERE email = 'cumplimiento@synthetic.mx'")
+        .fetch_one(pool)
+        .await
+        .unwrap()
 }
 
 fn dictamen(estado: EstadoKyc, motivo: Option<&str>) -> DictamenKyc {
@@ -163,7 +167,13 @@ async fn contar(pool: &PgPool, sql: &str, id: Uuid) -> i64 {
 }
 
 /// Paso 1 + envío (sin procesar el resultado: proveedor asíncrono).
-async fn enviar(pool: &PgPool, cfg: &Config, cliente_id: Uuid, id: &IdentidadPrueba, p: &ProveedorSimulado) -> kyc::EnvioVerificacion {
+async fn enviar(
+    pool: &PgPool,
+    cfg: &Config,
+    cliente_id: Uuid,
+    id: &IdentidadPrueba,
+    p: &ProveedorSimulado,
+) -> kyc::EnvioVerificacion {
     onboarding(pool, cfg, cliente_id, id, p).await.unwrap()
 }
 
@@ -231,7 +241,12 @@ async fn sin_kyc_no_entra_ni_sale_dinero(pool: PgPool) {
     let e = puente::invertir(
         &pool,
         &cfg.pld,
-        &puente::SolicitudMutuo { cliente_id: beto.cliente.id, monto: d("10"), plazo_dias: 28, clave_idempotencia: clave() },
+        &puente::SolicitudMutuo {
+            cliente_id: beto.cliente.id,
+            monto: d("10"),
+            plazo_dias: 28,
+            clave_idempotencia: clave(),
+        },
     )
     .await
     .unwrap_err();
@@ -252,9 +267,14 @@ async fn revocar_el_kyc_bloquea_al_instante(pool: PgPool) {
     let beto = cliente(&pool, &cfg, "Beto").await;
     depositar(&pool, &cfg, ana.cuenta_ifpe.id, "1000").await;
 
-    kyc::dictaminar(&pool, op, ana.cliente.id, &dictamen(EstadoKyc::Rechazado, Some("credencial reportada como robada")))
-        .await
-        .unwrap();
+    kyc::dictaminar(
+        &pool,
+        op,
+        ana.cliente.id,
+        &dictamen(EstadoKyc::Rechazado, Some("credencial reportada como robada")),
+    )
+    .await
+    .unwrap();
     assert_eq!(estado(&pool, ana.cliente.id).await, ("RECHAZADO".into(), "RECHAZADO".into(), 1));
 
     let e = inbound::abonar(
@@ -300,13 +320,20 @@ async fn reembolsos_y_vencimientos_no_dependen_del_kyc(pool: PgPool) {
     let mutuo = puente::invertir(
         &pool,
         &cfg.pld,
-        &puente::SolicitudMutuo { cliente_id: ana.cliente.id, monto: d("200"), plazo_dias: 28, clave_idempotencia: clave() },
+        &puente::SolicitudMutuo {
+            cliente_id: ana.cliente.id,
+            monto: d("200"),
+            plazo_dias: 28,
+            clave_idempotencia: clave(),
+        },
     )
     .await
     .unwrap();
     assert_eq!(saldo_ifpe(&pool, ana.cuenta_ifpe.id).await.0, d("500"));
 
-    kyc::dictaminar(&pool, op, ana.cliente.id, &dictamen(EstadoKyc::Rechazado, Some("revisión de cumplimiento"))).await.unwrap();
+    kyc::dictaminar(&pool, op, ana.cliente.id, &dictamen(EstadoKyc::Rechazado, Some("revisión de cumplimiento")))
+        .await
+        .unwrap();
 
     // El reembolso de su propia orden fallida ('spei-reverso:') sí entra.
     vencer_ordenes(&pool).await;
@@ -377,11 +404,12 @@ async fn rls_bloquea_aunque_el_backend_no_compruebe(pool: PgPool) {
 
     // Ni el rol de captura (sc_kyc) puede verificar ni escribir el espejo.
     let mut tx = db::begin(&pool, Rol::Kyc).await.unwrap();
-    let err = sqlx::query("UPDATE kyc.clientes SET estatus_kyc = 'VERIFICADO', kyc_verificado_en = now() WHERE id = $1")
-        .bind(beto.cliente.id)
-        .execute(&mut *tx)
-        .await
-        .unwrap_err();
+    let err =
+        sqlx::query("UPDATE kyc.clientes SET estatus_kyc = 'VERIFICADO', kyc_verificado_en = now() WHERE id = $1")
+            .bind(beto.cliente.id)
+            .execute(&mut *tx)
+            .await
+            .unwrap_err();
     assert!(err.to_string().contains("permission denied"), "{err}");
     drop(tx);
     let mut tx = db::begin(&pool, Rol::Kyc).await.unwrap();
@@ -434,7 +462,10 @@ async fn onboarding_completo_verifica_y_desbloquea(pool: PgPool) {
             .fetch_all(&pool)
             .await
             .unwrap();
-    assert_eq!(historial, vec![("EN_REVISION".into(), "sc_kyc".into()), ("VERIFICADO".into(), "sc_kyc_verificador".into())]);
+    assert_eq!(
+        historial,
+        vec![("EN_REVISION".into(), "sc_kyc".into()), ("VERIFICADO".into(), "sc_kyc_verificador".into())]
+    );
 
     // Ya opera.
     depositar(&pool, &cfg, ana.cuenta_ifpe.id, "250").await;
@@ -478,7 +509,9 @@ async fn zona_gris_va_a_un_operador(pool: PgPool) {
     assert_eq!(cola.len(), 1);
     assert_eq!(cola[0].score_similitud, Some(d("0.78")));
     assert_eq!(cola[0].resultado.as_deref(), Some("REVISION"));
-    let e = kyc::dictaminar(&pool, ana.cliente.id, ana.cliente.id, &verificar(&pool, ana.cliente.id).await).await.unwrap_err();
+    let e = kyc::dictaminar(&pool, ana.cliente.id, ana.cliente.id, &verificar(&pool, ana.cliente.id).await)
+        .await
+        .unwrap_err();
     assert_eq!(e.codigo(), "KYC_AUTODICTAMEN");
     // Sin decir qué envío revisó, no verifica.
     let e = kyc::dictaminar(&pool, op, ana.cliente.id, &dictamen(EstadoKyc::Verificado, None)).await.unwrap_err();
@@ -558,21 +591,26 @@ async fn fallas_consumen_intentos_hasta_rechazar(pool: PgPool) {
     }
     let (perfil, espejo, intentos) = estado(&pool, ana.cliente.id).await;
     assert_eq!((perfil.as_str(), espejo.as_str(), intentos), ("RECHAZADO", "RECHAZADO", 3));
-    let motivo: Option<String> = sqlx::query_scalar("SELECT motivo_rechazo FROM kyc.kyc_perfiles WHERE cliente_id = $1")
-        .bind(ana.cliente.id)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-    assert!(motivo.unwrap().starts_with("intentos agotados"));
-    assert_eq!(contar(&pool, "SELECT count(*) FROM kyc.kyc_auditoria_biometrica WHERE cliente_id = $1", ana.cliente.id).await, 3);
-    // coincide_identidad solo mira la identidad: verdadero si solo falla el
-    // rostro; falso con la CURP ajena o sin lectura de la credencial.
-    let coincide: Vec<bool> =
-        sqlx::query_scalar("SELECT coincide_identidad FROM kyc.kyc_auditoria_biometrica WHERE cliente_id = $1 ORDER BY id")
+    let motivo: Option<String> =
+        sqlx::query_scalar("SELECT motivo_rechazo FROM kyc.kyc_perfiles WHERE cliente_id = $1")
             .bind(ana.cliente.id)
-            .fetch_all(&pool)
+            .fetch_one(&pool)
             .await
             .unwrap();
+    assert!(motivo.unwrap().starts_with("intentos agotados"));
+    assert_eq!(
+        contar(&pool, "SELECT count(*) FROM kyc.kyc_auditoria_biometrica WHERE cliente_id = $1", ana.cliente.id).await,
+        3
+    );
+    // coincide_identidad solo mira la identidad: verdadero si solo falla el
+    // rostro; falso con la CURP ajena o sin lectura de la credencial.
+    let coincide: Vec<bool> = sqlx::query_scalar(
+        "SELECT coincide_identidad FROM kyc.kyc_auditoria_biometrica WHERE cliente_id = $1 ORDER BY id",
+    )
+    .bind(ana.cliente.id)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
     assert_eq!(coincide, vec![true, false, false]);
 
     // Sin intentos, un nuevo envío ni siquiera llega al proveedor.
@@ -593,7 +631,8 @@ async fn evidencia_ajena_o_imagenes_repetidas_se_rechazan(pool: PgPool) {
         .unwrap();
     let mut s = id.solicitud();
     s.selfie.frames[1] = s.selfie.frames[0].clone();
-    let e = kyc::verificar_identidad(&pool, &cfg.kyc, &p, ana.cliente.id, &s, &OrigenEnvio::default()).await.unwrap_err();
+    let e =
+        kyc::verificar_identidad(&pool, &cfg.kyc, &p, ana.cliente.id, &s, &OrigenEnvio::default()).await.unwrap_err();
     assert_eq!(e.codigo(), "VALIDACION");
     assert_eq!(estado(&pool, ana.cliente.id).await.2, 0, "no consume intentos");
 
@@ -683,7 +722,8 @@ async fn requisitos_del_expediente(pool: PgPool) {
     // Consentimiento expreso para datos biométricos.
     let mut s = id.solicitud();
     s.consentimiento_biometrico = false;
-    let e = kyc::verificar_identidad(&pool, &cfg.kyc, &p, ana.cliente.id, &s, &OrigenEnvio::default()).await.unwrap_err();
+    let e =
+        kyc::verificar_identidad(&pool, &cfg.kyc, &p, ana.cliente.id, &s, &OrigenEnvio::default()).await.unwrap_err();
     assert_eq!(e.codigo(), "KYC_SIN_CONSENTIMIENTO");
 
     // Credencial vencida o con una clave de elector de otra fecha de nacimiento.
@@ -691,13 +731,19 @@ async fn requisitos_del_expediente(pool: PgPool) {
     s.ine.emision = 2014;
     s.ine.vigencia = 2024;
     assert_eq!(
-        kyc::verificar_identidad(&pool, &cfg.kyc, &p, ana.cliente.id, &s, &OrigenEnvio::default()).await.unwrap_err().codigo(),
+        kyc::verificar_identidad(&pool, &cfg.kyc, &p, ana.cliente.id, &s, &OrigenEnvio::default())
+            .await
+            .unwrap_err()
+            .codigo(),
         "VALIDACION"
     );
     let mut s = id.solicitud();
     s.ine.clave_elector = IdentidadPrueba::nueva("Ana").clave_elector;
     assert_eq!(
-        kyc::verificar_identidad(&pool, &cfg.kyc, &p, ana.cliente.id, &s, &OrigenEnvio::default()).await.unwrap_err().codigo(),
+        kyc::verificar_identidad(&pool, &cfg.kyc, &p, ana.cliente.id, &s, &OrigenEnvio::default())
+            .await
+            .unwrap_err()
+            .codigo(),
         "VALIDACION"
     );
     assert_eq!(estado(&pool, ana.cliente.id).await.2, 0, "las validaciones previas no consumen intentos");
@@ -770,7 +816,11 @@ async fn webhook_firmado_idempotente_y_solo_del_envio_vigente(pool: PgPool) {
     // Sin firma, con firma de otro secreto o con el cuerpo alterado: 401.
     let (s, _) = api.webhook(&cuerpo, None).await;
     assert_eq!(s, StatusCode::UNAUTHORIZED);
-    let ajena = synthetic_capital::spei::firma::firmar(b"secreto-de-otro-proveedor-0123456789abcdef", chrono::Utc::now().timestamp(), &cuerpo);
+    let ajena = synthetic_capital::spei::firma::firmar(
+        b"secreto-de-otro-proveedor-0123456789abcdef",
+        chrono::Utc::now().timestamp(),
+        &cuerpo,
+    );
     let (s, _) = api.webhook(&cuerpo, Some(&ajena)).await;
     assert_eq!(s, StatusCode::UNAUTHORIZED);
     let mut alterado: Value = serde_json::from_slice(&cuerpo).unwrap();
@@ -806,7 +856,13 @@ async fn ip_de_origen_y_limite_de_cuerpo(pool: PgPool) {
     let id = IdentidadPrueba::nueva("Ana");
     api.llamar("POST", "/api/v1/kyc/perfil", Some(&token), Some(id.datos_json()), &[]).await;
     let (s, r) = api
-        .llamar("POST", "/api/v1/kyc/verificar", Some(&token), Some(id.solicitud_json()), &[("x-forwarded-for", "198.51.100.7")])
+        .llamar(
+            "POST",
+            "/api/v1/kyc/verificar",
+            Some(&token),
+            Some(id.solicitud_json()),
+            &[("x-forwarded-for", "198.51.100.7")],
+        )
         .await;
     assert_eq!(s, StatusCode::OK, "{r}");
     let ip: Option<String> =
@@ -826,13 +882,12 @@ async fn ip_de_origen_y_limite_de_cuerpo(pool: PgPool) {
     let ua = [("x-forwarded-for", "10.9.9.9, 203.0.113.42"), ("user-agent", "Mozilla/5.0 prueba")];
     let (s, r) = api.llamar("POST", "/api/v1/kyc/verificar", Some(&token), Some(id.solicitud_json()), &ua).await;
     assert_eq!(s, StatusCode::OK, "{r}");
-    let (ip, agente): (Option<String>, Option<String>) = sqlx::query_as(
-        "SELECT host(ip_origen), user_agent FROM kyc.kyc_auditoria_biometrica WHERE cliente_id = $1",
-    )
-    .bind(beto)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
+    let (ip, agente): (Option<String>, Option<String>) =
+        sqlx::query_as("SELECT host(ip_origen), user_agent FROM kyc.kyc_auditoria_biometrica WHERE cliente_id = $1")
+            .bind(beto)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
     assert_eq!((ip.as_deref(), agente.as_deref()), (Some("203.0.113.42"), Some("Mozilla/5.0 prueba")));
 
     // /kyc/verificar admite imágenes (más de 64 KB) pero no más de 12 MB.
@@ -841,7 +896,9 @@ async fn ip_de_origen_y_limite_de_cuerpo(pool: PgPool) {
     let (s, e) = api.llamar("POST", "/api/v1/kyc/verificar", Some(&token), Some(enorme), &[]).await;
     assert_eq!(s, StatusCode::PAYLOAD_TOO_LARGE, "{e}");
     // El resto de la API conserva su límite.
-    let (s, _) = api.llamar("POST", "/api/v1/kyc/perfil", Some(&token), Some(json!({ "relleno": "x".repeat(70_000) })), &[]).await;
+    let (s, _) = api
+        .llamar("POST", "/api/v1/kyc/perfil", Some(&token), Some(json!({ "relleno": "x".repeat(70_000) })), &[])
+        .await;
     assert_eq!(s, StatusCode::PAYLOAD_TOO_LARGE);
 }
 
@@ -866,7 +923,10 @@ async fn rechazado_entra_a_ver_su_estado_pero_no_opera(pool: PgPool) {
     assert_eq!(s, StatusCode::OK, "{sesion}");
     let (s, exp) = api.llamar("GET", "/api/v1/kyc/expediente", Some(&token), None, &[]).await;
     assert_eq!(s, StatusCode::OK);
-    assert_eq!((exp["estado_kyc"].as_str(), exp["motivo_rechazo"].as_str()), (Some("RECHAZADO"), Some("documento apócrifo")));
+    assert_eq!(
+        (exp["estado_kyc"].as_str(), exp["motivo_rechazo"].as_str()),
+        (Some("RECHAZADO"), Some("documento apócrifo"))
+    );
     let (s, e) = api
         .llamar(
             "POST",
@@ -904,7 +964,10 @@ async fn sin_proveedor_certificado_falla_cerrado(pool: PgPool) {
     let (s, _) = api.llamar("POST", "/api/v1/kyc/perfil", Some(&token), Some(id.datos_json()), &[]).await;
     assert_eq!(s, StatusCode::OK);
     let (s, e) = api.llamar("POST", "/api/v1/kyc/verificar", Some(&token), Some(id.solicitud_json()), &[]).await;
-    assert_eq!((s, e["error"]["codigo"].as_str()), (StatusCode::SERVICE_UNAVAILABLE, Some("KYC_PROVEEDOR_NO_DISPONIBLE")));
+    assert_eq!(
+        (s, e["error"]["codigo"].as_str()),
+        (StatusCode::SERVICE_UNAVAILABLE, Some("KYC_PROVEEDOR_NO_DISPONIBLE"))
+    );
     assert_eq!(estado(&pool, ana).await, ("PENDIENTE".into(), "PENDIENTE".into(), 0));
 
     // Aunque alguien conecte el simulado, la base de datos rechaza su

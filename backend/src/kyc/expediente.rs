@@ -112,7 +112,8 @@ pub struct IdentidadPropia {
 
 impl IdentidadPropia {
     pub fn de(e: &Expediente) -> AppResult<Self> {
-        let falta = || AppError::negocio("KYC_DATOS_INCOMPLETOS", "el expediente no tiene completos sus datos de identidad");
+        let falta =
+            || AppError::negocio("KYC_DATOS_INCOMPLETOS", "el expediente no tiene completos sus datos de identidad");
         Ok(Self {
             nombres: e.nombres.clone().ok_or_else(falta)?,
             apellido_paterno: e.apellido_paterno.clone().ok_or_else(falta)?,
@@ -271,7 +272,8 @@ pub async fn vista(pool: &PgPool, cliente_id: Uuid) -> AppResult<VistaExpediente
             .bind(cliente_id)
             .fetch_one(&mut *tx)
             .await?;
-    let max_intentos: i16 = sqlx::query_scalar("SELECT max_intentos FROM kyc.parametros WHERE id").fetch_one(&mut *tx).await?;
+    let max_intentos: i16 =
+        sqlx::query_scalar("SELECT max_intentos FROM kyc.parametros WHERE id").fetch_one(&mut *tx).await?;
     let bloqueo = bloqueo(&mut tx, &expediente, max_intentos).await?;
     let ultimo_resultado = sqlx::query_as(
         "SELECT verificacion_id, proveedor, score_similitud, prueba_vida_exitosa, documento_valido, coincide_identidad, \
@@ -386,7 +388,8 @@ pub fn validar_datos(d: &DatosPersonales, hoy: NaiveDate) -> AppResult<DatosVali
     };
     let curp = Curp::parse(&d.curp).map_err(|e| AppError::validacion(e.to_string()))?;
     let rfc = rfc::validar_persona_fisica(&d.rfc).map_err(|e| AppError::validacion(e.to_string()))?;
-    let (errores, mut advertencias) = rfc::cotejar_con_curp(&rfc, &curp, &apellido_paterno, apellido_materno.as_deref());
+    let (errores, mut advertencias) =
+        rfc::cotejar_con_curp(&rfc, &curp, &apellido_paterno, apellido_materno.as_deref());
     if let Some(e) = errores.into_iter().next() {
         return Err(AppError::validacion(e));
     }
@@ -429,7 +432,12 @@ pub struct DatosGuardados {
     pub advertencias: Vec<String>,
 }
 
-pub async fn guardar_datos(pool: &PgPool, cliente_id: Uuid, d: &DatosPersonales, hoy: NaiveDate) -> AppResult<DatosGuardados> {
+pub async fn guardar_datos(
+    pool: &PgPool,
+    cliente_id: Uuid,
+    d: &DatosPersonales,
+    hoy: NaiveDate,
+) -> AppResult<DatosGuardados> {
     let v = validar_datos(d, hoy)?;
     let mut tx = db::begin(pool, Rol::Kyc).await?;
     exigir_persona_fisica(&mut tx, cliente_id).await?;
@@ -534,7 +542,8 @@ pub fn decodificar_imagen(campo: &str, entrada: &str) -> AppResult<Imagen> {
     if bytes.len() < MIN_BYTES_IMAGEN || bytes.len() > MAX_BYTES_IMAGEN {
         return Err(AppError::validacion(format!("{campo}: la imagen debe pesar entre 1 KB y 3 MB")));
     }
-    let tipo = tipo_imagen(&bytes).ok_or_else(|| AppError::validacion(format!("{campo}: se admite JPEG, PNG o WebP")))?;
+    let tipo =
+        tipo_imagen(&bytes).ok_or_else(|| AppError::validacion(format!("{campo}: se admite JPEG, PNG o WebP")))?;
     let sha256 = hex::encode(Sha256::digest(&bytes));
     Ok(Imagen { bytes, sha256, tipo })
 }
@@ -611,7 +620,8 @@ pub async fn exigir_enviable(pool: &PgPool, cliente_id: Uuid) -> AppResult<()> {
     let mut tx = db::begin_lectura(pool, Rol::Kyc).await?;
     exigir_persona_fisica(&mut tx, cliente_id).await?;
     let e = cargar(&mut tx, cliente_id).await?;
-    let max_intentos: i16 = sqlx::query_scalar("SELECT max_intentos FROM kyc.parametros WHERE id").fetch_one(&mut *tx).await?;
+    let max_intentos: i16 =
+        sqlx::query_scalar("SELECT max_intentos FROM kyc.parametros WHERE id").fetch_one(&mut *tx).await?;
     let bloqueo = bloqueo(&mut tx, &e, max_intentos).await?;
     tx.commit().await?;
     if e.estado_kyc != EstadoKyc::Pendiente {
@@ -667,7 +677,9 @@ pub async fn enviar(
         .as_deref()
         .and_then(|c| Curp::parse(c).ok())
         .filter(|_| actual.nombres.is_some() && actual.rfc.is_some() && actual.domicilio.get("codigo_postal").is_some())
-        .ok_or_else(|| AppError::negocio("KYC_DATOS_INCOMPLETOS", "primero captura tus datos personales y tu domicilio"))?;
+        .ok_or_else(|| {
+            AppError::negocio("KYC_DATOS_INCOMPLETOS", "primero captura tus datos personales y tu domicilio")
+        })?;
     let credencial = CredencialDeclarada {
         clave_elector: &clave_elector,
         cic: &cic,
@@ -776,7 +788,14 @@ mod pruebas {
         assert_eq!(validar_datos(&d, hoy()).unwrap().advertencias.len(), 1);
         // Menor de edad.
         let curp = super::super::curp::construir(
-            "Ana", "Ruiz", None, NaiveDate::from_ymd_opt(2010, 1, 1).unwrap(), Sexo::M, "DF", 1);
+            "Ana",
+            "Ruiz",
+            None,
+            NaiveDate::from_ymd_opt(2010, 1, 1).unwrap(),
+            Sexo::M,
+            "DF",
+            1,
+        );
         let mut d = datos();
         d.rfc = rfc::construir_desde_curp(&curp, "AB");
         d.curp = curp;

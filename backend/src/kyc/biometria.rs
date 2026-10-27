@@ -215,12 +215,19 @@ impl ProveedorSimulado {
         let vida = if regla.vida_fallida {
             PruebaVida { exitosa: false, motivo: Some("no se detectó un rostro vivo frente a la cámara".into()) }
         } else if !cuadros_distintos || !selfie_no_es_ine {
-            PruebaVida { exitosa: false, motivo: Some("los cuadros de la cámara son idénticos (posible foto o repetición)".into()) }
+            PruebaVida {
+                exitosa: false,
+                motivo: Some("los cuadros de la cámara son idénticos (posible foto o repetición)".into()),
+            }
         } else {
             PruebaVida { exitosa: true, motivo: None }
         };
         let documento = if regla.documento_invalido {
-            Documento { valido: false, motivo: Some("la credencial no está vigente en la lista nominal".into()), ocr: None }
+            Documento {
+                valido: false,
+                motivo: Some("la credencial no está vigente en la lista nominal".into()),
+                ocr: None,
+            }
         } else if i.ine_frente.sha256 == i.ine_reverso.sha256 {
             Documento { valido: false, motivo: Some("anverso y reverso son la misma imagen".into()), ocr: None }
         } else {

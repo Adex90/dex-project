@@ -155,8 +155,8 @@ impl Curp {
         }
         let siglo = if b[16].is_ascii_digit() { 1900 } else { 2000 };
         let anio = siglo + dos_digitos(&b[4..6]) as i32;
-        let fecha_nacimiento = NaiveDate::from_ymd_opt(anio, dos_digitos(&b[6..8]), dos_digitos(&b[8..10]))
-            .ok_or(ErrorCurp::Fecha)?;
+        let fecha_nacimiento =
+            NaiveDate::from_ymd_opt(anio, dos_digitos(&b[6..8]), dos_digitos(&b[8..10])).ok_or(ErrorCurp::Fecha)?;
         let entidad = &valor[11..13];
         if !ENTIDADES.iter().any(|(c, _, _)| *c == entidad) {
             return Err(ErrorCurp::Entidad(entidad.to_owned()));
@@ -210,8 +210,10 @@ impl Curp {
 
 /// Preposiciones, conjunciones y contracciones que se omiten en nombres y
 /// apellidos compuestos.
-const PARTICULAS: &[&str] =
-    &["DA", "DAS", "DE", "DEL", "DER", "DI", "DIE", "DD", "EL", "LA", "LOS", "LAS", "LE", "LES", "MAC", "MC", "VAN", "VON", "Y"];
+const PARTICULAS: &[&str] = &[
+    "DA", "DAS", "DE", "DEL", "DER", "DI", "DIE", "DD", "EL", "LA", "LOS", "LAS", "LE", "LES", "MAC", "MC", "VAN",
+    "VON", "Y",
+];
 
 /// Si el nombre es compuesto y empieza con alguno de estos, se usa el segundo.
 const NOMBRES_OMITIDOS: &[&str] = &["MARIA", "MA", "M", "JOSE", "J"];
@@ -286,7 +288,11 @@ pub fn derivar_letras(nombres: &str, paterno: &str, materno: Option<&str>) -> St
     }
     cuatro
         .into_iter()
-        .chain([consonante_interna(pat.as_deref()), consonante_interna(mat.as_deref()), consonante_interna(nom.as_deref())])
+        .chain([
+            consonante_interna(pat.as_deref()),
+            consonante_interna(mat.as_deref()),
+            consonante_interna(nom.as_deref()),
+        ])
         .collect()
 }
 
@@ -303,11 +309,8 @@ pub fn construir(
     homoclave: u8,
 ) -> String {
     let letras = derivar_letras(nombres, paterno, materno);
-    let diferenciador = if fecha.year() < 2000 {
-        char::from(b'0' + homoclave % 10)
-    } else {
-        char::from(b'A' + homoclave % 26)
-    };
+    let diferenciador =
+        if fecha.year() < 2000 { char::from(b'0' + homoclave % 10) } else { char::from(b'A' + homoclave % 26) };
     let primeros: String = format!(
         "{}{:02}{:02}{:02}{}{}{}{}",
         &letras[..4],

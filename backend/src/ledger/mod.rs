@@ -520,12 +520,11 @@ async fn retener_tx(pool: &PgPool, r: &Retencion, monto: Decimal) -> AppResult<M
     let cuenta = bloquear_cuenta_ifpe(&mut tx, r.cuenta_id).await?;
     // Idempotencia (después del candado): la clave del operador vive en
     // ifpe.retenciones_operador, no en el ledger.
-    let previa: Option<(Uuid, String)> = sqlx::query_as(
-        "SELECT transaccion_id, motivo FROM ifpe.retenciones_operador WHERE clave_idempotencia = $1",
-    )
-    .bind(&r.clave_idempotencia)
-    .fetch_optional(&mut *tx)
-    .await?;
+    let previa: Option<(Uuid, String)> =
+        sqlx::query_as("SELECT transaccion_id, motivo FROM ifpe.retenciones_operador WHERE clave_idempotencia = $1")
+            .bind(&r.clave_idempotencia)
+            .fetch_optional(&mut *tx)
+            .await?;
     if let Some((transaccion_id, motivo)) = previa {
         let previa: TransaccionIfpe = sqlx::query_as("SELECT * FROM ifpe.transacciones WHERE id = $1")
             .bind(transaccion_id)

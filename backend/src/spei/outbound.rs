@@ -1238,12 +1238,8 @@ async fn renovar_reclamo(pool: &PgPool, o: &SpeiOutbound) -> AppResult<Option<Op
          RETURNING CASE WHEN registro_incierto_desde = now() THEN registro_incierto_desde END",
         aml::evaluacion::FILTRO_REGISTRO
     );
-    let fila: Option<(Option<DateTime<Utc>>,)> = sqlx::query_as(&sql)
-    .bind(o.id)
-    .bind(o.intentos_envio)
-    .bind(ARRENDAMIENTO_SEG)
-    .fetch_optional(&mut *tx)
-    .await?;
+    let fila: Option<(Option<DateTime<Utc>>,)> =
+        sqlx::query_as(&sql).bind(o.id).bind(o.intentos_envio).bind(ARRENDAMIENTO_SEG).fetch_optional(&mut *tx).await?;
     tx.commit().await?;
     if fila.is_none() {
         tracing::warn!(rastreo = %o.clave_rastreo, intentos = o.intentos_envio, "reclamo SPEI vencido o retenido: no se llama al proveedor");

@@ -238,12 +238,11 @@ pub async fn iniciar_sesion(estado: &AppState, email: &str, password_plano: &str
     }
 
     let mut tx = db::begin(pool, Rol::Kyc).await?;
-    let fila: FilaLogin = sqlx::query_as(
-        "SELECT c.id AS cliente_id, c.en_lista_bloqueadas FROM kyc.clientes c WHERE c.id = $1",
-    )
-    .bind(cliente_id)
-    .fetch_one(&mut *tx)
-    .await?;
+    let fila: FilaLogin =
+        sqlx::query_as("SELECT c.id AS cliente_id, c.en_lista_bloqueadas FROM kyc.clientes c WHERE c.id = $1")
+            .bind(cliente_id)
+            .fetch_one(&mut *tx)
+            .await?;
     if fila.en_lista_bloqueadas {
         tx.commit().await?;
         return Err(AppError::Prohibido);
