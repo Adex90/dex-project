@@ -37,8 +37,15 @@
 --     segregación de funciones (CUMPLIMIENTO; nadie resuelve sobre sí mismo;
 --     cuatro ojos para levantar, liberar y cambiar reglas) y bitácora
 --     inmutable con hash canónico por renglón y sellado por lotes.
---  7. Sin aviso al cliente: códigos y conceptos neutros; un solo error
---     constante para toda operación bloqueada.
+--  7. Sin aviso al cliente: códigos y conceptos neutros (también en las
+--     retenciones del operador, que tienen la misma forma que las de PLD); un
+--     solo error constante para toda operación bloqueada; congelar, levantar o
+--     cambiar el nivel de riesgo no mueve actualizado_en de lo que el cliente
+--     lee. Nadie de cumplimiento ve los expedientes de los que es sujeto, y
+--     sc_auditor (rutas del cliente) no tiene acceso a aml.
+--  8. El nivel de riesgo PLD del cliente no baja fuera de cumplimiento
+--     mientras el cliente está bajo revisión (alerta abierta o confirmada,
+--     congelamiento activo), y todo cambio de nivel queda en la bitácora.
 --
 --  No cambian: SC_RESERVA_100, SC_SALDO_SIN_LEDGER, la lista blanca de 0005,
 --  el RLS de 0006/0007, `ifpe.v_hojas_reserva` (una cuenta congelada sigue
@@ -543,7 +550,8 @@ CREATE TABLE aml.bitacora (
                          'LEVANTAMIENTO_SOLICITADO', 'LEVANTAMIENTO_APROBADO', 'LEVANTAMIENTO_RECHAZADO',
                          'LEVANTAMIENTO_ANULADO', 'OPERACION_BLOQUEADA', 'CARGO_EN_CUENTA_CONGELADA',
                          'EVALUACION_DIFERIDA', 'EVALUACION_FALLIDA', 'CONSULTA_EXPEDIENTE', 'RIESGO_CLIENTE_ELEVADO',
-                         'RIESGO_CLIENTE_REDUCIDO', 'RIESGO_CLIENTE_REDUCCION_DENEGADA', 'PROPUESTA_CREADA', 'PROPUESTA_APROBADA', 'PROPUESTA_RECHAZADA', 'REGLA_VERSION_NUEVA',
+                         'RIESGO_CLIENTE_REDUCIDO', 'RIESGO_CLIENTE_REDUCCION_DENEGADA', 'PROPUESTA_CREADA',
+                         'PROPUESTA_APROBADA', 'PROPUESTA_RECHAZADA', 'REGLA_VERSION_NUEVA',
                          'REGLA_DESACTIVADA', 'PARAMETROS_VERSION_NUEVA', 'MIGRACION_0009')),
     objeto           TEXT NOT NULL CHECK (objeto IN ('ALERTA', 'CONGELAMIENTO', 'RETENCION', 'SOLICITUD', 'PROPUESTA',
                                                      'REGLA', 'PARAMETROS', 'EVALUACION', 'OPERACION', 'CLIENTE',
@@ -4377,10 +4385,11 @@ $$;
 CREATE FUNCTION aml.movimientos_ledger(p_ids UUID[]) RETURNS SETOF ifpe.transacciones
 LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, pg_temp
 AS $$
-    SELECT * FROM ifpe.transacciones
-     WHERE id = ANY (p_ids) AND tipo IN ('RETENCION', 'LIBERACION_RETENCION')
-       AND (clave_idempotencia LIKE 'ret:%' OR clave_idempotencia LIKE 'lib:%')
-     ORDER BY secuencia
+    SELECT t.* FROM ifpe.transacciones t
+     WHERE t.id = ANY (p_ids) AND t.tipo IN ('RETENCION', 'LIBERACION_RETENCION')
+       AND (t.clave_idempotencia LIKE 'ret:%' OR t.clave_idempotencia LIKE 'lib:%')
+       AND EXISTS (SELECT 1 FROM aml.retenciones r WHERE r.tx_retencion_id = t.id OR r.tx_liberacion_id = t.id)
+     ORDER BY t.secuencia
 $$;
 
 -- -----------------------------------------------------------------------------

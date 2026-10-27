@@ -477,6 +477,20 @@ async fn transferir_tx(pool: &PgPool, t: &Transferencia, monto: Decimal) -> AppR
 // Retención / liberación (cumplimiento). El dinero retenido sigue respaldado.
 // -----------------------------------------------------------------------------
 
+/// Concepto neutro de una retención en el ledger del cliente, el mismo que usa
+/// PLD (`aml.aplicar_retencion`).
+pub const CONCEPTO_RETENCION: &str = "Retención temporal";
+/// Concepto neutro de una liberación, el mismo que usa PLD (`aml.liberar_retencion`).
+pub const CONCEPTO_LIBERACION: &str = "Liberación de retención";
+
+/// Retención o liberación del operador (`POST /operaciones/retenciones`).
+///
+/// En el ledger del cliente (`/ifpe/movimientos`) tiene la misma forma que una
+/// retención de PLD: clave `ret:<id>` / `lib:<id>` y concepto neutro. El motivo
+/// del operador y su clave de idempotencia quedan en
+/// `ifpe.retenciones_operador`, que ninguna ruta del cliente sirve. Antes la
+/// clave era `op:<operador>:<clave>` con el texto del operador, así que el
+/// cliente sabía que una retención `ret:` era de cumplimiento.
 #[derive(Debug, Clone)]
 pub struct Retencion {
     pub cuenta_id: Uuid,
@@ -497,9 +511,36 @@ pub async fn retener(pool: &PgPool, r: &Retencion) -> AppResult<Movimiento> {
 }
 
 async fn retener_tx(pool: &PgPool, r: &Retencion, monto: Decimal) -> AppResult<Movimiento> {
-    let tipo = if r.liberar { TipoTxIfpe::LiberacionRetencion } else { TipoTxIfpe::Retencion };
+    let (tipo, prefijo, concepto) = if r.liberar {
+        (TipoTxIfpe::LiberacionRetencion, "lib", CONCEPTO_LIBERACION)
+    } else {
+        (TipoTxIfpe::Retencion, "ret", CONCEPTO_RETENCION)
+    };
     let mut tx = db::begin(pool, Rol::Ifpe).await?;
     let cuenta = bloquear_cuenta_ifpe(&mut tx, r.cuenta_id).await?;
+    // Idempotencia (después del candado): la clave del operador vive en
+    // ifpe.retenciones_operador, no en el ledger.
+    let previa: Option<(Uuid, String)> = sqlx::query_as(
+        "SELECT transaccion_id, motivo FROM ifpe.retenciones_operador WHERE clave_idempotencia = $1",
+    )
+    .bind(&r.clave_idempotencia)
+    .fetch_optional(&mut *tx)
+    .await?;
+    if let Some((transaccion_id, motivo)) = previa {
+        let previa: TransaccionIfpe = sqlx::query_as("SELECT * FROM ifpe.transacciones WHERE id = $1")
+            .bind(transaccion_id)
+            .fetch_one(&mut *tx)
+            .await?;
+        exigir_misma_operacion(&previa, tipo, monto, Some(cuenta.id), Some(cuenta.id), Some(concepto), None)?;
+        if motivo != r.motivo {
+            return Err(AppError::conflicto(
+                "CLAVE_IDEMPOTENCIA_REUTILIZADA",
+                "la clave de idempotencia ya se usó para una operación distinta",
+            ));
+        }
+        return Ok(Movimiento { transaccion: previa, idempotente: true });
+    }
+    // Una clave ya usada en el ledger por otra operación sigue siendo un conflicto.
     if let Some(previa) = buscar_por_clave(&mut tx, &r.clave_idempotencia).await? {
         exigir_misma_operacion(&previa, tipo, monto, Some(cuenta.id), Some(cuenta.id), Some(&r.motivo), None)?;
         return Ok(Movimiento { transaccion: previa, idempotente: true });
@@ -520,6 +561,8 @@ async fn retener_tx(pool: &PgPool, r: &Retencion, monto: Decimal) -> AppResult<M
         return Err(AppError::negocio("SALDO_INSUFICIENTE", "saldo insuficiente para la retención/liberación"));
     }
     sqlx::query(sql).bind(monto).bind(cuenta.id).execute(&mut *tx).await?;
+    let registro = Uuid::new_v4();
+    let clave = format!("{prefijo}:{registro}");
     let t = insertar_tx_ifpe(
         &mut tx,
         NuevaTxIfpe {
@@ -529,12 +572,27 @@ async fn retener_tx(pool: &PgPool, r: &Retencion, monto: Decimal) -> AppResult<M
             destino: Some(cuenta.id),
             reserva: None,
             monto,
-            concepto: Some(&r.motivo),
+            concepto: Some(concepto),
             referencia_externa: None,
-            clave: &r.clave_idempotencia,
+            clave: &clave,
             espejo: None,
         },
     )
+    .await?;
+    // El trigger diferido trg_ifpe_tx_zz_aml_clave exige este registro (misma
+    // transacción, mismo monto, cuenta y concepto neutro) para la clave reservada.
+    sqlx::query(
+        "INSERT INTO ifpe.retenciones_operador (id, clave_idempotencia, tipo, cuenta_id, monto, motivo, transaccion_id) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7)",
+    )
+    .bind(registro)
+    .bind(&r.clave_idempotencia)
+    .bind(tipo)
+    .bind(cuenta.id)
+    .bind(monto)
+    .bind(&r.motivo)
+    .bind(t.id)
+    .execute(&mut *tx)
     .await?;
     tx.commit().await?;
     Ok(Movimiento { transaccion: t, idempotente: false })

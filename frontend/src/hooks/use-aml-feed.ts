@@ -277,7 +277,8 @@ export function useAmlFeed({
       if (!alive) return;
       if (!failure) {
         failures = 0;
-        setError(null);
+        // A rejected first page stays reported until the filters change or Refresh is pressed.
+        if (rejectedKey !== currentKey()) setError(null);
         setLastUpdated(Date.now());
       } else if (fail(failure.reason)) {
         failures += 1;

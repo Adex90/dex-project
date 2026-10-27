@@ -3432,6 +3432,123 @@ async fn sondeo_reenvia_la_alerta_al_levantar_su_congelamiento(pool: PgPool) {
     verificar_invariantes_aml(&pool).await;
 }
 
+/// Forma de un renglón del ledger del cliente con los identificadores
+/// normalizados: lo que un cliente puede comparar entre dos retenciones.
+fn forma_de_retencion(m: &Value) -> Value {
+    let clave = m["clave_idempotencia"].as_str().unwrap_or_default();
+    let (prefijo, resto) = clave.split_once(':').unwrap_or((clave, ""));
+    let mut llaves: Vec<&str> = m.as_object().unwrap().keys().map(String::as_str).collect();
+    llaves.sort_unstable();
+    json!({
+        "tipo": m["tipo"],
+        "clave": format!("{prefijo}:{}", if Uuid::parse_str(resto).is_ok() { "<uuid>" } else { resto }),
+        "concepto": m["concepto"],
+        "misma_cuenta": m["cuenta_origen_id"] == m["cuenta_destino_id"],
+        "reserva": m["reserva_id"],
+        "referencia": m["referencia_externa"],
+        "llaves": llaves,
+    })
+}
+
+/// authz#11: una retención del operador (POST /operaciones/retenciones) y su
+/// liberación se ven en el ledger del cliente igual que las de PLD (clave
+/// `ret:`/`lib:` y concepto neutro); el motivo y la clave del operador quedan
+/// en `ifpe.retenciones_operador`. Antes llevaban `op:<operador>:<clave>` y el
+/// texto del operador, así que una retención `ret:` delataba a cumplimiento.
+#[sqlx::test(migrations = "../migrations")]
+async fn retencion_del_operador_igual_a_la_de_pld(pool: PgPool) {
+    let (api, cfg) = api(&pool).await;
+    let ana = cliente(&pool, &cfg, "Ana").await;
+    let beto = cliente(&pool, &cfg, "Beto").await;
+    congelar_por_estructuracion(&pool, &cfg, ana.cuenta_ifpe.id).await;
+    depositar(&pool, &cfg, beto.cuenta_ifpe.id, "1000").await;
+    let tok_ana = token_cliente(&api, "Ana").await;
+    let tok_beto = token_cliente(&api, "Beto").await;
+    let operador = api.token("operador@synthetic.mx", "operador-de-pruebas-123").await;
+    let operador_id = operador_id(&pool).await;
+    const MOTIVO_OPERADOR: &str = "Embargo ordenado por el juzgado tercero de lo civil";
+    let clave_ret = clave_api();
+    let retener = |monto: &str, liberar: bool, motivo: &str, clave: &str| {
+        json!({ "cuenta_id": beto.cuenta_ifpe.id, "monto": monto, "motivo": motivo, "liberar": liberar, "clave_idempotencia": clave })
+    };
+    let (s, ret) = api.post("/api/v1/operaciones/retenciones", &operador, retener("300", false, MOTIVO_OPERADOR, &clave_ret)).await;
+    assert_eq!(s, StatusCode::CREATED, "{ret}");
+    // Repetición idempotente, y la misma clave para otra cosa: 409.
+    let (s, otra) = api.post("/api/v1/operaciones/retenciones", &operador, retener("300", false, MOTIVO_OPERADOR, &clave_ret)).await;
+    assert_eq!((s, &otra["transaccion"]["id"]), (StatusCode::OK, &ret["transaccion"]["id"]), "{otra}");
+    for cuerpo in [retener("300", false, "Otro motivo cualquiera", &clave_ret), retener("301", false, MOTIVO_OPERADOR, &clave_ret)] {
+        let (s, v) = api.post("/api/v1/operaciones/retenciones", &operador, cuerpo).await;
+        assert_eq!((s, error(&v)), (StatusCode::CONFLICT, "CLAVE_IDEMPOTENCIA_REUTILIZADA"), "{v}");
+    }
+    let (s, lib) = api.post("/api/v1/operaciones/retenciones", &operador, retener("100", true, "Levantamiento parcial", &clave_api())).await;
+    assert_eq!(s, StatusCode::CREATED, "{lib}");
+    assert_eq!(saldo_ifpe(&pool, beto.cuenta_ifpe.id).await, (d("800"), d("200")));
+
+    // Lo que ve cada cliente en /ifpe/movimientos.
+    let (_, movs_ana) = api.get("/api/v1/ifpe/movimientos", &tok_ana).await;
+    let (_, movs_beto) = api.get("/api/v1/ifpe/movimientos", &tok_beto).await;
+    let de_tipo = |movs: &Value, tipo: &str| -> Vec<Value> {
+        movs.as_array().unwrap().iter().filter(|m| m["tipo"] == tipo).map(forma_de_retencion).collect()
+    };
+    let pld = de_tipo(&movs_ana, "RETENCION");
+    let del_operador = de_tipo(&movs_beto, "RETENCION");
+    assert_eq!(pld.len(), 1, "{movs_ana}");
+    assert_eq!(del_operador.len(), 1, "{movs_beto}");
+    assert_eq!(del_operador[0], pld[0], "la retención del operador tiene la misma forma que la de PLD");
+    assert_eq!(pld[0]["clave"], "ret:<uuid>");
+    assert_eq!(pld[0]["concepto"], "Retención temporal");
+    let liberacion = de_tipo(&movs_beto, "LIBERACION_RETENCION");
+    assert_eq!(liberacion.len(), 1, "{movs_beto}");
+    assert_eq!((liberacion[0]["clave"].as_str(), liberacion[0]["concepto"].as_str()), (Some("lib:<uuid>"), Some("Liberación de retención")));
+    let texto = movs_beto.to_string();
+    for rastro in ["op:", &operador_id.to_string(), MOTIVO_OPERADOR, "Levantamiento parcial", &clave_ret] {
+        assert!(!texto.contains(rastro), "/ifpe/movimientos del cliente contiene «{rastro}»: {texto}");
+    }
+    // El motivo y la clave del operador quedan en su registro interno.
+    let (motivo, clave): (String, String) = sqlx::query_as(
+        "SELECT motivo, clave_idempotencia FROM ifpe.retenciones_operador WHERE transaccion_id = $1",
+    )
+    .bind(Uuid::parse_str(ret["transaccion"]["id"].as_str().unwrap()).unwrap())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!((motivo.as_str(), clave), (MOTIVO_OPERADOR, format!("op:{operador_id}:{clave_ret}")));
+
+    // Una clave ret: sin registro, o con un concepto que no es el neutro, no entra al ledger.
+    let b = beto.cuenta_ifpe.id;
+    let mover = format!(
+        "UPDATE ifpe.cuentas SET saldo_disponible = saldo_disponible - 1, saldo_bloqueado = saldo_bloqueado + 1 WHERE id = '{b}'; "
+    );
+    let r = como(
+        &pool,
+        Rol::Ifpe,
+        &format!(
+            "{mover} INSERT INTO ifpe.transacciones (tipo, cuenta_origen_id, cuenta_destino_id, monto, concepto, clave_idempotencia) \
+             VALUES ('RETENCION', '{b}', '{b}', 1, 'Retención temporal', 'ret:{}')",
+            Uuid::new_v4()
+        ),
+    )
+    .await;
+    assert!(matches!(&r, Err(e) if e.contains("SC_AML_CLAVE_RESERVADA")), "{r:?}");
+    let (registro, tx_id) = (Uuid::new_v4(), Uuid::new_v4());
+    let r = como(
+        &pool,
+        Rol::Ifpe,
+        &format!(
+            "{mover} INSERT INTO ifpe.transacciones (id, tipo, cuenta_origen_id, cuenta_destino_id, monto, concepto, clave_idempotencia) \
+             VALUES ('{tx_id}', 'RETENCION', '{b}', '{b}', 1, 'Embargo del juzgado', 'ret:{registro}'); \
+             INSERT INTO ifpe.retenciones_operador (id, clave_idempotencia, tipo, cuenta_id, monto, motivo, transaccion_id) \
+             VALUES ('{registro}', 'op:x:forja', 'RETENCION', '{b}', 1, 'Embargo del juzgado', '{tx_id}')"
+        ),
+    )
+    .await;
+    assert!(matches!(&r, Err(e) if e.contains("SC_AML_CLAVE_RESERVADA")), "{r:?}");
+    assert_eq!(saldo_ifpe(&pool, b).await, (d("800"), d("200")));
+
+    verificar_invariantes(&pool).await;
+    verificar_invariantes_aml(&pool).await;
+}
+
 /// e2e#4: los oficiales que crea el arranque (MODO_DEMO) tienen nombres
 /// distintos, así que la consola distingue al solicitante del aprobador.
 #[sqlx::test(migrations = "../migrations")]

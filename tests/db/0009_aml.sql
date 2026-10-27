@@ -2530,6 +2530,55 @@ SELECT pg_temp.exigir('e2e#1: un cambio de nivel del cliente también mueve la m
           AND aml.alerta_json(a.id) -> 'cliente' ->> 'nivel_riesgo_pld' = 'ALTO'
      FROM aml.alertas a WHERE a.id = pg_temp.alerta('Frec', 'R08_FRECUENCIA')));
 
+-- authz#11: una retención del operador usa la misma clave neutra ('ret:<id>' /
+-- 'lib:<id>') y el mismo concepto que una de PLD, con su registro en
+-- ifpe.retenciones_operador; sin registro o con otro concepto, la clave
+-- reservada no entra al ledger.
+SELECT pg_temp.cliente('Opr');
+SELECT pg_temp.paso('Opr', 'DEPOSITO', 1000, NULL, 'PERMITIR', 0, 'BAJO');
+CREATE FUNCTION pg_temp.retencion_operador(p_cliente TEXT, p_tipo TEXT, p_concepto TEXT, p_registro BOOLEAN) RETURNS TEXT[]
+LANGUAGE sql STABLE AS $$
+    SELECT ARRAY['SET LOCAL ROLE sc_ifpe',
+                 format($q$UPDATE ifpe.cuentas SET saldo_disponible = saldo_disponible %s 5, saldo_bloqueado = saldo_bloqueado %s 5
+                            WHERE id = %L$q$, CASE p_tipo WHEN 'RETENCION' THEN '-' ELSE '+' END,
+                        CASE p_tipo WHEN 'RETENCION' THEN '+' ELSE '-' END, pg_temp.cta(p_cliente)),
+                 format($q$INSERT INTO ifpe.transacciones (id, tipo, cuenta_origen_id, cuenta_destino_id, monto, concepto,
+                                                           clave_idempotencia)
+                           VALUES (%L, %L, %L, %L, 5, %L, %L)$q$, t.id, p_tipo, pg_temp.cta(p_cliente), pg_temp.cta(p_cliente),
+                        p_concepto, CASE p_tipo WHEN 'RETENCION' THEN 'ret:' ELSE 'lib:' END || r.id),
+                 CASE WHEN p_registro THEN format(
+                     $q$INSERT INTO ifpe.retenciones_operador (id, clave_idempotencia, tipo, cuenta_id, monto, motivo, transaccion_id)
+                        VALUES (%L, %L, %L, %L, 5, 'Embargo ordenado por el juzgado', %L)$q$,
+                     r.id, 'op:0f000000-0000-0000-0000-0000000000f0:' || r.id, p_tipo, pg_temp.cta(p_cliente), t.id)
+                      ELSE 'SELECT 1' END,
+                 'RESET ROLE']
+      FROM (SELECT gen_random_uuid() AS id) r, (SELECT gen_random_uuid() AS id) t
+$$;
+SELECT pg_temp.debe_pasar('authz#11: el operador retiene con la clave y el concepto neutros (y su registro)',
+  pg_temp.retencion_operador('Opr', 'RETENCION', 'Retención temporal', TRUE));
+SELECT pg_temp.debe_pasar('authz#11: y libera igual',
+  pg_temp.retencion_operador('Opr', 'LIBERACION_RETENCION', 'Liberación de retención', TRUE));
+SELECT pg_temp.exigir('authz#11: en el ledger del cliente, la retención del operador tiene la forma de la de PLD',
+  (SELECT array_agg(t.tipo || ' ' || t.concepto || ' ' || (t.clave_idempotencia ~ '^(ret|lib):[0-9a-f-]{36}$')::text
+                    ORDER BY t.secuencia)
+     FROM ifpe.transacciones t WHERE t.cuenta_origen_id = pg_temp.cta('Opr') AND t.tipo LIKE '%RETENCION')
+  = ARRAY['RETENCION Retención temporal true', 'LIBERACION_RETENCION Liberación de retención true']
+  AND (SELECT count(*) = 2 FROM ifpe.retenciones_operador WHERE cuenta_id = pg_temp.cta('Opr')));
+SELECT pg_temp.debe_fallar('authz#11: con el motivo del operador como concepto, la clave reservada no entra',
+  pg_temp.retencion_operador('Opr', 'RETENCION', 'Embargo ordenado por el juzgado', TRUE), 'SC_AML_CLAVE_RESERVADA');
+SELECT pg_temp.debe_fallar('authz#11: sin registro (ni de PLD ni del operador) tampoco',
+  pg_temp.retencion_operador('Opr', 'RETENCION', 'Retención temporal', FALSE), 'SC_AML_CLAVE_RESERVADA');
+SELECT pg_temp.debe_fallar('authz#11: el registro del operador es solo de inserción', ARRAY[
+  format($q$UPDATE ifpe.retenciones_operador SET motivo = 'otro' WHERE cuenta_id = %L$q$, pg_temp.cta('Opr'))
+], 'SC_LEDGER_INMUTABLE');
+SELECT pg_temp.exigir('authz#11: sc_ifpe inserta y lee el registro, no lo cambia; los demás roles no lo ven',
+  has_table_privilege('sc_ifpe', 'ifpe.retenciones_operador', 'INSERT')
+  AND has_table_privilege('sc_ifpe', 'ifpe.retenciones_operador', 'SELECT')
+  AND NOT has_table_privilege('sc_ifpe', 'ifpe.retenciones_operador', 'UPDATE')
+  AND NOT has_table_privilege('sc_ifpe', 'ifpe.retenciones_operador', 'DELETE')
+  AND NOT EXISTS (SELECT 1 FROM unnest(ARRAY['sc_spei', 'sc_kyc', 'sc_auditor', 'sc_aml', 'sc_puente', 'sc_sofom']) r
+                   WHERE has_table_privilege(r, 'ifpe.retenciones_operador', 'SELECT')));
+
 -- -----------------------------------------------------------------------------
 -- 14. Reserva del 100% al final (antes de alterar la bitácora)
 -- -----------------------------------------------------------------------------

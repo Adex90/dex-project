@@ -249,6 +249,7 @@ export function ClientReviewDrawer({
                 setReloadKey((k) => k + 1);
                 onChanged(message);
               }}
+              onStale={() => setReloadKey((k) => k + 1)}
             />
           ))}
           <Section title={withPanel.length > 0 ? "Earlier restrictions" : "Restrictions"} icon={<Snowflake className="size-3.5" aria-hidden />}>

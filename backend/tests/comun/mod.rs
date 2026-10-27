@@ -558,18 +558,25 @@ pub async fn verificar_invariantes_aml(pool: &PgPool) {
     let (valido, error): (bool, Option<String>) =
         sqlx::query_as("SELECT valido, primer_error FROM aml.verificar_bitacora()").fetch_one(pool).await.unwrap();
     assert!(valido, "bitácora PLD inválida: {error:?}");
-    // 4. Todo renglón ret:/lib: del ledger tiene su vínculo en aml.retenciones.
+    // 4. Todo renglón ret:/lib: del ledger tiene su vínculo en aml.retenciones
+    //    (PLD) o en ifpe.retenciones_operador (operador), y el concepto neutro.
     let huerfanos: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM ifpe.transacciones t \
           WHERE (t.clave_idempotencia LIKE 'ret:%' \
-                 AND NOT EXISTS (SELECT 1 FROM aml.retenciones r WHERE r.tx_retencion_id = t.id)) \
+                 AND (t.concepto IS DISTINCT FROM 'Retención temporal' \
+                      OR (NOT EXISTS (SELECT 1 FROM aml.retenciones r WHERE r.tx_retencion_id = t.id) \
+                          AND NOT EXISTS (SELECT 1 FROM ifpe.retenciones_operador o \
+                                           WHERE o.transaccion_id = t.id AND o.tipo = 'RETENCION')))) \
              OR (t.clave_idempotencia LIKE 'lib:%' \
-                 AND NOT EXISTS (SELECT 1 FROM aml.retenciones r WHERE r.tx_liberacion_id = t.id))",
+                 AND (t.concepto IS DISTINCT FROM 'Liberación de retención' \
+                      OR (NOT EXISTS (SELECT 1 FROM aml.retenciones r WHERE r.tx_liberacion_id = t.id) \
+                          AND NOT EXISTS (SELECT 1 FROM ifpe.retenciones_operador o \
+                                           WHERE o.transaccion_id = t.id AND o.tipo = 'LIBERACION_RETENCION'))))",
     )
     .fetch_one(pool)
     .await
     .unwrap();
-    assert_eq!(huerfanos, 0, "movimientos ret:/lib: sin vínculo en aml.retenciones");
+    assert_eq!(huerfanos, 0, "movimientos ret:/lib: sin vínculo en aml.retenciones / ifpe.retenciones_operador");
 }
 
 /// Como [`depositar`], con el origen indicado (webhook, captura del operador o demo).

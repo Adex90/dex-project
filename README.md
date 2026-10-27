@@ -329,8 +329,29 @@ verdict. Rust only passes the facts of the operation it is about to write.
   blocked operation (`422 OPERACION_NO_DISPONIBLE`, the same bytes whatever
   the reason), keeps seeing `"estado": "ACTIVA"`, and sees a hold only as a
   neutral "Retención temporal". `/yo`, `/tablero` and `/auth/registro` no
-  longer return the risk tier or PEP flag. Senders to a frozen client see a
-  normal success. Client roles have no access to the `aml` schema at all.
+  longer return the risk tier or PEP flag. Freezing, lifting and CONFIRMAR
+  change nothing a client can read: the account's and the client's
+  `actualizado_en` keep their value when only the AML state or the risk tier
+  changes (a ledger movement still moves them). Operator holds
+  (`POST /operaciones/retenciones`) look exactly like AML holds in the
+  client's ledger: the same `ret:<id>` / `lib:<id>` keys and neutral concepts,
+  with the operator's reason and key kept in `ifpe.retenciones_operador`
+  (before, an operator hold carried `op:<operator>:<key>` and the operator's
+  text, so a `ret:` hold could only be AML). Senders to a frozen client see a
+  normal success. Client roles have no access to the `aml` schema at all,
+  including `sc_auditor`, which serves `/tablero` and `/reserva/prueba`.
+- **Risk tier.** `kyc.clientes.nivel_riesgo_pld` feeds the score (R03, the
+  per-tier bands, M03) and CONFIRMAR raises it to ALTO. The operator's KYC
+  dictamen (`POST /operaciones/kyc/{id}`) still assigns it at onboarding, but
+  it cannot lower it while the client is under AML review (an open or
+  confirmed alert, or an active freeze): the database keeps the tier without
+  an error, so an operator cannot probe for a case, and logs
+  `RIESGO_CLIENTE_REDUCCION_DENEGADA`. Every tier change made outside the
+  compliance functions is logged in `aml.bitacora` with the operator (or the
+  database user) as actor. The dictamen answers with the client projection
+  (no tier, evaluation time or PEP flag), and an empty dictamen is a 400.
+  Lowering the tier of a confirmed client is a schema-owner action, and it is
+  logged too.
 - **Deadlines and audit.** Alerts carry the UIF reporting deadline (60 days,
   24 h when urgent). `aml.bitacora` is append-only with a canonical hash per
   row, sealed by the worker in chained batches by transaction id (each seal
@@ -339,8 +360,10 @@ verdict. Rust only passes the facts of the operation it is about to write.
   `aml.verificaciones_bitacora`; `GET /api/v1/aml/bitacora/verificacion`
   re-verifies from there (rows, seal chain and the unsealed tail), which stays
   within the request limits however long the log grows; a failed verification
-  is kept forever. A full verification is `aml.verificar_bitacora(1)` (owner
-  or auditor job). Every case-file view is logged.
+  is kept forever. A full verification is `aml.verificar_bitacora(1)`, run by
+  the schema owner or by a login granted `sc_auditor_pld` (a role that can
+  run that function and nothing else in `aml`). Every case-file view is
+  logged.
 - **Batch worker** (`AML_MONITOREO_INTERVALO_SEG`, default 300 s, 0 disables;
   `AML_MONITOREO_LOTE` ledger rows per cycle): one instance at a time (a
   lease of at most 600 s in `aml.monitoreo_estado`, fenced by a token: only
@@ -363,10 +386,27 @@ verdict. Rust only passes the facts of the operation it is about to write.
   seals and verifies the audit log and delivers the notification outbox to the
   log (`target: "aml"`, codes and folios only). Nothing uses `pg_notify`.
 - **Roles.** `CUMPLIMIENTO` (compliance officer) has the console;
-  `AUDITOR` reads it; `OPERADOR` and `CLIENTE` get 403. The database repeats
-  the role check in every function. Officer POSTs take a
-  `clave_idempotencia` (201 when performed, 200 on a replay, 409 when the key
-  was used for something else).
+  `AUDITOR` reads it; `OPERADOR` and `CLIENTE` get 403 on every console
+  route, checked before the path, query or body is read (a malformed request
+  still gets 403, so the request schema cannot be explored). The database
+  repeats the role check in every function. Nobody sees a case about
+  themselves: an officer or auditor who is the subject of an alert (an
+  `INTERNA_PREOCUPANTE` case) does not see it, its restriction, its four-eyes
+  request, its notifications or their relevant operations; the summary
+  counters leave them out, and the case file and client review answer 404 as
+  if they did not exist. Officer POSTs take a `clave_idempotencia` (201 when
+  performed, 200 on a replay, 409 when the key was used for something else).
+- **Console.** The feed polls by a change marker that also covers what each
+  row embeds: a change of the linked restriction (lift, confirmation, SLA) or
+  of the client (risk tier, PEP flag, name) moves the alert's `actualizado_en`,
+  so every open console drops the "Client restricted" lock after a lift. An
+  action refused because the case changed meanwhile (409, e.g. another officer
+  took the alert) reloads the case file with the conflict message; a 401 ends
+  on the sign-in page with the "session expired" notice; a deep link with a
+  rule code or alert id the API rejects is ignored ("Alert not found") instead
+  of being retried forever. Internal users are named after their role and the
+  local part of their email ("Cumplimiento oficial1"), so the requester,
+  proposer and approver of a four-eyes decision are distinguishable.
 
 | Method | Route (`/api/v1/aml/...`) | Access |
 |---|---|---|
@@ -384,6 +424,47 @@ verdict. Rust only passes the facts of the operation it is about to write.
 
 The legacy `kyc.alertas_pld` is now read-only history: open alerts were copied
 into `aml.alertas` and `GET /api/v1/operaciones/alertas` was removed.
+
+**Residual risks (accepted, with the reasons).**
+
+- *A sender can infer a hold on the recipient from the ledger position.* A
+  hold on an internal transfer to a frozen client (or on a credit that scores
+  CRITICO) is written in the sender's own transaction, so it takes the
+  ledger sequence right after the sender's TRANSFERENCIA. The live ledger
+  head is public (`GET /api/v1/reserva/estado`), every published snapshot
+  anchors (`secuencia_ledger`, `hash_ledger`), and clients see `secuencia`
+  and `hash_anterior` of their own rows, so on a quiet ledger a sender can
+  tell that another row followed their transfer in the same transaction.
+  It is not fixed because both ways out weaken an invariant: writing the hold
+  in a later transaction would leave the credit unheld between the two commits
+  (the deferred `SC_AML_RETENCION_FALTANTE` check exists to forbid exactly
+  that), and hiding positions from clients does not help while the head is
+  public for Proof of Reserve (per-account chains would be a new ledger
+  design). Concurrent traffic adds noise, the gap does not say why the row
+  is there, and repeated probing transfers count towards R08 (frequency).
+- *The database four-eyes check trusts the officer id the backend passes.*
+  All officers share the `sc_aml` database role, so the officer functions take
+  the acting officer as a parameter: the database checks that the id belongs
+  to a `CUMPLIMIENTO` user, is not the subject and differs from the first
+  officer, but it cannot tell whether the session really is that officer.
+  The backend binds the id from the verified JWT (checked against the
+  database on every request) and `sc_aml` is granted only to the application
+  user, so abusing this needs code execution as the application or its
+  database credentials, which can already `SET ROLE` to every `sc_*` role.
+  A real fix needs per-officer database identities (or single-use tokens
+  issued at login and consumed by the officer functions). Every bitácora row
+  records the database user and role next to the officer.
+- *Hold timing.* Operator and AML holds now have the same shape, but an AML
+  hold still lands in the same transaction (and instant) as the credit it
+  holds, for the credited or pattern amount, while an operator hold stands
+  alone. A client who studies their ledger can still guess that a hold that
+  arrives with a credit came from monitoring. Seeing funds on hold is an
+  accepted residual (spec §7); the hold cannot move to a later transaction
+  for the reason above.
+- *Staff seen as counterparties.* The subject filter covers records whose
+  client is the officer. An officer who only appears in another client's
+  alert (as a transfer counterparty or as a member of an R25-R27 network) can
+  still open that alert.
 
 ## Layout
 
@@ -438,7 +519,15 @@ GRANT sc_ifpe, sc_sofom, sc_puente, sc_auditor, sc_kyc, sc_kyc_verificador, sc_s
 -- Compliance console (/api/v1/aml) and the AML batch worker. Money paths do
 -- not need it: they reach the engine through SECURITY DEFINER wrappers.
 GRANT sc_aml TO sc_app;
+-- Optional: an external job that re-verifies the whole AML audit log
+-- (SELECT * FROM aml.verificar_bitacora(1)) and can do nothing else.
+CREATE ROLE audit_job LOGIN PASSWORD '...';
+GRANT sc_auditor_pld TO audit_job;
 ```
+
+`sc_auditor` (Proof of Reserve, also used by client routes such as
+`/tablero`) has no access to the `aml` schema; console auditors read it
+through `sc_aml`, where every function checks their read-only role.
 
 **Deploying migration 0009 (AML/PLD):** drain every instance running a
 pre-0009 binary before applying it. 0009 revokes INSERT on `kyc.alertas_pld`,
@@ -490,7 +579,7 @@ the password is hashed, so a parallel burst cannot test more than 5 passwords.
 | POST | `/api/v1/kyc/verificar` | client: steps 2-3, INE images and data + liveness frames + consent (up to 12 MB) |
 | POST | `/api/v1/kyc/webhook` | biometric provider (HMAC signature `X-Kyc-Firma`) |
 | GET | `/api/v1/operaciones/kyc/pendientes` | operator: files awaiting human review |
-| POST | `/api/v1/operaciones/kyc/{cliente_id}` | operator: verify / reject (with reason) / reopen, risk level |
+| POST | `/api/v1/operaciones/kyc/{cliente_id}` | operator: verify / reject (with reason) / reopen, risk level (not lowered while the client is under AML review); answers the client projection, without risk fields; an empty dictamen is 400 |
 | GET | `/api/v1/tablero` | client: vault + investment + live reserve |
 | GET | `/api/v1/ifpe/cuenta`, `/api/v1/ifpe/movimientos` | client |
 | POST | `/api/v1/ifpe/transferencias` | client: internal transfer |
@@ -516,7 +605,7 @@ the password is hashed, so a parallel burst cannot test more than 5 passwords.
 | POST | `/api/v1/operaciones/spei/recibidos/{id}/anulacion` | operator: void a wrong manual SPEI entry and free its identity |
 | POST | `/api/v1/operaciones/spei/enviados/{id}/reembolso` | operator: refund an order in manual review that the provider never received |
 | POST | `/api/v1/operaciones/spei/en-revision/{id}/descarte` | operator: discard a held SPEI notification as a duplicate (no money moves) |
-| POST | `/api/v1/operaciones/...` | operator: holds, KYC, capital |
+| POST | `/api/v1/operaciones/...` | operator: holds (shown to the client as neutral `ret:`/`lib:` entries), KYC, capital |
 | GET/POST | `/api/v1/aml/...` | compliance officer (auditor read-only): AML/PLD console, see above |
 
 Full table in `backend/src/routes/mod.rs`.
@@ -529,4 +618,5 @@ releasing AML holds and changing risk rules need a second officer (four-eyes,
 enforced in the database), so staff at least two `CUMPLIMIENTO` users.
 Internal users are provisioned by the schema owner, like operators; with
 `MODO_DEMO=true`, `BOOTSTRAP_CUMPLIMIENTO_EMAILS` / `_PASSWORD` create demo
-officers on startup.
+officers on startup, each named after the local part of their email
+("Cumplimiento oficial1").
