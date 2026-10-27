@@ -210,7 +210,11 @@ CREATE TABLE aml.reglas_riesgo (
     CONSTRAINT ck_aml_regla_r07 CHECK (codigo <> 'R07_VOLUMEN_DIARIO' OR (volumen_max IS NOT NULL AND ventana_horas IS NOT NULL)),
     CONSTRAINT ck_aml_regla_r08 CHECK (codigo <> 'R08_FRECUENCIA' OR (operaciones_max IS NOT NULL AND ventana_horas IS NOT NULL)),
     CONSTRAINT ck_aml_regla_r11 CHECK (codigo <> 'R11_PASO_RAPIDO'
-        OR (umbral_monto IS NOT NULL AND porcentaje_min IS NOT NULL AND ventana_horas IS NOT NULL)),
+        OR (umbral_monto IS NOT NULL AND porcentaje_min IS NOT NULL AND banda_inferior IS NOT NULL
+            AND ventana_horas IS NOT NULL)),
+    CONSTRAINT ck_aml_regla_r12 CHECK (codigo <> 'R12_ESTRUCTURACION_FRECUENTE'
+        OR (umbral_monto IS NOT NULL AND banda_inferior IS NOT NULL AND frecuencia_min IS NOT NULL
+            AND volumen_max IS NOT NULL AND ventana_horas IS NOT NULL)),
     CONSTRAINT ck_aml_regla_r20 CHECK (codigo <> 'R20_ESTRUCTURACION_LENTA'
         OR (umbral_monto IS NOT NULL AND banda_inferior IS NOT NULL AND frecuencia_min IS NOT NULL
             AND operaciones_max IS NOT NULL AND ventana_horas IS NOT NULL)),
@@ -328,8 +332,10 @@ CREATE TABLE aml.alertas (
     estado                aml.estado_alerta NOT NULL DEFAULT 'PENDIENTE',
     "timestamp"           TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
     detalles              JSONB NOT NULL CHECK (jsonb_typeof(detalles) = 'object'),
-    monto                 NUMERIC(18, 8) CHECK (monto > 0),
-    monto_acumulado       NUMERIC(20, 8),
+    -- Sumas de ventanas de hasta 30 días (no un solo movimiento): más anchas
+    -- que un monto del ledger para que ninguna suma desborde la columna.
+    monto                 NUMERIC(24, 8) CHECK (monto > 0),
+    monto_acumulado       NUMERIC(24, 8),
     ocurrencias           INTEGER NOT NULL DEFAULT 1 CHECK (ocurrencias >= 1),
     ultima_ocurrencia_en  TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
     clave_deduplicacion   TEXT NOT NULL,
@@ -342,6 +348,11 @@ CREATE TABLE aml.alertas (
     resolucion_propuesta  TEXT CHECK (resolucion_propuesta = 'FALSO_POSITIVO'),
     propuesta_por         UUID REFERENCES kyc.clientes (id) ON DELETE RESTRICT,
     dictamen_propuesto    TEXT,
+    -- Cuándo se propuso y bajo qué solicitud de levantamiento: la aprobación
+    -- de esa solicitud (y solo de esa) resuelve la propuesta, y nunca sobre
+    -- evidencia que llegó después de proponerla.
+    propuesta_en          TIMESTAMPTZ,
+    solicitud_propuesta_id UUID,
     dictamen              TEXT,
     resuelta_por          UUID REFERENCES kyc.clientes (id) ON DELETE RESTRICT,
     resuelta_en           TIMESTAMPTZ,
@@ -360,6 +371,8 @@ CREATE TABLE aml.alertas (
     CONSTRAINT ck_aml_cuatro_ojos_fp CHECK (aprobada_por IS NULL OR aprobada_por IS DISTINCT FROM resuelta_por),
     CONSTRAINT ck_aml_propuesta CHECK ((resolucion_propuesta IS NULL) = (propuesta_por IS NULL)
         AND (resolucion_propuesta IS NULL) = (dictamen_propuesto IS NULL)
+        AND (resolucion_propuesta IS NULL) = (propuesta_en IS NULL)
+        AND (resolucion_propuesta IS NULL) = (solicitud_propuesta_id IS NULL)
         AND (resolucion_propuesta IS NULL OR estado = 'EN_REVISION')),
     CONSTRAINT ck_aml_uif CHECK ((folio_uif IS NULL) = (reportada_uif_en IS NULL) AND (folio_uif IS NULL OR estado = 'CONFIRMADO'))
 );
@@ -368,7 +381,9 @@ CREATE INDEX ix_aml_alertas_bandeja ON aml.alertas (estado, nivel_riesgo, folio 
 CREATE INDEX ix_aml_alertas_cliente ON aml.alertas (cliente_id, folio DESC);
 CREATE INDEX ix_aml_alertas_actualizado ON aml.alertas (actualizado_en);
 CREATE INDEX ix_aml_alertas_congelamiento ON aml.alertas (congelamiento_id);
-CREATE INDEX ix_aml_alertas_supresion ON aml.alertas (cliente_id, regla_codigo, resuelta_en) WHERE estado = 'FALSO_POSITIVO';
+CREATE INDEX ix_aml_alertas_supresion ON aml.alertas (cliente_id, regla_codigo, sentido, resuelta_en)
+    WHERE estado = 'FALSO_POSITIVO';
+CREATE INDEX ix_aml_alertas_propuesta ON aml.alertas (solicitud_propuesta_id) WHERE solicitud_propuesta_id IS NOT NULL;
 CREATE INDEX ix_aml_alertas_clave ON aml.alertas (clave_deduplicacion);
 
 -- 3.7 Evaluaciones agrupadas en una alerta (además de la primera).
@@ -522,34 +537,79 @@ CREATE TABLE aml.bitacora (
 CREATE INDEX ix_aml_bitacora_cliente ON aml.bitacora (cliente_id, id);
 CREATE INDEX ix_aml_bitacora_alerta ON aml.bitacora (alerta_id, id);
 CREATE INDEX ix_aml_bitacora_congelamiento ON aml.bitacora (congelamiento_id, id);
+-- El sellado y la verificación recorren la bitácora por transacción.
+CREATE INDEX ix_aml_bitacora_txid ON aml.bitacora (txid, id);
 
--- 3.14 Sellos de la bitácora por lotes encadenados (solo inserción).
+-- 3.14 Sellos de la bitácora por lotes encadenados (solo inserción). Cada
+-- sello cubre los renglones de las transacciones [desde_txid, hasta_txid):
+-- hasta_txid es el xmin de la instantánea al sellar, así que todas esas
+-- transacciones ya terminaron y el conjunto no cambia nunca (un renglón que
+-- confirma tarde pertenece a una transacción posterior y a un sello posterior).
+-- desde_id / hasta_id: el primer y el último renglón del lote (informativos).
 CREATE TABLE aml.sellos_bitacora (
     id            BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     desde_id      BIGINT NOT NULL,
     hasta_id      BIGINT NOT NULL,
+    desde_txid    BIGINT NOT NULL CHECK (desde_txid >= 0),
+    hasta_txid    BIGINT NOT NULL,
     filas         INTEGER NOT NULL CHECK (filas >= 0),
     hash_anterior CHAR(64) NOT NULL CHECK (hash_anterior ~ '^[0-9a-f]{64}$'),
     hash_lote     CHAR(64) NOT NULL CHECK (hash_lote ~ '^[0-9a-f]{64}$'),
     sellado_en    TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
 
-    CONSTRAINT ck_aml_sello_rango CHECK (hasta_id >= desde_id)
+    CONSTRAINT ck_aml_sello_rango CHECK (hasta_id >= desde_id AND hasta_txid > desde_txid)
 );
 
 -- 3.15 Estado del monitoreo por lotes (renglón único: turno y marcas del ledger).
+-- `turno` es la ficha del arrendamiento vigente: solo quien la tiene renueva,
+-- fija el rango del ciclo, avanza la marca o libera el turno.
 CREATE TABLE aml.monitoreo_estado (
     id                     BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (id),
     ultima_secuencia_ifpe  BIGINT NOT NULL,
     ultima_secuencia_sofom BIGINT NOT NULL,
     en_curso_hasta         TIMESTAMPTZ NOT NULL DEFAULT '-infinity',
+    turno                  UUID,
+    -- Rango del ciclo en curso (aml.monitoreo_rango); la marca solo avanza hasta él.
+    rango_hasta_ifpe       BIGINT,
+    rango_hasta_sofom      BIGINT,
+    rezago_notificado_en   TIMESTAMPTZ,
     ultimo_ciclo_en        TIMESTAMPTZ,
     ultimo_resultado       JSONB
+);
+
+-- 3.16 Verificaciones de la bitácora (solo inserción): hasta qué sello quedó
+-- verificada la cadena. La verificación de la consola parte del último sello
+-- verificado (incremental); una verificación fallida queda para siempre.
+CREATE TABLE aml.verificaciones_bitacora (
+    id            BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    hasta_sello   BIGINT NOT NULL,
+    valido        BOOLEAN NOT NULL,
+    primer_error  TEXT,
+    filas         BIGINT NOT NULL CHECK (filas >= 0),
+    verificada_en TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+
+    CONSTRAINT ck_aml_verificacion_error CHECK (valido = (primer_error IS NULL))
+);
+
+-- 3.17 Clientes cuyo barrido por lotes falla: tras tres ciclos fallidos el
+-- cliente queda en cuarentena (aviso COBERTURA), la marca de agua sigue y el
+-- ciclo lo reintenta aparte hasta que pasa.
+CREATE TABLE aml.monitoreo_fallos (
+    cliente_id       UUID PRIMARY KEY REFERENCES kyc.clientes (id) ON DELETE RESTRICT,
+    fallos           INTEGER NOT NULL DEFAULT 1 CHECK (fallos >= 1),
+    primer_fallo_en  TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+    ultimo_fallo_en  TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+    ultimo_error     TEXT NOT NULL,
+    cuarentena_desde TIMESTAMPTZ
 );
 
 -- Llaves foráneas circulares.
 ALTER TABLE aml.congelamientos
     ADD CONSTRAINT congelamientos_alerta_id_fkey FOREIGN KEY (alerta_id) REFERENCES aml.alertas (id) ON DELETE RESTRICT,
     ADD CONSTRAINT congelamientos_solicitud_id_fkey FOREIGN KEY (solicitud_id)
+        REFERENCES aml.solicitudes_levantamiento (id) ON DELETE RESTRICT;
+ALTER TABLE aml.alertas
+    ADD CONSTRAINT alertas_solicitud_propuesta_id_fkey FOREIGN KEY (solicitud_propuesta_id)
         REFERENCES aml.solicitudes_levantamiento (id) ON DELETE RESTRICT;
 
 -- -----------------------------------------------------------------------------
