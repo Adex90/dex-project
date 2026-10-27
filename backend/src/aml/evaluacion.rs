@@ -18,14 +18,25 @@ use crate::{
 
 use super::modelos::{Decision, Dictamen, Operacion, Sentido};
 
-/// Filtro del reclamo del despachador SPEI (§3.3 c): una orden nunca
-/// intentada de un cliente congelado no se reclama. Sin él, las filas que
+/// Filtro del reclamo del despachador SPEI (§3.3 c, ampliado): la orden de un
+/// cliente congelado que el proveedor seguro no tiene (PENDIENTE, sin ninguna
+/// llamada a `registrar` que pudiera haberla registrado y fuera de revisión
+/// manual) no se reclama, aunque ya se haya reclamado antes y su llamada
+/// probara no llegar al proveedor. Sin el filtro, las filas que
 /// `trg_spei_outbound_aml_retenida` omite (`RETURN NULL`) conservarían
 /// `proximo_intento_en` en el pasado y acapararían el `LIMIT` del lote. Las
-/// órdenes ya intentadas, ENVIADAS o LIQUIDADAS siguen su curso; el trigger es
-/// el respaldo de un congelamiento que confirme entre la subconsulta y el UPDATE.
-pub const FILTRO_DESPACHO: &str =
-    "AND NOT (estado = 'PENDIENTE' AND intentos_envio = 0 AND ifpe.aml_cliente_congelado(cliente_id))";
+/// órdenes que el proveedor pudo registrar, ENVIADAS o LIQUIDADAS siguen su
+/// curso; el trigger es el respaldo de un congelamiento que confirme entre la
+/// subconsulta y el UPDATE.
+pub const FILTRO_DESPACHO: &str = "AND NOT (estado = 'PENDIENTE' AND registro_incierto_desde IS NULL \
+     AND NOT revision_manual AND ifpe.aml_cliente_congelado(cliente_id))";
+
+/// Condición de la renovación del reclamo justo antes de la primera llamada a
+/// `registrar` (`spei::outbound`): un congelamiento confirmado después del
+/// reclamo detiene la orden si el proveedor aún no puede tenerla.
+/// `trg_spei_outbound_aml_registro` es el respaldo en la base de datos.
+pub const FILTRO_REGISTRO: &str =
+    "AND (registro_incierto_desde IS NOT NULL OR NOT ifpe.aml_cliente_congelado(cliente_id))";
 
 /// Evaluación en línea. Corre dentro de la transacción del dinero: después de
 /// que el camino bloqueó la fila IFPE del cliente (caminos SOFOM: después de

@@ -405,8 +405,16 @@ SELECT pg_temp.exigir('Catálogo: sc_aml no ejecuta el motor ni las funciones so
   AND NOT has_function_privilege('sc_aml', 'aml.liberar_retencion(uuid, uuid)', 'EXECUTE')
   AND has_function_privilege('sc_aml', 'aml.exigir_lector(uuid)', 'EXECUTE')
   AND has_function_privilege('sc_aml', 'aml.persona_json(uuid)', 'EXECUTE')
-  AND has_function_privilege('sc_auditor', 'aml.verificar_bitacora()', 'EXECUTE')
+  AND has_function_privilege('sc_auditor', 'aml.verificar_bitacora(bigint)', 'EXECUTE')
   AND NOT has_function_privilege('sc_auditor', 'aml.resolver_alerta(uuid, uuid, text, text, text, boolean, boolean, text, text)', 'EXECUTE'));
+-- robustness#5: nadie escucha 'aml_eventos'; un NOTIFY serializaría los COMMIT
+-- de los caminos del dinero que alertan o congelan.
+SELECT pg_temp.exigir('Catálogo: sin pg_notify en aml ni triggers AFTER INSERT en la bandeja de notificaciones',
+  NOT EXISTS (SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+               WHERE n.nspname = 'aml' AND p.prosrc ~* 'pg_notify|\mnotify\M')
+  AND NOT EXISTS (SELECT 1 FROM pg_trigger t
+                   WHERE t.tgrelid = 'aml.notificaciones'::regclass AND NOT t.tgisinternal
+                     AND (t.tgtype & 4) <> 0 AND (t.tgtype & 2) = 0));
 SELECT pg_temp.debe_fallar('Catálogo: sc_ifpe no lee aml.alertas', ARRAY[
   'SET LOCAL ROLE sc_ifpe', 'SELECT 1 FROM aml.alertas'
 ], 'permission denied for schema aml');
@@ -437,19 +445,25 @@ SELECT pg_temp.exigir('Semillas: una regla activa por (código, nivel) según la
           'R04_FUERA_DE_PERFIL:BAJO', 'R04_FUERA_DE_PERFIL:MEDIO', 'R05_ESTRUCTURACION:ALTO', 'R05_ESTRUCTURACION:BAJO',
           'R05_ESTRUCTURACION:MEDIO', 'R07_VOLUMEN_DIARIO:ALTO', 'R07_VOLUMEN_DIARIO:BAJO', 'R07_VOLUMEN_DIARIO:MEDIO',
           'R08_FRECUENCIA:ALTO', 'R08_FRECUENCIA:BAJO', 'R08_FRECUENCIA:MEDIO', 'R09_LISTA_BLOQUEADAS:TODOS',
-          'R11_PASO_RAPIDO:TODOS', 'R20_ESTRUCTURACION_LENTA:ALTO', 'R20_ESTRUCTURACION_LENTA:BAJO',
+          'R11_PASO_RAPIDO:TODOS', 'R12_ESTRUCTURACION_FRECUENTE:TODOS', 'R20_ESTRUCTURACION_LENTA:ALTO', 'R20_ESTRUCTURACION_LENTA:BAJO',
           'R20_ESTRUCTURACION_LENTA:MEDIO', 'R21_VOLUMEN_MENSUAL:ALTO', 'R21_VOLUMEN_MENSUAL:BAJO',
           'R21_VOLUMEN_MENSUAL:MEDIO', 'R22_CONCENTRACION_ENTRADAS:TODOS', 'R23_DISPERSION_SALIDAS:TODOS',
           'R24_PASO_RAPIDO_48H:TODOS', 'R25_CIRCULAR:TODOS', 'R26_RED_ORDENANTE:TODOS', 'R27_RED_BENEFICIARIO:TODOS',
           'R30_CONGELAMIENTO_MANUAL:TODOS']
   AND (SELECT NOT activa FROM aml.reglas_riesgo WHERE codigo = 'R00_LEGADO'));
-SELECT pg_temp.exigir('Semillas: R05 bandas 0.80 / 0.75 / 0.60 y frecuencias 3 / 3 / 2; solo R05, R09, R11, R20 y R30 congelan',
+SELECT pg_temp.exigir('Semillas: R05 bandas 0.80 / 0.75 / 0.75 y frecuencia 3 en todos los niveles; solo R05, R09, R11, R12, R20 y R30 congelan',
   (SELECT banda_inferior = 0.75 AND frecuencia_min = 3 FROM aml.regla('R05_ESTRUCTURACION', 'MEDIO'))
-  AND (SELECT banda_inferior = 0.60 AND frecuencia_min = 2 FROM aml.regla('R05_ESTRUCTURACION', 'ALTO'))
-  AND (SELECT banda_inferior = 0.80 FROM aml.regla('R05_ESTRUCTURACION', 'BAJO'))
+  AND (SELECT banda_inferior = 0.75 AND frecuencia_min = 3 FROM aml.regla('R05_ESTRUCTURACION', 'ALTO'))
+  AND (SELECT banda_inferior = 0.80 AND frecuencia_min = 3 FROM aml.regla('R05_ESTRUCTURACION', 'BAJO'))
   AND (SELECT array_agg(DISTINCT codigo ORDER BY codigo) FROM aml.reglas_riesgo WHERE permite_congelar)
-      = ARRAY['R05_ESTRUCTURACION', 'R09_LISTA_BLOQUEADAS', 'R11_PASO_RAPIDO', 'R20_ESTRUCTURACION_LENTA',
-              'R30_CONGELAMIENTO_MANUAL']);
+      = ARRAY['R05_ESTRUCTURACION', 'R09_LISTA_BLOQUEADAS', 'R11_PASO_RAPIDO', 'R12_ESTRUCTURACION_FRECUENTE',
+              'R20_ESTRUCTURACION_LENTA', 'R30_CONGELAMIENTO_MANUAL']);
+-- Detection#1: toda regla que congela llega sola a CRITICO (no depende de
+-- los modificadores de un cliente nuevo o de riesgo medio).
+SELECT pg_temp.exigir('Semillas: R05, R11, R12 y R20 valen al menos el umbral crítico por sí solas',
+  NOT EXISTS (SELECT 1 FROM aml.reglas_riesgo r
+               WHERE r.activa AND r.permite_congelar AND r.clase IN ('PRIMARIA', 'LOTE')
+                 AND r.puntos < (SELECT umbral_critico FROM aml.parametros_vigentes())));
 SELECT pg_temp.exigir('Semillas: M02 con los países del llamado a la acción del GAFI {KP,IR,MM}; R03 solo para ALTO',
   (SELECT paises_alto_riesgo::text[] = ARRAY['KP', 'IR', 'MM'] AND entidades_alto_riesgo = '{}' AND estados_alto_riesgo = '{}'
      FROM aml.regla('M02_GEOGRAFIA', 'MEDIO'))
@@ -533,11 +547,11 @@ SELECT pg_temp.exigir('Dispersión: el tercer envío se bloquea sin ledger; R07 
   AND aml.cliente_congelado(pg_temp.c('Fan'))
   AND (SELECT estado = 'CONGELADO_PREVENTIVO' FROM ifpe.cuentas WHERE id = pg_temp.cta('Fan')));
 
--- Paso rápido: 200k de entrada y 185k de salida.
+-- Paso rápido: 200k de entrada y 185k de salida (R11 85 + M03 5 + M04 10).
 SELECT pg_temp.paso('Paso', 'DEPOSITO', 200000, NULL, 'PERMITIR', 0, 'BAJO');
-SELECT pg_temp.paso('Paso', 'RETIRO', 185000, '012180001234567899', 'BLOQUEAR', 85, 'CRITICO');
-SELECT pg_temp.exigir('Paso rápido: R11 CRITICO 85 bloqueada, congelamiento y ningún RETIRO',
-  pg_temp.alertas('Paso') = ARRAY['R11_PASO_RAPIDO CRITICO 85.00 BLOQUEADA'] AND aml.cliente_congelado(pg_temp.c('Paso'))
+SELECT pg_temp.paso('Paso', 'RETIRO', 185000, '012180001234567899', 'BLOQUEAR', 100, 'CRITICO');
+SELECT pg_temp.exigir('Paso rápido: R11 CRITICO 100 bloqueada, congelamiento y ningún RETIRO',
+  pg_temp.alertas('Paso') = ARRAY['R11_PASO_RAPIDO CRITICO 100.00 BLOQUEADA'] AND aml.cliente_congelado(pg_temp.c('Paso'))
   AND NOT EXISTS (SELECT 1 FROM ifpe.transacciones WHERE cuenta_origen_id = pg_temp.cta('Paso')));
 
 -- Perfil: PEP de riesgo alto con ingreso de 20,000; los factores de perfil
@@ -566,21 +580,30 @@ SELECT pg_temp.exigir('Mutuo: sin alertas ni congelamiento',
 -- Bordes de banda MEDIO [112,500, 150,000) tras dos abonos de 145k.
 SELECT pg_temp.paso(n, 'DEPOSITO', 145000, NULL, 'PERMITIR', 0, 'BAJO') FROM unnest(ARRAY['Borde1', 'Borde2', 'Borde3', 'Borde4']) n;
 SELECT pg_temp.paso(n, 'DEPOSITO', 145000, NULL, 'PERMITIR', 65, 'ALTO') FROM unnest(ARRAY['Borde1', 'Borde2', 'Borde3', 'Borde4']) n;
-SELECT pg_temp.paso('Borde1', 'DEPOSITO', 112499.99, NULL, 'PERMITIR', 0, 'BAJO');
+-- Fuera de banda: R05 no dispara, pero R02 vuelve a disparar (la suma de
+-- abonos bajo el umbral ya pasó el umbral) y se agrupa en su alerta.
+SELECT pg_temp.paso('Borde1', 'DEPOSITO', 112499.99, NULL, 'PERMITIR', 65, 'ALTO');
 SELECT pg_temp.paso('Borde2', 'DEPOSITO', 112500, NULL, 'RETENER', 100, 'CRITICO');
 SELECT pg_temp.paso('Borde3', 'DEPOSITO', 149999.99, NULL, 'RETENER', 100, 'CRITICO');
 SELECT pg_temp.paso('Borde4', 'DEPOSITO', 150000, NULL, 'PERMITIR', 0, 'BAJO');
 SELECT pg_temp.exigir('Bordes MEDIO: 112,499.99 fuera, 112,500 y 149,999.99 dentro, 150,000 solo registro',
   NOT aml.cliente_congelado(pg_temp.c('Borde1')) AND aml.cliente_congelado(pg_temp.c('Borde2'))
+  AND pg_temp.alertas('Borde1') = ARRAY['R02_FRACCIONAMIENTO ALTO 65.00 REGISTRADA']
+  AND (SELECT ocurrencias = 2 FROM aml.alertas WHERE cliente_id = pg_temp.c('Borde1'))
   AND aml.cliente_congelado(pg_temp.c('Borde3')) AND NOT aml.cliente_congelado(pg_temp.c('Borde4'))
   AND EXISTS (SELECT 1 FROM aml.operaciones_relevantes WHERE cliente_id = pg_temp.c('Borde4') AND monto = 150000)
   AND (SELECT sum(monto) = 402500 FROM aml.retenciones WHERE cliente_id = pg_temp.c('Borde2')));
 
--- Bordes ALTO [90,000, 150,000) con frecuencia 2 (R03 suma 35 a todo >= 50k).
+-- Bordes ALTO [112,500, 150,000) con frecuencia 3 (detection#7: la banda
+-- ALTO mide 25% y dos abonos no bastan; R03 suma 35 a todo >= 50k).
 SELECT pg_temp.paso(n, 'DEPOSITO', 145000, NULL, 'PERMITIR', 55, 'MEDIO') FROM unnest(ARRAY['Alto1', 'Alto2']) n;
-SELECT pg_temp.paso('Alto1', 'DEPOSITO', 89999.99, NULL, 'PERMITIR', 100, 'CRITICO');
-SELECT pg_temp.paso('Alto2', 'DEPOSITO', 90000, NULL, 'RETENER', 100, 'CRITICO');
-SELECT pg_temp.exigir('Bordes ALTO: 89,999.99 queda fuera de banda (CRITICO sin congelar), 90,000 dentro (congela)',
+SELECT pg_temp.paso(n, 'DEPOSITO', 145000, NULL, 'PERMITIR', 100, 'CRITICO') FROM unnest(ARRAY['Alto1', 'Alto2']) n;
+SELECT pg_temp.exigir('Bordes ALTO: dos abonos en banda alertan CRITICO (R03 + R02) sin congelar ni retener',
+  NOT aml.cliente_congelado(pg_temp.c('Alto1')) AND NOT aml.cliente_congelado(pg_temp.c('Alto2'))
+  AND NOT EXISTS (SELECT 1 FROM aml.retenciones WHERE cliente_id IN (pg_temp.c('Alto1'), pg_temp.c('Alto2'))));
+SELECT pg_temp.paso('Alto1', 'DEPOSITO', 112499.99, NULL, 'PERMITIR', 100, 'CRITICO');
+SELECT pg_temp.paso('Alto2', 'DEPOSITO', 112500, NULL, 'RETENER', 100, 'CRITICO');
+SELECT pg_temp.exigir('Bordes ALTO: 112,499.99 queda fuera de banda (CRITICO sin congelar), 112,500 dentro (congela)',
   NOT aml.cliente_congelado(pg_temp.c('Alto1')) AND aml.cliente_congelado(pg_temp.c('Alto2'))
   AND NOT EXISTS (SELECT 1 FROM aml.alertas WHERE cliente_id = pg_temp.c('Alto1') AND regla_codigo = 'R05_ESTRUCTURACION'));
 
@@ -1528,7 +1551,7 @@ SELECT pg_temp.debe_fallar('Propuesta: una propuesta ya decidida', ARRAY[
 SELECT pg_temp.cliente('Ana2');
 SELECT pg_temp.paso('Ana2', 'DEPOSITO', 145000, NULL, 'PERMITIR', 0, 'BAJO');
 SELECT pg_temp.paso('Ana2', 'DEPOSITO', 145000, NULL, 'PERMITIR', 65, 'ALTO');
-SELECT pg_temp.paso('Ana2', 'DEPOSITO', 145000, NULL, 'PERMITIR', 0, 'BAJO');
+SELECT pg_temp.paso('Ana2', 'DEPOSITO', 145000, NULL, 'PERMITIR', 65, 'ALTO');
 SELECT pg_temp.paso('Ana2', 'DEPOSITO', 145000, NULL, 'RETENER', 100, 'CRITICO');
 SELECT pg_temp.exigir('Propuesta: con frecuencia 4, R05 dispara al cuarto abono y la evaluación cita la versión 2',
   (SELECT (SELECT id FROM aml.regla('R05_ESTRUCTURACION', 'MEDIO')) = ANY (reglas_aplicadas)
@@ -1554,7 +1577,7 @@ SELECT pg_temp.exigir('Propuesta: parámetros nuevos en modo observación (alert
 SELECT pg_temp.cliente('Obs');
 SELECT pg_temp.paso('Obs', 'DEPOSITO', 145000, NULL, 'PERMITIR', 0, 'BAJO');
 SELECT pg_temp.paso('Obs', 'DEPOSITO', 145000, NULL, 'PERMITIR', 65, 'ALTO');
-SELECT pg_temp.paso('Obs', 'DEPOSITO', 145000, NULL, 'PERMITIR', 0, 'BAJO');
+SELECT pg_temp.paso('Obs', 'DEPOSITO', 145000, NULL, 'PERMITIR', 65, 'ALTO');
 SELECT pg_temp.paso('Obs', 'DEPOSITO', 145000, NULL, 'PERMITIR', 100, 'CRITICO');
 SELECT pg_temp.exigir('Observación: alerta CRITICO REGISTRADA sin congelamiento ni retención',
   (SELECT decision = 'REGISTRADA' AND nivel_riesgo = 'CRITICO' FROM aml.alertas WHERE id = pg_temp.alerta('Obs', 'R05_ESTRUCTURACION'))
@@ -1766,36 +1789,88 @@ SELECT pg_temp.paso('Lento', 'DEPOSITO', 120000, NULL, 'PERMITIR', 0, 'BAJO');
 SELECT pg_temp.fechar('Lento', interval '3 days 10 minutes');
 SELECT pg_temp.paso('Lento', 'DEPOSITO', 120000, NULL, 'PERMITIR', 0, 'BAJO');
 SELECT pg_temp.fechar('Lento', interval '3 days 20 minutes');
+-- invariants#5: el instante de quien llama solo vale para el dueño; sc_aml
+-- barre con el reloj del servidor (los abonos fechados en el futuro no cuentan).
+SELECT pg_temp.exigir('Lotes: sc_aml no adelanta el reloj del barrido (instante ignorado)',
+  pg_temp.como_aml(format('SELECT to_jsonb(aml.barrer_cliente(%L, now() + interval %L))', pg_temp.c('Lento'), '4 days')) = '0'
+  AND NOT EXISTS (SELECT 1 FROM aml.alertas WHERE cliente_id = pg_temp.c('Lento') AND origen = 'LOTE'));
 SELECT pg_temp.exigir('Lotes: R20 (5 abonos en banda en 3 días de la Ciudad de México) crea una alerta y congela',
-  pg_temp.como_aml(format('SELECT to_jsonb(aml.barrer_cliente(%L, now() + interval %L))', pg_temp.c('Lento'), '4 days')) = '1');
-SELECT pg_temp.exigir('Lotes: alerta R20 LOTE CRITICO 85 y congelamiento LOTE, sin retención (los abonos son pasado)',
-  (SELECT origen = 'LOTE' AND nivel_riesgo = 'CRITICO' AND puntaje = 85 AND decision = 'REGISTRADA'
+  (SELECT aml.barrer_cliente(pg_temp.c('Lento'), now() + interval '4 days')) = 1);
+SELECT pg_temp.exigir('Lotes: alerta R20 LOTE CRITICO 100 (R20 85 + M03 + M04) y congelamiento LOTE, sin retención (los abonos son pasado)',
+  (SELECT origen = 'LOTE' AND nivel_riesgo = 'CRITICO' AND puntaje = 100 AND decision = 'REGISTRADA'
           AND detalles -> 'lote' -> 'evidencia' ->> 'variante' = 'A' AND jsonb_array_length(detalles -> 'transacciones') = 5
      FROM aml.alertas WHERE id = pg_temp.alerta('Lento', 'R20_ESTRUCTURACION_LENTA'))
   AND (SELECT origen = 'LOTE' FROM aml.congelamientos WHERE cliente_id = pg_temp.c('Lento'))
   AND NOT EXISTS (SELECT 1 FROM aml.retenciones WHERE cliente_id = pg_temp.c('Lento')));
 SELECT pg_temp.exigir('Lotes: volver a barrer al cliente no crea nada',
-  pg_temp.como_aml(format('SELECT to_jsonb(aml.barrer_cliente(%L, now() + interval %L))', pg_temp.c('Lento'), '4 days')) = '0');
+  (SELECT aml.barrer_cliente(pg_temp.c('Lento'), now() + interval '4 days')) = 0);
 
-SELECT pg_temp.exigir('Monitoreo: el turno se toma una vez (marcas en las cabezas al migrar)',
-  pg_temp.como_aml('SELECT to_jsonb(t) FROM aml.monitoreo_tomar_turno(600) t')
-  = '{"ultima_secuencia_ifpe": 0, "ultima_secuencia_sofom": 0}');
+-- Turno con ficha (robustness#2) y marcas acotadas (invariants#5).
+SELECT pg_temp.debe_fallar('Monitoreo: un arrendamiento de más de 600 s', ARRAY[
+  'SET LOCAL ROLE sc_aml', 'SELECT * FROM aml.monitoreo_tomar_turno(2000000000)'
+], 'SC_AML_PARAMETRO_INVALIDO');
+INSERT INTO r SELECT 'turno', pg_temp.como_aml('SELECT to_jsonb(t) FROM aml.monitoreo_tomar_turno(600) t');
+SELECT pg_temp.exigir('Monitoreo: el turno se toma una vez (marcas en las cabezas al migrar) y trae su ficha',
+  (SELECT v - 'turno' = '{"ultima_secuencia_ifpe": 0, "ultima_secuencia_sofom": 0}' AND v ->> 'turno' IS NOT NULL
+     FROM r WHERE k = 'turno'));
 SELECT pg_temp.exigir('Monitoreo: con el turno tomado, otra instancia no lo obtiene',
   pg_temp.como_aml('SELECT to_jsonb(t) FROM aml.monitoreo_tomar_turno(600) t') IS NULL);
-SELECT pg_temp.exigir('Monitoreo: rango hasta la cabeza y candidatos por cliente',
-  pg_temp.como_aml('SELECT to_jsonb(t) FROM aml.monitoreo_rango(100000) t')
+SELECT pg_temp.debe_fallar('Monitoreo: sin la ficha vigente no se fija el rango', ARRAY[
+  'SET LOCAL ROLE sc_aml', format('SELECT * FROM aml.monitoreo_rango(%L, 100000)', gen_random_uuid())
+], 'SC_AML_TURNO_PERDIDO');
+SELECT pg_temp.exigir('Monitoreo: rango hasta la cabeza y candidatos por cliente (con sus anclas)',
+  pg_temp.como_aml(format('SELECT to_jsonb(t) FROM aml.monitoreo_rango(%L, 100000) t', (SELECT v ->> 'turno' FROM r WHERE k = 'turno')))
   = jsonb_build_object('hasta_ifpe', (SELECT ultima_secuencia FROM ifpe.ledger_cabeza),
                        'hasta_sofom', (SELECT ultima_secuencia FROM sofom.ledger_cabeza))
-  AND pg_temp.como_aml(format('SELECT to_jsonb(array_agg(c)) FROM aml.monitoreo_candidatos(0, %s, 0, %s) c',
-                              (SELECT ultima_secuencia FROM ifpe.ledger_cabeza), (SELECT ultima_secuencia FROM sofom.ledger_cabeza)))
-      @> jsonb_build_array(pg_temp.c('Ana'), pg_temp.c('Lento'), pg_temp.c('Cob')));
-SELECT pg_temp.como_aml(format('SELECT to_jsonb(aml.monitoreo_avanzar_marca(%s, %s)::text)',
-                               (SELECT ultima_secuencia FROM ifpe.ledger_cabeza), (SELECT ultima_secuencia FROM sofom.ledger_cabeza)));
-SELECT pg_temp.como_aml($q$SELECT to_jsonb(aml.monitoreo_liberar_turno('{"alertas_lote": 1}')::text)$q$);
-SELECT pg_temp.exigir('Monitoreo: marcas avanzadas (nunca hacia atrás) y turno liberado',
+  AND pg_temp.como_aml(format('SELECT to_jsonb(array_agg(c.cliente_id)) FROM aml.monitoreo_candidatos(%L) c',
+                              (SELECT v ->> 'turno' FROM r WHERE k = 'turno')))
+      @> jsonb_build_array(pg_temp.c('Ana'), pg_temp.c('Lento'), pg_temp.c('Cob'))
+  AND pg_temp.como_aml(format('SELECT to_jsonb(c.anclas) FROM aml.monitoreo_candidatos(%L) c WHERE c.cliente_id = %L',
+                              (SELECT v ->> 'turno' FROM r WHERE k = 'turno'), pg_temp.c('Lento')))
+      = (SELECT jsonb_agg(m.creado_en ORDER BY m.creado_en DESC)
+           FROM (SELECT max(t.creado_en) AS creado_en FROM ifpe.transacciones t
+                  WHERE t.cuenta_destino_id = pg_temp.cta('Lento') GROUP BY date_trunc('hour', t.creado_en)) m));
+SELECT pg_temp.exigir('Monitoreo: una ficha ajena no avanza la marca',
+  pg_temp.como_aml(format('SELECT to_jsonb(aml.monitoreo_avanzar_marca(%L))', gen_random_uuid())) = 'false'
+  AND (SELECT ultima_secuencia_ifpe = 0 FROM aml.monitoreo_estado));
+INSERT INTO r SELECT 'avanza1', pg_temp.como_aml(format('SELECT to_jsonb(aml.monitoreo_avanzar_marca(%L))',
+                                                        (SELECT v ->> 'turno' FROM r WHERE k = 'turno')));
+INSERT INTO r SELECT 'avanza2', pg_temp.como_aml(format('SELECT to_jsonb(aml.monitoreo_avanzar_marca(%L))',
+                                                        (SELECT v ->> 'turno' FROM r WHERE k = 'turno')));
+SELECT pg_temp.exigir('Monitoreo: la marca avanza solo hasta el rango registrado (las cabezas), una vez',
+  (SELECT v FROM r WHERE k = 'avanza1') = 'true' AND (SELECT v FROM r WHERE k = 'avanza2') = 'false'
+  AND (SELECT ultima_secuencia_ifpe = (SELECT ultima_secuencia FROM ifpe.ledger_cabeza)
+              AND ultima_secuencia_sofom = (SELECT ultima_secuencia FROM sofom.ledger_cabeza)
+         FROM aml.monitoreo_estado));
+SELECT pg_temp.exigir('Monitoreo: una ficha ajena no libera el turno',
+  pg_temp.como_aml(format($q$SELECT to_jsonb(aml.monitoreo_liberar_turno(%L, '{"inst": "otra"}'))$q$, gen_random_uuid())) = 'false'
+  AND (SELECT en_curso_hasta > clock_timestamp() FROM aml.monitoreo_estado));
+SELECT pg_temp.como_aml(format($q$SELECT to_jsonb(aml.monitoreo_liberar_turno(%L, '{"alertas_lote": 1}'))$q$,
+                               (SELECT v ->> 'turno' FROM r WHERE k = 'turno')));
+SELECT pg_temp.exigir('Monitoreo: marcas avanzadas (nunca hacia atrás) y turno liberado por su titular',
   (SELECT ultima_secuencia_ifpe = (SELECT ultima_secuencia FROM ifpe.ledger_cabeza) AND en_curso_hasta = '-infinity'
-          AND ultimo_ciclo_en IS NOT NULL AND ultimo_resultado = '{"alertas_lote": 1}'
+          AND turno IS NULL AND ultimo_ciclo_en IS NOT NULL AND ultimo_resultado = '{"alertas_lote": 1}'
      FROM aml.monitoreo_estado));
+-- robustness#2: A se pasa de su arrendamiento; B lo retoma; A no libera ni
+-- avanza por B y una tercera instancia no entra mientras B lo tiene.
+INSERT INTO r SELECT 'turno_a', pg_temp.como_aml('SELECT to_jsonb(t) FROM aml.monitoreo_tomar_turno(60) t');
+UPDATE aml.monitoreo_estado SET en_curso_hasta = clock_timestamp() - interval '1 second';
+INSERT INTO r SELECT 'turno_b', pg_temp.como_aml('SELECT to_jsonb(t) FROM aml.monitoreo_tomar_turno(600) t');
+INSERT INTO r SELECT 'libera_a', pg_temp.como_aml(format($q$SELECT to_jsonb(aml.monitoreo_liberar_turno(%L, '{"inst": "A"}'))$q$,
+                                                         (SELECT v ->> 'turno' FROM r WHERE k = 'turno_a')));
+INSERT INTO r SELECT 'renueva_a', pg_temp.como_aml(format('SELECT to_jsonb(aml.monitoreo_renovar_turno(%L, 600))',
+                                                          (SELECT v ->> 'turno' FROM r WHERE k = 'turno_a')));
+INSERT INTO r SELECT 'turno_c', coalesce(pg_temp.como_aml('SELECT to_jsonb(t) FROM aml.monitoreo_tomar_turno(600) t'), 'null');
+INSERT INTO r SELECT 'renueva_b', pg_temp.como_aml(format('SELECT to_jsonb(aml.monitoreo_renovar_turno(%L, 600))',
+                                                          (SELECT v ->> 'turno' FROM r WHERE k = 'turno_b')));
+SELECT pg_temp.exigir('Monitoreo: el titular vencido (A) no libera el turno que retomó B ni renueva',
+  (SELECT v ->> 'turno' FROM r WHERE k = 'turno_b') IS NOT NULL
+  AND (SELECT v FROM r WHERE k = 'libera_a') = 'false' AND (SELECT v FROM r WHERE k = 'renueva_a') = 'false'
+  AND (SELECT v FROM r WHERE k = 'turno_c') = 'null' AND (SELECT v FROM r WHERE k = 'renueva_b') = 'true'
+  AND (SELECT turno::text = (SELECT v ->> 'turno' FROM r WHERE k = 'turno_b') AND ultimo_resultado = '{"alertas_lote": 1}'
+         FROM aml.monitoreo_estado));
+SELECT pg_temp.como_aml(format($q$SELECT to_jsonb(aml.monitoreo_liberar_turno(%L, '{"inst": "B"}'))$q$,
+                               (SELECT v ->> 'turno' FROM r WHERE k = 'turno_b')));
 
 SELECT pg_temp.exigir('Reevaluación: las ocho marcas DIFERIDA esperan',
   pg_temp.como_aml('SELECT to_jsonb(count(*)) FROM aml.marcadores_pendientes(100)') = '8');
@@ -1819,10 +1894,15 @@ SELECT pg_temp.exigir('Redes: una alerta R26 por cliente de la red, sin congelam
   AND EXISTS (SELECT 1 FROM aml.alertas WHERE regla_codigo = 'R27_RED_BENEFICIARIO')
   AND pg_temp.como_aml('SELECT to_jsonb(aml.barrer_redes(clock_timestamp()))') = '0');
 
+-- invariants#5: un reloj adelantado de sc_aml no consume avisos antes de tiempo.
+SELECT pg_temp.como_aml($q$SELECT to_jsonb(aml.revisar_plazos(now() + interval '400 days'))$q$);
+SELECT pg_temp.exigir('Plazos: sc_aml no adelanta el reloj (ningún plazo UIF vencido ni SLA antes de tiempo)',
+  NOT EXISTS (SELECT 1 FROM aml.notificaciones WHERE tipo IN ('PLAZO_UIF_VENCIDO', 'SLA_CONGELAMIENTO')));
+-- El dueño sí fija el instante (prueba de los plazos a 73 h).
 SELECT pg_temp.exigir('Plazos: la primera revisión crea avisos (SLA de congelamiento y escalamiento de CRITICO)',
-  (pg_temp.como_aml($q$SELECT to_jsonb(aml.revisar_plazos(now() + interval '73 hours'))$q$))::text::int > 0);
+  (SELECT aml.revisar_plazos(now() + interval '73 hours')) > 0);
 SELECT pg_temp.exigir('Plazos: la segunda revisión no repite ninguno',
-  pg_temp.como_aml($q$SELECT to_jsonb(aml.revisar_plazos(now() + interval '73 hours'))$q$) = '0'
+  (SELECT aml.revisar_plazos(now() + interval '73 hours')) = 0
   AND EXISTS (SELECT 1 FROM aml.notificaciones WHERE tipo = 'SLA_CONGELAMIENTO'
                  AND congelamiento_id = (SELECT id FROM aml.congelamientos WHERE cliente_id = pg_temp.c('Lento')))
   AND EXISTS (SELECT 1 FROM aml.notificaciones WHERE tipo = 'ESCALAMIENTO'
@@ -1834,21 +1914,413 @@ SELECT pg_temp.exigir('Notificaciones: ninguna queda sin entregar',
   NOT EXISTS (SELECT 1 FROM aml.notificaciones WHERE entregada_en IS NULL)
   AND (aml.resumen() ->> 'notificaciones_sin_entregar')::int = 0);
 
-INSERT INTO aml.bitacora (ocurrido_en, evento, objeto, actor_tipo, motivo)
-VALUES (now() - interval '1 hour', 'MIGRACION_0009', 'SISTEMA', 'MIGRACION', 'renglón antiguo 1'),
-       (now() - interval '1 hour', 'MIGRACION_0009', 'SISTEMA', 'MIGRACION', 'renglón antiguo 2');
-SELECT pg_temp.exigir('Sellado: los renglones de más de 10 minutos se sellan en un lote encadenado',
-  (pg_temp.como_aml('SELECT to_jsonb(aml.sellar_bitacora())'))::text::int = (SELECT count(*) FROM aml.bitacora));
-SELECT pg_temp.exigir('Sellado: sin renglones nuevos no hay otro lote; la verificación es válida (también para sc_auditor)',
+-- Sellado por transacción (robustness#3): solo se sellan renglones de
+-- transacciones terminadas (txid < xmin de la instantánea). Dos renglones
+-- con el txid de una transacción antigua (como si los hubiera confirmado otra
+-- sesión) se sellan; los de esta transacción, aún en curso, no.
+INSERT INTO aml.bitacora (ocurrido_en, evento, objeto, actor_tipo, motivo, txid)
+VALUES (now() - interval '1 hour', 'MIGRACION_0009', 'SISTEMA', 'MIGRACION', 'renglón antiguo 1', 3),
+       (now() - interval '1 hour', 'MIGRACION_0009', 'SISTEMA', 'MIGRACION', 'renglón antiguo 2', 3);
+SELECT pg_temp.exigir('Sellado: se sellan en un lote encadenado los renglones de transacciones ya terminadas',
+  (pg_temp.como_aml('SELECT to_jsonb(aml.sellar_bitacora())'))::text::bigint
+  = (SELECT count(*) FROM aml.bitacora WHERE txid < pg_snapshot_xmin(pg_current_snapshot())::text::bigint));
+SELECT pg_temp.exigir('Sellado: ningún renglón de una transacción en curso queda sellado (un COMMIT tardío no falsea el lote)',
+  EXISTS (SELECT 1 FROM aml.bitacora WHERE txid = pg_current_xact_id()::text::bigint)
+  AND NOT EXISTS (SELECT 1 FROM aml.bitacora b JOIN aml.sellos_bitacora s ON b.txid >= s.desde_txid AND b.txid < s.hasta_txid
+                   WHERE b.txid = pg_current_xact_id()::text::bigint)
+  AND (SELECT hasta_txid <= pg_current_xact_id()::text::bigint FROM aml.sellos_bitacora));
+SELECT pg_temp.exigir('Sellado: sin transacciones nuevas terminadas no hay otro lote; la verificación es válida',
   pg_temp.como_aml('SELECT to_jsonb(aml.sellar_bitacora())') = '0'
   AND (SELECT valido AND sellos = 1 AND filas = (SELECT count(*) FROM aml.bitacora) AND primer_error IS NULL
          FROM aml.verificar_bitacora())
-  AND (SELECT hash_anterior = nucleo.hash_genesis() AND desde_id = 1 FROM aml.sellos_bitacora));
+  AND (SELECT hash_anterior = nucleo.hash_genesis() AND desde_txid = 0 AND desde_id = 1 FROM aml.sellos_bitacora));
+-- Verificación incremental (robustness#4): el ciclo registra el sello
+-- verificado y la consola sigue desde ahí; la completa sigue disponible.
+INSERT INTO r SELECT 'verifica1', pg_temp.como_aml('SELECT to_jsonb(aml.registrar_verificacion_bitacora())');
+SELECT pg_temp.exigir('Verificación: el ciclo registra el último sello verificado',
+  (SELECT v FROM r WHERE k = 'verifica1') = 'true'
+  AND (SELECT count(*) = 1 AND bool_and(valido AND hasta_sello = (SELECT max(id) FROM aml.sellos_bitacora))
+         FROM aml.verificaciones_bitacora));
+SELECT pg_temp.exigir('Verificación: la consulta por omisión solo rehace lo posterior al último sello verificado',
+  (SELECT valido AND desde_sello = 2 AND filas_verificadas = (SELECT count(*) FROM aml.bitacora
+                                                               WHERE txid >= (SELECT max(hasta_txid) FROM aml.sellos_bitacora))
+          AND filas_verificadas < filas
+     FROM aml.verificar_bitacora())
+  AND (SELECT valido AND desde_sello = 1 AND filas_verificadas = filas FROM aml.verificar_bitacora(1)));
+SELECT pg_temp.debe_fallar('Verificación: inmutable', ARRAY['DELETE FROM aml.verificaciones_bitacora'], 'SC_LEDGER_INMUTABLE');
 SELECT pg_temp.debe_pasar('Sellado: sc_auditor verifica la bitácora', ARRAY[
   'SET LOCAL ROLE sc_auditor',
-  $q$DO $d$ BEGIN IF NOT (SELECT valido FROM aml.verificar_bitacora()) THEN RAISE EXCEPTION 'inválida'; END IF; END $d$$q$,
+  $q$DO $d$ BEGIN IF NOT (SELECT valido FROM aml.verificar_bitacora(1)) THEN RAISE EXCEPTION 'inválida'; END IF; END $d$$q$,
   'RESET ROLE'
 ]);
+
+-- -----------------------------------------------------------------------------
+-- 15. Regresiones de la revisión de PLD (cada prueba falla sin su corrección)
+-- -----------------------------------------------------------------------------
+-- invariants#1: la evaluación describe su renglón del ledger (tipo, sentido,
+-- canal, cliente, monto, clave) y cada rol evalúa solo sus canales.
+SELECT pg_temp.cliente(n) FROM unnest(ARRAY['VicH2', 'AtkH2', 'VicH2b']) n;
+SELECT pg_temp.paso('VicH2', 'DEPOSITO', 120000, NULL, 'PERMITIR', 0, 'BAJO');
+SELECT pg_temp.paso('VicH2', 'DEPOSITO', 115000, NULL, 'PERMITIR', 65, 'ALTO');
+SELECT pg_temp.paso('AtkH2', 'DEPOSITO', 1000, NULL, 'PERMITIR', 0, 'BAJO');
+SELECT pg_temp.paso('VicH2b', 'DEPOSITO', 160000, NULL, 'PERMITIR', 0, 'BAJO');
+SELECT pg_temp.debe_fallar('Coherencia: una ENTRADA forjada ligada a una RETENCION ajena (sc_ifpe)', ARRAY[
+  'SET LOCAL ROLE sc_ifpe',
+  format($q$UPDATE ifpe.cuentas SET saldo_disponible = saldo_disponible - 1, saldo_bloqueado = saldo_bloqueado + 1
+             WHERE id = %L$q$, pg_temp.cta('AtkH2')),
+  format($q$INSERT INTO ifpe.transacciones (id, tipo, cuenta_origen_id, cuenta_destino_id, monto, clave_idempotencia)
+            VALUES ('22222222-2222-2222-2222-222222222222', 'RETENCION', %L, %L, 1, 'op:x:forja')$q$,
+         pg_temp.cta('AtkH2'), pg_temp.cta('AtkH2')),
+  format($q$SELECT * FROM ifpe.aml_evaluar(%L, 'ENTRADA', 'TRANSFERENCIA_RECIBIDA', 120000,
+                                           '22222222-2222-2222-2222-222222222222', 'forja', '{}')$q$, pg_temp.c('VicH2'))
+], 'SC_AML_EVALUACION_INCOHERENTE');
+SELECT pg_temp.debe_fallar('Coherencia: una ENTRADA ligada a un RETIRO (la perspectiva contraria)', ARRAY[
+  'SET LOCAL ROLE sc_ifpe',
+  format($q$SELECT * FROM ifpe.aml_evaluar(%L, 'SALIDA', 'SPEI_ENVIADO', 100, '7e000000-0000-0000-0000-0000000000a1',
+                                           'cli:perspectiva-1', '{"cuenta": "012180001234567899"}')$q$, pg_temp.c('AtkH2')),
+  format($q$SELECT * FROM ifpe.aml_evaluar(%L, 'ENTRADA', 'TRANSFERENCIA_RECIBIDA', 100, '7e000000-0000-0000-0000-0000000000a1',
+                                           'cli:perspectiva-1', '{}')$q$, pg_temp.c('AtkH2')),
+  format($q$UPDATE ifpe.cuentas SET saldo_disponible = saldo_disponible - 100 WHERE id = %L$q$, pg_temp.cta('AtkH2')),
+  $q$UPDATE ifpe.reserva_custodia SET saldo = saldo - 100 WHERE id = 'e0000000-0000-0000-0000-00000000000e'$q$,
+  format($q$INSERT INTO ifpe.transacciones (id, tipo, cuenta_origen_id, reserva_id, monto, clave_idempotencia, referencia_externa)
+            VALUES ('7e000000-0000-0000-0000-0000000000a1', 'RETIRO', %L, 'e0000000-0000-0000-0000-00000000000e', 100,
+                    'cli:perspectiva-1', '012180001234567899')$q$, pg_temp.cta('AtkH2')),
+  format($q$INSERT INTO ifpe.spei_outbound (cliente_id, cuenta_id, clave_idempotencia, clave_rastreo, fecha_solicitud,
+                 ordenante_nombre, ordenante_clabe, banco_receptor, beneficiario_clabe, beneficiario_nombre, monto, concepto,
+                 referencia_numerica, tx_retiro_id)
+            VALUES (%L, %L, 'cli:perspectiva-1', 'SCPERSPECTIVA1', current_date, 'ATK', %L, '012', '012180001234567899',
+                    'BENEFICIARIO', 100, 'PAGO', 1, '7e000000-0000-0000-0000-0000000000a1')$q$,
+         pg_temp.c('AtkH2'), pg_temp.cta('AtkH2'), (SELECT clabe FROM ifpe.cuentas WHERE id = pg_temp.cta('AtkH2')))
+], 'SC_AML_EVALUACION_INCOHERENTE');
+SELECT pg_temp.debe_fallar('Coherencia: la clave de la evaluación no es la del renglón', ARRAY[
+  format($q$SELECT ifpe.aml_evaluar(%L, 'ENTRADA', 'SPEI_WEBHOOK', 1000, '7e000000-0000-0000-0000-0000000000a2',
+                                    'spei:40012:20261001:OTRACLAVE', '{}')$q$, pg_temp.c('AtkH2')),
+  pg_temp.abono_directo('7e000000-0000-0000-0000-0000000000a2', pg_temp.cta('AtkH2'), 1000, 'CLAVE1')
+], 'SC_AML_EVALUACION_INCOHERENTE');
+SELECT pg_temp.debe_fallar('Envolturas: sc_puente no evalúa (ni bloquea) un SPEI enviado sin renglón', ARRAY[
+  'SET LOCAL ROLE sc_puente',
+  format($q$SELECT * FROM ifpe.aml_evaluar(%L, 'SALIDA', 'SPEI_ENVIADO', 9000000, gen_random_uuid(), 'nada', '{}')$q$,
+         pg_temp.c('VicH2b'))
+], 'SC_AML_PARAMETRO_INVALIDO');
+SELECT pg_temp.debe_fallar('Envolturas: sc_spei no evalúa salidas', ARRAY[
+  'SET LOCAL ROLE sc_spei',
+  format($q$SELECT * FROM ifpe.aml_evaluar(%L, 'SALIDA', 'TRANSFERENCIA_ENVIADA', 100, gen_random_uuid(), 'x', '{}')$q$,
+         pg_temp.c('VicH2b'))
+], 'SC_AML_PARAMETRO_INVALIDO');
+SELECT pg_temp.debe_fallar('Envolturas: sc_ifpe no evalúa abonos SPEI', ARRAY[
+  'SET LOCAL ROLE sc_ifpe',
+  format($q$SELECT * FROM ifpe.aml_evaluar(%L, 'ENTRADA', 'SPEI_WEBHOOK', 100, gen_random_uuid(), 'x', '{}')$q$,
+         pg_temp.c('VicH2b'))
+], 'SC_AML_PARAMETRO_INVALIDO');
+SELECT pg_temp.exigir('Coherencia: ninguna evaluación forjada congeló a las víctimas',
+  NOT aml.cliente_congelado(pg_temp.c('VicH2')) AND NOT aml.cliente_congelado(pg_temp.c('VicH2b'))
+  AND NOT EXISTS (SELECT 1 FROM aml.evaluaciones WHERE clave_operacion IN ('forja', 'nada')));
+
+-- invariants#2: una corrección se reconoce por su registro, no por su clave.
+SELECT pg_temp.debe_fallar('Corrección: sc_ifpe no arma una orden con la clave spei-correccion: (cliente congelado)', ARRAY[
+  'SET LOCAL ROLE sc_ifpe',
+  format($q$INSERT INTO ifpe.transacciones (id, tipo, cuenta_origen_id, reserva_id, monto, clave_idempotencia, referencia_externa)
+            VALUES ('11111111-1111-1111-1111-111111111111', 'RETIRO', %L, 'e0000000-0000-0000-0000-00000000000e', 100,
+                    'spei-correccion:fuga', '002010077777777771')$q$, pg_temp.cta('Bx')),
+  format($q$UPDATE ifpe.cuentas SET saldo_disponible = saldo_disponible - 100 WHERE id = %L$q$, pg_temp.cta('Bx')),
+  $q$UPDATE ifpe.reserva_custodia SET saldo = saldo - 100 WHERE id = 'e0000000-0000-0000-0000-00000000000e'$q$,
+  format($q$INSERT INTO ifpe.spei_outbound (cliente_id, cuenta_id, clave_idempotencia, clave_rastreo, fecha_solicitud,
+                 ordenante_nombre, ordenante_clabe, banco_receptor, beneficiario_clabe, beneficiario_nombre, monto, concepto,
+                 referencia_numerica, tx_retiro_id)
+            SELECT c.cliente_id, c.id, 'spei-correccion:fuga', 'FUGA0001', current_date, 'BX', c.clabe, '002',
+                   '002010077777777771', 'TERCERO', 100, 'PAGO', 1, '11111111-1111-1111-1111-111111111111'
+              FROM ifpe.cuentas c WHERE c.id = %L$q$, pg_temp.cta('Bx'))
+], 'SC_AML_CLAVE_RESERVADA');
+SELECT pg_temp.debe_fallar('Corrección: una orden SPEI nunca usa una clave reservada (ret:)', ARRAY[
+  'SET LOCAL ROLE sc_ifpe',
+  format($q$INSERT INTO ifpe.spei_outbound (cliente_id, cuenta_id, clave_idempotencia, clave_rastreo, fecha_solicitud,
+                 ordenante_nombre, ordenante_clabe, banco_receptor, beneficiario_clabe, beneficiario_nombre, monto, concepto,
+                 referencia_numerica, tx_retiro_id)
+            SELECT c.cliente_id, c.id, 'ret:' || gen_random_uuid(), 'RESERVADA01', current_date, 'MUT', c.clabe, '002',
+                   '002010077777777771', 'TERCERO', 100, 'PAGO', 1, gen_random_uuid()
+              FROM ifpe.cuentas c WHERE c.id = %L$q$, pg_temp.cta('Mut'))
+], 'SC_AML_CLAVE_RESERVADA');
+ALTER TABLE ifpe.transacciones DISABLE TRIGGER trg_ifpe_tx_spei_registrado;
+SELECT pg_temp.debe_fallar('Corrección: sin su registro, ni el dueño debita a un congelado con la clave spei-correccion:', ARRAY[
+  format($q$UPDATE ifpe.cuentas SET saldo_disponible = saldo_disponible - 100 WHERE id = %L$q$, pg_temp.cta('Bx')),
+  $q$UPDATE ifpe.reserva_custodia SET saldo = saldo - 100 WHERE id = 'e0000000-0000-0000-0000-00000000000e'$q$,
+  format($q$INSERT INTO ifpe.transacciones (tipo, cuenta_origen_id, reserva_id, monto, clave_idempotencia, referencia_externa)
+            VALUES ('RETIRO', %L, 'e0000000-0000-0000-0000-00000000000e', 100, 'spei-correccion:' || gen_random_uuid(),
+                    '002010077777777771')$q$, pg_temp.cta('Bx'))
+], 'SC_OPERACION_NO_DISPONIBLE');
+SELECT pg_temp.debe_fallar('Corrección: sin su registro, la clave spei-correccion: está reservada', ARRAY[
+  format($q$UPDATE ifpe.cuentas SET saldo_disponible = saldo_disponible - 100 WHERE id = %L$q$, pg_temp.cta('Borde1')),
+  $q$UPDATE ifpe.reserva_custodia SET saldo = saldo - 100 WHERE id = 'e0000000-0000-0000-0000-00000000000e'$q$,
+  format($q$INSERT INTO ifpe.transacciones (tipo, cuenta_origen_id, reserva_id, monto, clave_idempotencia, referencia_externa)
+            VALUES ('RETIRO', %L, 'e0000000-0000-0000-0000-00000000000e', 100, 'spei-correccion:' || gen_random_uuid(),
+                    '002010077777777771')$q$, pg_temp.cta('Borde1'))
+], 'SC_AML_CLAVE_RESERVADA');
+ALTER TABLE ifpe.transacciones ENABLE TRIGGER trg_ifpe_tx_spei_registrado;
+
+-- invariants#3: la orden de un congelado que el proveedor seguro no tiene
+-- espera aunque ya se haya reclamado (NoRecibida) o se congele tras el reclamo.
+SELECT pg_temp.cliente('Desp');
+SELECT pg_temp.paso('Desp', 'DEPOSITO', 50000, NULL, 'PERMITIR', 0, 'BAJO');
+SELECT pg_temp.paso('Desp', 'RETIRO', 40000, '002010077777777771', 'PERMITIR', 0, 'BAJO');
+SELECT pg_temp.debe_pasar('Despacho: primer reclamo antes del congelamiento (intentos 0 -> 1), la llamada no llega', ARRAY[
+  'SET LOCAL ROLE sc_spei',
+  format($q$UPDATE ifpe.spei_outbound SET intentos_envio = intentos_envio + 1, proximo_intento_en = now() - interval '1 minute'
+             WHERE cliente_id = %L AND estado = 'PENDIENTE'$q$, pg_temp.c('Desp')),
+  'RESET ROLE'
+]);
+SELECT pg_temp.como_aml(format(
+    $q$SELECT aml.congelar_manual(%L, %L, 'Información de autoridad sobre el cliente; revisión pendiente', NULL, 'cum:o1:desp-1')$q$,
+    pg_temp.c('Oficial1'), pg_temp.c('Desp')));
+CREATE TEMP TABLE afectadas (k TEXT PRIMARY KEY, n BIGINT);
+CREATE FUNCTION pg_temp.afectar(p_k TEXT, p_sentencia TEXT) RETURNS void
+LANGUAGE plpgsql AS $$
+DECLARE
+    n BIGINT;
+BEGIN
+    SET LOCAL ROLE sc_spei;
+    EXECUTE p_sentencia;
+    GET DIAGNOSTICS n = ROW_COUNT;
+    RESET ROLE;
+    INSERT INTO afectadas VALUES (p_k, n);
+END
+$$;
+SELECT pg_temp.afectar('reclamo', format(
+    $q$UPDATE ifpe.spei_outbound SET intentos_envio = intentos_envio + 1 WHERE cliente_id = %L AND estado = 'PENDIENTE'$q$,
+    pg_temp.c('Desp')));
+SELECT pg_temp.afectar('registro', format(
+    $q$UPDATE ifpe.spei_outbound
+          SET registro_intentado_en = greatest(coalesce(registro_intentado_en, now()), now()),
+              registro_incierto_desde = coalesce(registro_incierto_desde, now())
+        WHERE cliente_id = %L AND estado = 'PENDIENTE'$q$, pg_temp.c('Desp')));
+SELECT pg_temp.exigir('Despacho: ya reclamada una vez, ni un segundo reclamo ni el primer registro tocan la orden del congelado',
+  (SELECT n FROM afectadas WHERE k = 'reclamo') = 0 AND (SELECT n FROM afectadas WHERE k = 'registro') = 0
+  AND (SELECT intentos_envio = 1 AND registro_incierto_desde IS NULL FROM ifpe.spei_outbound WHERE cliente_id = pg_temp.c('Desp')));
+
+-- invariants#4: solicitudes y propuestas nacen PENDIENTE, de un oficial (el actor).
+SELECT pg_temp.debe_fallar('Cuatro ojos: una solicitud insertada ya APROBADA', ARRAY[
+  format($q$INSERT INTO aml.solicitudes_levantamiento (congelamiento_id, tipo, justificacion, solicitada_por, estado,
+                                                      decidida_por, decidida_en, comentario)
+            VALUES (%L, 'LEVANTAR_Y_LIBERAR', 'Justificación suficientemente larga para la prueba', %L, 'APROBADA', %L,
+                    clock_timestamp(), 'aprobada al insertar')$q$,
+         (SELECT id FROM aml.congelamientos WHERE cliente_id = pg_temp.c('Bx') AND estado = 'ACTIVO'),
+         pg_temp.c('Oficial1'), pg_temp.c('Oficial2'))
+], 'SC_AML_REGISTRO_INMUTABLE');
+SELECT pg_temp.debe_fallar('Cuatro ojos: una propuesta insertada ya APROBADA', ARRAY[
+  format($q$INSERT INTO aml.propuestas_cambio (tipo, cambios, justificacion, propuesta_por, estado, decidida_por, decidida_en,
+                                              comentario)
+            VALUES ('PARAMETROS', '{"modo_observacion": true}', 'Justificación suficientemente larga para la prueba', %L,
+                    'APROBADA', %L, clock_timestamp(), 'aprobada al insertar')$q$, pg_temp.c('Oficial1'), pg_temp.c('Oficial2'))
+], 'SC_AML_REGISTRO_INMUTABLE');
+SELECT pg_temp.debe_fallar('Cuatro ojos: una solicitud PENDIENTE fuera de las funciones de los oficiales', ARRAY[
+  'SELECT aml.fijar_actor(NULL)',
+  format($q$INSERT INTO aml.solicitudes_levantamiento (congelamiento_id, tipo, justificacion, solicitada_por)
+            VALUES (%L, 'LEVANTAR_Y_LIBERAR', 'Justificación suficientemente larga para la prueba', %L)$q$,
+         (SELECT id FROM aml.congelamientos WHERE cliente_id = pg_temp.c('Bx') AND estado = 'ACTIVO'), pg_temp.c('Oficial1'))
+], 'SC_AML_NO_AUTORIZADO');
+INSERT INTO r SELECT 'sol_bx', pg_temp.como_aml(format(
+    $q$SELECT aml.solicitar_levantamiento(%L, %L, 'LEVANTAR_Y_LIBERAR', 'Revisión del expediente sin hallazgos adicionales',
+                                          'cum:o1:sol-bx')$q$,
+    pg_temp.c('Oficial1'), (SELECT id FROM aml.congelamientos WHERE cliente_id = pg_temp.c('Bx') AND estado = 'ACTIVO')));
+SELECT pg_temp.debe_fallar('Cuatro ojos: el dueño no aprueba una solicitud con DML (sin el actor de decidir_levantamiento)', ARRAY[
+  'SELECT aml.fijar_actor(NULL)',
+  format($q$UPDATE aml.solicitudes_levantamiento SET estado = 'APROBADA', decidida_por = %L, decidida_en = clock_timestamp(),
+                   comentario = 'aprobada por DML' WHERE id = %L$q$,
+         pg_temp.c('Oficial2'), (SELECT (v -> 'solicitud' ->> 'id')::uuid FROM r WHERE k = 'sol_bx'))
+], 'SC_AML_NO_AUTORIZADO');
+
+-- detection#8: una propuesta reactiva una regla desactivada.
+INSERT INTO r SELECT 'apaga_r07', pg_temp.como_aml(format(
+    $q$SELECT aml.decidir_propuesta(%L, (aml.proponer_cambio(%L, 'REGLA', 'R07_VOLUMEN_DIARIO', 'BAJO', '{"activa": false}',
+           'Pausa temporal del volumen diario para clientes de riesgo bajo', 'cum:o1:r07-off') -> 'propuesta' ->> 'id')::uuid,
+           TRUE, 'De acuerdo con la pausa', 'cum:o2:r07-off')$q$,
+    pg_temp.c('Oficial2'), pg_temp.c('Oficial1')));
+SELECT pg_temp.exigir('Reglas: la pausa deja R07 BAJO sin versión activa', aml.regla('R07_VOLUMEN_DIARIO', 'BAJO') IS NULL);
+INSERT INTO r SELECT 'prende_r07', pg_temp.como_aml(format(
+    $q$SELECT aml.decidir_propuesta(%L, (aml.proponer_cambio(%L, 'REGLA', 'R07_VOLUMEN_DIARIO', 'BAJO', '{"activa": true}',
+           'Fin de la pausa: se reactiva el volumen diario para riesgo bajo', 'cum:o1:r07-on') -> 'propuesta' ->> 'id')::uuid,
+           TRUE, 'De acuerdo con reactivar', 'cum:o2:r07-on')$q$,
+    pg_temp.c('Oficial2'), pg_temp.c('Oficial1')));
+SELECT pg_temp.exigir('Reglas: una propuesta reactiva la regla (versión 3 activa sobre la última versión)',
+  (SELECT version = 3 AND activa AND desactivada_en IS NULL AND volumen_max = 1000000 FROM aml.regla('R07_VOLUMEN_DIARIO', 'BAJO'))
+  AND (SELECT array_agg(version || ':' || activa ORDER BY version) FROM aml.reglas_riesgo
+        WHERE codigo = 'R07_VOLUMEN_DIARIO' AND nivel_cliente = 'BAJO') = ARRAY['1:false', '2:false', '3:true']);
+SELECT pg_temp.debe_fallar('Reglas: la regla heredada no se reactiva', ARRAY[
+  'SET LOCAL ROLE sc_aml',
+  format($q$SELECT aml.proponer_cambio(%L, 'REGLA', 'R00_LEGADO', 'TODOS', '{"activa": true}',
+                                       'Justificación suficientemente larga para la prueba', 'cum:o1:r00')$q$, pg_temp.c('Oficial1'))
+], 'SC_AML_CAMBIO_INVALIDO');
+
+-- detection#9: la marca de falso positivo es por sentido: aclarar una R05
+-- de ENTRADA no borra las salidas en banda que nadie revisó.
+-- (BAJO: banda [120,000, 150,000) y frecuencia 3; R05 MEDIO ya va en la versión 2.)
+SELECT pg_temp.cliente('Dir', 'BAJO');
+SELECT pg_temp.paso('Dir', 'DEPOSITO', 500000, NULL, 'PERMITIR', 0, 'BAJO');
+SELECT pg_temp.paso('Dir', 'RETIRO', 125000, '012180001234567899', 'PERMITIR', 0, 'BAJO');
+SELECT pg_temp.paso('Dir', 'RETIRO', 125000, '002010077777777771', 'PERMITIR', 0, 'BAJO');
+INSERT INTO aml.alertas (cliente_id, entidad, sentido, regla_id, regla_codigo, tipo_reporte, origen, decision, nivel_riesgo,
+                         puntaje, estado, detalles, clave_deduplicacion, fecha_limite_reporte, dictamen, resuelta_por,
+                         resuelta_en)
+SELECT pg_temp.c('Dir'), 'IFPE', 'ENTRADA', r.id, r.codigo, 'INUSUAL', 'EN_LINEA', 'REGISTRADA', 'CRITICO', 100,
+       'FALSO_POSITIVO', '{}', 'R05_ESTRUCTURACION:' || pg_temp.c('Dir') || ':ENTRADA:revisada', now() + interval '60 days',
+       'Abonos de nómina documentados; sin indicios de estructuración', pg_temp.c('Oficial1'), clock_timestamp()
+  FROM aml.regla('R05_ESTRUCTURACION', 'BAJO') r;
+SELECT pg_temp.paso('Dir', 'RETIRO', 125000, '014180655000000002', 'BLOQUEAR', 100, 'CRITICO');
+SELECT pg_temp.exigir('Marca por sentido: la tercera salida en banda dispara R05 de SALIDA pese al falso positivo de ENTRADA',
+  EXISTS (SELECT 1 FROM aml.alertas WHERE cliente_id = pg_temp.c('Dir') AND regla_codigo = 'R05_ESTRUCTURACION'
+             AND sentido = 'SALIDA' AND decision = 'BLOQUEADA'));
+
+-- detection#10: R03 (y R04) se agrupan por cliente, sentido y día; un falso
+-- positivo los suprime el resto del día.
+SELECT pg_temp.cliente('Alt10', 'ALTO');
+SELECT pg_temp.paso('Alt10', 'DEPOSITO', 60000, NULL, 'PERMITIR', 55, 'MEDIO');
+SELECT pg_temp.paso('Alt10', 'DEPOSITO', 60000, NULL, 'PERMITIR', 55, 'MEDIO');
+SELECT pg_temp.exigir('R03: dos abonos del día en una sola alerta (dos ocurrencias)',
+  (SELECT array_agg(regla_codigo || ' ' || ocurrencias) FROM aml.alertas WHERE cliente_id = pg_temp.c('Alt10'))
+  = ARRAY['R03_CLIENTE_RIESGO_ALTO 2']);
+SELECT pg_temp.como_aml(pg_temp.resolver('Oficial2', 'Alt10', 'R03_CLIENTE_RIESGO_ALTO', 'TOMAR', NULL, 'cum:o2:alt10-1'));
+SELECT pg_temp.como_aml(pg_temp.resolver('Oficial2', 'Alt10', 'R03_CLIENTE_RIESGO_ALTO', 'FALSO_POSITIVO',
+                                         'Cobros de honorarios habituales del cliente, documentados', 'cum:o2:alt10-2'));
+-- R03 suprimido el resto del día; R02 sí dispara (180,000 bajo el umbral).
+SELECT pg_temp.paso('Alt10', 'DEPOSITO', 60000, NULL, 'PERMITIR', 70, 'ALTO');
+SELECT pg_temp.exigir('R03: tras el falso positivo, otro abono del mismo día no abre otra alerta R03',
+  (SELECT count(*) = 1 AND bool_and(estado = 'FALSO_POSITIVO') FROM aml.alertas
+    WHERE cliente_id = pg_temp.c('Alt10') AND regla_codigo = 'R03_CLIENTE_RIESGO_ALTO'));
+
+-- detection#4: ninguna propuesta de falso positivo se aprueba sobre
+-- evidencia que llegó después de proponerla.
+-- authz#7: una liberación de retenciones de un congelamiento viejo no
+-- resuelve (ni retira) las propuestas del congelamiento vigente.
+SELECT pg_temp.oficial('Oficial3');
+SELECT pg_temp.cliente('Zeta');
+INSERT INTO r SELECT 'f1', pg_temp.como_aml(format(
+    $q$SELECT aml.congelar_manual(%L, %L, 'Información de autoridad sobre el cliente; revisión pendiente', NULL, 'cum:o1:zeta-f1')$q$,
+    pg_temp.c('Oficial1'), pg_temp.c('Zeta')));
+SELECT pg_temp.paso('Zeta', 'DEPOSITO', 100, NULL, 'RETENER', 0, 'BAJO');
+SELECT pg_temp.como_aml(pg_temp.resolver('Oficial1', 'Zeta', 'R30_CONGELAMIENTO_MANUAL', 'TOMAR', NULL, 'cum:o1:zeta-t1'));
+INSERT INTO r SELECT 'zeta_r0', pg_temp.como_aml(pg_temp.resolver('Oficial1', 'Zeta', 'R30_CONGELAMIENTO_MANUAL', 'FALSO_POSITIVO',
+    'Instrucción de la autoridad aclarada; sin indicios en la cuenta', 'cum:o1:zeta-fp1', FALSE, FALSE,
+    'LEVANTAR_CONSERVANDO_RETENCIONES'));
+SELECT pg_temp.como_aml(format($q$SELECT aml.decidir_levantamiento(%L, %L, TRUE, 'Aprobado tras revisar', 'cum:o2:zeta-d0')$q$,
+                               pg_temp.c('Oficial2'), (SELECT v -> 'solicitud' ->> 'id' FROM r WHERE k = 'zeta_r0')));
+INSERT INTO r SELECT 'f2', pg_temp.como_aml(format(
+    $q$SELECT aml.congelar_manual(%L, %L, 'Segunda instrucción de la autoridad sobre el cliente', NULL, 'cum:o2:zeta-f2')$q$,
+    pg_temp.c('Oficial2'), pg_temp.c('Zeta')));
+SELECT pg_temp.como_aml(format($q$SELECT aml.resolver_alerta(%L, %L, 'TOMAR', NULL, NULL, FALSE, FALSE, NULL, 'cum:o1:zeta-t2')$q$,
+                               pg_temp.c('Oficial1'), (SELECT (v -> 'alerta' ->> 'id')::uuid FROM r WHERE k = 'f2')));
+INSERT INTO r SELECT 'zeta_r2', pg_temp.como_aml(format(
+    $q$SELECT aml.resolver_alerta(%L, %L, 'FALSO_POSITIVO', 'Segunda instrucción también aclarada por la autoridad',
+                                  NULL, FALSE, FALSE, NULL, 'cum:o1:zeta-fp2')$q$,
+    pg_temp.c('Oficial1'), (SELECT (v -> 'alerta' ->> 'id')::uuid FROM r WHERE k = 'f2')));
+SELECT pg_temp.exigir('Propuesta: queda ligada a la solicitud del congelamiento vigente y fechada',
+  (SELECT solicitud_propuesta_id = (SELECT (v -> 'solicitud' ->> 'id')::uuid FROM r WHERE k = 'zeta_r2')
+          AND propuesta_en IS NOT NULL
+     FROM aml.alertas WHERE id = (SELECT (v -> 'alerta' ->> 'id')::uuid FROM r WHERE k = 'f2')));
+SELECT pg_temp.debe_fallar('Propuesta: no se aprueba si la alerta recibió evidencia después de proponerla', ARRAY[
+  format($q$UPDATE aml.alertas SET ultima_ocurrencia_en = clock_timestamp() + interval '1 second' WHERE id = %L$q$,
+         (SELECT (v -> 'alerta' ->> 'id')::uuid FROM r WHERE k = 'f2')),
+  'SET LOCAL ROLE sc_aml',
+  format($q$SELECT aml.decidir_levantamiento(%L, %L, TRUE, 'Aprobado sin ver lo nuevo', 'cum:o3:zeta-x')$q$,
+         pg_temp.c('Oficial3'), (SELECT v -> 'solicitud' ->> 'id' FROM r WHERE k = 'zeta_r2'))
+], 'SC_AML_ALERTAS_ABIERTAS');
+INSERT INTO r SELECT 'zeta_r1', pg_temp.como_aml(format(
+    $q$SELECT aml.solicitar_levantamiento(%L, %L, 'LIBERAR_RETENCIONES', 'Origen del abono retenido documentado por el cliente',
+                                          'cum:o2:zeta-r1')$q$,
+    pg_temp.c('Oficial2'), (SELECT (v -> 'congelamiento' ->> 'id')::uuid FROM r WHERE k = 'f1')));
+SELECT pg_temp.como_aml(format($q$SELECT aml.decidir_levantamiento(%L, %L, FALSE, 'Falta el comprobante del abono', 'cum:o3:zeta-d1')$q$,
+                               pg_temp.c('Oficial3'), (SELECT v -> 'solicitud' ->> 'id' FROM r WHERE k = 'zeta_r1')));
+SELECT pg_temp.exigir('authz#7: rechazar la liberación del congelamiento viejo no retira la propuesta del vigente',
+  (SELECT resolucion_propuesta = 'FALSO_POSITIVO' FROM aml.alertas WHERE id = (SELECT (v -> 'alerta' ->> 'id')::uuid FROM r WHERE k = 'f2')));
+INSERT INTO r SELECT 'zeta_r1b', pg_temp.como_aml(format(
+    $q$SELECT aml.solicitar_levantamiento(%L, %L, 'LIBERAR_RETENCIONES', 'Comprobante del abono retenido entregado por el cliente',
+                                          'cum:o2:zeta-r1b')$q$,
+    pg_temp.c('Oficial2'), (SELECT (v -> 'congelamiento' ->> 'id')::uuid FROM r WHERE k = 'f1')));
+INSERT INTO r SELECT 'zeta_d1b', pg_temp.como_aml(format(
+    $q$SELECT aml.decidir_levantamiento(%L, %L, TRUE, 'Liberación de retenciones conservadas', 'cum:o3:zeta-d1b')$q$,
+    pg_temp.c('Oficial3'), (SELECT v -> 'solicitud' ->> 'id' FROM r WHERE k = 'zeta_r1b')));
+SELECT pg_temp.exigir('authz#7: aprobar la liberación del congelamiento viejo no resuelve la propuesta del vigente',
+  (SELECT jsonb_array_length(v -> 'alertas_resueltas') = 0 AND jsonb_array_length(v -> 'liberaciones') = 1
+     FROM r WHERE k = 'zeta_d1b')
+  AND (SELECT estado = 'EN_REVISION' AND resolucion_propuesta = 'FALSO_POSITIVO' AND aprobada_por IS NULL
+         FROM aml.alertas WHERE id = (SELECT (v -> 'alerta' ->> 'id')::uuid FROM r WHERE k = 'f2'))
+  AND (SELECT estado = 'PENDIENTE' FROM aml.solicitudes_levantamiento
+        WHERE id = (SELECT (v -> 'solicitud' ->> 'id')::uuid FROM r WHERE k = 'zeta_r2'))
+  AND aml.cliente_congelado(pg_temp.c('Zeta')));
+
+-- robustness#1: R25 suma cada tramo una vez (sin el producto cruzado) y un
+-- cliente que falla queda en cuarentena al tercer ciclo, con aviso.
+SELECT pg_temp.cliente(n) FROM unnest(ARRAY['CircX', 'CircY']) n;
+SELECT pg_temp.paso(n, 'DEPOSITO', 100000, NULL, 'PERMITIR', 0, 'BAJO') FROM unnest(ARRAY['CircX', 'CircY']) n;
+SELECT pg_temp.transferencia(pg_temp.cta(o), pg_temp.cta(d), 20000)
+  FROM (VALUES ('CircX', 'CircY'), ('CircY', 'CircX'), ('CircX', 'CircY'), ('CircY', 'CircX'), ('CircX', 'CircY'),
+               ('CircY', 'CircX')) v (o, d);
+INSERT INTO r SELECT 'circ', to_jsonb(aml.barrer_cliente(pg_temp.c('CircX'), clock_timestamp()));
+SELECT pg_temp.exigir('R25: seis tramos de 20,000 suman 120,000 (no 360,000)',
+  (SELECT v::text::int FROM r WHERE k = 'circ') = 1
+  AND (SELECT monto = 120000 AND jsonb_array_length(detalles -> 'transacciones') = 6 FROM aml.alertas
+        WHERE cliente_id = pg_temp.c('CircX') AND regla_codigo = 'R25_CIRCULAR'));
+INSERT INTO r SELECT 'turno_f', pg_temp.como_aml('SELECT to_jsonb(t) FROM aml.monitoreo_tomar_turno(600) t');
+INSERT INTO r SELECT 'fallo1', pg_temp.como_aml(format($q$SELECT to_jsonb(aml.monitoreo_registrar_fallo(%L, %L, 'numeric field overflow'))$q$,
+                                                       (SELECT v ->> 'turno' FROM r WHERE k = 'turno_f'), pg_temp.c('CircY')));
+INSERT INTO r SELECT 'fallo2', pg_temp.como_aml(format($q$SELECT to_jsonb(aml.monitoreo_registrar_fallo(%L, %L, 'numeric field overflow'))$q$,
+                                                       (SELECT v ->> 'turno' FROM r WHERE k = 'turno_f'), pg_temp.c('CircY')));
+INSERT INTO r SELECT 'fallo3', pg_temp.como_aml(format($q$SELECT to_jsonb(aml.monitoreo_registrar_fallo(%L, %L, 'numeric field overflow'))$q$,
+                                                       (SELECT v ->> 'turno' FROM r WHERE k = 'turno_f'), pg_temp.c('CircY')));
+SELECT pg_temp.exigir('Cuarentena: al tercer fallo el cliente queda en cuarentena, con aviso COBERTURA y bitácora',
+  (SELECT v FROM r WHERE k = 'fallo1') = 'false' AND (SELECT v FROM r WHERE k = 'fallo2') = 'false'
+  AND (SELECT v FROM r WHERE k = 'fallo3') = 'true'
+  AND pg_temp.como_aml('SELECT to_jsonb(array_agg(c)) FROM aml.monitoreo_cuarentena() c') = jsonb_build_array(pg_temp.c('CircY'))
+  AND EXISTS (SELECT 1 FROM aml.notificaciones WHERE tipo = 'COBERTURA' AND cliente_id = pg_temp.c('CircY'))
+  AND EXISTS (SELECT 1 FROM aml.bitacora WHERE evento = 'EVALUACION_FALLIDA' AND cliente_id = pg_temp.c('CircY')
+                 AND estado_nuevo = 'CUARENTENA'));
+SELECT pg_temp.como_aml(format('SELECT to_jsonb(aml.barrer_cliente(%L, NULL))', pg_temp.c('CircY')));
+SELECT pg_temp.exigir('Cuarentena: un barrido exitoso saca al cliente de la cuarentena',
+  NOT EXISTS (SELECT 1 FROM aml.monitoreo_fallos WHERE cliente_id = pg_temp.c('CircY')));
+SELECT pg_temp.como_aml(format($q$SELECT to_jsonb(aml.monitoreo_liberar_turno(%L, '{}'))$q$,
+                               (SELECT v ->> 'turno' FROM r WHERE k = 'turno_f')));
+
+-- detection#1, #2, #6, #7 en la tabla de calificación, con cuentas antiguas
+-- (más de 30 días: sin M04).
+SELECT pg_temp.cliente(n) FROM unnest(ARRAY['PasoViejo', 'Evasion', 'Nomina']) n;
+SELECT pg_temp.cliente('PasoBajo', 'BAJO');
+SELECT pg_temp.cliente('PepViejo', 'ALTO');
+UPDATE kyc.clientes SET es_pep = TRUE WHERE nombre = 'PepViejo';
+UPDATE ifpe.cuentas SET creado_en = now() - interval '400 days'
+ WHERE cliente_id IN (SELECT id FROM kyc.clientes WHERE nombre IN ('PasoViejo', 'PasoBajo', 'Evasion', 'Nomina', 'PepViejo'));
+-- Paso rápido de una cuenta antigua: MEDIO R11 85 + M03 5; BAJO R11 85 sola.
+SELECT pg_temp.paso('PasoViejo', 'DEPOSITO', 200000, NULL, 'PERMITIR', 0, 'BAJO');
+SELECT pg_temp.paso('PasoViejo', 'RETIRO', 199000, '012180001234567899', 'BLOQUEAR', 90, 'CRITICO');
+SELECT pg_temp.paso('PasoBajo', 'DEPOSITO', 240000, NULL, 'PERMITIR', 0, 'BAJO');
+SELECT pg_temp.paso('PasoBajo', 'RETIRO', 239000, '012180001234567899', 'BLOQUEAR', 85, 'CRITICO');
+-- Evasión de la banda de R05 (detection#2): dos abonos en banda y luego
+-- abonos un peso debajo de la banda MEDIO; R02 vuelve a disparar y R12
+-- (frecuencia 5, suma >= 600,000) congela y retiene el patrón.
+SELECT pg_temp.paso('Evasion', 'DEPOSITO', 145000, NULL, 'PERMITIR', 0, 'BAJO');
+SELECT pg_temp.paso('Evasion', 'DEPOSITO', 145000, NULL, 'PERMITIR', 55, 'MEDIO');
+SELECT pg_temp.paso('Evasion', 'DEPOSITO', 112499, NULL, 'PERMITIR', 55, 'MEDIO');
+SELECT pg_temp.paso('Evasion', 'DEPOSITO', 112499, NULL, 'PERMITIR', 80, 'ALTO');
+SELECT pg_temp.paso('Evasion', 'DEPOSITO', 112499, NULL, 'RETENER', 100, 'CRITICO');
+SELECT pg_temp.exigir('Evasión: R12 congela y retiene los cinco abonos del patrón (627,497)',
+  aml.cliente_congelado(pg_temp.c('Evasion'))
+  AND (SELECT sum(monto) = 627497 FROM aml.retenciones WHERE cliente_id = pg_temp.c('Evasion'))
+  AND EXISTS (SELECT 1 FROM aml.alertas WHERE cliente_id = pg_temp.c('Evasion') AND regla_codigo = 'R12_ESTRUCTURACION_FRECUENTE'
+                 AND nivel_riesgo = 'CRITICO' AND decision = 'RETENIDA'));
+-- Nómina (detection#6): 300,000 de fondeo y 20 pagos de 15,000 a CLABE
+-- distintas: alertas de volumen y frecuencia, nunca un bloqueo.
+SELECT pg_temp.paso('Nomina', 'DEPOSITO', 300000, NULL, 'PERMITIR', 0, 'BAJO');
+SELECT count(*) FROM generate_series(1, 20) g, LATERAL pg_temp.retiro_spei(pg_temp.cta('Nomina'), 15000, pg_temp.clabe(7000 + g)) d
+ WHERE d.decision = 'PERMITIR';
+SELECT pg_temp.exigir('Nómina: los 20 pagos salen, sin R11 ni congelamiento (a lo más MEDIO por volumen y frecuencia)',
+  (SELECT count(*) = 20 FROM ifpe.transacciones WHERE cuenta_origen_id = pg_temp.cta('Nomina') AND tipo = 'RETIRO')
+  AND NOT aml.cliente_congelado(pg_temp.c('Nomina'))
+  AND NOT EXISTS (SELECT 1 FROM aml.alertas WHERE cliente_id = pg_temp.c('Nomina') AND regla_codigo = 'R11_PASO_RAPIDO')
+  AND (SELECT max(nivel_riesgo) <= 'MEDIO' FROM aml.alertas WHERE cliente_id = pg_temp.c('Nomina')));
+-- ALTO/PEP (detection#7): dos abonos de 95,000 (salario y aguinaldo).
+SELECT pg_temp.paso('PepViejo', 'DEPOSITO', 95000, NULL, 'PERMITIR', 60, 'ALTO');
+SELECT pg_temp.paso('PepViejo', 'DEPOSITO', 95000, NULL, 'PERMITIR', 100, 'CRITICO');
+SELECT pg_temp.exigir('ALTO/PEP: dos abonos de 95,000 alertan sin congelar ni retener',
+  NOT aml.cliente_congelado(pg_temp.c('PepViejo'))
+  AND NOT EXISTS (SELECT 1 FROM aml.retenciones WHERE cliente_id = pg_temp.c('PepViejo'))
+  AND NOT EXISTS (SELECT 1 FROM aml.alertas WHERE cliente_id = pg_temp.c('PepViejo') AND regla_codigo = 'R05_ESTRUCTURACION'));
 
 -- -----------------------------------------------------------------------------
 -- 14. Reserva del 100% al final (antes de alterar la bitácora)
@@ -1862,12 +2334,25 @@ SELECT pg_temp.exigir('Espejo final: CONGELADO_PREVENTIVO <=> congelamiento ACTI
                WHERE (c.estado = 'CONGELADO_PREVENTIVO') <> aml.cliente_congelado(c.cliente_id)
                  AND NOT (c.estado IN ('CONGELADA', 'CERRADA') AND aml.cliente_congelado(c.cliente_id))));
 
--- Alterar un renglón (con la protección desactivada por el dueño) rompe la verificación.
+-- Alterar un renglón (con la protección desactivada por el dueño) rompe la
+-- verificación: uno ya sellado y verificado lo detecta la completa; uno del
+-- tramo sin verificar, también la incremental, y el ciclo lo deja registrado.
 ALTER TABLE aml.bitacora DISABLE TRIGGER trg_aml_bitacora_inmutable;
 UPDATE aml.bitacora SET motivo = 'alterado' WHERE id = (SELECT min(id) FROM aml.bitacora);
 ALTER TABLE aml.bitacora ENABLE TRIGGER trg_aml_bitacora_inmutable;
-SELECT pg_temp.exigir('Sellado: un renglón alterado se detecta',
+SELECT pg_temp.exigir('Sellado: un renglón alterado se detecta (verificación completa)',
+  (SELECT NOT valido AND primer_error LIKE 'renglón %' FROM aml.verificar_bitacora(1)));
+ALTER TABLE aml.bitacora DISABLE TRIGGER trg_aml_bitacora_inmutable;
+UPDATE aml.bitacora SET motivo = 'alterado'
+ WHERE id = (SELECT max(id) FROM aml.bitacora WHERE txid = pg_current_xact_id()::text::bigint);
+ALTER TABLE aml.bitacora ENABLE TRIGGER trg_aml_bitacora_inmutable;
+SELECT pg_temp.exigir('Sellado: un renglón alterado sin verificar se detecta (verificación incremental)',
   (SELECT NOT valido AND primer_error LIKE 'renglón %' FROM aml.verificar_bitacora()));
+INSERT INTO r SELECT 'verifica2', pg_temp.como_aml('SELECT to_jsonb(aml.registrar_verificacion_bitacora())');
+SELECT pg_temp.exigir('Sellado: el ciclo registra la falla y queda para siempre',
+  (SELECT v FROM r WHERE k = 'verifica2') = 'false'
+  AND (SELECT count(*) = 1 FROM aml.verificaciones_bitacora WHERE NOT valido)
+  AND (SELECT NOT valido FROM aml.verificar_bitacora()));
 
 ROLLBACK;
 

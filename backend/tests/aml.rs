@@ -28,7 +28,10 @@ use synthetic_capital::{
         clabe, firma, hoy_cdmx,
         inbound::{self, Origen},
         outbound::{self, Evento},
-        pasarela::PasarelaSimulada,
+        pasarela::{
+            Comportamiento, ConsultaOrden, ErrorPasarela, EstadoProveedor, Futuro, OrdenPasarela, Pasarela,
+            PasarelaSimulada, Registro as RegistroPasarela,
+        },
     },
     AppState,
 };
@@ -338,12 +341,100 @@ async fn aprobar_propuesta(api: &Api, c1: &str, c2: &str, cuerpo: Value) -> Valu
     v
 }
 
+/// Cuenta IFPE con antigüedad (como dueño del esquema): sin el modificador
+/// M04 de cuenta nueva, como la mayoría de los clientes reales.
+async fn envejecer_cuenta(pool: &PgPool, cuenta_id: Uuid, dias: i32) {
+    sqlx::query("UPDATE ifpe.cuentas SET creado_en = creado_en - make_interval(days => $2) WHERE id = $1")
+        .bind(cuenta_id)
+        .bind(dias)
+        .execute(pool)
+        .await
+        .unwrap();
+}
+
+/// Simula el paso del tiempo para renglones del ledger (como dueño del
+/// esquema, solo en pruebas): recorre su `creado_en` hacia atrás y vuelve a
+/// encadenar los hashes desde el primer renglón afectado, así que la cadena
+/// sigue íntegra y `verificar_invariantes` la acepta.
+async fn envejecer_movimientos(pool: &PgPool, esquema: &str, ids: &[Uuid], horas: i32) {
+    let lista = ids.iter().map(|i| format!("'{i}'")).collect::<Vec<_>>().join(", ");
+    let sql = format!(
+        r#"ALTER TABLE {e}.transacciones DISABLE TRIGGER trg_{e}_tx_inmutable;
+           UPDATE {e}.transacciones SET creado_en = creado_en - make_interval(hours => {horas}) WHERE id IN ({lista});
+           DO $$
+           DECLARE
+               t      {e}.transacciones;
+               previo TEXT;
+               desde  BIGINT;
+           BEGIN
+               SELECT min(secuencia) INTO desde FROM {e}.transacciones WHERE id IN ({lista});
+               previo := coalesce((SELECT tx_hash FROM {e}.transacciones WHERE secuencia = desde - 1), nucleo.hash_genesis());
+               FOR t IN SELECT * FROM {e}.transacciones WHERE secuencia >= desde ORDER BY secuencia LOOP
+                   t.hash_anterior := previo;
+                   t.tx_hash := nucleo.sha256_hex({e}.payload_canonico(t));
+                   UPDATE {e}.transacciones SET hash_anterior = t.hash_anterior, tx_hash = t.tx_hash WHERE id = t.id;
+                   previo := t.tx_hash;
+               END LOOP;
+               UPDATE {e}.ledger_cabeza SET ultimo_hash = previo;
+           END $$;
+           SET CONSTRAINTS ALL IMMEDIATE;
+           ALTER TABLE {e}.transacciones ENABLE TRIGGER trg_{e}_tx_inmutable;"#,
+        e = esquema
+    );
+    como_dueno(pool, &sql).await.unwrap();
+}
+
+/// Levantamiento de cuatro ojos con varias alertas abiertas: `c1` toma y
+/// propone FALSO_POSITIVO en cada una (la primera crea la solicitud) y `c2`
+/// aprueba. Devuelve la respuesta de la aprobación.
+async fn levantar_alertas_con_cuatro_ojos(pool: &PgPool, c1: &Usuario, c2: &Usuario, alertas: &[Uuid]) -> AppResult<Value> {
+    let mut solicitud = None;
+    for alerta in alertas {
+        for (accion, dictamen) in [(AccionResolucion::Tomar, None), (AccionResolucion::FalsoPositivo, Some(DICTAMEN))] {
+            let s = SolicitudResolucion {
+                accion,
+                dictamen: dictamen.map(Into::into),
+                tipo_reporte: None,
+                urgente: None,
+                congelar: None,
+                tipo_levantamiento: None,
+                clave_idempotencia: clave_api(),
+            };
+            let v = oficial::resolver_alerta(pool, c1, *alerta, &s).await.unwrap();
+            if let Some(id) = v["solicitud"]["id"].as_str() {
+                solicitud = Some(id.parse::<Uuid>().unwrap());
+            }
+        }
+    }
+    let decision = SolicitudDecision {
+        aprobar: true,
+        comentario: "Revisado el expediente completo.".into(),
+        clave_idempotencia: clave_api(),
+    };
+    oficial::decidir_levantamiento(pool, c2, solicitud.expect("solicitud de levantamiento"), &decision).await
+}
+
+/// Ids de las alertas abiertas del cliente, por folio.
+async fn alertas_abiertas(pool: &PgPool, cliente: Uuid) -> Vec<Uuid> {
+    sqlx::query_scalar(
+        "SELECT id FROM aml.alertas WHERE cliente_id = $1 AND estado IN ('PENDIENTE', 'EN_REVISION') ORDER BY folio",
+    )
+    .bind(cliente)
+    .fetch_all(pool)
+    .await
+    .unwrap()
+}
+
 // -----------------------------------------------------------------------------
 // §6.1: detección en línea, congelamiento y retención
 // -----------------------------------------------------------------------------
 
 /// §6.1 prueba 1: la calibración de §2.5 no congela ninguno de los escenarios
-/// de las pruebas existentes.
+/// de las pruebas existentes. Con cuentas antiguas (sin M04), los escenarios
+/// normales (nómina, un abono grande, dos abonos de 95k de un PEP, pago de un
+/// crédito y pago a proveedor) no congelan, y los ataques (estructuración,
+/// paso rápido, evasión de la banda, estructuración lenta de un cliente BAJO)
+/// congelan igual (detection#1, #2, #5, #6, #7).
 #[sqlx::test(migrations = "../migrations")]
 async fn calibracion_sin_regresiones(pool: PgPool) {
     let cfg = preparar(&pool).await;
@@ -378,8 +469,111 @@ async fn calibracion_sin_regresiones(pool: PgPool) {
     assert!(alertas_de(&pool, carla.cliente.id).await.is_empty());
     let canales: Vec<String> = evaluaciones_de(&pool, carla.cliente.id).await.into_iter().map(|e| e.0).collect();
     assert_eq!(canales, ["SPEI_WEBHOOK", "INVERSION_MUTUO"]);
-
     assert_eq!(contar(&pool, "SELECT count(*) FROM aml.congelamientos").await, 0);
+
+    // Escenarios normales con cuentas antiguas (sin M04): nunca congelan.
+    // (a) Nómina (detection#6): 300,000 de fondeo y 20 pagos de 15,000 a
+    // CLABE distintas; R11 exige salidas concentradas.
+    let nomina = cliente(&pool, &cfg, "Nomina").await;
+    envejecer_cuenta(&pool, nomina.cuenta_ifpe.id, 400).await;
+    depositar(&pool, &cfg, nomina.cuenta_ifpe.id, "300000").await;
+    for n in 0..20 {
+        retirar(&pool, &cfg, nomina.cliente.id, "15000", &externa(100 + n), None, &clave()).await.unwrap();
+    }
+    // (b) Un solo abono grande.
+    let grande = cliente(&pool, &cfg, "Grande").await;
+    envejecer_cuenta(&pool, grande.cuenta_ifpe.id, 400).await;
+    depositar(&pool, &cfg, grande.cuenta_ifpe.id, "5000000").await;
+    // (c) ALTO / PEP (detection#7): salario y aguinaldo de 95,000 el mismo día.
+    let pep = cliente(&pool, &cfg, "Pep").await;
+    envejecer_cuenta(&pool, pep.cuenta_ifpe.id, 400).await;
+    sqlx::query("UPDATE kyc.clientes SET nivel_riesgo_pld = 'ALTO', es_pep = TRUE WHERE id = $1")
+        .bind(pep.cliente.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    depositar(&pool, &cfg, pep.cuenta_ifpe.id, "95000").await;
+    depositar(&pool, &cfg, pep.cuenta_ifpe.id, "95000").await;
+    assert_eq!(retenido(&pool, pep.cuenta_ifpe.id).await, d("0"));
+    // (d) Pago de un crédito y pago a proveedor con ahorros de días antes
+    // (detection#5): el cobro de un crédito no es dinero que entre a la bóveda.
+    let inversionista = cliente(&pool, &cfg, "Inversionista").await;
+    depositar(&pool, &cfg, inversionista.cuenta_ifpe.id, "250000").await;
+    invertir(&pool, &cfg, &inversionista, "250000", 182).await.unwrap();
+    let deudor = cliente(&pool, &cfg, "Deudor").await;
+    envejecer_cuenta(&pool, deudor.cuenta_ifpe.id, 400).await;
+    let ahorros = depositar(&pool, &cfg, deudor.cuenta_ifpe.id, "280000").await;
+    envejecer_movimientos(&pool, "ifpe", &[ahorros.transaccion.id], 72).await;
+    let credito_deudor = credito::originar(&pool, &cfg.pld, &solicitud_credito(deudor.cliente.id, "200000")).await.unwrap();
+    credito::pagar(
+        &pool,
+        &credito::PagoCredito {
+            credito_id: credito_deudor.credito.id,
+            principal: d("200000"),
+            interes: d("0"),
+            clave_idempotencia: clave(),
+        },
+    )
+    .await
+    .unwrap();
+    retirar(&pool, &cfg, deudor.cliente.id, "185000", &externa(200), None, &clave()).await.unwrap();
+    for c in [&nomina, &grande, &pep, &deudor] {
+        assert!(congelamiento_activo(&pool, c.cliente.id).await.is_none(), "{} no debe congelarse", c.cliente.nombre);
+        let r11 = alertas_de(&pool, c.cliente.id).await.into_iter().any(|a| a.0 == "R11_PASO_RAPIDO");
+        assert!(!r11, "{}: sin R11", c.cliente.nombre);
+    }
+    let pep_alertas = alertas_de(&pool, pep.cliente.id).await;
+    assert!(!pep_alertas.iter().any(|a| a.0 == "R05_ESTRUCTURACION"), "{pep_alertas:?}");
+    assert!(
+        alertas_de(&pool, nomina.cliente.id).await.iter().all(|a| a.1 == "BAJO" || a.1 == "MEDIO"),
+        "la nómina a lo más alerta MEDIO"
+    );
+    assert_eq!(contar(&pool, "SELECT count(*) FROM aml.congelamientos").await, 0);
+
+    // Ataques con cuentas antiguas: congelan igual (detection#1, #2).
+    // (e) Estructuración (TAREA 4): R05 90 + M03 5.
+    let estructura = cliente(&pool, &cfg, "Estructura").await;
+    envejecer_cuenta(&pool, estructura.cuenta_ifpe.id, 400).await;
+    congelar_por_estructuracion(&pool, &cfg, estructura.cuenta_ifpe.id).await;
+    assert_eq!(retenido(&pool, estructura.cuenta_ifpe.id).await, d("435000"));
+    assert_eq!(puntaje_de(&pool, estructura.cliente.id, "R05_ESTRUCTURACION").await, "95.00");
+    // (f) Paso rápido: R11 85 + M03 5 bloquea y congela.
+    let paso = cliente(&pool, &cfg, "Paso").await;
+    envejecer_cuenta(&pool, paso.cuenta_ifpe.id, 400).await;
+    depositar(&pool, &cfg, paso.cuenta_ifpe.id, "200000").await;
+    let e = retirar(&pool, &cfg, paso.cliente.id, "199000", &externa(201), None, &clave()).await.unwrap_err();
+    assert_eq!(e.codigo(), "OPERACION_NO_DISPONIBLE");
+    assert_eq!(puntaje_de(&pool, paso.cliente.id, "R11_PASO_RAPIDO").await, "90.00");
+    // (g) Evasión de la banda de R05 un peso debajo: R12 congela y retiene el patrón.
+    let evasion = cliente(&pool, &cfg, "Evasion").await;
+    envejecer_cuenta(&pool, evasion.cuenta_ifpe.id, 400).await;
+    for monto in ["145000", "145000", "112499", "112499", "112499"] {
+        depositar(&pool, &cfg, evasion.cuenta_ifpe.id, monto).await;
+    }
+    assert_eq!(retenido(&pool, evasion.cuenta_ifpe.id).await, d("627497"));
+    // (h) Estructuración lenta de un cliente BAJO: R20 85 sola congela en el lote.
+    let lento = cliente(&pool, &cfg, "Lento").await;
+    envejecer_cuenta(&pool, lento.cuenta_ifpe.id, 400).await;
+    sqlx::query("UPDATE kyc.clientes SET nivel_riesgo_pld = 'BAJO' WHERE id = $1")
+        .bind(lento.cliente.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    for _ in 0..8 {
+        depositar(&pool, &cfg, lento.cuenta_ifpe.id, "40000").await;
+    }
+    let c = ciclo_aml(&pool, &cfg).await;
+    assert_eq!((c.errores, c.fallidos), (0, 0), "{c:?}");
+    assert_eq!(puntaje_de(&pool, lento.cliente.id, "R20_ESTRUCTURACION_LENTA").await, "85.00");
+
+    let mut congelados: Vec<String> = sqlx::query_scalar(
+        "SELECT k.nombre FROM aml.congelamientos f JOIN kyc.clientes k ON k.id = f.cliente_id WHERE f.estado = 'ACTIVO'",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    congelados.sort();
+    assert_eq!(congelados, ["Estructura", "Evasion", "Lento", "Paso"]);
     verificar_invariantes(&pool).await;
     verificar_invariantes_aml(&pool).await;
 }
@@ -626,7 +820,8 @@ async fn salida_estructurada_bloquea_sin_ledger(pool: PgPool) {
 }
 
 /// §6.1 prueba 6: el paso rápido (R11) bloquea y congela; los factores de
-/// perfil (PEP, riesgo ALTO, fuera de perfil) solo alertan.
+/// perfil (PEP, riesgo ALTO, fuera de perfil) solo alertan. (Calibración:
+/// R11 pasó de 70 a 85 puntos, así que el puntaje de (a) es 100, antes 85.)
 #[sqlx::test(migrations = "../migrations")]
 async fn paso_rapido_bloquea_y_perfil_no_congela(pool: PgPool) {
     let cfg = preparar(&pool).await;
@@ -641,7 +836,8 @@ async fn paso_rapido_bloquea_y_perfil_no_congela(pool: PgPool) {
         alertas_de(&pool, beto.cliente.id).await,
         [("R11_PASO_RAPIDO".into(), "CRITICO".into(), "PENDIENTE".into(), "BLOQUEADA".into(), 1)]
     );
-    assert_eq!(puntaje_de(&pool, beto.cliente.id, "R11_PASO_RAPIDO").await, "85.00");
+    // R11 85 + M03 5 + M04 10: el paso rápido llega solo a CRITICO (detection#1).
+    assert_eq!(puntaje_de(&pool, beto.cliente.id, "R11_PASO_RAPIDO").await, "100.00");
     assert!(congelamiento_activo(&pool, beto.cliente.id).await.is_some());
     assert_eq!(saldo_ifpe(&pool, beto.cuenta_ifpe.id).await, (d("200000"), d("0")));
 
@@ -2144,7 +2340,8 @@ async fn monitoreo_lote_redes_plazos_y_notificaciones(pool: PgPool) {
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert_eq!((puntaje.as_str(), origen.as_str(), nivel.as_str()), ("85.00", "LOTE", "CRITICO"));
+    // R20 85 + M03 5 + M04 10 (detection#1: R20 congela sola, sin modificadores).
+    assert_eq!((puntaje.as_str(), origen.as_str(), nivel.as_str()), ("100.00", "LOTE", "CRITICO"));
     let (_, origen, _) = congelamiento_activo(&pool, ana.cliente.id).await.expect("congelamiento por lotes");
     assert_eq!(origen, "LOTE");
     assert_eq!(estado_cuenta(&pool, ana.cuenta_ifpe.id).await, "CONGELADO_PREVENTIVO");
@@ -2487,6 +2684,377 @@ async fn reporte_uif_y_propuestas_por_http(pool: PgPool) {
         .post("/api/v1/aml/propuestas", &c1, json!({ "tipo": "PARAMETROS", "cambios": { "no_existe": 1 }, "justificacion": justificacion, "clave_idempotencia": "prop-0005" }))
         .await;
     assert_eq!((s, error(&v)), (StatusCode::UNPROCESSABLE_ENTITY, "AML_CAMBIO_INVALIDO"));
+
+    verificar_invariantes(&pool).await;
+    verificar_invariantes_aml(&pool).await;
+}
+
+// -----------------------------------------------------------------------------
+// Regresiones de la revisión de PLD
+// -----------------------------------------------------------------------------
+
+/// detection#3: una alerta por lotes CERRADA no suprime un patrón nuevo,
+/// posterior a la marca de agua, en la misma semana ISO: se abre otra alerta y
+/// se congela. Las redes (R26) aplican la marca de falso positivo por cliente.
+#[sqlx::test(migrations = "../migrations")]
+async fn lote_alerta_cerrada_no_suprime_patron_nuevo(pool: PgPool) {
+    let cfg = preparar(&pool).await;
+    let c1 = usuario_oficial(&pool, "Uno").await;
+    let c2 = usuario_oficial(&pool, "Dos").await;
+    let ana = cliente(&pool, &cfg, "Ana").await;
+    for _ in 0..8 {
+        depositar(&pool, &cfg, ana.cuenta_ifpe.id, "40000").await;
+    }
+    let c = ciclo_aml(&pool, &cfg).await;
+    assert_eq!(c.alertas_lote, 1, "{c:?}");
+    assert_eq!(congelamiento_activo(&pool, ana.cliente.id).await.unwrap().1, "LOTE");
+    // Falso positivo con cuatro ojos (R20 y la R02 en línea): se levanta.
+    let v = levantar_alertas_con_cuatro_ojos(&pool, &c1, &c2, &alertas_abiertas(&pool, ana.cliente.id).await)
+        .await
+        .unwrap();
+    assert_eq!(v["congelamiento"]["estado"], "LEVANTADO", "{v}");
+    assert!(congelamiento_activo(&pool, ana.cliente.id).await.is_none());
+
+    // El cliente repite el patrón (todo después de la marca de agua).
+    for _ in 0..8 {
+        depositar(&pool, &cfg, ana.cuenta_ifpe.id, "40000").await;
+    }
+    let c = ciclo_aml(&pool, &cfg).await;
+    assert_eq!((c.alertas_lote, c.errores), (1, 0), "{c:?}");
+    let r20: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT estado::text, nivel_riesgo::text, clave_deduplicacion FROM aml.alertas \
+          WHERE cliente_id = $1 AND regla_codigo = 'R20_ESTRUCTURACION_LENTA' ORDER BY folio",
+    )
+    .bind(ana.cliente.id)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(r20.len(), 2, "{r20:?}");
+    assert_eq!((r20[0].0.as_str(), r20[1].0.as_str(), r20[1].1.as_str()), ("FALSO_POSITIVO", "PENDIENTE", "CRITICO"));
+    assert!(r20[1].2.starts_with(&r20[0].2) && r20[1].2 != r20[0].2, "{r20:?}");
+    assert_eq!(congelamiento_activo(&pool, ana.cliente.id).await.unwrap().1, "LOTE");
+    // Volver a barrir no duplica.
+    assert_eq!(ciclo_aml(&pool, &cfg).await.alertas_lote, 0);
+
+    // R26: tres clientes reciben en banda del mismo ordenante; el falso
+    // positivo de Beto excluye sus abonos revisados de la red.
+    let mut red = Vec::new();
+    for nombre in ["Beto", "Carla", "Dani"] {
+        let c = cliente(&pool, &cfg, nombre).await;
+        depositar(&pool, &cfg, c.cuenta_ifpe.id, "100000").await;
+        red.push(c);
+    }
+    assert_eq!(ciclo_aml(&pool, &cfg).await.alertas_redes, 3);
+    let r26_beto = alerta_de(&pool, red[0].cliente.id, "R26_RED_ORDENANTE").await;
+    for (accion, dictamen) in [(AccionResolucion::Tomar, None), (AccionResolucion::FalsoPositivo, Some(DICTAMEN))] {
+        let s = SolicitudResolucion {
+            accion,
+            dictamen: dictamen.map(Into::into),
+            tipo_reporte: None,
+            urgente: None,
+            congelar: None,
+            tipo_levantamiento: None,
+            clave_idempotencia: clave_api(),
+        };
+        oficial::resolver_alerta(&pool, &c1, r26_beto, &s).await.unwrap();
+    }
+    let nuevo = depositar(&pool, &cfg, red[0].cuenta_ifpe.id, "100000").await;
+    assert_eq!(ciclo_aml(&pool, &cfg).await.alertas_redes, 1);
+    let transacciones: Value = sqlx::query_scalar(
+        "SELECT detalles -> 'transacciones' FROM aml.alertas \
+          WHERE cliente_id = $1 AND regla_codigo = 'R26_RED_ORDENANTE' AND estado = 'PENDIENTE'",
+    )
+    .bind(red[0].cliente.id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(transacciones, json!([nuevo.transaccion.id.to_string()]), "solo el abono posterior a la marca");
+
+    verificar_invariantes(&pool).await;
+    verificar_invariantes_aml(&pool).await;
+}
+
+/// detection#4: evidencia nueva agrupada en una alerta con una propuesta de
+/// falso positivo pendiente retira la propuesta; el segundo oficial no puede
+/// aprobar a ciegas (409) hasta que el primero dictamine de nuevo.
+#[sqlx::test(migrations = "../migrations")]
+async fn evidencia_nueva_retira_propuesta_de_falso_positivo(pool: PgPool) {
+    let cfg = preparar(&pool).await;
+    let c1 = usuario_oficial(&pool, "Uno").await;
+    let c2 = usuario_oficial(&pool, "Dos").await;
+    let ana = cliente(&pool, &cfg, "Ana").await;
+    congelar_por_estructuracion(&pool, &cfg, ana.cuenta_ifpe.id).await;
+    let r05 = alerta_de(&pool, ana.cliente.id, "R05_ESTRUCTURACION").await;
+    let r02 = alerta_de(&pool, ana.cliente.id, "R02_FRACCIONAMIENTO").await;
+    let mut solicitud = None;
+    for alerta in [r05, r02] {
+        for (accion, dictamen) in [(AccionResolucion::Tomar, None), (AccionResolucion::FalsoPositivo, Some(DICTAMEN))] {
+            let s = SolicitudResolucion {
+                accion,
+                dictamen: dictamen.map(Into::into),
+                tipo_reporte: None,
+                urgente: None,
+                congelar: None,
+                tipo_levantamiento: None,
+                clave_idempotencia: clave_api(),
+            };
+            let v = oficial::resolver_alerta(&pool, &c1, alerta, &s).await.unwrap();
+            if let Some(id) = v["solicitud"]["id"].as_str() {
+                solicitud = Some(id.parse::<Uuid>().unwrap());
+            }
+        }
+    }
+    // Llegan dos abonos más en banda mientras la solicitud espera.
+    depositar(&pool, &cfg, ana.cuenta_ifpe.id, "149000").await;
+    depositar(&pool, &cfg, ana.cuenta_ifpe.id, "149000").await;
+    let (propuesta, ocurrencias): (Option<String>, i32) =
+        sqlx::query_as("SELECT resolucion_propuesta, ocurrencias FROM aml.alertas WHERE id = $1")
+            .bind(r05)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!((propuesta, ocurrencias), (None, 3), "la evidencia nueva retira la propuesta");
+    let retiros: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM aml.bitacora WHERE alerta_id = $1 AND evento = 'ALERTA_FP_RETIRADO' AND motivo LIKE 'Evidencia nueva%'",
+    )
+    .bind(r05)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(retiros, 1);
+    let decision = |comentario: &str| SolicitudDecision {
+        aprobar: true,
+        comentario: comentario.into(),
+        clave_idempotencia: clave_api(),
+    };
+    let solicitud = solicitud.unwrap();
+    let e = oficial::decidir_levantamiento(&pool, &c2, solicitud, &decision("Revisado el expediente.")).await.unwrap_err();
+    assert_eq!(e.codigo(), "AML_ALERTAS_ABIERTAS");
+    assert_eq!(retenido(&pool, ana.cuenta_ifpe.id).await, d("733000"));
+    assert!(congelamiento_activo(&pool, ana.cliente.id).await.is_some());
+
+    // El primer oficial dictamina de nuevo con toda la evidencia; ahora sí.
+    let s = SolicitudResolucion {
+        accion: AccionResolucion::FalsoPositivo,
+        dictamen: Some(DICTAMEN.into()),
+        tipo_reporte: None,
+        urgente: None,
+        congelar: None,
+        tipo_levantamiento: None,
+        clave_idempotencia: clave_api(),
+    };
+    oficial::resolver_alerta(&pool, &c1, r05, &s).await.unwrap();
+    let v = oficial::decidir_levantamiento(&pool, &c2, solicitud, &decision("Revisada también la evidencia nueva."))
+        .await
+        .unwrap();
+    assert_eq!(v["alertas_resueltas"].as_array().unwrap().len(), 2, "{v}");
+    assert_eq!(retenido(&pool, ana.cuenta_ifpe.id).await, d("0"));
+
+    verificar_invariantes(&pool).await;
+    verificar_invariantes_aml(&pool).await;
+}
+
+/// detection#11 e invariants#5: el ciclo evalúa las reglas por lotes en los
+/// instantes de los movimientos del rango, no en su reloj, así que un ciclo
+/// rezagado (o que propone un instante futuro) no pierde un paso rápido de
+/// 48 h; y el instante que propone `sc_aml` no adelanta los plazos UIF.
+#[sqlx::test(migrations = "../migrations")]
+async fn monitoreo_rezagado_ancla_en_movimientos(pool: PgPool) {
+    let cfg = preparar(&pool).await;
+    let ana = cliente(&pool, &cfg, "Ana").await;
+    depositar(&pool, &cfg, ana.cuenta_ifpe.id, "200000").await;
+    retirar(&pool, &cfg, ana.cliente.id, "170000", &externa(40), None, &clave()).await.unwrap();
+    // Beto: una alerta R02 en línea con plazo UIF a 60 días.
+    let beto = cliente(&pool, &cfg, "Beto").await;
+    for monto in ["150000", "80000", "80000"] {
+        depositar(&pool, &cfg, beto.cuenta_ifpe.id, monto).await;
+    }
+    assert_eq!(alertas_de(&pool, ana.cliente.id).await, []);
+
+    let tarde = chrono::Utc::now() + chrono::Duration::hours(49);
+    let c = monitoreo::ciclo_en(&pool, &cfg.pld, Some(tarde)).await.unwrap();
+    assert!(c.turno && c.errores == 0, "{c:?}");
+    let codigos: Vec<String> = alertas_de(&pool, ana.cliente.id).await.into_iter().map(|a| a.0).collect();
+    assert_eq!(codigos, ["R24_PASO_RAPIDO_48H"]);
+
+    let muy_tarde = chrono::Utc::now() + chrono::Duration::days(400);
+    monitoreo::ciclo_en(&pool, &cfg.pld, Some(muy_tarde)).await.unwrap();
+    let avisos = notificaciones_de(&pool, beto.cliente.id).await;
+    assert!(!avisos.iter().any(|a| a == "PLAZO_UIF_VENCIDO" || a == "PLAZO_UIF_PROXIMO"), "{avisos:?}");
+
+    verificar_invariantes(&pool).await;
+    verificar_invariantes_aml(&pool).await;
+}
+
+/// robustness#1: un cliente cuyo barrido falla no detiene la marca de agua
+/// para siempre: al tercer ciclo queda en cuarentena (aviso COBERTURA) y la
+/// marca avanza; se reintenta aparte. Un barrido sin hallazgos no toma la
+/// fila del cliente (sus caminos del dinero nunca esperan al monitoreo).
+#[sqlx::test(migrations = "../migrations")]
+async fn monitoreo_aisla_cliente_fallido_y_no_bloquea(pool: PgPool) {
+    let cfg = preparar(&pool).await;
+    let ana = cliente(&pool, &cfg, "Ana").await;
+    let beto = cliente(&pool, &cfg, "Beto").await;
+    depositar(&pool, &cfg, ana.cuenta_ifpe.id, "1000").await;
+    depositar(&pool, &cfg, beto.cuenta_ifpe.id, "1000").await;
+    // Una fecha imposible hace fallar el perfil de Beto (solo el dueño puede).
+    como_dueno(&pool, &format!("UPDATE ifpe.cuentas SET creado_en = '-infinity' WHERE id = '{}'", beto.cuenta_ifpe.id))
+        .await
+        .unwrap();
+    let marca = || async {
+        sqlx::query_scalar::<_, i64>("SELECT ultima_secuencia_ifpe FROM aml.monitoreo_estado").fetch_one(&pool).await.unwrap()
+    };
+    let inicial = marca().await;
+    for ciclo in 1..=3 {
+        let c = ciclo_aml(&pool, &cfg).await;
+        assert_eq!(c.fallidos, 1, "ciclo {ciclo}: {c:?}");
+        if ciclo < 3 {
+            assert_eq!(marca().await, inicial, "ciclo {ciclo}: la marca espera al cliente fallido");
+            assert_eq!(c.cuarentena, 0);
+        } else {
+            assert_eq!(c.cuarentena, 1, "{c:?}");
+            assert_eq!(marca().await, cabeza_ifpe(&pool).await.0, "en cuarentena, la marca avanza");
+        }
+    }
+    let avisos = notificaciones_de(&pool, beto.cliente.id).await;
+    assert!(avisos.iter().any(|a| a == "COBERTURA"), "{avisos:?}");
+    // Corregido el dato, el siguiente ciclo lo saca de la cuarentena.
+    como_dueno(&pool, &format!("UPDATE ifpe.cuentas SET creado_en = now() WHERE id = '{}'", beto.cuenta_ifpe.id))
+        .await
+        .unwrap();
+    let c = ciclo_aml(&pool, &cfg).await;
+    assert_eq!((c.cuarentena, c.fallidos), (0, 0), "{c:?}");
+
+    // Una transacción del dinero tiene la fila de Ana: el barrido (sin
+    // hallazgos) no espera ni la reporta ocupada.
+    let mut camino = pool.begin().await.unwrap();
+    sqlx::query("SELECT 1 FROM ifpe.cuentas WHERE id = $1 FOR NO KEY UPDATE")
+        .bind(ana.cuenta_ifpe.id)
+        .execute(&mut *camino)
+        .await
+        .unwrap();
+    let mut tx = synthetic_capital::db::begin(&pool, Rol::Aml).await.unwrap();
+    let n: i32 = sqlx::query_scalar("SELECT aml.barrer_cliente($1, NULL)")
+        .bind(ana.cliente.id)
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    camino.rollback().await.unwrap();
+    assert_eq!(n, 0);
+
+    verificar_invariantes(&pool).await;
+    verificar_invariantes_aml(&pool).await;
+}
+
+/// Pasarela que congela al cliente justo cuando el despachador consulta la
+/// orden (entre el reclamo y la primera llamada a `registrar`).
+struct CongelaAlConsultar {
+    interior: PasarelaSimulada,
+    pool: PgPool,
+    oficial: Usuario,
+    cliente: Uuid,
+    hecho: std::sync::atomic::AtomicBool,
+}
+
+impl Pasarela for CongelaAlConsultar {
+    fn nombre(&self) -> &'static str {
+        "congela-al-consultar"
+    }
+
+    fn registrar<'a>(&'a self, orden: &'a OrdenPasarela) -> Futuro<'a, Result<RegistroPasarela, ErrorPasarela>> {
+        self.interior.registrar(orden)
+    }
+
+    fn consultar<'a>(&'a self, consulta: &'a ConsultaOrden) -> Futuro<'a, Result<EstadoProveedor, ErrorPasarela>> {
+        Box::pin(async move {
+            if !self.hecho.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                congelar_manual(&self.pool, &self.oficial, self.cliente).await;
+            }
+            self.interior.consultar(consulta).await
+        })
+    }
+}
+
+/// invariants#3: la orden de un cliente congelado que el proveedor seguro no
+/// tiene no sale, aunque ya se haya reclamado (su llamada no llegó) o el
+/// congelamiento confirme entre el reclamo y la primera llamada a `registrar`.
+#[sqlx::test(migrations = "../migrations")]
+async fn despacho_retiene_orden_no_recibida_de_congelado(pool: PgPool) {
+    let cfg = preparar(&pool).await;
+    let c1 = usuario_oficial(&pool, "Uno").await;
+    // (a) Reclamada antes del congelamiento; la llamada no llegó al proveedor.
+    let ana = cliente(&pool, &cfg, "Ana").await;
+    depositar(&pool, &cfg, ana.cuenta_ifpe.id, "50000").await;
+    let orden = retirar(&pool, &cfg, ana.cliente.id, "40000", &externa(30), None, &clave()).await.unwrap().orden;
+    let pasarela = PasarelaSimulada::default();
+    pasarela.programar(&externa(30), Comportamiento::SinConexionAlRegistrar { veces: 1 });
+    vencer_ordenes(&pool).await;
+    let d = outbound::despachar(&pool, &pasarela, &cfg.spei).await.unwrap();
+    assert_eq!(d.reclamadas, 1, "{d:?}");
+    let estado: (String, i32, Option<chrono::DateTime<chrono::Utc>>) = sqlx::query_as(
+        "SELECT estado, intentos_envio, registro_incierto_desde FROM ifpe.spei_outbound WHERE id = $1",
+    )
+    .bind(orden.id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!((estado.0.as_str(), estado.1, estado.2), ("PENDIENTE", 1, None));
+    congelar_manual(&pool, &c1, ana.cliente.id).await;
+    vencer_ordenes(&pool).await;
+    let d = outbound::despachar(&pool, &pasarela, &cfg.spei).await.unwrap();
+    assert_eq!(d.reclamadas, 0, "{d:?}");
+    assert_eq!(pasarela.registros_de(&orden.clave_rastreo), 0, "el dinero no sale de un cliente congelado");
+
+    // (b) Congelamiento confirmado entre el reclamo y el registro.
+    let beto = cliente(&pool, &cfg, "Beto").await;
+    depositar(&pool, &cfg, beto.cuenta_ifpe.id, "50000").await;
+    let orden_b = retirar(&pool, &cfg, beto.cliente.id, "40000", &externa(31), None, &clave()).await.unwrap().orden;
+    let interior = PasarelaSimulada::default();
+    interior.programar(&externa(31), Comportamiento::SinConexionAlRegistrar { veces: 1 });
+    let congela = CongelaAlConsultar {
+        interior,
+        pool: pool.clone(),
+        oficial: c1,
+        cliente: beto.cliente.id,
+        hecho: std::sync::atomic::AtomicBool::new(false),
+    };
+    vencer_ordenes(&pool).await;
+    outbound::despachar(&pool, &congela, &cfg.spei).await.unwrap(); // reclamo 1: no llega
+    vencer_ordenes(&pool).await;
+    outbound::despachar(&pool, &congela, &cfg.spei).await.unwrap(); // reclamo 2: consulta y congela
+    assert!(congelamiento_activo(&pool, beto.cliente.id).await.is_some());
+    assert_eq!(congela.interior.registros_de(&orden_b.clave_rastreo), 0, "ningún registro tras el congelamiento");
+    let (estado, incierto): (String, Option<chrono::DateTime<chrono::Utc>>) =
+        sqlx::query_as("SELECT estado, registro_incierto_desde FROM ifpe.spei_outbound WHERE id = $1")
+            .bind(orden_b.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!((estado.as_str(), incierto), ("PENDIENTE", None));
+
+    verificar_invariantes(&pool).await;
+    verificar_invariantes_aml(&pool).await;
+}
+
+/// invariants#1: una evaluación RETENIDA solo retiene en su propia
+/// transacción (no se "reproduce" después para retener otra vez).
+#[sqlx::test(migrations = "../migrations")]
+async fn retencion_solo_en_su_transaccion(pool: PgPool) {
+    let cfg = preparar(&pool).await;
+    let ana = cliente(&pool, &cfg, "Ana").await;
+    depositar(&pool, &cfg, ana.cuenta_ifpe.id, "10000").await;
+    congelar_por_estructuracion(&pool, &cfg, ana.cuenta_ifpe.id).await;
+    let saldo = saldo_ifpe(&pool, ana.cuenta_ifpe.id).await;
+    let evaluacion: Uuid =
+        sqlx::query_scalar("SELECT id FROM aml.evaluaciones WHERE cliente_id = $1 AND resultado = 'RETENIDA'")
+            .bind(ana.cliente.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let r = como(&pool, Rol::Spei, &format!("SELECT ifpe.aml_retener('{evaluacion}')")).await;
+    assert!(matches!(&r, Err(e) if e.contains("SC_AML_EVALUACION_INCOHERENTE")), "{r:?}");
+    assert_eq!(saldo_ifpe(&pool, ana.cuenta_ifpe.id).await, saldo);
 
     verificar_invariantes(&pool).await;
     verificar_invariantes_aml(&pool).await;

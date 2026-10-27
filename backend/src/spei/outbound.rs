@@ -1132,8 +1132,9 @@ async fn con_limite<T>(
 /// resultado.
 pub async fn despachar(pool: &PgPool, pasarela: &dyn Pasarela, cfg: &ConfigSpei) -> AppResult<Despacho> {
     let mut tx = db::begin(pool, Rol::Spei).await?;
-    // Las órdenes nunca intentadas de un cliente con congelamiento preventivo
-    // no se reclaman (`aml::evaluacion::FILTRO_DESPACHO`): el trigger que las
+    // Las órdenes que el proveedor seguro no tiene de un cliente con
+    // congelamiento preventivo no se reclaman
+    // (`aml::evaluacion::FILTRO_DESPACHO`): el trigger que las
     // retiene las omitiría sin avanzar `proximo_intento_en` y acapararían el
     // LIMIT del lote.
     let sql = format!(
@@ -1226,14 +1227,18 @@ fn pudo_cambiar_dia_operacion(
 /// llamada anterior pudo registrar la orden).
 async fn renovar_reclamo(pool: &PgPool, o: &SpeiOutbound) -> AppResult<Option<Option<DateTime<Utc>>>> {
     let mut tx = db::begin(pool, Rol::Spei).await?;
-    let fila: Option<(Option<DateTime<Utc>>,)> = sqlx::query_as(
+    // Un cliente congelado después del reclamo: si el proveedor aún no puede
+    // tener la orden, no se registra (`aml::evaluacion::FILTRO_REGISTRO`).
+    let sql = format!(
         "UPDATE ifpe.spei_outbound \
             SET proximo_intento_en = now() + make_interval(secs => $3), \
                 registro_intentado_en = greatest(coalesce(registro_intentado_en, now()), now()), \
                 registro_incierto_desde = coalesce(registro_incierto_desde, now()) \
-          WHERE id = $1 AND estado = 'PENDIENTE' AND intentos_envio = $2 AND NOT revision_manual \
+          WHERE id = $1 AND estado = 'PENDIENTE' AND intentos_envio = $2 AND NOT revision_manual {} \
          RETURNING CASE WHEN registro_incierto_desde = now() THEN registro_incierto_desde END",
-    )
+        aml::evaluacion::FILTRO_REGISTRO
+    );
+    let fila: Option<(Option<DateTime<Utc>>,)> = sqlx::query_as(&sql)
     .bind(o.id)
     .bind(o.intentos_envio)
     .bind(ARRENDAMIENTO_SEG)
@@ -1241,7 +1246,7 @@ async fn renovar_reclamo(pool: &PgPool, o: &SpeiOutbound) -> AppResult<Option<Op
     .await?;
     tx.commit().await?;
     if fila.is_none() {
-        tracing::warn!(rastreo = %o.clave_rastreo, intentos = o.intentos_envio, "reclamo SPEI vencido: no se llama al proveedor");
+        tracing::warn!(rastreo = %o.clave_rastreo, intentos = o.intentos_envio, "reclamo SPEI vencido o retenido: no se llama al proveedor");
     }
     Ok(fila.map(|(desde,)| desde))
 }

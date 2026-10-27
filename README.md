@@ -257,18 +257,41 @@ verdict. Rust only passes the facts of the operation it is about to write.
   lock) is taken before any window query, so concurrent deposits see each
   other. A ledger row that somehow arrives without an evaluation gets a
   `DIFERIDA` marker and a `COBERTURA` notification; the worker scores it.
+  The facts an evaluation declares are checked at COMMIT against its ledger
+  row (type and direction, channel, owner, amount and key; holds, releases,
+  reversals and corrections admit no evaluation), and each transactional role
+  may only evaluate its own channels (`sc_spei` incoming SPEI, `sc_ifpe`
+  transfers and outgoing SPEI, `sc_puente` the mutuum): a role cannot forge
+  an alert, a freeze or a blocked attempt for a channel it does not operate.
 - **Rules** live in `aml.reglas_riesgo` (versioned, rows immutable) and the
   thresholds in `aml.parametros`. Inline (windows up to 24 h): R01 relevant
-  operation (quarterly register, not an alert), R02 fragmentation, R03
-  high-risk client, R04 out of profile, R05 structuring, R07 daily volume, R08
-  frequency, R11 rapid pass-through; modifiers for PEP, high-risk geography,
-  risk tier and new accounts; R09 Blocked Persons List. Batch worker: R20 slow
+  operation (quarterly register, not an alert), R02 fragmentation (fires again
+  on every further sub-threshold credit once the 24 h sum reaches the
+  threshold), R03 high-risk client and R04 out of profile (one alert per
+  client, direction and day; a false positive silences them for the rest of
+  the day), R05 structuring (in-band credits; the ALTO band is 25% wide with
+  frequency 3, so two ordinary credits of a PEP do not freeze), R12 frequent
+  structuring (at least 5 credits in the wide band [50%, 100%) of the
+  threshold summing at least 600,000: catches amounts kept one peso below the
+  R05 band), R07 daily volume, R08 frequency, R11 rapid pass-through (only
+  money that credited the vault counts as inflow, not a loan repayment; only
+  outflows to counterparties that each take at least 10% of the inflow count,
+  so a dispersed payroll is not pass-through); modifiers for PEP, high-risk
+  geography, risk tier and new accounts; R09 Blocked Persons List. Batch worker: R20 slow
   structuring (7 and 30 days), R21 monthly volume vs declared income, R22/R23
   fan-in and fan-out, R24 48-hour pass-through, R25 circular flows between
   clients, R26/R27 one payer or one beneficiary shared by several clients.
   Score = primary points + modifiers (capped at 100): <30 BAJO, 30–59 MEDIO,
-  60–84 ALTO, ≥85 CRITICO. Changing a rule or a parameter (including the
-  observation-mode kill switch) is a proposal that a second officer approves.
+  60–84 ALTO, ≥85 CRITICO. Every rule allowed to freeze (R05 90, R11, R12 and
+  R20 85) reaches CRITICO on its own, so an aged BAJO or MEDIO account is
+  frozen like a new one. Changing a rule or a parameter (including the
+  observation-mode kill switch) is a proposal that a second officer approves;
+  a deactivated rule can be re-activated the same way. Proposals and unfreeze
+  requests can only be created `PENDIENTE` by an officer and decided by the
+  officer acting in the decision function (a row inserted already approved is
+  rejected). A same-day sale followed by a purchase that takes most of the
+  proceeds to one counterparty is indistinguishable from pass-through and is
+  frozen for review; a purchase paid from earlier savings is not.
 - **Freeze semantics.** An automatic freeze needs a CRITICO score, a fired
   rule allowed to freeze, and observation mode off; profile factors alone
   never freeze. A freeze is per client: the IFPE account goes to
@@ -280,15 +303,28 @@ verdict. Rust only passes the facts of the operation it is about to write.
   money is never refused: it is credited and then held (`RETENCION`, so the
   100% reserve and the shadow balances are unchanged), covering the pattern
   funds; every later credit to a frozen client is held in full. Refunds,
-  maturities and operator corrections still work. SPEI orders of a frozen
-  client that were never sent are not dispatched.
+  maturities and operator corrections still work; a correction is recognized
+  by its `ifpe.spei_correcciones` record, not by its key, and a SPEI order can
+  never use a reserved ledger key (`spei:`, `spei-reverso:`,
+  `spei-correccion:`, `ret:`, `lib:`). SPEI orders of a frozen client that the
+  provider provably does not have (pending, no `registrar` call that could have
+  registered them, not in manual review) are not dispatched, including an
+  order already claimed whose call never reached the provider and a freeze
+  that commits between the claim and the first `registrar` call.
 - **Four-eyes.** One officer may tighten (take, escalate, confirm, freeze).
   Unfreezing, releasing holds and approving a false positive while the client
   is frozen need a second officer, enforced in the database
   (`SC_AML_CUATRO_OJOS`), as is acting on one's own client record
   (`SC_AML_AUTORESOLUCION`). An unfreeze either releases the holds or keeps
-  them for a later, separate release request. A false positive sets a
-  suppression watermark, so the reviewed movements do not re-freeze the client.
+  them for a later, separate release request. A false-positive proposal is
+  bound to the unfreeze request it was made under: only approving that request
+  resolves it (a hold release on an older freeze does not), and rejecting it
+  withdraws only its own proposals. New evidence merged into a proposed alert
+  withdraws the proposal (`ALERTA_FP_RETIRADO`), and no request is approved
+  while a proposed alert has evidence newer than its proposal. A false
+  positive sets a suppression watermark per rule and direction, so the
+  reviewed movements do not re-freeze the client, while unreviewed movements
+  in the other direction still count.
 - **No tipping off.** A frozen client gets one constant error for every
   blocked operation (`422 OPERACION_NO_DISPONIBLE`, the same bytes whatever
   the reason), keeps seeing `"estado": "ACTIVA"`, and sees a hold only as a
@@ -297,16 +333,35 @@ verdict. Rust only passes the facts of the operation it is about to write.
   normal success. Client roles have no access to the `aml` schema at all.
 - **Deadlines and audit.** Alerts carry the UIF reporting deadline (60 days,
   24 h when urgent). `aml.bitacora` is append-only with a canonical hash per
-  row, sealed by the worker in chained batches; `GET
-  /api/v1/aml/bitacora/verificacion` recomputes everything. Every case-file
-  view is logged.
+  row, sealed by the worker in chained batches by transaction id (each seal
+  covers only transactions that had already finished, so a late commit never
+  looks like tampering). The worker records the last verified seal in
+  `aml.verificaciones_bitacora`; `GET /api/v1/aml/bitacora/verificacion`
+  re-verifies from there (rows, seal chain and the unsealed tail), which stays
+  within the request limits however long the log grows; a failed verification
+  is kept forever. A full verification is `aml.verificar_bitacora(1)` (owner
+  or auditor job). Every case-file view is logged.
 - **Batch worker** (`AML_MONITOREO_INTERVALO_SEG`, default 300 s, 0 disables;
   `AML_MONITOREO_LOTE` ledger rows per cycle): one instance at a time (a
-  lease in `aml.monitoreo_estado`), it scans the clients that moved since its
-  ledger watermark with the batch and network rules, re-scores `DIFERIDA`
-  markers, raises SLA and UIF-deadline notifications, seals the audit log and
-  delivers the notification outbox to the log (`target: "aml"`, codes and
-  folios only).
+  lease of at most 600 s in `aml.monitoreo_estado`, fenced by a token: only
+  the holder renews it, records the cycle's range, advances the watermark or
+  releases it; it is renewed between steps). It scans the clients that moved
+  since its ledger watermark with the batch rules evaluated at the times of
+  their movements in the range (a lagging worker sees what a punctual one
+  would; a range starting more than 24 h ago raises a `COBERTURA` notice), and
+  the network rules. The watermark only advances up to the range the cycle
+  recorded, never past the ledger heads. A batch alert is not duplicated while
+  open; after it is closed, a pattern with evidence newer than the closure
+  opens a new alert (and may freeze). The network rules apply each client's
+  false-positive watermark. Reading a client's 30 days takes no lock; the
+  client lock (without waiting) only covers creating alerts and freezing, so
+  a long sweep never times out that client's money paths. A client whose sweep
+  fails three cycles running is quarantined (`COBERTURA` notice), stops holding
+  back the watermark and is retried separately. The worker also re-scores
+  `DIFERIDA` markers, raises SLA and UIF-deadline notifications on the server
+  clock (a caller-supplied instant is honored only for the schema owner),
+  seals and verifies the audit log and delivers the notification outbox to the
+  log (`target: "aml"`, codes and folios only). Nothing uses `pg_notify`.
 - **Roles.** `CUMPLIMIENTO` (compliance officer) has the console;
   `AUDITOR` reads it; `OPERADOR` and `CLIENTE` get 403. The database repeats
   the role check in every function. Officer POSTs take a

@@ -14,15 +14,23 @@
 //!   sin evaluación en línea) y de las evaluaciones fallidas;
 //! - plazos: alertas críticas sin atender, congelamientos sin decisión y
 //!   plazos de reporte a la UIF próximos o vencidos;
-//! - sellado de la bitácora en lotes encadenados;
+//! - sellado de la bitácora en lotes encadenados y verificación incremental
+//!   de la cadena (desde el último sello verificado);
 //! - entrega de la bandeja de salida de notificaciones al log.
 //!
 //! Toda la lógica vive en funciones definer del esquema `aml` (§2.10); aquí
 //! solo se encadenan, cada paso en su propia transacción corta `sc_aml`
-//! (READ COMMITTED, como exige `aml.calcular`). Un arrendamiento en
-//! `aml.monitoreo_estado` garantiza una sola instancia a la vez, y la marca
-//! de agua del ledger (que arranca en las cabezas sembradas por 0009) solo
-//! avanza cuando todos los clientes del rango se revisaron.
+//! (READ COMMITTED, como exige `aml.calcular`). Un arrendamiento con ficha en
+//! `aml.monitoreo_estado` garantiza una sola instancia a la vez: se renueva
+//! entre pasos y cada `TURNO_RENOVAR_CADA` clientes, y si otra instancia lo
+//! retomó el ciclo se detiene sin tocar su turno. La marca de agua del ledger
+//! (que arranca en las cabezas sembradas por 0009) solo avanza, hasta el rango
+//! que registró el turno, cuando todos los clientes del rango se revisaron o
+//! quedaron en cuarentena (tres ciclos fallidos: aviso COBERTURA; se
+//! reintentan aparte). Las reglas por cliente se evalúan en los instantes de
+//! sus movimientos del rango, no en el reloj del ciclo, y las funciones del
+//! esquema usan el reloj del servidor: el instante de [`ciclo_en`] solo lo
+//! respeta la base de datos cuando quien llama es el dueño del esquema.
 
 use chrono::{DateTime, Utc};
 use serde::Serialize;
@@ -35,9 +43,12 @@ use crate::{
     error::{AppError, AppResult},
 };
 
-/// Duración del arrendamiento del ciclo. Si el proceso muere a mitad del
-/// ciclo, otra instancia puede tomar el turno cuando vence.
+/// Duración del arrendamiento del ciclo (la base de datos acepta a lo sumo
+/// 600 s). Si el proceso muere a mitad del ciclo, otra instancia puede tomar
+/// el turno cuando vence.
 const TURNO_SEG: i32 = 600;
+/// Clientes barridos entre dos renovaciones del arrendamiento.
+const TURNO_RENOVAR_CADA: usize = 200;
 /// Marcas DIFERIDA que se reevalúan por ciclo.
 const MARCADORES_POR_CICLO: i32 = 100;
 /// Notificaciones que se entregan por ciclo.
@@ -54,11 +65,16 @@ pub struct Ciclo {
     pub clientes: usize,
     /// Clientes ocupados (fila o candado PLD tomados) aun después de un reintento.
     pub ocupados: usize,
+    /// Clientes cuyo barrido falló en este ciclo y clientes en cuarentena.
+    pub fallidos: usize,
+    pub cuarentena: usize,
     pub alertas_lote: i64,
     pub alertas_redes: i64,
     pub reevaluadas: usize,
     pub plazos: i64,
     pub sellados: i64,
+    /// Resultado de la verificación incremental de la bitácora.
+    pub bitacora_valida: bool,
     pub notificaciones: usize,
     pub errores: usize,
 }
@@ -68,27 +84,34 @@ pub async fn ciclo(pool: &PgPool, cfg: &ConfigAml) -> AppResult<Ciclo> {
     ciclo_en(pool, cfg, None).await
 }
 
-/// Un ciclo completo. `ahora = None` usa el reloj de la base de datos; las
-/// pruebas pasan un instante futuro para ejercitar los plazos.
+/// Un ciclo completo con un instante propuesto. La base de datos lo ignora
+/// para `sc_aml` (usa su propio reloj: nadie adelanta plazos ni ventanas);
+/// solo lo respeta cuando quien llama es el dueño del esquema.
 ///
 /// Solo falla si no se puede tomar o liberar el turno: el error de un paso se
 /// registra, cuenta en `errores` y no impide los pasos siguientes (un error
-/// en las reglas por lotes sí impide avanzar la marca de agua, así que el
-/// siguiente ciclo vuelve a revisar el mismo rango).
+/// en las reglas por lotes de un cliente impide avanzar la marca de agua
+/// hasta que el cliente queda en cuarentena). Si el turno se pierde (otra
+/// instancia lo retomó), el ciclo se detiene.
 pub async fn ciclo_en(pool: &PgPool, cfg: &ConfigAml, ahora: Option<DateTime<Utc>>) -> AppResult<Ciclo> {
     // 1. Turno.
-    let Some((desde_ifpe, desde_sofom)) = tomar_turno(pool).await? else {
+    let Some((turno, desde_ifpe, desde_sofom)) = tomar_turno(pool).await? else {
         return Ok(Ciclo::default());
     };
     let mut c = Ciclo { turno: true, hasta_ifpe: desde_ifpe, hasta_sofom: desde_sofom, ..Ciclo::default() };
 
-    // 2-5. Reglas por lotes de los clientes que se movieron y marca de agua.
-    if let Err(err) = barrer_rango(pool, cfg, ahora, desde_ifpe, desde_sofom, &mut c).await {
+    // 2-5. Clientes en cuarentena, reglas por lotes de los clientes que se
+    // movieron y marca de agua.
+    if let Err(err) = barrer_rango(pool, cfg, ahora, turno, &mut c).await {
         registrar_error(&mut c, "reglas por lotes", &err);
+    }
+    if !renovar_turno(pool, turno).await? {
+        tracing::warn!(target: "aml", "otra instancia retomó el turno del monitoreo: el ciclo se detiene");
+        return Ok(c);
     }
 
     // 6. Redes entre clientes (R26/R27); idempotente por semana.
-    match escalar_i32(pool, "SELECT aml.barrer_redes(coalesce($1::timestamptz, clock_timestamp()))", ahora).await {
+    match escalar_i32(pool, "SELECT aml.barrer_redes($1::timestamptz)", ahora).await {
         Ok(n) => c.alertas_redes = i64::from(n),
         Err(err) => registrar_error(&mut c, "redes entre clientes", &err),
     }
@@ -99,15 +122,25 @@ pub async fn ciclo_en(pool: &PgPool, cfg: &ConfigAml, ahora: Option<DateTime<Utc
     }
 
     // 8. Plazos (cada aviso una sola vez, por los índices únicos).
-    match escalar_i32(pool, "SELECT aml.revisar_plazos(coalesce($1::timestamptz, clock_timestamp()))", ahora).await {
+    match escalar_i32(pool, "SELECT aml.revisar_plazos($1::timestamptz)", ahora).await {
         Ok(n) => c.plazos = i64::from(n),
         Err(err) => registrar_error(&mut c, "revisión de plazos", &err),
     }
 
-    // 9. Sellado de la bitácora (renglones con más de 10 minutos).
+    // 9. Sellado de la bitácora (transacciones ya terminadas) y verificación
+    // incremental desde el último sello verificado.
     match sellar(pool).await {
         Ok(n) => c.sellados = i64::from(n),
         Err(err) => registrar_error(&mut c, "sellado de la bitácora", &err),
+    }
+    match verificar_bitacora(pool).await {
+        Ok(valida) => {
+            c.bitacora_valida = valida;
+            if !valida {
+                tracing::error!(target: "aml", "la verificación de la bitácora de cumplimiento falló");
+            }
+        }
+        Err(err) => registrar_error(&mut c, "verificación de la bitácora", &err),
     }
 
     // 10. Entrega de notificaciones.
@@ -116,8 +149,8 @@ pub async fn ciclo_en(pool: &PgPool, cfg: &ConfigAml, ahora: Option<DateTime<Utc
         Err(err) => registrar_error(&mut c, "entrega de notificaciones", &err),
     }
 
-    // 11. Libera el turno con el resultado.
-    liberar_turno(pool, &c).await?;
+    // 11. Libera el turno con el resultado (solo si sigue siendo nuestro).
+    liberar_turno(pool, turno, &c).await?;
     Ok(c)
 }
 
@@ -147,22 +180,42 @@ fn registrar_error(c: &mut Ciclo, paso: &str, err: &AppError) {
     tracing::error!(target: "aml", paso, codigo = err.codigo(), error = %err.detalle(), "falló un paso del monitoreo AML");
 }
 
-async fn tomar_turno(pool: &PgPool) -> AppResult<Option<(i64, i64)>> {
+async fn tomar_turno(pool: &PgPool) -> AppResult<Option<(Uuid, i64, i64)>> {
     let mut tx = db::begin(pool, Rol::Aml).await?;
-    let marcas: Option<(i64, i64)> =
-        sqlx::query_as("SELECT ultima_secuencia_ifpe, ultima_secuencia_sofom FROM aml.monitoreo_tomar_turno($1)")
-            .bind(TURNO_SEG)
-            .fetch_optional(&mut *tx)
-            .await?;
+    let marcas: Option<(Uuid, i64, i64)> = sqlx::query_as(
+        "SELECT turno, ultima_secuencia_ifpe, ultima_secuencia_sofom FROM aml.monitoreo_tomar_turno($1)",
+    )
+    .bind(TURNO_SEG)
+    .fetch_optional(&mut *tx)
+    .await?;
     tx.commit().await?;
     Ok(marcas)
 }
 
-async fn liberar_turno(pool: &PgPool, c: &Ciclo) -> AppResult<()> {
+/// Renueva el arrendamiento; `false` si el turno ya no es de esta instancia.
+async fn renovar_turno(pool: &PgPool, turno: Uuid) -> AppResult<bool> {
+    let mut tx = db::begin(pool, Rol::Aml).await?;
+    let vigente: bool = sqlx::query_scalar("SELECT aml.monitoreo_renovar_turno($1, $2)")
+        .bind(turno)
+        .bind(TURNO_SEG)
+        .fetch_one(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(vigente)
+}
+
+async fn liberar_turno(pool: &PgPool, turno: Uuid, c: &Ciclo) -> AppResult<()> {
     let resultado = serde_json::to_value(c).map_err(anyhow::Error::from)?;
     let mut tx = db::begin(pool, Rol::Aml).await?;
-    sqlx::query("SELECT aml.monitoreo_liberar_turno($1)").bind(resultado).execute(&mut *tx).await?;
+    let liberado: bool = sqlx::query_scalar("SELECT aml.monitoreo_liberar_turno($1, $2)")
+        .bind(turno)
+        .bind(resultado)
+        .fetch_one(&mut *tx)
+        .await?;
     tx.commit().await?;
+    if !liberado {
+        tracing::warn!(target: "aml", "el turno del monitoreo ya era de otra instancia: no se libera");
+    }
     Ok(())
 }
 
@@ -182,89 +235,150 @@ async fn sellar(pool: &PgPool) -> AppResult<i32> {
     Ok(n)
 }
 
-/// Pasos 2 a 5: rango del ledger, clientes candidatos, reglas R20–R25 por
-/// cliente y, si todos se revisaron sin error, avance de la marca de agua.
+async fn verificar_bitacora(pool: &PgPool) -> AppResult<bool> {
+    let mut tx = db::begin(pool, Rol::Aml).await?;
+    let valida: bool = sqlx::query_scalar("SELECT aml.registrar_verificacion_bitacora()").fetch_one(&mut *tx).await?;
+    tx.commit().await?;
+    Ok(valida)
+}
+
+/// Pasos 2 a 5: reintento de los clientes en cuarentena, rango del ledger,
+/// clientes candidatos (con sus anclas), reglas R20–R25 por cliente y, si
+/// todos se revisaron o quedaron en cuarentena, avance de la marca de agua.
 async fn barrer_rango(
     pool: &PgPool,
     cfg: &ConfigAml,
     ahora: Option<DateTime<Utc>>,
-    desde_ifpe: i64,
-    desde_sofom: i64,
+    turno: Uuid,
     c: &mut Ciclo,
 ) -> AppResult<()> {
+    // 2. Clientes en cuarentena: se reintentan con el reloj del servidor; un
+    // barrido exitoso los saca (aml.barrer_cliente borra su registro de fallos).
+    let mut tx = db::begin(pool, Rol::Aml).await?;
+    let en_cuarentena: Vec<Uuid> =
+        sqlx::query_scalar("SELECT aml.monitoreo_cuarentena()").fetch_all(&mut *tx).await?;
+    tx.commit().await?;
+    for cliente in en_cuarentena {
+        match barrer_cliente(pool, cliente, ahora, &[]).await {
+            Ok(n) if n >= 0 => c.alertas_lote += i64::from(n),
+            Ok(_) => {}
+            Err(err) => {
+                tracing::warn!(target: "aml", %cliente, codigo = err.codigo(), "cliente en cuarentena: el barrido sigue fallando");
+                registrar_fallo(pool, turno, cliente, &err).await?;
+            }
+        }
+    }
+
+    // 3. Rango (queda registrado con el turno) y candidatos con sus anclas.
     let lote = i32::try_from(cfg.monitoreo_lote.clamp(1, 100_000)).unwrap_or(5_000);
     let mut tx = db::begin(pool, Rol::Aml).await?;
     let (hasta_ifpe, hasta_sofom): (i64, i64) =
-        sqlx::query_as("SELECT hasta_ifpe, hasta_sofom FROM aml.monitoreo_rango($1)")
+        sqlx::query_as("SELECT hasta_ifpe, hasta_sofom FROM aml.monitoreo_rango($1, $2)")
+            .bind(turno)
             .bind(lote)
             .fetch_one(&mut *tx)
             .await?;
-    let candidatos: Vec<Uuid> = sqlx::query_scalar("SELECT aml.monitoreo_candidatos($1, $2, $3, $4)")
-        .bind(desde_ifpe)
-        .bind(hasta_ifpe)
-        .bind(desde_sofom)
-        .bind(hasta_sofom)
-        .fetch_all(&mut *tx)
-        .await?;
+    let candidatos: Vec<(Uuid, Vec<DateTime<Utc>>)> =
+        sqlx::query_as("SELECT cliente_id, anclas FROM aml.monitoreo_candidatos($1)")
+            .bind(turno)
+            .fetch_all(&mut *tx)
+            .await?;
     tx.commit().await?;
     c.hasta_ifpe = hasta_ifpe;
     c.hasta_sofom = hasta_sofom;
     c.clientes = candidatos.len();
 
-    // Un cliente ocupado (otra transacción tiene su fila o su candado PLD) se
-    // reintenta una vez al final; barrer_cliente nunca espera un candado.
-    let mut fallidos = 0usize;
+    // 4. Un cliente ocupado (otra transacción tiene su fila o su candado PLD
+    // mientras se alertaba o congelaba) se reintenta una vez al final;
+    // barrer_cliente nunca espera un candado. Uno que falla suma un fallo:
+    // al tercer ciclo queda en cuarentena y deja de detener la marca.
+    let mut sin_cuarentena = 0usize;
     let mut ocupados = Vec::new();
-    for cliente in candidatos {
-        match barrer_cliente(pool, cliente, ahora).await {
-            Ok(n) if n < 0 => ocupados.push(cliente),
+    for (i, (cliente, anclas)) in candidatos.iter().enumerate() {
+        if i > 0 && i % TURNO_RENOVAR_CADA == 0 && !renovar_turno(pool, turno).await? {
+            return Err(AppError::Integridad("el turno del monitoreo lo retomó otra instancia".into()));
+        }
+        match barrer_cliente(pool, *cliente, ahora, anclas).await {
+            Ok(n) if n < 0 => ocupados.push((*cliente, anclas)),
             Ok(n) => c.alertas_lote += i64::from(n),
             Err(err) => {
-                fallidos += 1;
+                c.fallidos += 1;
                 registrar_error(c, "reglas por lotes de un cliente", &err);
+                if !registrar_fallo(pool, turno, *cliente, &err).await? {
+                    sin_cuarentena += 1;
+                }
             }
         }
     }
     let mut siguen_ocupados = 0usize;
-    for cliente in ocupados {
-        match barrer_cliente(pool, cliente, ahora).await {
+    for (cliente, anclas) in ocupados {
+        match barrer_cliente(pool, cliente, ahora, anclas).await {
             Ok(n) if n < 0 => siguen_ocupados += 1,
             Ok(n) => c.alertas_lote += i64::from(n),
             Err(err) => {
-                fallidos += 1;
+                c.fallidos += 1;
                 registrar_error(c, "reglas por lotes de un cliente", &err);
+                if !registrar_fallo(pool, turno, cliente, &err).await? {
+                    sin_cuarentena += 1;
+                }
             }
         }
     }
     c.ocupados = siguen_ocupados;
+    let mut tx = db::begin(pool, Rol::Aml).await?;
+    c.cuarentena = usize::try_from(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM aml.monitoreo_cuarentena()").fetch_one(&mut *tx).await?,
+    )
+    .unwrap_or(0);
+    tx.commit().await?;
 
-    // Sin avanzar la marca, el siguiente ciclo revisa el mismo rango: es
-    // seguro porque las alertas por lotes se deduplican por cliente, regla y
-    // semana (volver a correr no crea nada).
-    if siguen_ocupados > 0 || fallidos > 0 {
-        tracing::warn!(target: "aml", ocupados = siguen_ocupados, fallidos, "la marca de agua del monitoreo no avanza en este ciclo");
+    // 5. Sin avanzar la marca, el siguiente ciclo revisa el mismo rango: es
+    // seguro porque las alertas por lotes no se duplican (una abierta por
+    // cliente, regla y semana; una cerrada solo cede ante evidencia posterior).
+    if siguen_ocupados > 0 || sin_cuarentena > 0 {
+        tracing::warn!(target: "aml", ocupados = siguen_ocupados, fallidos = sin_cuarentena, "la marca de agua del monitoreo no avanza en este ciclo");
         return Ok(());
     }
     let mut tx = db::begin(pool, Rol::Aml).await?;
-    sqlx::query("SELECT aml.monitoreo_avanzar_marca($1, $2)")
-        .bind(hasta_ifpe)
-        .bind(hasta_sofom)
-        .execute(&mut *tx)
-        .await?;
+    let avanzo: bool =
+        sqlx::query_scalar("SELECT aml.monitoreo_avanzar_marca($1)").bind(turno).fetch_one(&mut *tx).await?;
     tx.commit().await?;
+    if !avanzo {
+        return Err(AppError::Integridad("el turno del monitoreo lo retomó otra instancia".into()));
+    }
     Ok(())
 }
 
-/// Reglas por lotes de un cliente en su propia transacción. `-1`: ocupado.
-async fn barrer_cliente(pool: &PgPool, cliente: Uuid, ahora: Option<DateTime<Utc>>) -> AppResult<i32> {
+/// Reglas por lotes de un cliente en su propia transacción, en sus anclas
+/// (vacío: el reloj del servidor). `-1`: ocupado.
+async fn barrer_cliente(
+    pool: &PgPool,
+    cliente: Uuid,
+    ahora: Option<DateTime<Utc>>,
+    anclas: &[DateTime<Utc>],
+) -> AppResult<i32> {
     let mut tx = db::begin(pool, Rol::Aml).await?;
-    let n: i32 = sqlx::query_scalar("SELECT aml.barrer_cliente($1, coalesce($2::timestamptz, clock_timestamp()))")
+    let n: i32 = sqlx::query_scalar("SELECT aml.barrer_cliente($1, $2, $3)")
         .bind(cliente)
         .bind(ahora)
+        .bind(anclas)
         .fetch_one(&mut *tx)
         .await?;
     tx.commit().await?;
     Ok(n)
+}
+
+/// Registra el fallo de un cliente; `true` si quedó (o ya estaba) en cuarentena.
+async fn registrar_fallo(pool: &PgPool, turno: Uuid, cliente: Uuid, err: &AppError) -> AppResult<bool> {
+    let mut tx = db::begin(pool, Rol::Aml).await?;
+    let cuarentena: bool = sqlx::query_scalar("SELECT aml.monitoreo_registrar_fallo($1, $2, $3)")
+        .bind(turno)
+        .bind(cliente)
+        .bind(format!("{}: {}", err.codigo(), err.detalle()))
+        .fetch_one(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(cuarentena)
 }
 
 /// Paso 7: una transacción por marca. Una segunda reevaluación de la misma

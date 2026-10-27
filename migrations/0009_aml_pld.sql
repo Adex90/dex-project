@@ -620,6 +620,13 @@ ALTER TABLE aml.alertas
 -- primaria suma M03 5 + M04 10 = 15. 150k/80k/80k da R01 (registro) y R02 a 65
 -- ALTO sin congelar; tres abonos de 145k dan R05 a 100 CRITICO (congela y
 -- retiene 435k). Ninguna prueba existente congela.
+-- Toda regla que congela (R05, R11, R12, R20) llega sola a CRITICO (>= 85):
+-- congela igual a un cliente BAJO o MEDIO con cuenta antigua; los
+-- modificadores de perfil nunca son los que deciden un congelamiento. Los
+-- escenarios normales no congelan: nómina dispersa (R11 exige concentración),
+-- un abono grande, dos abonos de 95k de un cliente ALTO/PEP (banda ALTO de 25%
+-- y frecuencia 3) y el pago de un crédito seguido de un pago a proveedor (el
+-- cobro de un crédito no es dinero que entre a la bóveda).
 INSERT INTO aml.parametros DEFAULT VALUES;
 
 INSERT INTO aml.reglas_riesgo (codigo, nivel_cliente, version, nombre, descripcion, clase, sentido, tipo_reporte, activa,
@@ -637,7 +644,7 @@ VALUES ('R01_OPERACION_RELEVANTE', 'TODOS', 1, 'Operación relevante',
 INSERT INTO aml.reglas_riesgo (codigo, nivel_cliente, version, nombre, descripcion, clase, sentido, tipo_reporte,
                                puntos, permite_congelar, umbral_monto, frecuencia_min, ventana_horas)
 VALUES ('R02_FRACCIONAMIENTO', 'TODOS', 1, 'Fraccionamiento',
-        'Abonos individualmente menores al umbral cuya suma en la ventana lo alcanza por primera vez.',
+        'Abonos individualmente menores al umbral cuya suma en la ventana lo alcanza; cada abono adicional vuelve a disparar (se agrupa en la alerta abierta). No suma si ya disparó R05 o R12 con la misma evidencia.',
         'PRIMARIA', 'ENTRADA', 'INUSUAL', 50, FALSE, 150000, 2, 24);
 
 INSERT INTO aml.reglas_riesgo (codigo, nivel_cliente, version, nombre, descripcion, clase, sentido, tipo_reporte,
@@ -658,7 +665,7 @@ INSERT INTO aml.reglas_riesgo (codigo, nivel_cliente, version, nombre, descripci
 SELECT 'R05_ESTRUCTURACION', n, 1, 'Estructuración',
        'Varias operaciones del mismo sentido en la banda inmediatamente inferior al umbral, cuya suma lo alcanza (todos los canales).',
        'PRIMARIA', 'AMBOS', 'INUSUAL', 90, TRUE, 150000, b, f, 24
-  FROM (VALUES ('BAJO', 0.80, 3), ('MEDIO', 0.75, 3), ('ALTO', 0.60, 2)) v (n, b, f);
+  FROM (VALUES ('BAJO', 0.80, 3), ('MEDIO', 0.75, 3), ('ALTO', 0.75, 3)) v (n, b, f);
 
 INSERT INTO aml.reglas_riesgo (codigo, nivel_cliente, version, nombre, descripcion, clase, sentido, tipo_reporte,
                                puntos, permite_congelar, volumen_max, ventana_horas)
@@ -681,18 +688,25 @@ VALUES ('R09_LISTA_BLOQUEADAS', 'TODOS', 1, 'Lista de Personas Bloqueadas',
         'SISTEMA', 'NINGUNO', 'INUSUAL', 100, TRUE);
 
 INSERT INTO aml.reglas_riesgo (codigo, nivel_cliente, version, nombre, descripcion, clase, sentido, tipo_reporte,
-                               puntos, permite_congelar, umbral_monto, porcentaje_min, ventana_horas)
+                               puntos, permite_congelar, umbral_monto, porcentaje_min, ventana_horas, banda_inferior)
 VALUES ('R11_PASO_RAPIDO', 'TODOS', 1, 'Paso rápido de fondos',
-        'Salidas por SPEI o transferencia que se llevan casi todo lo recibido en la ventana.',
-        'PRIMARIA', 'SALIDA', 'INUSUAL', 70, TRUE, 150000, 0.90, 24);
+        'Salidas concentradas por SPEI o transferencia que se llevan casi todo lo recibido en la bóveda en la ventana. Solo cuentan las salidas a contrapartes que se llevan cada una al menos banda_inferior de lo recibido (una nómina dispersa no es paso rápido) y solo las entradas que abonan la bóveda (SPEI y transferencias recibidas, no el cobro de un crédito).',
+        'PRIMARIA', 'SALIDA', 'INUSUAL', 85, TRUE, 150000, 0.90, 24, 0.10);
+
+INSERT INTO aml.reglas_riesgo (codigo, nivel_cliente, version, nombre, descripcion, clase, sentido, tipo_reporte,
+                               puntos, permite_congelar, umbral_monto, banda_inferior, frecuencia_min, volumen_max,
+                               ventana_horas)
+VALUES ('R12_ESTRUCTURACION_FRECUENTE', 'TODOS', 1, 'Estructuración frecuente',
+        'Muchos abonos cerca del umbral (banda amplia, debajo de la banda de R05) cuya suma en la ventana alcanza un múltiplo del umbral (volumen_max). Comparte la marca de supresión de R02 y R05.',
+        'PRIMARIA', 'ENTRADA', 'INUSUAL', 85, TRUE, 150000, 0.50, 5, 600000, 24);
 
 INSERT INTO aml.reglas_riesgo (codigo, nivel_cliente, version, nombre, descripcion, clase, sentido, tipo_reporte,
                                puntos, permite_congelar, umbral_monto, banda_inferior, frecuencia_min, operaciones_max,
                                ventana_horas)
 SELECT 'R20_ESTRUCTURACION_LENTA', n, 1, 'Estructuración lenta',
        'Abonos en banda durante 7 días en al menos 3 días distintos (Ciudad de México), o abonos bajo el umbral en 30 días que suman al menos el doble del umbral.',
-       'LOTE', 'ENTRADA', 'INUSUAL', 70, TRUE, 150000, b, 5, 8, 168
-  FROM (VALUES ('BAJO', 0.80), ('MEDIO', 0.75), ('ALTO', 0.60)) v (n, b);
+       'LOTE', 'ENTRADA', 'INUSUAL', 85, TRUE, 150000, b, 5, 8, 168
+  FROM (VALUES ('BAJO', 0.80), ('MEDIO', 0.75), ('ALTO', 0.75)) v (n, b);
 
 INSERT INTO aml.reglas_riesgo (codigo, nivel_cliente, version, nombre, descripcion, clase, sentido, tipo_reporte,
                                puntos, permite_congelar, volumen_max, multiplo_ingreso, ventana_horas)
@@ -980,6 +994,41 @@ $$;
 CREATE FUNCTION aml.canal_de_salida(p_canal TEXT) RETURNS BOOLEAN
 LANGUAGE sql IMMUTABLE SECURITY DEFINER SET search_path = pg_catalog, pg_temp
 AS $$ SELECT p_canal IN ('SPEI_ENVIADO', 'TRANSFERENCIA_ENVIADA') $$;
+
+-- Entradas que abonan la bóveda del cliente (lo único que puede pasar de
+-- largo, R11 y R24): el cobro de un crédito es dinero que el cliente paga a
+-- la SOFOM, no dinero que recibe.
+CREATE FUNCTION aml.canal_abona_boveda(p_canal TEXT) RETURNS BOOLEAN
+LANGUAGE sql IMMUTABLE SECURITY DEFINER SET search_path = pg_catalog, pg_temp
+AS $$ SELECT p_canal IN ('SPEI_WEBHOOK', 'SPEI_OPERADOR', 'SPEI_DEMO', 'TRANSFERENCIA_RECIBIDA') $$;
+
+-- Clave de la contraparte de un movimiento con el mismo formato que
+-- aml.movimientos_cliente ('cuenta:', 'rfc:', 'nombre:', 'cliente:', 'clabe:'),
+-- a partir de los hechos que trae la envoltura. NULL si no hay.
+CREATE FUNCTION aml.clave_contraparte(p_canal TEXT, p_contraparte JSONB) RETURNS TEXT
+LANGUAGE sql IMMUTABLE SECURITY DEFINER SET search_path = pg_catalog, pg_temp
+AS $$
+    SELECT CASE
+        WHEN p_canal IN ('SPEI_WEBHOOK', 'SPEI_OPERADOR', 'SPEI_DEMO') THEN
+            CASE WHEN nullif(btrim(p_contraparte ->> 'cuenta'), '') IS NOT NULL THEN 'cuenta:' || btrim(p_contraparte ->> 'cuenta')
+                 WHEN nullif(btrim(p_contraparte ->> 'rfc_curp'), '') IS NOT NULL
+                     THEN 'rfc:' || upper(btrim(p_contraparte ->> 'rfc_curp'))
+                 WHEN nullif(btrim(p_contraparte ->> 'nombre'), '') IS NOT NULL
+                     THEN 'nombre:' || aml.normalizar_texto(p_contraparte ->> 'nombre')
+            END
+        WHEN p_canal IN ('TRANSFERENCIA_ENVIADA', 'TRANSFERENCIA_RECIBIDA') THEN
+            'cliente:' || nullif(btrim(p_contraparte ->> 'cliente_id'), '')
+        WHEN p_canal IN ('SPEI_ENVIADO', 'DESEMBOLSO_CREDITO') THEN 'clabe:' || nullif(btrim(p_contraparte ->> 'cuenta'), '')
+    END
+$$;
+
+-- Reloj de las funciones del monitoreo que reciben un instante: solo el
+-- dueño del esquema (pruebas, tareas de operación) puede fijarlo; para sc_aml
+-- (la consola y el ciclo) manda el reloj del servidor, así que nadie adelanta
+-- plazos ni ventanas, ni consume avisos antes de tiempo.
+CREATE FUNCTION aml.reloj(p_ahora TIMESTAMPTZ) RETURNS TIMESTAMPTZ
+LANGUAGE sql VOLATILE SECURITY DEFINER SET search_path = pg_catalog, pg_temp
+AS $$ SELECT CASE WHEN p_ahora IS NOT NULL AND current_setting('role') = 'none' THEN p_ahora ELSE clock_timestamp() END $$;
 
 -- Fuerza de una decisión de alerta: REGISTRADA < RETENIDA < BLOQUEADA.
 CREATE FUNCTION aml.rango_decision(p TEXT) RETURNS INTEGER
@@ -1314,13 +1363,15 @@ AS $$
 $$;
 
 -- Marca de supresión de una regla de patrón: la resolución FALSO_POSITIVO más
--- reciente del cliente para esa regla. Los movimientos revisados no vuelven a
--- contar (ni a congelar al cliente).
-CREATE FUNCTION aml.marca_falso_positivo(p_cliente UUID, p_codigo TEXT) RETURNS TIMESTAMPTZ
+-- reciente del cliente para esa regla y ese sentido (el de la llave de la
+-- alerta; NULL: cualquiera). Los movimientos revisados no vuelven a contar
+-- (ni a congelar al cliente); los del otro sentido no se revisaron.
+CREATE FUNCTION aml.marca_falso_positivo(p_cliente UUID, p_codigo TEXT, p_sentido TEXT) RETURNS TIMESTAMPTZ
 LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, pg_temp
 AS $$
     SELECT coalesce(max(resuelta_en), '-infinity'::timestamptz) FROM aml.alertas
      WHERE cliente_id = p_cliente AND regla_codigo = p_codigo AND estado = 'FALSO_POSITIVO'
+       AND (p_sentido IS NULL OR sentido = p_sentido)
 $$;
 
 -- Perfil del cliente que entra en la calificación (se guarda con ella).
@@ -1417,8 +1468,9 @@ $$;
 -- Puntaje = LEAST(100, Σ primarias + Σ modificadores); los modificadores solo
 -- cuentan si disparó una primaria. `congelar` exige CRITICO y una regla
 -- disparada con permite_congelar (el modo observación lo aplica quien llama).
+-- p_contraparte: clave de la contraparte del movimiento (aml.clave_contraparte).
 CREATE FUNCTION aml.calcular(p_cliente UUID, p_entidad TEXT, p_sentido TEXT, p_canal TEXT, p_monto NUMERIC,
-                             p_excluir UUID, p_ahora TIMESTAMPTZ) RETURNS JSONB
+                             p_excluir UUID, p_ahora TIMESTAMPTZ, p_contraparte TEXT) RETURNS JSONB
 LANGUAGE plpgsql STABLE SECURITY DEFINER SET search_path = pg_catalog, pg_temp
 AS $$
 DECLARE
@@ -1434,6 +1486,9 @@ DECLARE
     v_puntos     NUMERIC := 0;
     v_congelable BOOLEAN := FALSE;
     v_desde      TIMESTAMPTZ;
+    v_dia        TIMESTAMPTZ;
+    v_wm_e       TIMESTAMPTZ;
+    v_wm_s       TIMESTAMPTZ;
     v_n          BIGINT;
     v_suma       NUMERIC;
     v_ids        JSONB;
@@ -1441,15 +1496,21 @@ DECLARE
     v_hi         NUMERIC;
     v_e          NUMERIC;
     v_o          NUMERIC;
+    v_oc         NUMERIC;
+    v_nc         BIGINT;
     v_relevante  BOOLEAN := FALSE;
     v_regla_rel  UUID;
+    v_estructura BOOLEAN := FALSE;
+    v_p05_ids    JSONB := '[]';
+    v_p05_suma   NUMERIC := 0;
+    v_p12_ids    JSONB := '[]';
+    v_p12_suma   NUMERIC := 0;
     v_b_ids      JSONB := '[]';
     v_b_suma     NUMERIC := 0;
     v_mod        RECORD;
     v_bruto      NUMERIC;
     v_puntaje    NUMERIC;
     v_dominante  JSONB;
-    v_patron     TEXT;
     v_ventana    JSONB;
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM kyc.clientes WHERE id = p_cliente) THEN
@@ -1458,6 +1519,8 @@ BEGIN
     v_perfil := aml.perfil_cliente(p_cliente, p_ahora);
     v_tier := v_perfil ->> 'nivel_riesgo_pld';
     v_ingreso := (v_perfil ->> 'ingreso_mensual_estimado')::numeric;
+    -- Inicio del día (Ciudad de México) del movimiento: R03 y R04 se agrupan por día.
+    v_dia := date_trunc('day', p_ahora AT TIME ZONE 'America/Mexico_City') AT TIME ZONE 'America/Mexico_City';
 
     -- Ventana de 24 h, leída una sola vez.
     v_w := ARRAY(SELECT ROW(m.entidad, m.transaccion_id, m.sentido, m.canal, m.monto, m.contraparte,
@@ -1473,14 +1536,16 @@ BEGIN
         v_relevante := p_monto >= r.umbral_monto;
     END IF;
 
-    -- R05: estructuración en la banda inferior al umbral, mismo sentido.
+    -- R05: estructuración en la banda inferior al umbral, mismo sentido (marca
+    -- de supresión de ese sentido).
     r := aml.regla('R05_ESTRUCTURACION', v_tier);
     IF r.id IS NOT NULL THEN
         v_aplicadas := v_aplicadas || r.id;
         IF aml.canal_en_banda(p_sentido, p_canal) THEN
             v_lo := r.banda_inferior * r.umbral_monto;
             v_hi := r.umbral_monto;
-            v_desde := greatest(p_ahora - r.ventana_horas * interval '1 hour', aml.marca_falso_positivo(p_cliente, r.codigo));
+            v_desde := greatest(p_ahora - r.ventana_horas * interval '1 hour',
+                                aml.marca_falso_positivo(p_cliente, r.codigo, p_sentido));
             SELECT count(*), coalesce(sum(m.monto), 0), coalesce(jsonb_agg(m.transaccion_id ORDER BY m.creado_en), '[]')
               INTO v_n, v_suma, v_ids
               FROM unnest(v_w) m
@@ -1494,25 +1559,62 @@ BEGIN
                 v_primarias := v_primarias || r.codigo;
                 v_puntos := v_puntos + r.puntos;
                 v_congelable := v_congelable OR r.permite_congelar;
-                v_b_ids := v_ids;
-                v_b_suma := v_suma;
+                v_estructura := TRUE;
+                v_p05_ids := v_ids;
+                v_p05_suma := v_suma;
             END IF;
         END IF;
     END IF;
 
-    -- R02: abonos bajo el umbral cuya suma lo alcanza por primera vez.
-    r := aml.regla('R02_FRACCIONAMIENTO', v_tier);
+    -- R12: estructuración frecuente. Muchos abonos en una banda amplia bajo el
+    -- umbral cuya suma alcanza un múltiplo del umbral (volumen_max): atrapa a
+    -- quien se queda un peso debajo de la banda de R05. Comparte la marca de
+    -- supresión de la familia (R02, R05, R12): lo revisado no vuelve a contar.
+    r := aml.regla('R12_ESTRUCTURACION_FRECUENTE', v_tier);
     IF r.id IS NOT NULL THEN
         v_aplicadas := v_aplicadas || r.id;
         IF p_sentido = 'ENTRADA' AND aml.canal_en_banda(p_sentido, p_canal) THEN
-            v_desde := greatest(p_ahora - r.ventana_horas * interval '1 hour', aml.marca_falso_positivo(p_cliente, r.codigo));
+            v_lo := r.banda_inferior * r.umbral_monto;
+            v_hi := r.umbral_monto;
+            v_desde := greatest(p_ahora - r.ventana_horas * interval '1 hour',
+                                aml.marca_falso_positivo(p_cliente, r.codigo, 'ENTRADA'),
+                                aml.marca_falso_positivo(p_cliente, 'R05_ESTRUCTURACION', 'ENTRADA'),
+                                aml.marca_falso_positivo(p_cliente, 'R02_FRACCIONAMIENTO', 'ENTRADA'));
+            SELECT count(*), coalesce(sum(m.monto), 0), coalesce(jsonb_agg(m.transaccion_id ORDER BY m.creado_en), '[]')
+              INTO v_n, v_suma, v_ids
+              FROM unnest(v_w) m
+             WHERE m.sentido = 'ENTRADA' AND aml.canal_en_banda(m.sentido, m.canal)
+               AND m.monto >= v_lo AND m.monto < v_hi AND m.creado_en > v_desde;
+            IF p_monto >= v_lo AND p_monto < v_hi AND v_n + 1 >= r.frecuencia_min AND v_suma + p_monto >= r.volumen_max THEN
+                v_factores := v_factores || jsonb_build_array(aml.factor(r, 'PRIMARIA', jsonb_build_object(
+                    'banda', jsonb_build_array(round(v_lo, 8)::text, round(v_hi, 8)::text), 'n', v_n + 1,
+                    'monto', (v_suma + p_monto)::text, 'frecuencia_min', r.frecuencia_min,
+                    'monto_min', r.volumen_max::text, 'desde', v_desde, 'transacciones', v_ids)));
+                v_primarias := v_primarias || r.codigo;
+                v_puntos := v_puntos + r.puntos;
+                v_congelable := v_congelable OR r.permite_congelar;
+                v_estructura := TRUE;
+                v_p12_ids := v_ids;
+                v_p12_suma := v_suma;
+            END IF;
+        END IF;
+    END IF;
+
+    -- R02: abonos bajo el umbral cuya suma lo alcanza. Vuelve a disparar con
+    -- cada abono posterior (la alerta abierta los agrupa); no suma cuando R05 o
+    -- R12 ya dispararon con la misma evidencia.
+    r := aml.regla('R02_FRACCIONAMIENTO', v_tier);
+    IF r.id IS NOT NULL THEN
+        v_aplicadas := v_aplicadas || r.id;
+        IF p_sentido = 'ENTRADA' AND aml.canal_en_banda(p_sentido, p_canal) AND NOT v_estructura THEN
+            v_desde := greatest(p_ahora - r.ventana_horas * interval '1 hour',
+                                aml.marca_falso_positivo(p_cliente, r.codigo, 'ENTRADA'));
             SELECT count(*), coalesce(sum(m.monto), 0), coalesce(jsonb_agg(m.transaccion_id ORDER BY m.creado_en), '[]')
               INTO v_n, v_suma, v_ids
               FROM unnest(v_w) m
              WHERE m.sentido = 'ENTRADA' AND aml.canal_en_banda(m.sentido, m.canal)
                AND m.monto < r.umbral_monto AND m.creado_en > v_desde;
-            IF p_monto < r.umbral_monto AND v_n + 1 >= r.frecuencia_min AND v_suma < r.umbral_monto
-               AND v_suma + p_monto >= r.umbral_monto THEN
+            IF p_monto < r.umbral_monto AND v_n + 1 >= r.frecuencia_min AND v_suma + p_monto >= r.umbral_monto THEN
                 v_factores := v_factores || jsonb_build_array(aml.factor(r, 'PRIMARIA', jsonb_build_object(
                     'n', v_n + 1, 'monto', (v_suma + p_monto)::text, 'umbral', r.umbral_monto::text, 'desde', v_desde,
                     'transacciones', v_ids)));
@@ -1523,11 +1625,13 @@ BEGIN
         END IF;
     END IF;
 
-    -- R03: cliente de riesgo alto (la regla existe solo para ese nivel).
+    -- R03: cliente de riesgo alto (la regla existe solo para ese nivel). Una
+    -- alerta por cliente, sentido y día; un falso positivo la suprime el resto
+    -- del día.
     r := aml.regla('R03_CLIENTE_RIESGO_ALTO', v_tier);
     IF r.id IS NOT NULL THEN
         v_aplicadas := v_aplicadas || r.id;
-        IF p_monto >= r.umbral_monto THEN
+        IF p_monto >= r.umbral_monto AND aml.marca_falso_positivo(p_cliente, r.codigo, p_sentido) < v_dia THEN
             v_factores := v_factores || jsonb_build_array(aml.factor(r, 'PRIMARIA', jsonb_build_object(
                 'monto', p_monto::text, 'umbral', r.umbral_monto::text)));
             v_primarias := v_primarias || r.codigo;
@@ -1536,11 +1640,12 @@ BEGIN
         END IF;
     END IF;
 
-    -- R04: fuera del perfil transaccional declarado.
+    -- R04: fuera del perfil transaccional declarado (misma agrupación y supresión que R03).
     r := aml.regla('R04_FUERA_DE_PERFIL', v_tier);
     IF r.id IS NOT NULL THEN
         v_aplicadas := v_aplicadas || r.id;
-        IF v_ingreso > 0 AND p_monto > r.multiplo_ingreso * v_ingreso THEN
+        IF v_ingreso > 0 AND p_monto > r.multiplo_ingreso * v_ingreso
+           AND aml.marca_falso_positivo(p_cliente, r.codigo, p_sentido) < v_dia THEN
             v_factores := v_factores || jsonb_build_array(aml.factor(r, 'PRIMARIA', jsonb_build_object(
                 'monto', p_monto::text, 'ingreso_mensual_estimado', v_ingreso::text,
                 'multiplo_ingreso', r.multiplo_ingreso::text)));
@@ -1550,50 +1655,75 @@ BEGIN
         END IF;
     END IF;
 
-    -- R07: volumen de la ventana (todos los canales, ambos sentidos).
+    -- R07: volumen de la ventana (todos los canales, ambos sentidos; cada
+    -- movimiento con la marca de supresión de su propio sentido).
     r := aml.regla('R07_VOLUMEN_DIARIO', v_tier);
     IF r.id IS NOT NULL THEN
         v_aplicadas := v_aplicadas || r.id;
-        v_desde := greatest(p_ahora - r.ventana_horas * interval '1 hour', aml.marca_falso_positivo(p_cliente, r.codigo));
-        SELECT coalesce(sum(m.monto), 0) INTO v_suma FROM unnest(v_w) m WHERE m.creado_en > v_desde;
+        v_desde := p_ahora - r.ventana_horas * interval '1 hour';
+        v_wm_e := aml.marca_falso_positivo(p_cliente, r.codigo, 'ENTRADA');
+        v_wm_s := aml.marca_falso_positivo(p_cliente, r.codigo, 'SALIDA');
+        SELECT coalesce(sum(m.monto), 0) INTO v_suma FROM unnest(v_w) m
+         WHERE m.creado_en > v_desde AND m.creado_en > CASE m.sentido WHEN 'ENTRADA' THEN v_wm_e ELSE v_wm_s END;
         IF v_suma + p_monto > r.volumen_max THEN
             v_factores := v_factores || jsonb_build_array(aml.factor(r, 'PRIMARIA', jsonb_build_object(
-                'volumen', (v_suma + p_monto)::text, 'volumen_max', r.volumen_max::text, 'desde', v_desde)));
+                'volumen', (v_suma + p_monto)::text, 'volumen_max', r.volumen_max::text,
+                'desde', greatest(v_desde, CASE p_sentido WHEN 'ENTRADA' THEN v_wm_e ELSE v_wm_s END))));
             v_primarias := v_primarias || r.codigo;
             v_puntos := v_puntos + r.puntos;
             v_congelable := v_congelable OR r.permite_congelar;
         END IF;
     END IF;
 
-    -- R08: frecuencia de la ventana.
+    -- R08: frecuencia de la ventana (misma marca por sentido que R07).
     r := aml.regla('R08_FRECUENCIA', v_tier);
     IF r.id IS NOT NULL THEN
         v_aplicadas := v_aplicadas || r.id;
-        v_desde := greatest(p_ahora - r.ventana_horas * interval '1 hour', aml.marca_falso_positivo(p_cliente, r.codigo));
-        SELECT count(*) INTO v_n FROM unnest(v_w) m WHERE m.creado_en > v_desde;
+        v_desde := p_ahora - r.ventana_horas * interval '1 hour';
+        v_wm_e := aml.marca_falso_positivo(p_cliente, r.codigo, 'ENTRADA');
+        v_wm_s := aml.marca_falso_positivo(p_cliente, r.codigo, 'SALIDA');
+        SELECT count(*) INTO v_n FROM unnest(v_w) m
+         WHERE m.creado_en > v_desde AND m.creado_en > CASE m.sentido WHEN 'ENTRADA' THEN v_wm_e ELSE v_wm_s END;
         IF v_n + 1 > r.operaciones_max THEN
             v_factores := v_factores || jsonb_build_array(aml.factor(r, 'PRIMARIA', jsonb_build_object(
-                'operaciones', v_n + 1, 'operaciones_max', r.operaciones_max, 'desde', v_desde)));
+                'operaciones', v_n + 1, 'operaciones_max', r.operaciones_max,
+                'desde', greatest(v_desde, CASE p_sentido WHEN 'ENTRADA' THEN v_wm_e ELSE v_wm_s END))));
             v_primarias := v_primarias || r.codigo;
             v_puntos := v_puntos + r.puntos;
             v_congelable := v_congelable OR r.permite_congelar;
         END IF;
     END IF;
 
-    -- R11: paso rápido de fondos (salida por SPEI o transferencia).
+    -- R11: paso rápido concentrado. E = lo que abonó la bóveda en la ventana
+    -- (SPEI y transferencias recibidas; el cobro de un crédito no). O = las
+    -- salidas por SPEI o transferencia (incluida esta) hacia las contrapartes
+    -- que se llevan cada una al menos banda_inferior × E: pagos dispersos de
+    -- poco monto (una nómina) no son paso rápido.
     r := aml.regla('R11_PASO_RAPIDO', v_tier);
     IF r.id IS NOT NULL THEN
         v_aplicadas := v_aplicadas || r.id;
         IF p_sentido = 'SALIDA' AND aml.canal_de_salida(p_canal) THEN
-            v_desde := greatest(p_ahora - r.ventana_horas * interval '1 hour', aml.marca_falso_positivo(p_cliente, r.codigo));
-            SELECT coalesce(sum(m.monto) FILTER (WHERE m.sentido = 'ENTRADA'), 0),
-                   coalesce(sum(m.monto) FILTER (WHERE m.sentido = 'SALIDA' AND aml.canal_de_salida(m.canal)), 0) + p_monto
-              INTO v_e, v_o
+            v_desde := greatest(p_ahora - r.ventana_horas * interval '1 hour',
+                                aml.marca_falso_positivo(p_cliente, r.codigo, 'SALIDA'));
+            SELECT coalesce(sum(m.monto) FILTER (WHERE m.sentido = 'ENTRADA' AND aml.canal_abona_boveda(m.canal)), 0)
+              INTO v_e
               FROM unnest(v_w) m WHERE m.creado_en > v_desde;
-            IF v_e >= r.umbral_monto AND v_o >= r.porcentaje_min * v_e THEN
+            WITH s AS (
+                SELECT coalesce(m.contraparte, 'movimiento:' || m.transaccion_id) AS c, m.monto
+                  FROM unnest(v_w) m
+                 WHERE m.sentido = 'SALIDA' AND aml.canal_de_salida(m.canal) AND m.creado_en > v_desde
+                UNION ALL
+                SELECT coalesce(p_contraparte, 'movimiento:actual'), p_monto),
+            g AS (SELECT s.c, sum(s.monto) AS total FROM s GROUP BY s.c)
+            SELECT coalesce(sum(g.total), 0), coalesce(sum(g.total) FILTER (WHERE g.total >= r.banda_inferior * v_e), 0),
+                   count(*) FILTER (WHERE g.total >= r.banda_inferior * v_e)
+              INTO v_o, v_oc, v_nc
+              FROM g;
+            IF v_e >= r.umbral_monto AND v_oc >= r.porcentaje_min * v_e THEN
                 v_factores := v_factores || jsonb_build_array(aml.factor(r, 'PRIMARIA', jsonb_build_object(
-                    'entradas', v_e::text, 'salidas', v_o::text, 'porcentaje_min', r.porcentaje_min::text,
-                    'desde', v_desde)));
+                    'entradas', v_e::text, 'salidas', v_o::text, 'salidas_concentradas', v_oc::text,
+                    'contrapartes', v_nc, 'porcentaje_min', r.porcentaje_min::text,
+                    'fraccion_min', r.banda_inferior::text, 'desde', v_desde)));
                 v_primarias := v_primarias || r.codigo;
                 v_puntos := v_puntos + r.puntos;
                 v_congelable := v_congelable OR r.permite_congelar;
@@ -1614,14 +1744,17 @@ BEGIN
     -- Regla dominante: la primaria con más puntos (empates por código).
     SELECT f INTO v_dominante FROM jsonb_array_elements(v_factores) f
      WHERE f ->> 'tipo' = 'PRIMARIA' ORDER BY (f ->> 'puntos')::numeric DESC, f ->> 'codigo' LIMIT 1;
-    -- Fondos del patrón: los abonos en banda de R05 cuando es la regla
-    -- congelante de más puntos y el movimiento es una entrada.
-    SELECT f ->> 'codigo' INTO v_patron FROM jsonb_array_elements(v_factores) f
-     WHERE f ->> 'tipo' = 'PRIMARIA' AND (f ->> 'permite_congelar')::boolean
-     ORDER BY (f ->> 'puntos')::numeric DESC, f ->> 'codigo' LIMIT 1;
-    IF NOT (v_patron = 'R05_ESTRUCTURACION' AND p_sentido = 'ENTRADA') OR v_patron IS NULL THEN
-        v_b_ids := '[]';
-        v_b_suma := 0;
+    -- Fondos del patrón de una entrada: los abonos de la estructuración que
+    -- disparó (R05 o R12; si ambas, el patrón de mayor suma). Son las únicas
+    -- primarias de entrada que congelan.
+    IF p_sentido = 'ENTRADA' AND (v_p05_suma > 0 OR v_p12_suma > 0) THEN
+        IF v_p12_suma > v_p05_suma THEN
+            v_b_ids := v_p12_ids;
+            v_b_suma := v_p12_suma;
+        ELSE
+            v_b_ids := v_p05_ids;
+            v_b_suma := v_p05_suma;
+        END IF;
     END IF;
 
     SELECT jsonb_build_object(
@@ -1666,11 +1799,16 @@ BEGIN
     IF r.id IS NULL THEN
         RAISE EXCEPTION 'SC_AML_PARAMETRO_INVALIDO: la regla % no existe', p_regla_id;
     END IF;
-    -- Las reglas de patrón agrupan por cliente y sentido; las demás, por movimiento.
+    -- Las reglas de patrón agrupan por cliente y sentido; las de perfil (R03,
+    -- R04), por cliente, sentido y día de la Ciudad de México (un cliente ALTO
+    -- no recibe una alerta por cada movimiento); las demás, por movimiento.
     v_clave := coalesce(p_clave_dedup,
         CASE WHEN r.codigo IN ('R02_FRACCIONAMIENTO', 'R05_ESTRUCTURACION', 'R07_VOLUMEN_DIARIO', 'R08_FRECUENCIA',
-                               'R11_PASO_RAPIDO')
+                               'R11_PASO_RAPIDO', 'R12_ESTRUCTURACION_FRECUENTE')
              THEN r.codigo || ':' || p_cliente || ':' || p_sentido
+             WHEN r.codigo IN ('R03_CLIENTE_RIESGO_ALTO', 'R04_FUERA_DE_PERFIL')
+             THEN r.codigo || ':' || p_cliente || ':' || p_sentido || ':'
+                  || to_char(clock_timestamp() AT TIME ZONE 'America/Mexico_City', 'YYYY-MM-DD')
              ELSE r.codigo || ':' || p_entidad || ':' || coalesce(p_transaccion, p_evaluacion, gen_random_uuid()) || ':'
                   || p_sentido
         END);
@@ -1680,6 +1818,11 @@ BEGIN
                                          ELSE par.dias_reporte_inusual * interval '1 day' END;
 
     IF p_agrupar THEN
+        -- Evidencia nueva sobre una alerta con una propuesta de falso positivo
+        -- pendiente: la propuesta se retira (se dictaminó sin esta evidencia;
+        -- el segundo oficial no la aprueba a ciegas). Queda en la bitácora
+        -- como ALERTA_FP_RETIRADO con este motivo.
+        PERFORM aml.fijar_motivo('Evidencia nueva agrupada en la alerta después de la propuesta de falso positivo');
         INSERT INTO aml.alertas AS a (cliente_id, transaccion_id, entidad, sentido, evaluacion_id, regla_id, regla_codigo,
                                       tipo_reporte, origen, decision, nivel_riesgo, puntaje, detalles, monto,
                                       monto_acumulado, clave_deduplicacion, urgente, fecha_limite_reporte)
@@ -1696,8 +1839,14 @@ BEGIN
             monto_acumulado      = GREATEST(a.monto_acumulado, EXCLUDED.monto_acumulado),
             urgente              = a.urgente OR EXCLUDED.urgente,
             fecha_limite_reporte = LEAST(a.fecha_limite_reporte, EXCLUDED.fecha_limite_reporte),
-            detalles             = aml.fusionar_detalles(a.detalles, EXCLUDED.detalles)
+            detalles             = aml.fusionar_detalles(a.detalles, EXCLUDED.detalles),
+            resolucion_propuesta = NULL,
+            propuesta_por        = NULL,
+            dictamen_propuesto   = NULL,
+            propuesta_en         = NULL,
+            solicitud_propuesta_id = NULL
         RETURNING a.id INTO v_id;
+        PERFORM aml.fijar_motivo(NULL);
     ELSE
         INSERT INTO aml.alertas (cliente_id, transaccion_id, entidad, sentido, evaluacion_id, regla_id, regla_codigo,
                                  tipo_reporte, origen, decision, nivel_riesgo, puntaje, detalles, monto, monto_acumulado,
@@ -1773,8 +1922,10 @@ BEGIN
     SELECT x.xmin INTO e_xmin FROM aml.evaluaciones x WHERE x.id = p_evaluacion;
     SELECT * INTO t FROM ifpe.transacciones WHERE id = e.transaccion_id;
     SELECT x.xmin INTO t_xmin FROM ifpe.transacciones x WHERE x.id = e.transaccion_id;
+    -- La evaluación es de esta misma transacción (una RETENIDA confirmada
+    -- antes no se "reproduce" para retener otra vez ni fuera de su abono).
     IF e.id IS NULL OR e.origen <> 'EN_LINEA' OR e.resultado <> 'RETENIDA' OR e.entidad <> 'IFPE' OR e.sentido <> 'ENTRADA'
-       OR t.id IS NULL OR t_xmin IS DISTINCT FROM e_xmin THEN
+       OR t.id IS NULL OR t_xmin IS DISTINCT FROM e_xmin OR e_xmin IS DISTINCT FROM pg_current_xact_id()::xid THEN
         RAISE EXCEPTION 'SC_AML_EVALUACION_INCOHERENTE: la evaluación % no corresponde a un abono retenido de esta transacción',
             p_evaluacion;
     END IF;
@@ -1851,6 +2002,7 @@ DECLARE
     v_retener   NUMERIC := 0;
     v_alerta    UUID;
     v_contra    JSONB := coalesce(p_contraparte, '{}');
+    v_clave_c   TEXT;
 BEGIN
     IF current_setting('transaction_isolation') <> 'read committed' THEN
         RAISE EXCEPTION 'SC_AML_AISLAMIENTO: la evaluación exige READ COMMITTED';
@@ -1872,6 +2024,7 @@ BEGIN
     PERFORM aml.bloquear_cliente(p_cliente);
     par := aml.parametros_vigentes();
     v_congelado := aml.cliente_congelado(p_cliente);
+    v_clave_c := aml.clave_contraparte(p_canal, v_contra);
 
     -- Cliente congelado: toda salida se bloquea (un reintento con la misma
     -- clave no cuenta un intento nuevo).
@@ -1902,7 +2055,7 @@ BEGIN
     -- Una SALIDA falla cerrada.
     IF p_sentido = 'ENTRADA' THEN
         BEGIN
-            v := aml.calcular(p_cliente, p_entidad, p_sentido, p_canal, p_monto, NULL, clock_timestamp());
+            v := aml.calcular(p_cliente, p_entidad, p_sentido, p_canal, p_monto, NULL, clock_timestamp(), v_clave_c);
         EXCEPTION WHEN OTHERS THEN
             IF SQLSTATE IN ('40001', '40P01', '55P03', '57014') THEN
                 RAISE;
@@ -1911,7 +2064,7 @@ BEGIN
             v_error := SQLERRM;
         END;
     ELSE
-        v := aml.calcular(p_cliente, p_entidad, p_sentido, p_canal, p_monto, NULL, clock_timestamp());
+        v := aml.calcular(p_cliente, p_entidad, p_sentido, p_canal, p_monto, NULL, clock_timestamp(), v_clave_c);
     END IF;
 
     IF v IS NULL THEN
@@ -2033,6 +2186,10 @@ CREATE TRIGGER trg_aml_sellos_inmutable BEFORE UPDATE OR DELETE ON aml.sellos_bi
     FOR EACH ROW EXECUTE FUNCTION nucleo.fn_ledger_inmutable();
 CREATE TRIGGER trg_aml_sellos_no_truncate BEFORE TRUNCATE ON aml.sellos_bitacora
     FOR EACH STATEMENT EXECUTE FUNCTION nucleo.fn_ledger_inmutable();
+CREATE TRIGGER trg_aml_verificaciones_inmutable BEFORE UPDATE OR DELETE ON aml.verificaciones_bitacora
+    FOR EACH ROW EXECUTE FUNCTION nucleo.fn_ledger_inmutable();
+CREATE TRIGGER trg_aml_verificaciones_no_truncate BEFORE TRUNCATE ON aml.verificaciones_bitacora
+    FOR EACH STATEMENT EXECUTE FUNCTION nucleo.fn_ledger_inmutable();
 
 -- 7.2 Bitácora: hash canónico al insertar; nunca UPDATE, DELETE ni TRUNCATE.
 -- No toma candados (no hay cabeza de cadena en el camino del dinero: el
@@ -2126,11 +2283,26 @@ CREATE TRIGGER trg_aml_reglas_proteger BEFORE INSERT OR UPDATE OR DELETE ON aml.
 CREATE TRIGGER trg_aml_reglas_no_truncate BEFORE TRUNCATE ON aml.reglas_riesgo
     FOR EACH STATEMENT EXECUTE FUNCTION aml.fn_proteger_regla();
 
--- 7.5 Propuestas: una sola decisión PENDIENTE -> APROBADA|RECHAZADA.
+-- 7.5 Propuestas: nacen PENDIENTE, de un oficial de cumplimiento (el actor
+-- de aml.proponer_cambio), y se deciden una sola vez PENDIENTE ->
+-- APROBADA|RECHAZADA por otro oficial (el actor de aml.decidir_propuesta).
+-- Una propuesta insertada ya APROBADA no desbloquea nada.
 CREATE FUNCTION aml.fn_proteger_propuesta() RETURNS trigger
 LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp
 AS $$
 BEGIN
+    IF TG_OP = 'INSERT' THEN
+        IF NEW.estado <> 'PENDIENTE' OR NEW.decidida_por IS NOT NULL OR NEW.decidida_en IS NOT NULL
+           OR NEW.comentario IS NOT NULL OR NEW.resultado_id IS NOT NULL THEN
+            RAISE EXCEPTION 'SC_AML_REGISTRO_INMUTABLE: una propuesta nace PENDIENTE, sin decisión'
+                USING ERRCODE = 'restrict_violation';
+        END IF;
+        IF NEW.propuesta_por IS DISTINCT FROM aml.actor_actual()
+           OR NOT EXISTS (SELECT 1 FROM kyc.credenciales WHERE cliente_id = NEW.propuesta_por AND rol = 'CUMPLIMIENTO') THEN
+            RAISE EXCEPTION 'SC_AML_NO_AUTORIZADO: una propuesta la hace un oficial de cumplimiento (aml.proponer_cambio)';
+        END IF;
+        RETURN NEW;
+    END IF;
     IF TG_OP IN ('DELETE', 'TRUNCATE')
        OR (to_jsonb(NEW) - ARRAY['estado', 'decidida_por', 'decidida_en', 'comentario', 'resultado_id'])
           IS DISTINCT FROM (to_jsonb(OLD) - ARRAY['estado', 'decidida_por', 'decidida_en', 'comentario', 'resultado_id'])
@@ -2138,19 +2310,38 @@ BEGIN
         RAISE EXCEPTION 'SC_AML_REGISTRO_INMUTABLE: una propuesta solo se decide una vez'
             USING ERRCODE = 'restrict_violation';
     END IF;
+    IF NEW.decidida_por IS DISTINCT FROM aml.actor_actual()
+       OR NOT EXISTS (SELECT 1 FROM kyc.credenciales WHERE cliente_id = NEW.decidida_por AND rol = 'CUMPLIMIENTO') THEN
+        RAISE EXCEPTION 'SC_AML_NO_AUTORIZADO: una propuesta la decide un oficial de cumplimiento (aml.decidir_propuesta)';
+    END IF;
     RETURN NEW;
 END
 $$;
-CREATE TRIGGER trg_aml_propuestas_proteger BEFORE UPDATE OR DELETE ON aml.propuestas_cambio
+CREATE TRIGGER trg_aml_propuestas_proteger BEFORE INSERT OR UPDATE OR DELETE ON aml.propuestas_cambio
     FOR EACH ROW EXECUTE FUNCTION aml.fn_proteger_propuesta();
 CREATE TRIGGER trg_aml_propuestas_no_truncate BEFORE TRUNCATE ON aml.propuestas_cambio
     FOR EACH STATEMENT EXECUTE FUNCTION aml.fn_proteger_propuesta();
 
--- 7.6 Solicitudes: una sola transición PENDIENTE -> APROBADA|RECHAZADA|ANULADA.
+-- 7.6 Solicitudes: nacen PENDIENTE, de un oficial de cumplimiento (el actor
+-- de la función que la crea), y tienen una sola transición PENDIENTE ->
+-- APROBADA|RECHAZADA (por el oficial que decide, el actor de
+-- aml.decidir_levantamiento) o ANULADA (el sistema, al confirmar una alerta).
 CREATE FUNCTION aml.fn_proteger_solicitud() RETURNS trigger
 LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp
 AS $$
 BEGIN
+    IF TG_OP = 'INSERT' THEN
+        IF NEW.estado <> 'PENDIENTE' OR NEW.decidida_por IS NOT NULL OR NEW.decidida_en IS NOT NULL
+           OR NEW.comentario IS NOT NULL THEN
+            RAISE EXCEPTION 'SC_AML_REGISTRO_INMUTABLE: una solicitud de levantamiento nace PENDIENTE, sin decisión'
+                USING ERRCODE = 'restrict_violation';
+        END IF;
+        IF NEW.solicitada_por IS DISTINCT FROM aml.actor_actual()
+           OR NOT EXISTS (SELECT 1 FROM kyc.credenciales WHERE cliente_id = NEW.solicitada_por AND rol = 'CUMPLIMIENTO') THEN
+            RAISE EXCEPTION 'SC_AML_NO_AUTORIZADO: una solicitud de levantamiento la hace un oficial de cumplimiento';
+        END IF;
+        RETURN NEW;
+    END IF;
     IF TG_OP IN ('DELETE', 'TRUNCATE')
        OR (to_jsonb(NEW) - ARRAY['estado', 'decidida_por', 'decidida_en', 'comentario'])
           IS DISTINCT FROM (to_jsonb(OLD) - ARRAY['estado', 'decidida_por', 'decidida_en', 'comentario'])
@@ -2158,10 +2349,15 @@ BEGIN
         RAISE EXCEPTION 'SC_AML_REGISTRO_INMUTABLE: una solicitud de levantamiento solo se decide una vez'
             USING ERRCODE = 'restrict_violation';
     END IF;
+    IF NEW.estado IN ('APROBADA', 'RECHAZADA')
+       AND (NEW.decidida_por IS DISTINCT FROM aml.actor_actual()
+            OR NOT EXISTS (SELECT 1 FROM kyc.credenciales WHERE cliente_id = NEW.decidida_por AND rol = 'CUMPLIMIENTO')) THEN
+        RAISE EXCEPTION 'SC_AML_NO_AUTORIZADO: una solicitud la decide un oficial de cumplimiento (aml.decidir_levantamiento)';
+    END IF;
     RETURN NEW;
 END
 $$;
-CREATE TRIGGER trg_aml_solicitudes_proteger BEFORE UPDATE OR DELETE ON aml.solicitudes_levantamiento
+CREATE TRIGGER trg_aml_solicitudes_proteger BEFORE INSERT OR UPDATE OR DELETE ON aml.solicitudes_levantamiento
     FOR EACH ROW EXECUTE FUNCTION aml.fn_proteger_solicitud();
 CREATE TRIGGER trg_aml_solicitudes_no_truncate BEFORE TRUNCATE ON aml.solicitudes_levantamiento
     FOR EACH STATEMENT EXECUTE FUNCTION aml.fn_proteger_solicitud();
@@ -2316,7 +2512,9 @@ CREATE TRIGGER trg_aml_relevantes_proteger BEFORE UPDATE OR DELETE ON aml.operac
 CREATE TRIGGER trg_aml_relevantes_no_truncate BEFORE TRUNCATE ON aml.operaciones_relevantes
     FOR EACH STATEMENT EXECUTE FUNCTION aml.fn_proteger_relevante();
 
--- 7.11 Notificaciones: solo se marca la entrega; aviso por pg_notify sin datos personales.
+-- 7.11 Notificaciones: solo se marca la entrega. Sin pg_notify: nadie escucha
+-- (la consola consulta y el ciclo entrega la bandeja), y un NOTIFY serializaría
+-- los COMMIT de los caminos del dinero que alertan o congelan.
 CREATE FUNCTION aml.fn_proteger_notificacion() RETURNS trigger
 LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp
 AS $$
@@ -2334,17 +2532,6 @@ CREATE TRIGGER trg_aml_notificaciones_proteger BEFORE UPDATE OR DELETE ON aml.no
     FOR EACH ROW EXECUTE FUNCTION aml.fn_proteger_notificacion();
 CREATE TRIGGER trg_aml_notificaciones_no_truncate BEFORE TRUNCATE ON aml.notificaciones
     FOR EACH STATEMENT EXECUTE FUNCTION aml.fn_proteger_notificacion();
-
-CREATE FUNCTION aml.fn_notificar_pg() RETURNS trigger
-LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp
-AS $$
-BEGIN
-    PERFORM pg_notify('aml_eventos', json_build_object('tipo', NEW.tipo, 'id', NEW.id)::text);
-    RETURN NULL;
-END
-$$;
-CREATE TRIGGER trg_aml_notificaciones_pg AFTER INSERT ON aml.notificaciones
-    FOR EACH ROW EXECUTE FUNCTION aml.fn_notificar_pg();
 
 -- 7.12 Bitácora y notificaciones de los cambios de estado (el actor lo fijó el
 -- punto de entrada; ver aml.fijar_actor).
@@ -2594,7 +2781,9 @@ BEGIN
         -- Las correcciones (y anulaciones) de un abono erróneo siguen
         -- permitidas; sobre un cliente congelado quedan en la bitácora y se
         -- notifican. Nunca alcanzan fondos retenidos: cargan saldo_disponible y
-        -- trg_ifpe_cuentas_zz_aml_retenido protege el resto.
+        -- trg_ifpe_cuentas_zz_aml_retenido protege el resto. La clave sola no
+        -- basta: trg_ifpe_tx_zz_aml_correccion exige al COMMIT su registro en
+        -- ifpe.spei_correcciones (sin él, ni el dueño debita a un congelado).
         IF v_estado = 'CONGELADO_PREVENTIVO' OR aml.cliente_congelado(v_cliente) THEN
             PERFORM aml.fijar_actor(NULL);
             PERFORM aml.registrar_bitacora('CARGO_EN_CUENTA_CONGELADA', 'OPERACION', NEW.id::text, v_cliente,
@@ -2618,6 +2807,53 @@ END
 $$;
 CREATE TRIGGER trg_ifpe_tx_aml_guardia BEFORE INSERT ON ifpe.transacciones
     FOR EACH ROW EXECUTE FUNCTION aml.fn_guardia_tx_ifpe();
+
+-- Una corrección se reconoce por su registro, no por su clave: un RETIRO
+-- 'spei-correccion:<id>' sin la fila de ifpe.spei_correcciones que lo liga
+-- (tx_id y clave) no es una corrección. Sobre un cliente congelado es un
+-- débito prohibido (SC_OPERACION_NO_DISPONIBLE); sobre cualquier otro, un uso
+-- de una clave reservada (se saltaría la cobertura y la velocidad PLD).
+CREATE FUNCTION aml.fn_correccion_registrada() RETURNS trigger
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp
+AS $$
+DECLARE
+    v_estado  TEXT;
+    v_cliente UUID;
+BEGIN
+    IF EXISTS (SELECT 1 FROM ifpe.spei_correcciones c
+                WHERE c.tx_id = NEW.id AND NEW.clave_idempotencia = 'spei-correccion:' || c.id::text) THEN
+        RETURN NULL;
+    END IF;
+    SELECT estado, cliente_id INTO v_estado, v_cliente FROM ifpe.cuentas WHERE id = NEW.cuenta_origen_id;
+    IF v_estado = 'CONGELADO_PREVENTIVO' OR aml.cliente_congelado(v_cliente) THEN
+        RAISE EXCEPTION 'SC_OPERACION_NO_DISPONIBLE: la operación no está disponible en este momento'
+            USING ERRCODE = 'check_violation', DETAIL = format('cuenta %s', NEW.cuenta_origen_id);
+    END IF;
+    RAISE EXCEPTION 'SC_AML_CLAVE_RESERVADA: la clave % está reservada para correcciones registradas', NEW.clave_idempotencia;
+END
+$$;
+CREATE CONSTRAINT TRIGGER trg_ifpe_tx_zz_aml_correccion
+    AFTER INSERT ON ifpe.transacciones
+    DEFERRABLE INITIALLY DEFERRED
+    FOR EACH ROW
+    WHEN (NEW.tipo = 'RETIRO' AND NEW.clave_idempotencia LIKE 'spei-correccion:%')
+    EXECUTE FUNCTION aml.fn_correccion_registrada();
+
+-- Una orden SPEI nunca usa una clave reservada del ledger (abonos, reversos,
+-- correcciones y retenciones): su RETIRO se haría pasar por otro movimiento.
+CREATE FUNCTION aml.fn_orden_clave_reservada() RETURNS trigger
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp
+AS $$
+BEGIN
+    IF NEW.clave_idempotencia ~ '^(spei|spei-reverso|spei-correccion|ret|lib):' THEN
+        RAISE EXCEPTION 'SC_AML_CLAVE_RESERVADA: la clave % está reservada y no identifica una orden SPEI',
+            NEW.clave_idempotencia;
+    END IF;
+    RETURN NEW;
+END
+$$;
+CREATE TRIGGER trg_spei_outbound_aml_clave BEFORE INSERT ON ifpe.spei_outbound
+    FOR EACH ROW EXECUTE FUNCTION aml.fn_orden_clave_reservada();
 
 -- 8.2 Cobertura: cada perspectiva de un movimiento de dinero de un cliente
 -- tiene su evaluación EN_LINEA coherente (mismo cliente, monto, canal y
@@ -2819,23 +3055,72 @@ CREATE CONSTRAINT TRIGGER trg_aml_congelamientos_zz_espejo
     FOR EACH ROW EXECUTE FUNCTION aml.fn_espejo();
 
 -- 8.7 Una evaluación en línea describe un renglón del ledger de esta misma
--- transacción (un intento bloqueado no tiene renglón).
+-- transacción (un intento bloqueado no tiene renglón), y los hechos que
+-- declara salen de ese renglón: el (sentido, canal) que el tipo de renglón
+-- admite, el cliente dueño de la cuenta (o el acreditado), el monto y la
+-- clave. Ningún otro renglón admite una evaluación (RETENCION, LIBERACION,
+-- RETORNO_DE_SOFOM, reversos 'spei-reverso:', correcciones 'spei-correccion:').
 CREATE FUNCTION aml.fn_evaluacion_ligada() RETURNS trigger
 LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp
 AS $$
 DECLARE
-    e_xmin xid;
-    t_xmin xid;
+    e_xmin    xid;
+    t_xmin    xid;
+    t         ifpe.transacciones;
+    st        sofom.transacciones;
+    v_cliente UUID;
+    v_monto   NUMERIC;
+    v_clave   TEXT;
+    v_canal   TEXT;
 BEGIN
     SELECT x.xmin INTO e_xmin FROM aml.evaluaciones x WHERE x.id = NEW.id;
     IF NEW.entidad = 'IFPE' THEN
+        SELECT * INTO t FROM ifpe.transacciones WHERE id = NEW.transaccion_id;
         SELECT x.xmin INTO t_xmin FROM ifpe.transacciones x WHERE x.id = NEW.transaccion_id;
     ELSE
+        SELECT * INTO st FROM sofom.transacciones WHERE id = NEW.transaccion_id;
         SELECT x.xmin INTO t_xmin FROM sofom.transacciones x WHERE x.id = NEW.transaccion_id;
     END IF;
     IF t_xmin IS NULL OR t_xmin IS DISTINCT FROM e_xmin THEN
         RAISE EXCEPTION 'SC_AML_EVALUACION_HUERFANA: la evaluación % no tiene su movimiento % en esta transacción',
             NEW.id, NEW.transaccion_id;
+    END IF;
+    IF NEW.entidad = 'IFPE' THEN
+        v_monto := t.monto;
+        v_clave := t.clave_idempotencia;
+        IF t.tipo = 'DEPOSITO' AND starts_with(t.clave_idempotencia, 'spei:') AND NEW.sentido = 'ENTRADA' THEN
+            -- Errata E1: sin registro en spei_inbound (lista blanca desactivada) es SPEI_WEBHOOK.
+            v_canal := coalesce((SELECT CASE s.origen WHEN 'OPERADOR' THEN 'SPEI_OPERADOR' WHEN 'DEMO' THEN 'SPEI_DEMO'
+                                                      ELSE 'SPEI_WEBHOOK' END
+                                   FROM ifpe.spei_inbound s WHERE s.transaccion_id = t.id), 'SPEI_WEBHOOK');
+            v_cliente := (SELECT cliente_id FROM ifpe.cuentas WHERE id = t.cuenta_destino_id);
+        ELSIF t.tipo = 'RETIRO' AND NOT starts_with(t.clave_idempotencia, 'spei-correccion:') AND NEW.sentido = 'SALIDA' THEN
+            v_canal := 'SPEI_ENVIADO';
+            v_cliente := (SELECT cliente_id FROM ifpe.cuentas WHERE id = t.cuenta_origen_id);
+        ELSIF t.tipo = 'TRASPASO_A_SOFOM' AND NEW.sentido = 'SALIDA' THEN
+            v_canal := 'INVERSION_MUTUO';
+            v_cliente := (SELECT cliente_id FROM ifpe.cuentas WHERE id = t.cuenta_origen_id);
+        ELSIF t.tipo = 'TRANSFERENCIA' AND NEW.sentido = 'SALIDA' THEN
+            v_canal := 'TRANSFERENCIA_ENVIADA';
+            v_cliente := (SELECT cliente_id FROM ifpe.cuentas WHERE id = t.cuenta_origen_id);
+        ELSIF t.tipo = 'TRANSFERENCIA' AND NEW.sentido = 'ENTRADA' THEN
+            v_canal := 'TRANSFERENCIA_RECIBIDA';
+            v_cliente := (SELECT cliente_id FROM ifpe.cuentas WHERE id = t.cuenta_destino_id);
+        END IF;
+    ELSE
+        v_monto := st.monto;
+        v_clave := st.clave_idempotencia;
+        IF st.tipo = 'DESEMBOLSO_CREDITO' AND NEW.sentido = 'SALIDA' THEN
+            v_canal := 'DESEMBOLSO_CREDITO';
+        ELSIF st.tipo = 'COBRO_CREDITO' AND NEW.sentido = 'ENTRADA' THEN
+            v_canal := 'COBRO_CREDITO';
+        END IF;
+        v_cliente := (SELECT acreditado_id FROM sofom.creditos WHERE id = st.credito_id);
+    END IF;
+    IF v_canal IS NULL OR NEW.canal IS DISTINCT FROM v_canal OR NEW.cliente_id IS DISTINCT FROM v_cliente
+       OR NEW.monto IS DISTINCT FROM v_monto OR NEW.clave_operacion IS DISTINCT FROM v_clave THEN
+        RAISE EXCEPTION 'SC_AML_EVALUACION_INCOHERENTE: la evaluación % no corresponde al movimiento % (%)',
+            NEW.id, NEW.transaccion_id, NEW.sentido;
     END IF;
     RETURN NULL;
 END
@@ -2846,9 +3131,18 @@ CREATE CONSTRAINT TRIGGER trg_aml_evaluaciones_zz_ligada
     FOR EACH ROW WHEN (NEW.origen = 'EN_LINEA' AND NEW.resultado <> 'BLOQUEADA')
     EXECUTE FUNCTION aml.fn_evaluacion_ligada();
 
--- 8.8 Despacho SPEI: la orden nunca intentada de un cliente congelado no se
--- reclama (RETURN NULL). Nunca falla: un cliente congelado no aborta el lote.
--- Su nombre la ordena antes de trg_spei_outbound_intentos y _proteger.
+-- 8.8 Despacho SPEI: la orden de un cliente congelado que el proveedor
+-- seguro no tiene (PENDIENTE, sin ninguna llamada a `registrar` que pudiera
+-- haberla registrado: registro_incierto_desde NULL, y fuera de revisión
+-- manual) no se reclama ni se registra (RETURN NULL: la fila no cambia).
+-- Va más allá del §3.3c original (solo intentos_envio = 0): una orden que se
+-- reclamó, cuya llamada probó no llegar al proveedor (NoRecibida), y cuyo
+-- cliente se congeló después, también espera. Dos respaldos: el reclamo
+-- (incrementa intentos_envio) y la renovación justo antes de `registrar` (fija
+-- registro_incierto_desde), así que un congelamiento confirmado entre el
+-- reclamo y la primera llamada también la detiene. Nunca falla: un cliente
+-- congelado no aborta el lote. Su nombre la ordena antes de
+-- trg_spei_outbound_intentos y _proteger.
 CREATE FUNCTION aml.fn_despacho_retenido() RETURNS trigger
 LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp
 AS $$
@@ -2860,7 +3154,12 @@ BEGIN
 END
 $$;
 CREATE TRIGGER trg_spei_outbound_aml_retenida BEFORE UPDATE OF intentos_envio ON ifpe.spei_outbound
-    FOR EACH ROW WHEN (OLD.estado = 'PENDIENTE' AND OLD.intentos_envio = 0 AND NEW.intentos_envio > 0)
+    FOR EACH ROW WHEN (OLD.estado = 'PENDIENTE' AND OLD.registro_incierto_desde IS NULL AND NOT OLD.revision_manual
+                       AND NEW.intentos_envio > OLD.intentos_envio)
+    EXECUTE FUNCTION aml.fn_despacho_retenido();
+CREATE TRIGGER trg_spei_outbound_aml_registro BEFORE UPDATE OF registro_incierto_desde ON ifpe.spei_outbound
+    FOR EACH ROW WHEN (OLD.estado = 'PENDIENTE' AND OLD.registro_incierto_desde IS NULL
+                       AND NEW.registro_incierto_desde IS NOT NULL)
     EXECUTE FUNCTION aml.fn_despacho_retenido();
 
 -- 8.9 SOFOM: sin desembolso ni activación de crédito para un acreditado congelado.
@@ -2944,12 +3243,26 @@ CREATE TRIGGER trg_clientes_aml_lista_bloqueadas AFTER UPDATE OF en_lista_bloque
 -- 9. Envolturas en los esquemas transaccionales (hechos de la operación, nunca
 --    un veredicto; ninguna regresa datos IFPE a sc_sofom)
 -- -----------------------------------------------------------------------------
+-- Cada rol transaccional evalúa solo los canales de sus propios caminos del
+-- dinero (sc_spei: abonos SPEI; sc_ifpe: transferencias y SPEI enviados;
+-- sc_puente: la inversión en mutuo). Un intento bloqueado no tiene renglón del
+-- ledger, así que esta es la única barrera para que un rol fabrique un
+-- bloqueo (y un congelamiento) en un canal que no opera.
 CREATE FUNCTION ifpe.aml_evaluar(p_cliente UUID, p_sentido TEXT, p_canal TEXT, p_monto NUMERIC, p_transaccion_id UUID,
                                  p_clave TEXT, p_contraparte JSONB)
 RETURNS TABLE (evaluacion_id UUID, decision TEXT, puntaje NUMERIC, nivel TEXT, monto_retener NUMERIC)
 LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp
 AS $$
+DECLARE
+    v_rol TEXT := current_setting('role');
 BEGIN
+    IF NOT (v_rol = 'none'
+            OR (v_rol = 'sc_spei' AND p_sentido = 'ENTRADA' AND p_canal IN ('SPEI_WEBHOOK', 'SPEI_OPERADOR', 'SPEI_DEMO'))
+            OR (v_rol = 'sc_ifpe' AND ((p_sentido = 'SALIDA' AND p_canal IN ('TRANSFERENCIA_ENVIADA', 'SPEI_ENVIADO'))
+                                       OR (p_sentido = 'ENTRADA' AND p_canal = 'TRANSFERENCIA_RECIBIDA')))
+            OR (v_rol = 'sc_puente' AND p_sentido = 'SALIDA' AND p_canal = 'INVERSION_MUTUO')) THEN
+        RAISE EXCEPTION 'SC_AML_PARAMETRO_INVALIDO: el rol % no evalúa operaciones (%, %)', v_rol, p_sentido, p_canal;
+    END IF;
     RETURN QUERY SELECT * FROM aml.evaluar_operacion('IFPE', p_cliente, p_sentido, p_canal, p_monto, p_transaccion_id,
                                                      p_clave, p_contraparte);
 END
@@ -3117,7 +3430,8 @@ BEGIN
         END IF;
         -- Errata E2: las propuestas de falso positivo del cliente se retiran
         -- antes de confirmar (ck_aml_propuesta solo las admite EN_REVISION).
-        UPDATE aml.alertas SET resolucion_propuesta = NULL, propuesta_por = NULL, dictamen_propuesto = NULL
+        UPDATE aml.alertas SET resolucion_propuesta = NULL, propuesta_por = NULL, dictamen_propuesto = NULL,
+                               propuesta_en = NULL, solicitud_propuesta_id = NULL
          WHERE cliente_id = v_cliente AND resolucion_propuesta IS NOT NULL;
         UPDATE aml.alertas
            SET estado = 'CONFIRMADO', dictamen = v_dictamen, resuelta_por = p_actor, resuelta_en = clock_timestamp(),
@@ -3162,16 +3476,19 @@ BEGIN
              WHERE id = a.id;
         ELSE
             -- Con el cliente congelado, el falso positivo (y su marca de
-            -- supresión) solo surte efecto con la aprobación de un segundo oficial.
-            UPDATE aml.alertas
-               SET resolucion_propuesta = 'FALSO_POSITIVO', propuesta_por = p_actor, dictamen_propuesto = v_dictamen
-             WHERE id = a.id;
+            -- supresión) solo surte efecto con la aprobación de un segundo
+            -- oficial: la propuesta queda ligada a la solicitud de levantamiento
+            -- (la que hay o una nueva) y fechada; solo esa solicitud la resuelve.
             SELECT id INTO v_sol FROM aml.solicitudes_levantamiento WHERE congelamiento_id = v_cong AND estado = 'PENDIENTE';
             IF v_sol IS NULL THEN
                 INSERT INTO aml.solicitudes_levantamiento (congelamiento_id, tipo, justificacion, solicitada_por)
                 VALUES (v_cong, coalesce(p_tipo_levantamiento, 'LEVANTAR_Y_LIBERAR'), v_dictamen, p_actor)
                 RETURNING id INTO v_sol;
             END IF;
+            UPDATE aml.alertas
+               SET resolucion_propuesta = 'FALSO_POSITIVO', propuesta_por = p_actor, dictamen_propuesto = v_dictamen,
+                   propuesta_en = clock_timestamp(), solicitud_propuesta_id = v_sol
+             WHERE id = a.id;
         END IF;
     END CASE;
 
@@ -3395,8 +3712,10 @@ BEGIN
         UPDATE aml.solicitudes_levantamiento
            SET estado = 'RECHAZADA', decidida_por = p_actor, decidida_en = clock_timestamp(), comentario = v_comentario
          WHERE id = s.id;
-        UPDATE aml.alertas SET resolucion_propuesta = NULL, propuesta_por = NULL, dictamen_propuesto = NULL
-         WHERE cliente_id = v_cliente AND resolucion_propuesta IS NOT NULL;
+        -- Solo se retiran las propuestas ligadas a esta solicitud.
+        UPDATE aml.alertas SET resolucion_propuesta = NULL, propuesta_por = NULL, dictamen_propuesto = NULL,
+                               propuesta_en = NULL, solicitud_propuesta_id = NULL
+         WHERE solicitud_propuesta_id = s.id;
     ELSE
         IF s.tipo IN ('LEVANTAR_Y_LIBERAR', 'LEVANTAR_CONSERVANDO_RETENCIONES') THEN
             IF f.estado <> 'ACTIVO' THEN
@@ -3404,8 +3723,13 @@ BEGIN
             END IF;
             IF EXISTS (SELECT 1 FROM aml.alertas
                         WHERE cliente_id = v_cliente AND estado IN ('PENDIENTE', 'EN_REVISION')
-                          AND nivel_riesgo IN ('ALTO', 'CRITICO') AND resolucion_propuesta IS NULL) THEN
+                          AND nivel_riesgo IN ('ALTO', 'CRITICO') AND solicitud_propuesta_id IS DISTINCT FROM s.id) THEN
                 RAISE EXCEPTION 'SC_AML_ALERTAS_ABIERTAS: el cliente tiene alertas ALTO o CRITICO abiertas sin propuesta de resolución';
+            END IF;
+            -- Ninguna propuesta se aprueba sobre evidencia que llegó después de proponerla.
+            IF EXISTS (SELECT 1 FROM aml.alertas
+                        WHERE solicitud_propuesta_id = s.id AND ultima_ocurrencia_en > propuesta_en) THEN
+                RAISE EXCEPTION 'SC_AML_ALERTAS_ABIERTAS: una alerta propuesta recibió evidencia nueva después de la propuesta';
             END IF;
         ELSIF f.estado <> 'LEVANTADO'
               OR NOT EXISTS (SELECT 1 FROM aml.retenciones WHERE congelamiento_id = f.id AND estado = 'VIGENTE') THEN
@@ -3417,15 +3741,20 @@ BEGIN
         UPDATE aml.solicitudes_levantamiento
            SET estado = 'APROBADA', decidida_por = p_actor, decidida_en = clock_timestamp(), comentario = v_comentario
          WHERE id = s.id;
-        -- 2. Los falsos positivos propuestos surten efecto (marca de supresión).
-        WITH u AS (
-            UPDATE aml.alertas
-               SET estado = 'FALSO_POSITIVO', dictamen = dictamen_propuesto, resuelta_por = propuesta_por,
-                   resuelta_en = clock_timestamp(), aprobada_por = p_actor,
-                   resolucion_propuesta = NULL, propuesta_por = NULL, dictamen_propuesto = NULL
-             WHERE cliente_id = v_cliente AND resolucion_propuesta = 'FALSO_POSITIVO'
-            RETURNING id, folio)
-        SELECT coalesce(array_agg(id ORDER BY folio), '{}') INTO v_resueltas FROM u;
+        -- 2. Los falsos positivos propuestos bajo esta solicitud de
+        --    levantamiento surten efecto (marca de supresión). Una liberación de
+        --    retenciones de otro congelamiento no resuelve ninguna propuesta.
+        IF s.tipo IN ('LEVANTAR_Y_LIBERAR', 'LEVANTAR_CONSERVANDO_RETENCIONES') THEN
+            WITH u AS (
+                UPDATE aml.alertas
+                   SET estado = 'FALSO_POSITIVO', dictamen = dictamen_propuesto, resuelta_por = propuesta_por,
+                       resuelta_en = clock_timestamp(), aprobada_por = p_actor,
+                       resolucion_propuesta = NULL, propuesta_por = NULL, dictamen_propuesto = NULL,
+                       propuesta_en = NULL, solicitud_propuesta_id = NULL
+                 WHERE solicitud_propuesta_id = s.id AND resolucion_propuesta = 'FALSO_POSITIVO'
+                RETURNING id, folio)
+            SELECT coalesce(array_agg(id ORDER BY folio), '{}') INTO v_resueltas FROM u;
+        END IF;
         -- 3. Levantamiento: el congelamiento y el estado de la cuenta.
         IF s.tipo IN ('LEVANTAR_Y_LIBERAR', 'LEVANTAR_CONSERVANDO_RETENCIONES') THEN
             UPDATE aml.congelamientos
@@ -3584,13 +3913,16 @@ BEGIN
         IF p_regla_codigo IS NULL OR p_nivel_cliente IS NULL THEN
             RAISE EXCEPTION 'SC_AML_CAMBIO_INVALIDO: una propuesta de regla exige su código y nivel';
         END IF;
-        IF p_regla_codigo IN ('R09_LISTA_BLOQUEADAS', 'R30_CONGELAMIENTO_MANUAL') THEN
-            RAISE EXCEPTION 'SC_AML_CAMBIO_INVALIDO: la regla % no se modifica (obligación legal o acción manual)',
+        IF p_regla_codigo IN ('R00_LEGADO', 'R09_LISTA_BLOQUEADAS', 'R30_CONGELAMIENTO_MANUAL') THEN
+            RAISE EXCEPTION 'SC_AML_CAMBIO_INVALIDO: la regla % no se modifica (obligación legal, acción manual o legado)',
                 p_regla_codigo;
         END IF;
-        SELECT * INTO r FROM aml.reglas_riesgo WHERE codigo = p_regla_codigo AND nivel_cliente = p_nivel_cliente AND activa;
+        -- La versión activa o, si la regla se desactivó, la última versión: una
+        -- propuesta puede reactivarla (el interruptor no es de un solo sentido).
+        SELECT * INTO r FROM aml.reglas_riesgo WHERE codigo = p_regla_codigo AND nivel_cliente = p_nivel_cliente
+         ORDER BY activa DESC, version DESC LIMIT 1;
         IF r.id IS NULL THEN
-            RAISE EXCEPTION 'SC_AML_NO_ENCONTRADO: no hay una regla activa % para el nivel %', p_regla_codigo, p_nivel_cliente;
+            RAISE EXCEPTION 'SC_AML_NO_ENCONTRADO: no hay una regla % para el nivel %', p_regla_codigo, p_nivel_cliente;
         END IF;
         PERFORM aml.validar_regla(jsonb_populate_record(r, v_cambios));
     ELSE
@@ -3655,11 +3987,12 @@ BEGIN
 
     IF p.tipo = 'REGLA' THEN
         SELECT * INTO r FROM aml.reglas_riesgo
-         WHERE codigo = p.regla_codigo AND nivel_cliente = p.nivel_cliente AND activa FOR UPDATE;
+         WHERE codigo = p.regla_codigo AND nivel_cliente = p.nivel_cliente
+         ORDER BY activa DESC, version DESC LIMIT 1 FOR UPDATE;
         IF r.id IS NULL THEN
-            RAISE EXCEPTION 'SC_AML_NO_ENCONTRADO: no hay una regla activa % para el nivel %', p.regla_codigo, p.nivel_cliente;
+            RAISE EXCEPTION 'SC_AML_NO_ENCONTRADO: no hay una regla % para el nivel %', p.regla_codigo, p.nivel_cliente;
         END IF;
-        IF r.codigo IN ('R09_LISTA_BLOQUEADAS', 'R30_CONGELAMIENTO_MANUAL') THEN
+        IF r.codigo IN ('R00_LEGADO', 'R09_LISTA_BLOQUEADAS', 'R30_CONGELAMIENTO_MANUAL') THEN
             RAISE EXCEPTION 'SC_AML_CAMBIO_INVALIDO: la regla % no se modifica', r.codigo;
         END IF;
         n := jsonb_populate_record(r, aml.validar_cambios('REGLA', p.cambios));
@@ -3673,7 +4006,9 @@ BEGIN
            SET estado = 'APROBADA', decidida_por = p_actor, decidida_en = clock_timestamp(), comentario = v_comentario,
                resultado_id = n.id::text
          WHERE id = p.id;
-        UPDATE aml.reglas_riesgo SET activa = FALSE, desactivada_en = clock_timestamp() WHERE id = r.id;
+        IF r.activa THEN
+            UPDATE aml.reglas_riesgo SET activa = FALSE, desactivada_en = clock_timestamp() WHERE id = r.id;
+        END IF;
         INSERT INTO aml.reglas_riesgo SELECT (n).*;
         RETURN aml.guardar_accion(p_clave, 'DECIDIR_PROPUESTA', p_actor, p_propuesta, v_huella, jsonb_build_object(
             'propuesta', aml.propuesta_json(p.id), 'regla', aml.regla_json(n.id), 'parametros', NULL));
@@ -3842,99 +4177,410 @@ $$;
 -- -----------------------------------------------------------------------------
 -- 11. Monitoreo por lotes (EXECUTE: sc_aml; verificar_bitacora también sc_auditor)
 -- -----------------------------------------------------------------------------
--- Turno de una sola instancia (arrendamiento) y marcas de agua del ledger.
+-- Turno de una sola instancia (arrendamiento con ficha) y marcas de agua del
+-- ledger. Solo quien tiene la ficha vigente renueva, fija el rango del ciclo,
+-- avanza la marca o libera el turno: un ciclo que se pasó de su arrendamiento
+-- no toca el turno de la instancia que lo retomó. El arrendamiento dura a lo
+-- sumo 600 s (TURNO_SEG del ciclo) y se renueva entre pasos.
 CREATE FUNCTION aml.monitoreo_tomar_turno(p_segundos INTEGER)
-RETURNS TABLE (ultima_secuencia_ifpe BIGINT, ultima_secuencia_sofom BIGINT)
-LANGUAGE sql SECURITY DEFINER SET search_path = pg_catalog, pg_temp
+RETURNS TABLE (turno UUID, ultima_secuencia_ifpe BIGINT, ultima_secuencia_sofom BIGINT)
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp
 AS $$
+BEGIN
+    IF p_segundos IS NULL OR p_segundos NOT BETWEEN 1 AND 600 THEN
+        RAISE EXCEPTION 'SC_AML_PARAMETRO_INVALIDO: el turno dura entre 1 y 600 segundos';
+    END IF;
+    RETURN QUERY
+    WITH u AS (
+        UPDATE aml.monitoreo_estado m
+           SET en_curso_hasta = clock_timestamp() + p_segundos * interval '1 second', turno = gen_random_uuid(),
+               rango_hasta_ifpe = NULL, rango_hasta_sofom = NULL
+         WHERE m.id AND m.en_curso_hasta < clock_timestamp()
+        RETURNING m.turno AS t, m.ultima_secuencia_ifpe AS i, m.ultima_secuencia_sofom AS s)
+    SELECT u.t, u.i, u.s FROM u;
+END
+$$;
+
+CREATE FUNCTION aml.monitoreo_renovar_turno(p_turno UUID, p_segundos INTEGER) RETURNS BOOLEAN
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp
+AS $$
+BEGIN
+    IF p_segundos IS NULL OR p_segundos NOT BETWEEN 1 AND 600 THEN
+        RAISE EXCEPTION 'SC_AML_PARAMETRO_INVALIDO: el turno dura entre 1 y 600 segundos';
+    END IF;
+    UPDATE aml.monitoreo_estado SET en_curso_hasta = clock_timestamp() + p_segundos * interval '1 second'
+     WHERE id AND turno = p_turno AND en_curso_hasta > clock_timestamp();
+    RETURN FOUND;
+END
+$$;
+
+CREATE FUNCTION aml.monitoreo_liberar_turno(p_turno UUID, p_resultado JSONB) RETURNS BOOLEAN
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp
+AS $$
+BEGIN
     UPDATE aml.monitoreo_estado
-       SET en_curso_hasta = clock_timestamp() + p_segundos * interval '1 second'
-     WHERE id AND en_curso_hasta < clock_timestamp()
-    RETURNING ultima_secuencia_ifpe, ultima_secuencia_sofom
+       SET en_curso_hasta = '-infinity', turno = NULL, rango_hasta_ifpe = NULL, rango_hasta_sofom = NULL,
+           ultimo_ciclo_en = clock_timestamp(), ultimo_resultado = p_resultado
+     WHERE id AND turno = p_turno;
+    RETURN FOUND;
+END
 $$;
 
-CREATE FUNCTION aml.monitoreo_liberar_turno(p_resultado JSONB) RETURNS void
-LANGUAGE sql SECURITY DEFINER SET search_path = pg_catalog, pg_temp
+-- El renglón de estado con el turno vigente de p_turno (o un error).
+CREATE FUNCTION aml.monitoreo_exigir_turno(p_turno UUID) RETURNS aml.monitoreo_estado
+LANGUAGE plpgsql STABLE SECURITY DEFINER SET search_path = pg_catalog, pg_temp
 AS $$
-    UPDATE aml.monitoreo_estado
-       SET en_curso_hasta = '-infinity', ultimo_ciclo_en = clock_timestamp(), ultimo_resultado = p_resultado
-     WHERE id
+DECLARE
+    est aml.monitoreo_estado;
+BEGIN
+    SELECT * INTO est FROM aml.monitoreo_estado WHERE id AND turno = p_turno AND en_curso_hasta > clock_timestamp();
+    IF est.id IS NULL THEN
+        RAISE EXCEPTION 'SC_AML_TURNO_PERDIDO: el turno del monitoreo venció o lo tomó otra instancia';
+    END IF;
+    RETURN est;
+END
 $$;
 
--- Hasta dónde revisar en este ciclo. Correcto porque las secuencias
--- confirmadas no tienen huecos y llegan en orden de COMMIT: el candado de la
--- cabeza del ledger se mantiene hasta el COMMIT.
-CREATE FUNCTION aml.monitoreo_rango(p_lote INTEGER) RETURNS TABLE (hasta_ifpe BIGINT, hasta_sofom BIGINT)
-LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, pg_temp
-AS $$
-    SELECT LEAST(coalesce((SELECT max(secuencia) FROM ifpe.transacciones), m.ultima_secuencia_ifpe),
-                 m.ultima_secuencia_ifpe + p_lote),
-           LEAST(coalesce((SELECT max(secuencia) FROM sofom.transacciones), m.ultima_secuencia_sofom),
-                 m.ultima_secuencia_sofom + p_lote)
-      FROM aml.monitoreo_estado m WHERE m.id
-$$;
-
-CREATE FUNCTION aml.monitoreo_candidatos(p_desde_ifpe BIGINT, p_hasta_ifpe BIGINT, p_desde_sofom BIGINT,
-                                         p_hasta_sofom BIGINT) RETURNS SETOF UUID
-LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, pg_temp
-AS $$
-    SELECT DISTINCT c.cliente_id
-      FROM ifpe.transacciones t
-      JOIN ifpe.cuentas c ON c.id IN (t.cuenta_origen_id, t.cuenta_destino_id)
-     WHERE t.secuencia > p_desde_ifpe AND t.secuencia <= p_hasta_ifpe
-       AND t.tipo IN ('DEPOSITO', 'TRANSFERENCIA', 'RETIRO', 'TRASPASO_A_SOFOM')
-    UNION
-    SELECT cr.acreditado_id
-      FROM sofom.transacciones t
-      JOIN sofom.creditos cr ON cr.id = t.credito_id
-     WHERE t.secuencia > p_desde_sofom AND t.secuencia <= p_hasta_sofom
-       AND t.tipo IN ('DESEMBOLSO_CREDITO', 'COBRO_CREDITO')
-    ORDER BY 1
-$$;
-
-CREATE FUNCTION aml.monitoreo_avanzar_marca(p_ifpe BIGINT, p_sofom BIGINT) RETURNS void
-LANGUAGE sql SECURITY DEFINER SET search_path = pg_catalog, pg_temp
-AS $$
-    UPDATE aml.monitoreo_estado
-       SET ultima_secuencia_ifpe = GREATEST(ultima_secuencia_ifpe, p_ifpe),
-           ultima_secuencia_sofom = GREATEST(ultima_secuencia_sofom, p_sofom)
-     WHERE id
-$$;
-
--- Reglas por lotes de un cliente (R20-R25) sobre 30 días de su ledger, con la
--- marca de supresión de cada regla. Una alerta por cliente, regla y semana ISO
--- (Ciudad de México): volver a correr no crea nada. -1: el cliente está ocupado
--- (fila o candado consultivo tomados); el ciclo lo reintenta.
-CREATE FUNCTION aml.barrer_cliente(p_cliente UUID, p_ahora TIMESTAMPTZ) RETURNS INTEGER
+-- Hasta dónde revisar en este ciclo (queda registrado con el turno: la marca
+-- solo avanza hasta aquí, nunca más allá de las cabezas del ledger ni hacia
+-- atrás). Correcto porque las secuencias confirmadas no tienen huecos y
+-- llegan en orden de COMMIT: el candado de la cabeza del ledger se mantiene
+-- hasta el COMMIT. Si el rango empieza hace más de 24 h (ciclo rezagado), un
+-- aviso COBERTURA (a lo más uno por hora): las reglas por cliente se anclan a
+-- los movimientos, pero las redes R26/R27 miden ventanas desde ahora.
+CREATE FUNCTION aml.monitoreo_rango(p_turno UUID, p_lote INTEGER) RETURNS TABLE (hasta_ifpe BIGINT, hasta_sofom BIGINT)
 LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp
 AS $$
 DECLARE
-    par       aml.parametros := aml.parametros_vigentes();
-    v_semana  TEXT := to_char(p_ahora AT TIME ZONE 'America/Mexico_City', 'IYYY-IW');
-    v_perfil  JSONB;
-    v_tier    TEXT;
-    v_ingreso NUMERIC;
-    v_mod     RECORD;
-    v_m       aml.movimiento[];
-    r         aml.reglas_riesgo;
-    v_wm      TIMESTAMPTZ;
-    v_desde   TIMESTAMPTZ;
-    v_n       BIGINT;
-    v_dias    BIGINT;
-    v_suma    NUMERIC;
-    v_e       NUMERIC;
-    v_o       NUMERIC;
-    v_ids     JSONB;
-    v_disparo BOOLEAN;
-    v_evid    JSONB;
-    v_disparos JSONB := '[]';
-    d         JSONB;
-    v_clave   TEXT;
-    v_puntaje NUMERIC;
-    v_alerta  UUID;
-    v_creadas INTEGER := 0;
+    est       aml.monitoreo_estado := aml.monitoreo_exigir_turno(p_turno);
+    v_lote    INTEGER := LEAST(GREATEST(coalesce(p_lote, 1), 1), 100000);
+    v_i       BIGINT;
+    v_s       BIGINT;
+    v_antiguo TIMESTAMPTZ;
+BEGIN
+    v_i := GREATEST(est.ultima_secuencia_ifpe,
+                    LEAST(coalesce((SELECT max(secuencia) FROM ifpe.transacciones), est.ultima_secuencia_ifpe),
+                          est.ultima_secuencia_ifpe + v_lote));
+    v_s := GREATEST(est.ultima_secuencia_sofom,
+                    LEAST(coalesce((SELECT max(secuencia) FROM sofom.transacciones), est.ultima_secuencia_sofom),
+                          est.ultima_secuencia_sofom + v_lote));
+    UPDATE aml.monitoreo_estado SET rango_hasta_ifpe = v_i, rango_hasta_sofom = v_s WHERE id AND turno = p_turno;
+    v_antiguo := LEAST((SELECT creado_en FROM ifpe.transacciones
+                         WHERE secuencia = est.ultima_secuencia_ifpe + 1 AND secuencia <= v_i),
+                       (SELECT creado_en FROM sofom.transacciones
+                         WHERE secuencia = est.ultima_secuencia_sofom + 1 AND secuencia <= v_s));
+    IF v_antiguo < clock_timestamp() - interval '24 hours'
+       AND (est.rezago_notificado_en IS NULL OR est.rezago_notificado_en < clock_timestamp() - interval '1 hour') THEN
+        PERFORM aml.notificar('COBERTURA', 'ALTA', NULL, NULL, NULL, NULL, NULL,
+                              'monitoreo por lotes rezagado: el rango revisado empieza hace más de 24 h');
+        UPDATE aml.monitoreo_estado SET rezago_notificado_en = clock_timestamp() WHERE id;
+    END IF;
+    RETURN QUERY SELECT v_i, v_s;
+END
+$$;
+
+-- Clientes con movimientos de dinero en el rango del ciclo, cada uno con sus
+-- anclas: el instante del último movimiento de cada hora del rango (a lo
+-- sumo 48, las más recientes). Las reglas por lotes se evalúan en esos
+-- instantes, no en el reloj del ciclo: un ciclo rezagado ve lo mismo que uno
+-- puntual.
+CREATE FUNCTION aml.monitoreo_candidatos(p_turno UUID) RETURNS TABLE (cliente_id UUID, anclas TIMESTAMPTZ[])
+LANGUAGE plpgsql STABLE SECURITY DEFINER SET search_path = pg_catalog, pg_temp
+AS $$
+DECLARE
+    est aml.monitoreo_estado := aml.monitoreo_exigir_turno(p_turno);
+BEGIN
+    IF est.rango_hasta_ifpe IS NULL THEN
+        RAISE EXCEPTION 'SC_AML_TURNO_PERDIDO: el ciclo no fijó su rango (aml.monitoreo_rango)';
+    END IF;
+    RETURN QUERY
+    WITH mov AS (
+        SELECT c.cliente_id AS cliente, t.creado_en
+          FROM ifpe.transacciones t
+          JOIN ifpe.cuentas c ON c.id IN (t.cuenta_origen_id, t.cuenta_destino_id)
+         WHERE t.secuencia > est.ultima_secuencia_ifpe AND t.secuencia <= est.rango_hasta_ifpe
+           AND t.tipo IN ('DEPOSITO', 'TRANSFERENCIA', 'RETIRO', 'TRASPASO_A_SOFOM')
+        UNION ALL
+        SELECT cr.acreditado_id, t.creado_en
+          FROM sofom.transacciones t
+          JOIN sofom.creditos cr ON cr.id = t.credito_id
+         WHERE t.secuencia > est.ultima_secuencia_sofom AND t.secuencia <= est.rango_hasta_sofom
+           AND t.tipo IN ('DESEMBOLSO_CREDITO', 'COBRO_CREDITO')),
+    horas AS (SELECT m.cliente, max(m.creado_en) AS ancla FROM mov m GROUP BY m.cliente, date_trunc('hour', m.creado_en))
+    SELECT h.cliente, (array_agg(h.ancla ORDER BY h.ancla DESC))[1:48]
+      FROM horas h GROUP BY h.cliente ORDER BY 1;
+END
+$$;
+
+-- La marca avanza hasta el rango que registró este turno, nunca hacia atrás.
+CREATE FUNCTION aml.monitoreo_avanzar_marca(p_turno UUID) RETURNS BOOLEAN
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp
+AS $$
+BEGIN
+    UPDATE aml.monitoreo_estado
+       SET ultima_secuencia_ifpe = GREATEST(ultima_secuencia_ifpe, rango_hasta_ifpe),
+           ultima_secuencia_sofom = GREATEST(ultima_secuencia_sofom, rango_hasta_sofom),
+           rango_hasta_ifpe = NULL, rango_hasta_sofom = NULL
+     WHERE id AND turno = p_turno AND en_curso_hasta > clock_timestamp() AND rango_hasta_ifpe IS NOT NULL;
+    RETURN FOUND;
+END
+$$;
+
+-- Un cliente cuyo barrido falló en este ciclo. Al tercer ciclo fallido queda
+-- en cuarentena (aviso COBERTURA y bitácora): la marca de agua ya no lo
+-- espera y el ciclo lo reintenta aparte. TRUE: el cliente está en cuarentena.
+CREATE FUNCTION aml.monitoreo_registrar_fallo(p_turno UUID, p_cliente UUID, p_error TEXT) RETURNS BOOLEAN
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp
+AS $$
+DECLARE
+    f aml.monitoreo_fallos;
+BEGIN
+    PERFORM aml.monitoreo_exigir_turno(p_turno);
+    PERFORM aml.fijar_actor(NULL);
+    INSERT INTO aml.monitoreo_fallos AS x (cliente_id, ultimo_error)
+    VALUES (p_cliente, left(coalesce(p_error, 'error desconocido'), 500))
+    ON CONFLICT (cliente_id) DO UPDATE
+       SET fallos = x.fallos + 1, ultimo_fallo_en = clock_timestamp(), ultimo_error = EXCLUDED.ultimo_error
+    RETURNING * INTO f;
+    IF f.fallos >= 3 AND f.cuarentena_desde IS NULL THEN
+        UPDATE aml.monitoreo_fallos SET cuarentena_desde = clock_timestamp() WHERE cliente_id = p_cliente
+        RETURNING * INTO f;
+        PERFORM aml.registrar_bitacora('EVALUACION_FALLIDA', 'CLIENTE', p_cliente::text, p_cliente, NULL, NULL, NULL, NULL,
+            NULL, 'CUARENTENA', f.ultimo_error, jsonb_build_object('fallos', f.fallos, 'monitoreo', 'lotes'));
+        PERFORM aml.notificar('COBERTURA', 'ALTA', p_cliente, NULL, NULL, NULL, NULL,
+                              format('monitoreo por lotes: cliente en cuarentena tras %s ciclos fallidos', f.fallos));
+    END IF;
+    RETURN f.cuarentena_desde IS NOT NULL;
+END
+$$;
+
+-- Clientes en cuarentena (el ciclo los reintenta con el reloj del servidor).
+CREATE FUNCTION aml.monitoreo_cuarentena() RETURNS SETOF UUID
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, pg_temp
+AS $$ SELECT cliente_id FROM aml.monitoreo_fallos WHERE cuarentena_desde IS NOT NULL ORDER BY ultimo_fallo_en, cliente_id $$;
+
+-- Reglas por lotes de un cliente (R20-R25) sobre 30 días de su ledger, con la
+-- marca de supresión de cada regla (por sentido), evaluadas en cada ancla
+-- (los instantes de sus movimientos del rango, aml.monitoreo_candidatos); sin
+-- anclas, en aml.reloj(p_ahora). La lectura no toma candados: el candado del
+-- cliente (fila IFPE y consultivo, sin esperar) solo cubre el alta de alertas
+-- y el congelamiento, así que un barrido largo nunca detiene sus caminos del
+-- dinero. -1: el cliente está ocupado; el ciclo lo reintenta.
+-- Deduplicación por cliente, regla y semana ISO (Ciudad de México): con una
+-- alerta ABIERTA de esa llave no se crea otra (la evidencia nueva sí retira
+-- una propuesta de falso positivo pendiente); con una CERRADA, un patrón con
+-- evidencia posterior al cierre abre una alerta nueva (llave con el folio de
+-- la cerrada) y puede congelar. Volver a correr sin movimientos nuevos no crea nada.
+CREATE FUNCTION aml.barrer_cliente(p_cliente UUID, p_ahora TIMESTAMPTZ, p_anclas TIMESTAMPTZ[] DEFAULT NULL)
+RETURNS INTEGER
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp
+AS $$
+DECLARE
+    par        aml.parametros := aml.parametros_vigentes();
+    v_reloj    TIMESTAMPTZ := clock_timestamp();
+    v_anclas   TIMESTAMPTZ[];
+    a          TIMESTAMPTZ;
+    v_semana   TEXT;
+    v_perfil   JSONB;
+    v_tier     TEXT;
+    v_ingreso  NUMERIC;
+    v_mod      RECORD;
+    v_m        aml.movimiento[];
+    v_w        aml.movimiento[];
+    r          aml.reglas_riesgo;
+    v_wm       TIMESTAMPTZ;
+    v_desde    TIMESTAMPTZ;
+    v_n        BIGINT;
+    v_dias     BIGINT;
+    v_suma     NUMERIC;
+    v_e        NUMERIC;
+    v_o        NUMERIC;
+    v_ids      JSONB;
+    v_ultimo   TIMESTAMPTZ;
+    v_disparo  BOOLEAN;
+    v_evid     JSONB;
+    v_disparos JSONB := '{}';
+    d          JSONB;
+    v_base     TEXT;
+    v_clave    TEXT;
+    v_prev     aml.alertas;
+    v_puntaje  NUMERIC;
+    v_detalles JSONB;
+    v_alerta   UUID;
+    v_creadas  INTEGER := 0;
 BEGIN
     PERFORM aml.fijar_actor(NULL);
+    -- 1. Anclas (nunca en el futuro del servidor).
+    v_anclas := ARRAY(SELECT DISTINCT LEAST(x, v_reloj) FROM unnest(p_anclas) x WHERE x IS NOT NULL ORDER BY 1 DESC LIMIT 48);
+    IF cardinality(v_anclas) = 0 THEN
+        v_anclas := ARRAY[aml.reloj(p_ahora)];
+    END IF;
+    v_perfil := aml.perfil_cliente(p_cliente, v_anclas[1]);
+    IF v_perfil IS NULL THEN
+        RETURN 0;
+    END IF;
+    v_tier := v_perfil ->> 'nivel_riesgo_pld';
+    v_ingreso := (v_perfil ->> 'ingreso_mensual_estimado')::numeric;
+    SELECT * INTO v_mod FROM aml.modificadores(v_perfil);
+    v_m := ARRAY(SELECT ROW(m.entidad, m.transaccion_id, m.sentido, m.canal, m.monto, m.contraparte,
+                            m.creado_en)::aml.movimiento
+                   FROM aml.movimientos_cliente(p_cliente,
+                                                greatest(v_anclas[cardinality(v_anclas)] - interval '720 hours',
+                                                         par.alertar_desde),
+                                                v_anclas[1], NULL) m
+                  ORDER BY m.creado_en, m.transaccion_id);
+
+    -- 2. Lectura: las reglas en cada ancla (la más reciente primero; por regla
+    --    y semana se conserva el disparo del ancla más reciente).
+    FOREACH a IN ARRAY v_anclas LOOP
+        v_semana := to_char(a AT TIME ZONE 'America/Mexico_City', 'IYYY-IW');
+        v_w := ARRAY(SELECT ROW(m.entidad, m.transaccion_id, m.sentido, m.canal, m.monto, m.contraparte,
+                                m.creado_en)::aml.movimiento
+                       FROM unnest(v_m) m WHERE m.creado_en <= a AND m.creado_en > a - interval '720 hours');
+
+        -- R20: (A) abonos en banda en la ventana, en al menos 3 días distintos;
+        -- o (B) abonos bajo el umbral en 30 días que suman el doble del umbral.
+        r := aml.regla('R20_ESTRUCTURACION_LENTA', v_tier);
+        IF r.id IS NOT NULL AND NOT v_disparos ? (r.codigo || '|' || v_semana) THEN
+            v_wm := aml.marca_falso_positivo(p_cliente, r.codigo, 'ENTRADA');
+            v_desde := greatest(a - r.ventana_horas * interval '1 hour', v_wm);
+            SELECT count(*), count(DISTINCT (m.creado_en AT TIME ZONE 'America/Mexico_City')::date),
+                   coalesce(sum(m.monto), 0), coalesce(jsonb_agg(m.transaccion_id ORDER BY m.creado_en), '[]'),
+                   max(m.creado_en)
+              INTO v_n, v_dias, v_suma, v_ids, v_ultimo
+              FROM unnest(v_w) m
+             WHERE m.sentido = 'ENTRADA' AND aml.canal_en_banda('ENTRADA', m.canal)
+               AND m.monto >= r.banda_inferior * r.umbral_monto AND m.monto < r.umbral_monto AND m.creado_en > v_desde;
+            v_disparo := v_n >= r.frecuencia_min AND v_dias >= 3;
+            v_evid := jsonb_build_object('variante', 'A', 'n', v_n, 'dias', v_dias, 'monto', v_suma::text, 'desde', v_desde);
+            IF NOT v_disparo THEN
+                v_desde := greatest(a - interval '720 hours', v_wm);
+                SELECT count(*), coalesce(sum(m.monto), 0), coalesce(jsonb_agg(m.transaccion_id ORDER BY m.creado_en), '[]'),
+                       max(m.creado_en)
+                  INTO v_n, v_suma, v_ids, v_ultimo
+                  FROM unnest(v_w) m
+                 WHERE m.sentido = 'ENTRADA' AND aml.canal_en_banda('ENTRADA', m.canal) AND m.monto < r.umbral_monto
+                   AND m.creado_en > v_desde;
+                v_disparo := v_n >= r.operaciones_max AND v_suma >= 2 * r.umbral_monto;
+                v_evid := jsonb_build_object('variante', 'B', 'n', v_n, 'monto', v_suma::text, 'desde', v_desde);
+            END IF;
+            IF v_disparo THEN
+                v_disparos := v_disparos || jsonb_build_object(r.codigo || '|' || v_semana, jsonb_build_object(
+                    'regla', r.id, 'semana', v_semana, 'monto', v_suma::text, 'ultimo', v_ultimo,
+                    'evidencia', v_evid || jsonb_build_object('transacciones', v_ids)));
+            END IF;
+        END IF;
+
+        -- R21: volumen de entradas de 30 días.
+        r := aml.regla('R21_VOLUMEN_MENSUAL', v_tier);
+        IF r.id IS NOT NULL AND NOT v_disparos ? (r.codigo || '|' || v_semana) THEN
+            v_desde := greatest(a - r.ventana_horas * interval '1 hour',
+                                aml.marca_falso_positivo(p_cliente, r.codigo, 'ENTRADA'));
+            SELECT coalesce(sum(m.monto), 0), coalesce(jsonb_agg(m.transaccion_id ORDER BY m.creado_en), '[]'),
+                   max(m.creado_en)
+              INTO v_suma, v_ids, v_ultimo
+              FROM unnest(v_w) m WHERE m.sentido = 'ENTRADA' AND m.creado_en > v_desde;
+            IF v_suma > r.volumen_max OR (v_ingreso > 0 AND v_suma > r.multiplo_ingreso * v_ingreso) THEN
+                v_disparos := v_disparos || jsonb_build_object(r.codigo || '|' || v_semana, jsonb_build_object(
+                    'regla', r.id, 'semana', v_semana, 'monto', v_suma::text, 'ultimo', v_ultimo,
+                    'evidencia', jsonb_build_object(
+                        'entradas', v_suma::text, 'volumen_max', r.volumen_max::text,
+                        'ingreso_mensual_estimado', v_ingreso::text, 'desde', v_desde, 'transacciones', v_ids)));
+            END IF;
+        END IF;
+
+        -- R22 / R23: concentración de entradas y dispersión de salidas.
+        r := aml.regla('R22_CONCENTRACION_ENTRADAS', v_tier);
+        IF r.id IS NOT NULL AND NOT v_disparos ? (r.codigo || '|' || v_semana) THEN
+            v_desde := greatest(a - r.ventana_horas * interval '1 hour',
+                                aml.marca_falso_positivo(p_cliente, r.codigo, 'ENTRADA'));
+            SELECT count(DISTINCT m.contraparte), coalesce(sum(m.monto), 0),
+                   coalesce(jsonb_agg(m.transaccion_id ORDER BY m.creado_en), '[]'), max(m.creado_en)
+              INTO v_n, v_suma, v_ids, v_ultimo
+              FROM unnest(v_w) m WHERE m.sentido = 'ENTRADA' AND m.contraparte IS NOT NULL AND m.creado_en > v_desde;
+            IF v_n >= r.contrapartes_min AND v_suma >= r.umbral_monto THEN
+                v_disparos := v_disparos || jsonb_build_object(r.codigo || '|' || v_semana, jsonb_build_object(
+                    'regla', r.id, 'semana', v_semana, 'monto', v_suma::text, 'ultimo', v_ultimo,
+                    'evidencia', jsonb_build_object(
+                        'contrapartes', v_n, 'monto', v_suma::text, 'desde', v_desde, 'transacciones', v_ids)));
+            END IF;
+        END IF;
+        r := aml.regla('R23_DISPERSION_SALIDAS', v_tier);
+        IF r.id IS NOT NULL AND NOT v_disparos ? (r.codigo || '|' || v_semana) THEN
+            v_desde := greatest(a - r.ventana_horas * interval '1 hour',
+                                aml.marca_falso_positivo(p_cliente, r.codigo, 'SALIDA'));
+            SELECT count(DISTINCT m.contraparte), coalesce(sum(m.monto), 0),
+                   coalesce(jsonb_agg(m.transaccion_id ORDER BY m.creado_en), '[]'), max(m.creado_en)
+              INTO v_n, v_suma, v_ids, v_ultimo
+              FROM unnest(v_w) m
+             WHERE m.sentido = 'SALIDA' AND aml.canal_de_salida(m.canal) AND m.contraparte IS NOT NULL
+               AND m.creado_en > v_desde;
+            IF v_n >= r.contrapartes_min AND v_suma >= r.umbral_monto THEN
+                v_disparos := v_disparos || jsonb_build_object(r.codigo || '|' || v_semana, jsonb_build_object(
+                    'regla', r.id, 'semana', v_semana, 'monto', v_suma::text, 'ultimo', v_ultimo,
+                    'evidencia', jsonb_build_object(
+                        'contrapartes', v_n, 'monto', v_suma::text, 'desde', v_desde, 'transacciones', v_ids)));
+            END IF;
+        END IF;
+
+        -- R24: paso rápido de fondos en 48 h (solo entradas que abonan la bóveda).
+        r := aml.regla('R24_PASO_RAPIDO_48H', v_tier);
+        IF r.id IS NOT NULL AND NOT v_disparos ? (r.codigo || '|' || v_semana) THEN
+            v_desde := greatest(a - r.ventana_horas * interval '1 hour',
+                                aml.marca_falso_positivo(p_cliente, r.codigo, 'SALIDA'));
+            SELECT coalesce(sum(m.monto) FILTER (WHERE m.sentido = 'ENTRADA' AND aml.canal_abona_boveda(m.canal)), 0),
+                   coalesce(sum(m.monto) FILTER (WHERE m.sentido = 'SALIDA' AND aml.canal_de_salida(m.canal)), 0),
+                   coalesce(jsonb_agg(m.transaccion_id ORDER BY m.creado_en)
+                                FILTER (WHERE (m.sentido = 'ENTRADA' AND aml.canal_abona_boveda(m.canal))
+                                           OR (m.sentido = 'SALIDA' AND aml.canal_de_salida(m.canal))), '[]'),
+                   max(m.creado_en) FILTER (WHERE (m.sentido = 'ENTRADA' AND aml.canal_abona_boveda(m.canal))
+                                               OR (m.sentido = 'SALIDA' AND aml.canal_de_salida(m.canal)))
+              INTO v_e, v_o, v_ids, v_ultimo
+              FROM unnest(v_w) m WHERE m.creado_en > v_desde;
+            IF v_e >= r.umbral_monto AND v_o >= r.porcentaje_min * v_e THEN
+                v_disparos := v_disparos || jsonb_build_object(r.codigo || '|' || v_semana, jsonb_build_object(
+                    'regla', r.id, 'semana', v_semana, 'monto', v_o::text, 'ultimo', v_ultimo,
+                    'evidencia', jsonb_build_object(
+                        'entradas', v_e::text, 'salidas', v_o::text, 'porcentaje_min', r.porcentaje_min::text,
+                        'desde', v_desde, 'transacciones', v_ids)));
+            END IF;
+        END IF;
+
+        -- R25: flujo circular con otro cliente (envía y recibe, cada tramo >=
+        -- umbral). Cada tramo cuenta una vez (sin el producto cruzado de las
+        -- dos listas): la suma es la evidencia real y el costo es lineal.
+        r := aml.regla('R25_CIRCULAR', v_tier);
+        IF r.id IS NOT NULL AND NOT v_disparos ? (r.codigo || '|' || v_semana) THEN
+            v_desde := greatest(a - r.ventana_horas * interval '1 hour',
+                                aml.marca_falso_positivo(p_cliente, r.codigo, 'NINGUNO'));
+            WITH s AS (SELECT * FROM unnest(v_w) m
+                        WHERE m.sentido = 'SALIDA' AND m.canal = 'TRANSFERENCIA_ENVIADA' AND m.monto >= r.umbral_monto
+                          AND m.creado_en > v_desde),
+                 e AS (SELECT * FROM unnest(v_w) m
+                        WHERE m.sentido = 'ENTRADA' AND m.canal = 'TRANSFERENCIA_RECIBIDA' AND m.monto >= r.umbral_monto
+                          AND m.creado_en > v_desde),
+                 c AS (SELECT s.contraparte FROM s INTERSECT SELECT e.contraparte FROM e),
+                 x AS (SELECT s.* FROM s WHERE s.contraparte IN (SELECT c.contraparte FROM c)
+                       UNION ALL
+                       SELECT e.* FROM e WHERE e.contraparte IN (SELECT c.contraparte FROM c))
+            SELECT (SELECT count(*) FROM c), coalesce(sum(x.monto), 0),
+                   coalesce(jsonb_agg(x.transaccion_id ORDER BY x.creado_en), '[]'), max(x.creado_en)
+              INTO v_n, v_suma, v_ids, v_ultimo
+              FROM x;
+            IF v_n >= 1 THEN
+                v_disparos := v_disparos || jsonb_build_object(r.codigo || '|' || v_semana, jsonb_build_object(
+                    'regla', r.id, 'semana', v_semana, 'monto', v_suma::text, 'ultimo', v_ultimo,
+                    'evidencia', jsonb_build_object('contrapartes', v_n, 'desde', v_desde, 'transacciones', v_ids)));
+            END IF;
+        END IF;
+    END LOOP;
+
+    IF v_disparos = '{}' THEN
+        DELETE FROM aml.monitoreo_fallos WHERE cliente_id = p_cliente;
+        RETURN 0;
+    END IF;
+
+    -- 3. Escritura: el candado del cliente (sin esperar) solo para alertar y congelar.
     IF EXISTS (SELECT 1 FROM ifpe.cuentas WHERE cliente_id = p_cliente AND moneda = 'MXN') THEN
         PERFORM 1 FROM ifpe.cuentas WHERE cliente_id = p_cliente AND moneda = 'MXN' FOR NO KEY UPDATE SKIP LOCKED;
         IF NOT FOUND THEN
@@ -3944,141 +4590,45 @@ BEGIN
     IF NOT pg_try_advisory_xact_lock(hashtextextended('aml:cliente:' || p_cliente::text, 0)) THEN
         RETURN -1;
     END IF;
-    v_perfil := aml.perfil_cliente(p_cliente, p_ahora);
-    IF v_perfil IS NULL THEN
-        RETURN 0;
-    END IF;
-    v_tier := v_perfil ->> 'nivel_riesgo_pld';
-    v_ingreso := (v_perfil ->> 'ingreso_mensual_estimado')::numeric;
-    SELECT * INTO v_mod FROM aml.modificadores(v_perfil);
-    v_m := ARRAY(SELECT ROW(m.entidad, m.transaccion_id, m.sentido, m.canal, m.monto, m.contraparte,
-                            m.creado_en)::aml.movimiento
-                   FROM aml.movimientos_cliente(p_cliente, greatest(p_ahora - interval '720 hours', par.alertar_desde),
-                                                p_ahora, NULL) m
-                  ORDER BY m.creado_en, m.transaccion_id);
 
-    -- R20: (A) abonos en banda en la ventana, en al menos 3 días distintos;
-    -- o (B) abonos bajo el umbral en 30 días que suman el doble del umbral.
-    r := aml.regla('R20_ESTRUCTURACION_LENTA', v_tier);
-    IF r.id IS NOT NULL THEN
-        v_wm := aml.marca_falso_positivo(p_cliente, r.codigo);
-        v_desde := greatest(p_ahora - r.ventana_horas * interval '1 hour', v_wm);
-        SELECT count(*), count(DISTINCT (m.creado_en AT TIME ZONE 'America/Mexico_City')::date), coalesce(sum(m.monto), 0),
-               coalesce(jsonb_agg(m.transaccion_id ORDER BY m.creado_en), '[]')
-          INTO v_n, v_dias, v_suma, v_ids
-          FROM unnest(v_m) m
-         WHERE m.sentido = 'ENTRADA' AND aml.canal_en_banda('ENTRADA', m.canal)
-           AND m.monto >= r.banda_inferior * r.umbral_monto AND m.monto < r.umbral_monto AND m.creado_en > v_desde;
-        v_disparo := v_n >= r.frecuencia_min AND v_dias >= 3;
-        v_evid := jsonb_build_object('variante', 'A', 'n', v_n, 'dias', v_dias, 'monto', v_suma::text, 'desde', v_desde);
-        IF NOT v_disparo THEN
-            v_desde := greatest(p_ahora - interval '720 hours', v_wm);
-            SELECT count(*), coalesce(sum(m.monto), 0), coalesce(jsonb_agg(m.transaccion_id ORDER BY m.creado_en), '[]')
-              INTO v_n, v_suma, v_ids
-              FROM unnest(v_m) m
-             WHERE m.sentido = 'ENTRADA' AND aml.canal_en_banda('ENTRADA', m.canal) AND m.monto < r.umbral_monto
-               AND m.creado_en > v_desde;
-            v_disparo := v_n >= r.operaciones_max AND v_suma >= 2 * r.umbral_monto;
-            v_evid := jsonb_build_object('variante', 'B', 'n', v_n, 'monto', v_suma::text, 'desde', v_desde);
-        END IF;
-        IF v_disparo THEN
-            v_disparos := v_disparos || jsonb_build_array(jsonb_build_object(
-                'regla', r.id, 'monto', v_suma::text, 'evidencia', v_evid || jsonb_build_object('transacciones', v_ids)));
-        END IF;
-    END IF;
-
-    -- R21: volumen de entradas de 30 días.
-    r := aml.regla('R21_VOLUMEN_MENSUAL', v_tier);
-    IF r.id IS NOT NULL THEN
-        v_desde := greatest(p_ahora - r.ventana_horas * interval '1 hour', aml.marca_falso_positivo(p_cliente, r.codigo));
-        SELECT coalesce(sum(m.monto), 0), coalesce(jsonb_agg(m.transaccion_id ORDER BY m.creado_en), '[]')
-          INTO v_suma, v_ids
-          FROM unnest(v_m) m WHERE m.sentido = 'ENTRADA' AND m.creado_en > v_desde;
-        IF v_suma > r.volumen_max OR (v_ingreso > 0 AND v_suma > r.multiplo_ingreso * v_ingreso) THEN
-            v_disparos := v_disparos || jsonb_build_array(jsonb_build_object(
-                'regla', r.id, 'monto', v_suma::text, 'evidencia', jsonb_build_object(
-                    'entradas', v_suma::text, 'volumen_max', r.volumen_max::text, 'ingreso_mensual_estimado', v_ingreso::text,
-                    'desde', v_desde, 'transacciones', v_ids)));
-        END IF;
-    END IF;
-
-    -- R22 / R23: concentración de entradas y dispersión de salidas.
-    r := aml.regla('R22_CONCENTRACION_ENTRADAS', v_tier);
-    IF r.id IS NOT NULL THEN
-        v_desde := greatest(p_ahora - r.ventana_horas * interval '1 hour', aml.marca_falso_positivo(p_cliente, r.codigo));
-        SELECT count(DISTINCT m.contraparte), coalesce(sum(m.monto), 0),
-               coalesce(jsonb_agg(m.transaccion_id ORDER BY m.creado_en), '[]')
-          INTO v_n, v_suma, v_ids
-          FROM unnest(v_m) m WHERE m.sentido = 'ENTRADA' AND m.contraparte IS NOT NULL AND m.creado_en > v_desde;
-        IF v_n >= r.contrapartes_min AND v_suma >= r.umbral_monto THEN
-            v_disparos := v_disparos || jsonb_build_array(jsonb_build_object(
-                'regla', r.id, 'monto', v_suma::text, 'evidencia', jsonb_build_object(
-                    'contrapartes', v_n, 'monto', v_suma::text, 'desde', v_desde, 'transacciones', v_ids)));
-        END IF;
-    END IF;
-    r := aml.regla('R23_DISPERSION_SALIDAS', v_tier);
-    IF r.id IS NOT NULL THEN
-        v_desde := greatest(p_ahora - r.ventana_horas * interval '1 hour', aml.marca_falso_positivo(p_cliente, r.codigo));
-        SELECT count(DISTINCT m.contraparte), coalesce(sum(m.monto), 0),
-               coalesce(jsonb_agg(m.transaccion_id ORDER BY m.creado_en), '[]')
-          INTO v_n, v_suma, v_ids
-          FROM unnest(v_m) m
-         WHERE m.sentido = 'SALIDA' AND aml.canal_de_salida(m.canal) AND m.contraparte IS NOT NULL AND m.creado_en > v_desde;
-        IF v_n >= r.contrapartes_min AND v_suma >= r.umbral_monto THEN
-            v_disparos := v_disparos || jsonb_build_array(jsonb_build_object(
-                'regla', r.id, 'monto', v_suma::text, 'evidencia', jsonb_build_object(
-                    'contrapartes', v_n, 'monto', v_suma::text, 'desde', v_desde, 'transacciones', v_ids)));
-        END IF;
-    END IF;
-
-    -- R24: paso rápido de fondos en 48 h.
-    r := aml.regla('R24_PASO_RAPIDO_48H', v_tier);
-    IF r.id IS NOT NULL THEN
-        v_desde := greatest(p_ahora - r.ventana_horas * interval '1 hour', aml.marca_falso_positivo(p_cliente, r.codigo));
-        SELECT coalesce(sum(m.monto) FILTER (WHERE m.sentido = 'ENTRADA'), 0),
-               coalesce(sum(m.monto) FILTER (WHERE m.sentido = 'SALIDA' AND aml.canal_de_salida(m.canal)), 0),
-               coalesce(jsonb_agg(m.transaccion_id ORDER BY m.creado_en), '[]')
-          INTO v_e, v_o, v_ids
-          FROM unnest(v_m) m WHERE m.creado_en > v_desde;
-        IF v_e >= r.umbral_monto AND v_o >= r.porcentaje_min * v_e THEN
-            v_disparos := v_disparos || jsonb_build_array(jsonb_build_object(
-                'regla', r.id, 'monto', v_o::text, 'evidencia', jsonb_build_object(
-                    'entradas', v_e::text, 'salidas', v_o::text, 'porcentaje_min', r.porcentaje_min::text, 'desde', v_desde,
-                    'transacciones', v_ids)));
-        END IF;
-    END IF;
-
-    -- R25: flujo circular con otro cliente (envía y recibe, cada tramo >= umbral).
-    r := aml.regla('R25_CIRCULAR', v_tier);
-    IF r.id IS NOT NULL THEN
-        v_desde := greatest(p_ahora - r.ventana_horas * interval '1 hour', aml.marca_falso_positivo(p_cliente, r.codigo));
-        SELECT count(DISTINCT s.contraparte), coalesce(sum(s.monto), 0) + coalesce(sum(e.monto), 0),
-               coalesce(jsonb_agg(DISTINCT s.transaccion_id), '[]') || coalesce(jsonb_agg(DISTINCT e.transaccion_id), '[]')
-          INTO v_n, v_suma, v_ids
-          FROM unnest(v_m) s
-          JOIN unnest(v_m) e ON e.contraparte = s.contraparte
-         WHERE s.sentido = 'SALIDA' AND s.canal = 'TRANSFERENCIA_ENVIADA' AND s.monto >= r.umbral_monto
-           AND e.sentido = 'ENTRADA' AND e.canal = 'TRANSFERENCIA_RECIBIDA' AND e.monto >= r.umbral_monto
-           AND s.creado_en > v_desde AND e.creado_en > v_desde;
-        IF v_n >= 1 THEN
-            v_disparos := v_disparos || jsonb_build_array(jsonb_build_object(
-                'regla', r.id, 'monto', v_suma::text, 'evidencia', jsonb_build_object(
-                    'contrapartes', v_n, 'desde', v_desde, 'transacciones', v_ids)));
-        END IF;
-    END IF;
-
-    FOR d IN SELECT * FROM jsonb_array_elements(v_disparos) LOOP
+    FOR d IN SELECT value FROM jsonb_each(v_disparos) ORDER BY key LOOP
         SELECT * INTO r FROM aml.reglas_riesgo WHERE id = (d ->> 'regla')::uuid;
-        v_clave := r.codigo || ':' || p_cliente || ':' || v_semana;
-        CONTINUE WHEN EXISTS (SELECT 1 FROM aml.alertas WHERE clave_deduplicacion = v_clave);
+        v_base := r.codigo || ':' || p_cliente || ':' || (d ->> 'semana');
+        v_ultimo := (d ->> 'ultimo')::timestamptz;
+        v_detalles := jsonb_build_object(
+            'lote', jsonb_build_object('regla', r.codigo, 'version', r.version, 'semana', d ->> 'semana',
+                                       'evidencia', d -> 'evidencia', 'modificadores', v_mod.factores,
+                                       'puntos', r.puntos::text),
+            'transacciones', d -> 'evidencia' -> 'transacciones');
+        SELECT * INTO v_prev FROM aml.alertas
+         WHERE cliente_id = p_cliente AND regla_codigo = r.codigo AND origen = 'LOTE'
+           AND (clave_deduplicacion = v_base OR starts_with(clave_deduplicacion, v_base || ':'))
+         ORDER BY folio DESC LIMIT 1;
+        IF v_prev.estado IN ('PENDIENTE', 'EN_REVISION') THEN
+            -- Abierta: no se duplica; la evidencia posterior a una propuesta de
+            -- falso positivo la retira (el segundo oficial no aprueba a ciegas).
+            IF v_prev.resolucion_propuesta IS NOT NULL AND v_ultimo > v_prev.propuesta_en THEN
+                PERFORM aml.fijar_motivo('Evidencia nueva del monitoreo por lotes después de la propuesta de falso positivo');
+                UPDATE aml.alertas
+                   SET ocurrencias = ocurrencias + 1, ultima_ocurrencia_en = clock_timestamp(),
+                       detalles = aml.fusionar_detalles(detalles, v_detalles),
+                       resolucion_propuesta = NULL, propuesta_por = NULL, dictamen_propuesto = NULL,
+                       propuesta_en = NULL, solicitud_propuesta_id = NULL
+                 WHERE id = v_prev.id;
+                PERFORM aml.fijar_motivo(NULL);
+            END IF;
+            CONTINUE;
+        ELSIF v_prev.id IS NOT NULL THEN
+            -- Cerrada: solo un patrón con evidencia posterior al cierre.
+            CONTINUE WHEN v_ultimo IS NULL OR v_ultimo <= v_prev.resuelta_en;
+            v_clave := v_base || ':' || v_prev.folio;
+        ELSE
+            v_clave := v_base;
+        END IF;
         v_puntaje := LEAST(100, r.puntos + v_mod.puntos);
         v_alerta := aml.registrar_alerta(p_cliente, 'IFPE', CASE WHEN r.sentido IN ('ENTRADA', 'SALIDA') THEN r.sentido
                                                                  ELSE 'NINGUNO' END,
-            NULL, NULL, r.id, 'LOTE', 'REGISTRADA', v_puntaje, nullif((d ->> 'monto')::numeric, 0),
-            jsonb_build_object('lote', jsonb_build_object('regla', r.codigo, 'version', r.version, 'semana', v_semana,
-                                                          'evidencia', d -> 'evidencia', 'modificadores', v_mod.factores,
-                                                          'puntos', r.puntos::text),
-                               'transacciones', d -> 'evidencia' -> 'transacciones'),
+            NULL, NULL, r.id, 'LOTE', 'REGISTRADA', v_puntaje, nullif((d ->> 'monto')::numeric, 0), v_detalles,
             FALSE, v_clave, FALSE);
         v_creadas := v_creadas + 1;
         IF v_puntaje >= par.umbral_critico AND r.permite_congelar AND NOT par.modo_observacion
@@ -4087,55 +4637,73 @@ BEGIN
                 format('Congelamiento por monitoreo: %s, puntaje %s', r.codigo, v_puntaje), NULL);
         END IF;
     END LOOP;
+    DELETE FROM aml.monitoreo_fallos WHERE cliente_id = p_cliente;
     RETURN v_creadas;
 END
 $$;
 
 -- Redes entre clientes (R26: un ordenante que abona en banda a varios
 -- clientes; R27: varios clientes que envían a una misma CLABE). Sin
--- congelamiento; una alerta por cliente, red y semana.
+-- congelamiento; una alerta por cliente, red y semana, con la misma
+-- deduplicación que aml.barrer_cliente. Cada cliente cuenta solo sus
+-- movimientos posteriores a su marca de falso positivo de la regla.
 CREATE FUNCTION aml.barrer_redes(p_ahora TIMESTAMPTZ) RETURNS INTEGER
 LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp
 AS $$
 DECLARE
     par       aml.parametros := aml.parametros_vigentes();
-    v_semana  TEXT := to_char(p_ahora AT TIME ZONE 'America/Mexico_City', 'IYYY-IW');
+    v_ahora   TIMESTAMPTZ := aml.reloj(p_ahora);
+    v_semana  TEXT;
     r         aml.reglas_riesgo;
     g         RECORD;
     v_cliente UUID;
+    v_base    TEXT;
     v_clave   TEXT;
+    v_prev    aml.alertas;
+    v_ids     JSONB;
+    v_ultimo  TIMESTAMPTZ;
     v_desde   TIMESTAMPTZ;
     v_mod     RECORD;
     v_creadas INTEGER := 0;
 BEGIN
     PERFORM aml.fijar_actor(NULL);
+    v_semana := to_char(v_ahora AT TIME ZONE 'America/Mexico_City', 'IYYY-IW');
 
     r := aml.regla('R26_RED_ORDENANTE', 'TODOS');
     IF r.id IS NOT NULL THEN
-        v_desde := greatest(p_ahora - r.ventana_horas * interval '1 hour', par.alertar_desde);
+        v_desde := greatest(v_ahora - r.ventana_horas * interval '1 hour', par.alertar_desde);
         FOR g IN
             SELECT s.cuenta_ordenante AS clave, array_agg(DISTINCT c.cliente_id ORDER BY c.cliente_id) AS clientes,
-                   jsonb_object_agg(s.transaccion_id, c.cliente_id) AS movimientos
+                   jsonb_agg(jsonb_build_object('tx', s.transaccion_id, 'cliente', c.cliente_id, 'en', s.recibido_en))
+                       AS movimientos
               FROM ifpe.spei_inbound s
               JOIN ifpe.cuentas c ON c.id = s.cuenta_id
              WHERE s.estado = 'ABONADO' AND s.cuenta_ordenante IS NOT NULL
                AND s.monto >= r.banda_inferior * r.umbral_monto AND s.monto < r.umbral_monto
-               AND s.recibido_en > v_desde AND s.recibido_en <= p_ahora
+               AND s.recibido_en > v_desde AND s.recibido_en <= v_ahora
+               AND s.recibido_en > aml.marca_falso_positivo(c.cliente_id, r.codigo, 'ENTRADA')
                AND NOT EXISTS (SELECT 1 FROM ifpe.spei_anulaciones a WHERE a.spei_inbound_id = s.id)
              GROUP BY s.cuenta_ordenante
             HAVING count(DISTINCT c.cliente_id) >= r.contrapartes_min
         LOOP
             FOREACH v_cliente IN ARRAY g.clientes LOOP
-                v_clave := 'R26:' || v_cliente || ':' || g.clave || ':' || v_semana;
-                CONTINUE WHEN EXISTS (SELECT 1 FROM aml.alertas WHERE clave_deduplicacion = v_clave);
-                SELECT * INTO v_mod FROM aml.modificadores(aml.perfil_cliente(v_cliente, p_ahora));
+                SELECT coalesce(jsonb_agg(m ->> 'tx'), '[]'), max((m ->> 'en')::timestamptz) INTO v_ids, v_ultimo
+                  FROM jsonb_array_elements(g.movimientos) m WHERE m ->> 'cliente' = v_cliente::text;
+                v_base := 'R26:' || v_cliente || ':' || g.clave || ':' || v_semana;
+                SELECT * INTO v_prev FROM aml.alertas
+                 WHERE cliente_id = v_cliente AND regla_codigo = r.codigo
+                   AND (clave_deduplicacion = v_base OR starts_with(clave_deduplicacion, v_base || ':'))
+                 ORDER BY folio DESC LIMIT 1;
+                CONTINUE WHEN v_prev.estado IN ('PENDIENTE', 'EN_REVISION');
+                CONTINUE WHEN v_prev.id IS NOT NULL AND v_ultimo <= v_prev.resuelta_en;
+                v_clave := CASE WHEN v_prev.id IS NULL THEN v_base ELSE v_base || ':' || v_prev.folio END;
+                SELECT * INTO v_mod FROM aml.modificadores(aml.perfil_cliente(v_cliente, v_ahora));
                 PERFORM aml.registrar_alerta(v_cliente, 'IFPE', 'ENTRADA', NULL, NULL, r.id, 'LOTE', 'REGISTRADA',
                     LEAST(100, r.puntos + v_mod.puntos), NULL,
                     jsonb_build_object('red', jsonb_build_object('clave', g.clave, 'clientes', to_jsonb(g.clientes)),
                                        'lote', jsonb_build_object('regla', r.codigo, 'version', r.version, 'semana', v_semana,
                                                                   'modificadores', v_mod.factores),
-                                       'transacciones', (SELECT coalesce(jsonb_agg(k), '[]') FROM jsonb_each_text(g.movimientos) x (k, v)
-                                                          WHERE v = v_cliente::text)),
+                                       'transacciones', v_ids),
                     FALSE, v_clave, FALSE);
                 v_creadas := v_creadas + 1;
             END LOOP;
@@ -4144,26 +4712,35 @@ BEGIN
 
     r := aml.regla('R27_RED_BENEFICIARIO', 'TODOS');
     IF r.id IS NOT NULL THEN
-        v_desde := greatest(p_ahora - r.ventana_horas * interval '1 hour', par.alertar_desde);
+        v_desde := greatest(v_ahora - r.ventana_horas * interval '1 hour', par.alertar_desde);
         FOR g IN
             SELECT o.beneficiario_clabe::text AS clave, array_agg(DISTINCT o.cliente_id ORDER BY o.cliente_id) AS clientes,
-                   jsonb_object_agg(o.tx_retiro_id, o.cliente_id) AS movimientos
+                   jsonb_agg(jsonb_build_object('tx', o.tx_retiro_id, 'cliente', o.cliente_id, 'en', o.creado_en))
+                       AS movimientos
               FROM ifpe.spei_outbound o
-             WHERE o.estado <> 'RECHAZADA' AND o.creado_en > v_desde AND o.creado_en <= p_ahora
+             WHERE o.estado <> 'RECHAZADA' AND o.creado_en > v_desde AND o.creado_en <= v_ahora
+               AND o.creado_en > aml.marca_falso_positivo(o.cliente_id, r.codigo, 'SALIDA')
              GROUP BY o.beneficiario_clabe
             HAVING count(DISTINCT o.cliente_id) >= r.contrapartes_min AND sum(o.monto) >= r.umbral_monto
         LOOP
             FOREACH v_cliente IN ARRAY g.clientes LOOP
-                v_clave := 'R27:' || v_cliente || ':' || g.clave || ':' || v_semana;
-                CONTINUE WHEN EXISTS (SELECT 1 FROM aml.alertas WHERE clave_deduplicacion = v_clave);
-                SELECT * INTO v_mod FROM aml.modificadores(aml.perfil_cliente(v_cliente, p_ahora));
+                SELECT coalesce(jsonb_agg(m ->> 'tx'), '[]'), max((m ->> 'en')::timestamptz) INTO v_ids, v_ultimo
+                  FROM jsonb_array_elements(g.movimientos) m WHERE m ->> 'cliente' = v_cliente::text;
+                v_base := 'R27:' || v_cliente || ':' || g.clave || ':' || v_semana;
+                SELECT * INTO v_prev FROM aml.alertas
+                 WHERE cliente_id = v_cliente AND regla_codigo = r.codigo
+                   AND (clave_deduplicacion = v_base OR starts_with(clave_deduplicacion, v_base || ':'))
+                 ORDER BY folio DESC LIMIT 1;
+                CONTINUE WHEN v_prev.estado IN ('PENDIENTE', 'EN_REVISION');
+                CONTINUE WHEN v_prev.id IS NOT NULL AND v_ultimo <= v_prev.resuelta_en;
+                v_clave := CASE WHEN v_prev.id IS NULL THEN v_base ELSE v_base || ':' || v_prev.folio END;
+                SELECT * INTO v_mod FROM aml.modificadores(aml.perfil_cliente(v_cliente, v_ahora));
                 PERFORM aml.registrar_alerta(v_cliente, 'IFPE', 'SALIDA', NULL, NULL, r.id, 'LOTE', 'REGISTRADA',
                     LEAST(100, r.puntos + v_mod.puntos), NULL,
                     jsonb_build_object('red', jsonb_build_object('clave', g.clave, 'clientes', to_jsonb(g.clientes)),
                                        'lote', jsonb_build_object('regla', r.codigo, 'version', r.version, 'semana', v_semana,
                                                                   'modificadores', v_mod.factores),
-                                       'transacciones', (SELECT coalesce(jsonb_agg(k), '[]') FROM jsonb_each_text(g.movimientos) x (k, v)
-                                                          WHERE v = v_cliente::text)),
+                                       'transacciones', v_ids),
                     FALSE, v_clave, FALSE);
                 v_creadas := v_creadas + 1;
             END LOOP;
@@ -4193,6 +4770,7 @@ DECLARE
     par       aml.parametros;
     e         aml.evaluaciones;
     v_creado  TIMESTAMPTZ;
+    v_contra  TEXT;
     v         JSONB;
     v_eval    UUID;
     v_alerta  UUID;
@@ -4213,7 +4791,13 @@ BEGIN
     IF v_creado IS NULL THEN
         RAISE EXCEPTION 'SC_AML_EVALUACION_HUERFANA: la evaluación % no tiene su movimiento %', e.id, e.transaccion_id;
     END IF;
-    v := aml.calcular(e.cliente_id, e.entidad, e.sentido, e.canal, e.monto, e.transaccion_id, v_creado);
+    -- La contraparte como la ve el ledger (una marca DIFERIDA no trae hechos).
+    SELECT m.contraparte INTO v_contra
+      FROM aml.movimientos_cliente(e.cliente_id, v_creado - interval '1 second', v_creado, NULL) m
+     WHERE m.transaccion_id = e.transaccion_id AND m.sentido = e.sentido
+     LIMIT 1;
+    v := aml.calcular(e.cliente_id, e.entidad, e.sentido, e.canal, e.monto, e.transaccion_id, v_creado,
+                      coalesce(v_contra, aml.clave_contraparte(e.canal, e.contraparte)));
     v_puntaje := (v ->> 'puntaje')::numeric;
     INSERT INTO aml.evaluaciones (cliente_id, entidad, sentido, canal, monto, transaccion_id, clave_operacion, contraparte,
                                   puntaje, nivel, resultado, origen, evaluacion_origen_id, factores, reglas_aplicadas,
@@ -4243,20 +4827,22 @@ BEGIN
 END
 $$;
 
--- Avisos de plazos (cada uno una sola vez, por los índices únicos).
+-- Avisos de plazos (cada uno una sola vez, por los índices únicos), con el
+-- reloj del servidor (aml.reloj): nadie consume un aviso antes de tiempo.
 CREATE FUNCTION aml.revisar_plazos(p_ahora TIMESTAMPTZ) RETURNS INTEGER
 LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp
 AS $$
 DECLARE
-    par aml.parametros := aml.parametros_vigentes();
-    a   RECORD;
-    f   RECORD;
-    n   INTEGER := 0;
+    par     aml.parametros := aml.parametros_vigentes();
+    v_ahora TIMESTAMPTZ := aml.reloj(p_ahora);
+    a       RECORD;
+    f       RECORD;
+    n       INTEGER := 0;
 BEGIN
     PERFORM aml.fijar_actor(NULL);
     FOR a IN SELECT id, cliente_id, folio, regla_codigo FROM aml.alertas
               WHERE estado = 'PENDIENTE' AND nivel_riesgo = 'CRITICO'
-                AND "timestamp" < p_ahora - par.sla_critica_horas * interval '1 hour'
+                AND "timestamp" < v_ahora - par.sla_critica_horas * interval '1 hour'
               ORDER BY folio LOOP
         IF aml.notificar('ESCALAMIENTO', 'ALTA', a.cliente_id, a.id, NULL, NULL, NULL,
                          format('%s · CRITICO · alerta %s sin atender', a.regla_codigo, a.folio)) IS NOT NULL THEN
@@ -4264,7 +4850,7 @@ BEGIN
         END IF;
     END LOOP;
     FOR f IN SELECT c.id, c.cliente_id, c.alerta_id, c.folio FROM aml.congelamientos c
-              WHERE c.estado = 'ACTIVO' AND c.sla_vence_en < p_ahora
+              WHERE c.estado = 'ACTIVO' AND c.sla_vence_en < v_ahora
                 AND NOT EXISTS (SELECT 1 FROM aml.solicitudes_levantamiento s
                                  WHERE s.congelamiento_id = c.id AND s.estado = 'PENDIENTE')
               ORDER BY c.folio LOOP
@@ -4275,9 +4861,9 @@ BEGIN
     END LOOP;
     FOR a IN SELECT id, cliente_id, folio, regla_codigo, fecha_limite_reporte FROM aml.alertas
               WHERE (estado IN ('PENDIENTE', 'EN_REVISION') OR (estado = 'CONFIRMADO' AND folio_uif IS NULL))
-                AND fecha_limite_reporte <= p_ahora + par.dias_aviso_plazo * interval '1 day'
+                AND fecha_limite_reporte <= v_ahora + par.dias_aviso_plazo * interval '1 day'
               ORDER BY folio LOOP
-        IF a.fecha_limite_reporte < p_ahora THEN
+        IF a.fecha_limite_reporte < v_ahora THEN
             IF aml.notificar('PLAZO_UIF_VENCIDO', 'ALTA', a.cliente_id, a.id, NULL, NULL, NULL,
                              format('%s · alerta %s · plazo UIF vencido', a.regla_codigo, a.folio)) IS NOT NULL THEN
                 n := n + 1;
@@ -4301,67 +4887,107 @@ CREATE FUNCTION aml.marcar_notificacion(p_id BIGINT) RETURNS void
 LANGUAGE sql SECURITY DEFINER SET search_path = pg_catalog, pg_temp
 AS $$ UPDATE aml.notificaciones SET entregada_en = clock_timestamp() WHERE id = p_id AND entregada_en IS NULL $$;
 
--- Sellado por lotes encadenados de los renglones con más de 10 minutos.
+-- Sellado por lotes encadenados: todos los renglones de las transacciones ya
+-- terminadas (txid menor que el xmin de la instantánea) que el sello anterior
+-- no cubrió. Un renglón de una transacción aún en curso (aunque su id sea
+-- menor) queda para el siguiente sello: nunca se sella un conjunto que luego
+-- cambie, así que un COMMIT tardío no produce una falsa alteración.
 CREATE FUNCTION aml.sellar_bitacora() RETURNS INTEGER
 LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp
 AS $$
 DECLARE
     v_desde    BIGINT;
-    v_hasta    BIGINT;
+    v_hasta    BIGINT := pg_snapshot_xmin(pg_current_snapshot())::text::bigint;
     v_anterior TEXT;
     v_filas    INTEGER;
     v_cadena   TEXT;
+    v_min      BIGINT;
+    v_max      BIGINT;
 BEGIN
     IF NOT pg_try_advisory_xact_lock(hashtextextended('aml:sello', 0)) THEN
         RETURN 0;
     END IF;
-    SELECT coalesce(max(hasta_id), 0) + 1 INTO v_desde FROM aml.sellos_bitacora;
-    SELECT hash_lote INTO v_anterior FROM aml.sellos_bitacora ORDER BY id DESC LIMIT 1;
+    SELECT hasta_txid, hash_lote INTO v_desde, v_anterior FROM aml.sellos_bitacora ORDER BY id DESC LIMIT 1;
+    v_desde := coalesce(v_desde, 0);
     v_anterior := coalesce(v_anterior, nucleo.hash_genesis());
-    SELECT max(id) INTO v_hasta FROM aml.bitacora WHERE ocurrido_en < clock_timestamp() - interval '10 minutes';
-    IF v_hasta IS NULL OR v_hasta < v_desde THEN
+    IF v_hasta <= v_desde THEN
         RETURN 0;
     END IF;
-    SELECT count(*), string_agg(hash_contenido, '' ORDER BY id) INTO v_filas, v_cadena
-      FROM aml.bitacora WHERE id BETWEEN v_desde AND v_hasta;
-    INSERT INTO aml.sellos_bitacora (desde_id, hasta_id, filas, hash_anterior, hash_lote)
-    VALUES (v_desde, v_hasta, v_filas, v_anterior, nucleo.sha256_hex(v_anterior || coalesce(v_cadena, '')));
+    SELECT count(*), string_agg(hash_contenido, '' ORDER BY id), min(id), max(id)
+      INTO v_filas, v_cadena, v_min, v_max
+      FROM aml.bitacora WHERE txid >= v_desde AND txid < v_hasta;
+    IF v_filas = 0 THEN
+        RETURN 0;
+    END IF;
+    INSERT INTO aml.sellos_bitacora (desde_id, hasta_id, desde_txid, hasta_txid, filas, hash_anterior, hash_lote)
+    VALUES (v_min, v_max, v_desde, v_hasta, v_filas, v_anterior, nucleo.sha256_hex(v_anterior || v_cadena));
     RETURN v_filas;
 END
 $$;
 
--- Verificación completa: hash de cada renglón, cadena de sellos, conteo de
--- renglones por sello y sellos contiguos desde el primer renglón.
-CREATE FUNCTION aml.verificar_bitacora() RETURNS TABLE (valido BOOLEAN, filas BIGINT, sellos BIGINT, primer_error TEXT)
+-- Verificación: hash de cada renglón, cadena de sellos, conteo y hash de cada
+-- lote, y sellos contiguos. Incremental: desde p_desde_sello (1 = completa)
+-- o, si es NULL, desde el sello siguiente al último verificado por el ciclo
+-- (aml.verificaciones_bitacora), anclada en el hash ya verificado de ese
+-- sello; así la consola nunca rehace toda la historia (límites de 30 s). Una
+-- verificación fallida registrada responde inválida para siempre.
+CREATE FUNCTION aml.verificar_bitacora(p_desde_sello BIGINT DEFAULT NULL)
+RETURNS TABLE (valido BOOLEAN, filas BIGINT, sellos BIGINT, primer_error TEXT, desde_sello BIGINT,
+               filas_verificadas BIGINT)
 LANGUAGE plpgsql STABLE SECURITY DEFINER SET search_path = pg_catalog, pg_temp
 AS $$
 DECLARE
     v_error    TEXT;
     v_filas    BIGINT;
     v_sellos   BIGINT;
+    v_inicio   BIGINT;
+    v_previo   aml.sellos_bitacora;
     s          aml.sellos_bitacora;
     v_anterior TEXT := nucleo.hash_genesis();
-    v_fin      BIGINT := 0;
+    v_fin_txid BIGINT := 0;
     v_cuenta   BIGINT;
     v_cadena   TEXT;
+    v_revisadas BIGINT := 0;
 BEGIN
     SELECT count(*) INTO v_filas FROM aml.bitacora;
     SELECT count(*) INTO v_sellos FROM aml.sellos_bitacora;
+    IF p_desde_sello IS NULL THEN
+        SELECT x.primer_error INTO v_error FROM aml.verificaciones_bitacora x WHERE NOT x.valido ORDER BY x.id LIMIT 1;
+        IF v_error IS NOT NULL THEN
+            RETURN QUERY SELECT FALSE, v_filas, v_sellos, v_error, NULL::bigint, 0::bigint;
+            RETURN;
+        END IF;
+        v_inicio := coalesce((SELECT max(x.hasta_sello) FROM aml.verificaciones_bitacora x WHERE x.valido), 0) + 1;
+    ELSE
+        v_inicio := GREATEST(p_desde_sello, 1);
+    END IF;
+    IF v_inicio > 1 THEN
+        SELECT * INTO v_previo FROM aml.sellos_bitacora WHERE id = v_inicio - 1;
+        IF v_previo.id IS NULL THEN
+            RETURN QUERY SELECT FALSE, v_filas, v_sellos, format('sello %s: no existe', v_inicio - 1), v_inicio, 0::bigint;
+            RETURN;
+        END IF;
+        v_anterior := v_previo.hash_lote;
+        v_fin_txid := v_previo.hasta_txid;
+    END IF;
+    -- Hash de cada renglón del tramo que se verifica (sellos desde v_inicio y los aún sin sellar).
     SELECT format('renglón %s: el hash no corresponde a su contenido', b.id) INTO v_error
-      FROM aml.bitacora b WHERE b.hash_contenido IS DISTINCT FROM aml.hash_bitacora(b) ORDER BY b.id LIMIT 1;
+      FROM aml.bitacora b WHERE b.txid >= v_fin_txid AND b.hash_contenido IS DISTINCT FROM aml.hash_bitacora(b)
+     ORDER BY b.id LIMIT 1;
+    SELECT count(*) INTO v_revisadas FROM aml.bitacora b WHERE b.txid >= v_fin_txid;
     IF v_error IS NULL THEN
-        FOR s IN SELECT * FROM aml.sellos_bitacora ORDER BY id LOOP
-            IF s.desde_id <> v_fin + 1 THEN
-                v_error := format('sello %s: no continúa al sello anterior (desde %s, se esperaba %s)', s.id, s.desde_id,
-                                  v_fin + 1);
+        FOR s IN SELECT * FROM aml.sellos_bitacora x WHERE x.id >= v_inicio ORDER BY x.id LOOP
+            IF s.desde_txid <> v_fin_txid THEN
+                v_error := format('sello %s: no continúa al sello anterior (desde la transacción %s, se esperaba %s)',
+                                  s.id, s.desde_txid, v_fin_txid);
                 EXIT;
             END IF;
             IF s.hash_anterior <> v_anterior THEN
                 v_error := format('sello %s: hash_anterior no es el hash del sello previo', s.id);
                 EXIT;
             END IF;
-            SELECT count(*), string_agg(hash_contenido, '' ORDER BY id) INTO v_cuenta, v_cadena
-              FROM aml.bitacora WHERE id BETWEEN s.desde_id AND s.hasta_id;
+            SELECT count(*), string_agg(b.hash_contenido, '' ORDER BY b.id) INTO v_cuenta, v_cadena
+              FROM aml.bitacora b WHERE b.txid >= s.desde_txid AND b.txid < s.hasta_txid;
             IF v_cuenta <> s.filas THEN
                 v_error := format('sello %s: declara %s renglones y hay %s', s.id, s.filas, v_cuenta);
                 EXIT;
@@ -4371,10 +4997,38 @@ BEGIN
                 EXIT;
             END IF;
             v_anterior := s.hash_lote;
-            v_fin := s.hasta_id;
+            v_fin_txid := s.hasta_txid;
         END LOOP;
     END IF;
-    RETURN QUERY SELECT v_error IS NULL, v_filas, v_sellos, v_error;
+    RETURN QUERY SELECT v_error IS NULL, v_filas, v_sellos, v_error, v_inicio, v_revisadas;
+END
+$$;
+
+-- El ciclo registra hasta qué sello quedó verificada la bitácora (o la
+-- primera falla, que queda para siempre). TRUE: válida.
+CREATE FUNCTION aml.registrar_verificacion_bitacora() RETURNS BOOLEAN
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp
+AS $$
+DECLARE
+    v        RECORD;
+    v_ultimo BIGINT := coalesce((SELECT max(id) FROM aml.sellos_bitacora), 0);
+BEGIN
+    IF NOT pg_try_advisory_xact_lock(hashtextextended('aml:sello', 0)) THEN
+        RETURN TRUE;
+    END IF;
+    SELECT * INTO v FROM aml.verificar_bitacora(NULL);
+    IF NOT v.valido THEN
+        IF NOT EXISTS (SELECT 1 FROM aml.verificaciones_bitacora WHERE NOT valido) THEN
+            INSERT INTO aml.verificaciones_bitacora (hasta_sello, valido, primer_error, filas)
+            VALUES (v_ultimo, FALSE, v.primer_error, v.filas);
+        END IF;
+        RETURN FALSE;
+    END IF;
+    IF v_ultimo > coalesce((SELECT max(hasta_sello) FROM aml.verificaciones_bitacora WHERE valido), 0) THEN
+        INSERT INTO aml.verificaciones_bitacora (hasta_sello, valido, primer_error, filas)
+        VALUES (v_ultimo, TRUE, NULL, v.filas);
+    END IF;
+    RETURN TRUE;
 END
 $$;
 
@@ -4521,11 +5175,14 @@ GRANT EXECUTE ON FUNCTION aml.consultar_alerta(UUID, UUID), aml.consultar_client
                           aml.movimientos_ledger(UUID[])
     TO sc_aml;
 -- Monitoreo por lotes.
-GRANT EXECUTE ON FUNCTION aml.monitoreo_tomar_turno(INTEGER), aml.monitoreo_liberar_turno(JSONB),
-                          aml.monitoreo_rango(INTEGER), aml.monitoreo_candidatos(BIGINT, BIGINT, BIGINT, BIGINT),
-                          aml.monitoreo_avanzar_marca(BIGINT, BIGINT), aml.barrer_cliente(UUID, TIMESTAMPTZ),
+GRANT EXECUTE ON FUNCTION aml.monitoreo_tomar_turno(INTEGER), aml.monitoreo_renovar_turno(UUID, INTEGER),
+                          aml.monitoreo_liberar_turno(UUID, JSONB), aml.monitoreo_rango(UUID, INTEGER),
+                          aml.monitoreo_candidatos(UUID), aml.monitoreo_avanzar_marca(UUID),
+                          aml.monitoreo_registrar_fallo(UUID, UUID, TEXT), aml.monitoreo_cuarentena(),
+                          aml.barrer_cliente(UUID, TIMESTAMPTZ, TIMESTAMPTZ[]),
                           aml.barrer_redes(TIMESTAMPTZ), aml.marcadores_pendientes(INTEGER), aml.reevaluar(UUID),
                           aml.revisar_plazos(TIMESTAMPTZ), aml.tomar_notificaciones(INTEGER),
-                          aml.marcar_notificacion(BIGINT), aml.sellar_bitacora(), aml.verificar_bitacora()
+                          aml.marcar_notificacion(BIGINT), aml.sellar_bitacora(), aml.verificar_bitacora(BIGINT),
+                          aml.registrar_verificacion_bitacora()
     TO sc_aml;
-GRANT EXECUTE ON FUNCTION aml.verificar_bitacora() TO sc_auditor;
+GRANT EXECUTE ON FUNCTION aml.verificar_bitacora(BIGINT) TO sc_auditor;
