@@ -1,0 +1,50 @@
+# Build context for images built from the repository root, e.g.
+#   docker build -f backend/Dockerfile .
+# Keeps secrets, state and build output out of the context (and of the cache).
+
+# Version control and tooling
+.git
+.github
+.claude
+.vscode
+.idea
+**/.DS_Store
+**/*.swp
+
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+**/.env
+**/.env.*
+!**/.env.example
+secrets/
+**/*.pem
+**/*.key
+**/*.crt
+**/*.p12
+**/*.pfx
+**/*.jks
+
+# Terraform: no image needs it; state, plans and tfvars may hold secrets
+terraform/
+**/.terraform/
+**/*.tfstate
+**/*.tfstate.*
+**/*.tfplan
+**/*.tfvars
+!**/*.tfvars.example
+
+# Build output and dependencies
+backend/target/
+**/target/
+**/node_modules/
+frontend/.next/
+frontend/out/
+frontend/coverage/
+frontend/test-results/
+frontend/playwright-report/
+**/*.log
+
+# SQL invariant suites (run with psql, not in an image)
+tests/

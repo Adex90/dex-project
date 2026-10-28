@@ -518,16 +518,65 @@ the frontend with `next start`; `stop` kills both by PID and drops the database.
 
 ### Production database users
 
-By default the backend connects as the schema owner, which can disable
-triggers. It logs a warning at startup when it does. In production, migrate as
-the owner and serve as a login that can act only through the `sc_*` roles:
+The backend uses two database identities:
+
+| Identity | Variable | Used by |
+|---|---|---|
+| Schema owner (needs `CREATEROLE` the first time; on RDS, the master user) | `DATABASE_URL_PROPIETARIO` | only the one-shot `synthetic-capital migrar` |
+| App login `sc_app`: `NOINHERIT`, member of `sc_ifpe`, `sc_sofom`, `sc_puente`, `sc_auditor`, `sc_kyc`, `sc_kyc_verificador`, `sc_spei` and `sc_aml` | `DATABASE_URL` | the long-running service |
+
+The owner can disable triggers; the app login has no privileges of its own and
+acts only through `SET LOCAL ROLE` to one `sc_*` role per transaction. By
+default (no owner URL, `MIGRAR_AL_INICIO=true`, `ARRANQUE_AL_INICIO=true`) the
+server migrates and bootstraps at startup with `DATABASE_URL`, and logs a
+warning when that user is the owner: fine for development, not for production.
+In production:
+
+```bash
+# 1. One-shot job, as the owner: migrations, bootstrap and the app login. Exit 0 or 1.
+DATABASE_URL_PROPIETARIO_FILE=/run/secrets/database_url_owner \
+DB_APP_PASSWORD_FILE=/run/secrets/db_app_password \
+synthetic-capital migrar
+
+# 2. The service, as sc_app only: the owner URL is not in its environment.
+DATABASE_URL_FILE=/run/secrets/database_url JWT_SECRET_FILE=/run/secrets/jwt_secret \
+MIGRAR_AL_INICIO=false ARRANQUE_AL_INICIO=false \
+synthetic-capital
+```
+
+`migrar` always migrates and bootstraps (the `*_AL_INICIO` flags only concern
+the server) and needs neither `JWT_SECRET` nor the webhook secrets. Give it the
+same `MODO_DEMO`, `KYC_*`, `RESERVA_*`, `CAJA_*` and `BOOTSTRAP_*` values as the
+service: the bootstrap writes them to the database. With `DB_APP_PASSWORD` set,
+it then does the following in one transaction:
+
+- creates or alters the login `DB_APP_USUARIO` (default `sc_app`) as
+  `LOGIN NOINHERIT`, setting the password as a SCRAM-SHA-256 verifier
+  (PBKDF2-HMAC-SHA-256, 4096 iterations, random 16-byte salt) computed by the
+  backend, so the plaintext never reaches the server or its logs;
+- grants the eight `sc_*` roles above (`WITH INHERIT FALSE, SET TRUE` on
+  PostgreSQL 16+, where inheritance is set per grant), never `sc_auditor_pld`;
+- checks the result, and rolls everything back if the login is the owner, a
+  member of the owner, a superuser, has `CREATEROLE`, `CREATEDB`,
+  `REPLICATION` or `BYPASSRLS`, or inherits the privileges of any `sc_*` role.
+
+Re-running it is safe and rotates the password: run `migrar` with the new
+password, then restart the service with the new `DATABASE_URL` (sessions that
+are already open keep working until then). `DATABASE_URL` carries the same
+password, URL-encoded; a hex password (`openssl rand -hex 32`) needs no
+encoding. The password must be at least 32 printable ASCII characters without
+spaces: PostgreSQL normalizes passwords with SASLprep and the driver does not,
+and for such passwords both agree. Without `DB_APP_PASSWORD`, `migrar` leaves
+the login alone. The manual equivalent is:
 
 ```sql
-CREATE ROLE sc_app LOGIN PASSWORD '...' NOINHERIT;
-GRANT sc_ifpe, sc_sofom, sc_puente, sc_auditor, sc_kyc, sc_kyc_verificador, sc_spei TO sc_app;
+CREATE ROLE sc_app LOGIN NOINHERIT PASSWORD '...';  -- ideally a SCRAM verifier, not plaintext
+-- PostgreSQL 16+; on older versions drop the WITH clause (NOINHERIT applies).
+GRANT sc_ifpe, sc_sofom, sc_puente, sc_auditor, sc_kyc, sc_kyc_verificador, sc_spei TO sc_app
+  WITH INHERIT FALSE, SET TRUE;
 -- Compliance console (/api/v1/aml) and the AML batch worker. Money paths do
 -- not need it: they reach the engine through SECURITY DEFINER wrappers.
-GRANT sc_aml TO sc_app;
+GRANT sc_aml TO sc_app WITH INHERIT FALSE, SET TRUE;
 -- Optional: an external job that re-verifies the whole AML audit log
 -- (SELECT * FROM aml.verificar_bitacora(1)) and can do nothing else.
 CREATE ROLE audit_job LOGIN PASSWORD '...';
@@ -542,10 +591,16 @@ through `sc_aml`, where every function checks their read-only role.
 pre-0009 binary before applying it. 0009 revokes INSERT on `kyc.alertas_pld`,
 so an old binary would fail every money transaction that raises an alert.
 
-```bash
-DATABASE_URL_PROPIETARIO=postgres://owner:...@db/synthetic_capital   # migrations + bootstrap only
-DATABASE_URL=postgres://sc_app:...@db/synthetic_capital              # the running service
-```
+**Containers and secrets files.** The image (`backend/Dockerfile`, distroless,
+uid 65532) runs the server by default and `migrar` as a one-shot command. Its
+`HEALTHCHECK` runs `synthetic-capital salud vivo`, a probe of `GET /vivo` on
+the loopback at the `BIND_ADDR` port that never touches the database, so a
+PostgreSQL outage does not restart the container. Load balancers use
+`GET /salud`, which checks the database (`salud listo` probes it). Every
+configuration variable `NAME` (all but `RUST_LOG`) also accepts `NAME_FILE`:
+the value is read from that file (trailing newline trimmed; setting both is an
+error), so Docker and Kubernetes secrets stay out of the environment. The
+process writes nothing to disk and runs with a read-only root filesystem.
 
 ### HTTP limits
 

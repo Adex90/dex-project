@@ -2,7 +2,8 @@
 //!
 //! | Método | Ruta | Acceso |
 //! |---|---|---|
-//! | GET  | `/salud` | público |
+//! | GET  | `/salud` | público: preparado (consulta la base de datos; balanceador) |
+//! | GET  | `/vivo` | público: vivo (no consulta la base de datos; salud del contenedor) |
 //! | POST | `/api/v1/auth/registro` | público |
 //! | POST | `/api/v1/auth/login` | público |
 //! | GET  | `/api/v1/yo` | cualquier rol (sin nivel de riesgo PLD) |
@@ -118,6 +119,7 @@ pub fn router(estado: AppState) -> Router {
     let cuerpo = Duration::from_secs(limites.cuerpo_seg);
     Router::new()
         .route("/salud", get(salud))
+        .route("/vivo", get(vivo))
         .nest("/api/v1", api)
         .fallback(ruta_inexistente)
         .method_not_allowed_fallback(metodo_no_permitido)
@@ -156,11 +158,20 @@ async fn tiempo_maximo(State(limite): State<Duration>, peticion: Request, siguie
     }
 }
 
+/// Preparado: el servicio puede atender peticiones (la base de datos responde).
+/// La usan el balanceador y el proxy inverso.
 async fn salud(State(e): State<AppState>) -> (StatusCode, Json<serde_json::Value>) {
     match sqlx::query_scalar::<_, i32>("SELECT 1").fetch_one(&e.pool).await {
         Ok(_) => (StatusCode::OK, Json(json!({ "estado": "ok", "base_de_datos": "ok" }))),
         Err(_) => (StatusCode::SERVICE_UNAVAILABLE, Json(json!({ "estado": "degradado", "base_de_datos": "error" }))),
     }
+}
+
+/// Vivo: el proceso atiende HTTP. No toca la base de datos, así una caída de
+/// PostgreSQL no hace que el orquestador reinicie el contenedor
+/// (`synthetic-capital salud vivo`).
+async fn vivo() -> Json<serde_json::Value> {
+    Json(json!({ "estado": "ok" }))
 }
 
 /// 201 si la operación es nueva, 200 si es una repetición idempotente.

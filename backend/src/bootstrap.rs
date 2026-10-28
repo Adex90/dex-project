@@ -4,11 +4,24 @@
 //! infraestructura que ningún rol transaccional puede crear: cuentas de
 //! reserva en custodia, caja de la SOFOM, el operador inicial y (solo en
 //! MODO_DEMO) los oficiales de cumplimiento. Ninguna mueve saldos: las cuentas
-//! nacen en cero.
+//! nacen en cero. `synthetic-capital migrar` además aprovisiona el login de la
+//! aplicación ([`asegurar_login_aplicacion`]).
 
+use anyhow::{bail, Context};
 use sqlx::PgPool;
 
-use crate::{auth::password, config::Config, db, error::AppResult, models::kyc::RolUsuario};
+use crate::{
+    auth::password,
+    config::{Config, LoginAplicacion},
+    crypto::scram,
+    db::{self, Rol},
+    error::AppResult,
+    models::kyc::RolUsuario,
+};
+
+/// Candado consultivo que serializa dos `migrar` simultáneos sobre la misma
+/// base de datos mientras aprovisionan el login.
+const CANDADO_LOGIN: i64 = 0x5343_5F41_5050_4C47;
 
 pub async fn ejecutar(pool: &PgPool, cfg: &Config) -> AppResult<()> {
     verificar_codificacion(pool).await?;
@@ -131,6 +144,106 @@ pub async fn asegurar_usuario_interno(pool: &PgPool, email: &str, pw: &str, rol:
         .await?;
     tx.commit().await?;
     tracing::info!(%email, ?rol, "usuario interno creado");
+    Ok(())
+}
+
+/// Crea o actualiza el login con el que corre el servicio: `LOGIN NOINHERIT`,
+/// con la contraseña como verificador SCRAM-SHA-256 calculado aquí (el texto
+/// en claro nunca llega al servidor ni a sus bitácoras) y miembro de cada rol
+/// de [`Rol::TODOS`] sin heredar sus privilegios: solo actúa con
+/// `SET LOCAL ROLE` (ver [`crate::db`]). Idempotente: repetirlo rota la
+/// contraseña y repara las concesiones.
+///
+/// Falla cerrado, revirtiendo todo, si el login resultante es superusuario,
+/// tiene CREATEROLE, CREATEDB, REPLICATION o BYPASSRLS, hereda privilegios de
+/// un rol `sc_*` o es miembro del dueño del esquema: con cualquiera de ellos
+/// el servicio podría saltarse el aislamiento por rol.
+///
+/// Las sentencias no fijan NOSUPERUSER/NOREPLICATION/NOBYPASSRLS: un dueño sin
+/// superusuario (el usuario maestro de RDS) no puede mencionarlas siquiera.
+pub async fn asegurar_login_aplicacion(pool: &PgPool, login: &LoginAplicacion) -> anyhow::Result<()> {
+    let usuario = login.usuario();
+    let verificador = scram::verificador(login.password());
+    let mut tx = db::begin_administrativa(pool).await?;
+    // Repetir una concesión existente avisa con un NOTICE por rol.
+    sqlx::raw_sql("SET LOCAL client_min_messages = warning").execute(&mut *tx).await?;
+    sqlx::query("SELECT pg_advisory_xact_lock($1)").bind(CANDADO_LOGIN).execute(&mut *tx).await?;
+    let (propietario, version, existe): (String, i32, bool) = sqlx::query_as(
+        "SELECT current_user::text, current_setting('server_version_num')::int, \
+                EXISTS (SELECT 1 FROM pg_roles WHERE rolname = $1)",
+    )
+    .bind(usuario)
+    .fetch_one(&mut *tx)
+    .await?;
+    if usuario == propietario {
+        bail!("DB_APP_USUARIO ({usuario}) es el usuario con que corre migrar; el servicio debe usar otro login");
+    }
+    // Las sentencias de roles no admiten parámetros. `usuario` es un
+    // identificador validado y el verificador solo contiene [A-Za-z0-9+/=$:-]:
+    // ninguno puede cerrar las comillas. `raw_sql` usa el protocolo simple, así
+    // el texto tampoco queda en la caché de sentencias preparadas.
+    let accion = if existe { "ALTER" } else { "CREATE" };
+    sqlx::raw_sql(&format!("{accion} ROLE \"{usuario}\" LOGIN NOINHERIT PASSWORD '{verificador}'"))
+        .execute(&mut *tx)
+        .await
+        .with_context(|| format!("{accion} ROLE {usuario}"))?;
+    // Desde PostgreSQL 16 la herencia es de cada concesión (NOINHERIT solo fija
+    // la opción por omisión): se fija explícitamente, lo que también corrige
+    // concesiones anteriores del mismo otorgante.
+    let roles = Rol::TODOS.map(Rol::nombre).join(", ");
+    let opciones = if version >= 160_000 { " WITH INHERIT FALSE, SET TRUE" } else { "" };
+    sqlx::raw_sql(&format!("GRANT {roles} TO \"{usuario}\"{opciones}"))
+        .execute(&mut *tx)
+        .await
+        .with_context(|| format!("GRANT {roles} TO {usuario}"))?;
+    verificar_login_aplicacion(&mut tx, usuario, version).await?;
+    tx.commit().await?;
+    tracing::info!(%usuario, creado = !existe, "login de la aplicación listo: NOINHERIT y miembro de {roles}");
+    Ok(())
+}
+
+async fn verificar_login_aplicacion(tx: &mut db::Tx, usuario: &str, version: i32) -> anyhow::Result<()> {
+    let roles = Rol::TODOS.map(Rol::nombre);
+    // Antes de PostgreSQL 16, ser miembro basta para SET ROLE; desde 16 es una
+    // opción de cada concesión.
+    let cambiar = if version >= 160_000 { "SET" } else { "MEMBER" };
+    let (privilegiado, inherit, puede_entrar, puede_cambiar, hereda, del_dueno): (bool, bool, bool, bool, bool, bool) =
+        sqlx::query_as(
+            "SELECT r.rolsuper OR r.rolcreaterole OR r.rolcreatedb OR r.rolreplication OR r.rolbypassrls, \
+                    r.rolinherit, r.rolcanlogin, \
+                    (SELECT bool_and(pg_has_role(r.oid, g, $3)) FROM unnest($2::name[]) g), \
+                    (SELECT bool_or(pg_has_role(r.oid, g, 'USAGE')) FROM unnest($2::name[]) g), \
+                    EXISTS (SELECT 1 FROM pg_namespace n \
+                             WHERE n.nspname IN ('nucleo', 'kyc', 'ifpe', 'sofom', 'aml') \
+                               AND pg_has_role(r.oid, n.nspowner, 'MEMBER')) \
+               FROM pg_roles r WHERE r.rolname = $1",
+        )
+        .bind(usuario)
+        .bind(&roles[..])
+        .bind(cambiar)
+        .fetch_one(&mut **tx)
+        .await?;
+    if privilegiado {
+        bail!(
+            "el login {usuario} tiene SUPERUSER, CREATEROLE, CREATEDB, REPLICATION o BYPASSRLS; el servicio debe \
+             correr sin ellos: quítalos (ALTER ROLE) y vuelve a ejecutar migrar"
+        );
+    }
+    if inherit || !puede_entrar {
+        bail!("el login {usuario} no quedó LOGIN NOINHERIT");
+    }
+    if !puede_cambiar {
+        bail!("el login {usuario} no puede cambiar (SET ROLE) a todos los roles {}", roles.join(", "));
+    }
+    if hereda {
+        bail!(
+            "el login {usuario} hereda privilegios de un rol sc_* (una concesión WITH INHERIT TRUE de otro \
+             otorgante); revócala: debe actuar solo con SET LOCAL ROLE"
+        );
+    }
+    if del_dueno {
+        bail!("el login {usuario} es miembro del dueño del esquema: podría desactivar triggers");
+    }
     Ok(())
 }
 

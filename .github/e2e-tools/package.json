@@ -1,0 +1,9 @@
+{
+  "name": "synthetic-capital-ci-e2e-tools",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Playwright for frontend/e2e/*.mjs in CI, loaded through NODE_PATH (see .github/workflows/ci.yml, job e2e).",
+  "dependencies": {
+    "playwright": "1.56.1"
+  }
+}

@@ -1,0 +1,21 @@
+# Exceptions for the Trivy gates in .github/workflows/ci.yml and security.yml.
+#
+# Prefer fixing: bump the package, or the digest-pinned base image. Use this
+# file only for a finding that cannot be fixed yet (no patched upstream image)
+# or does not apply, and only with:
+#   statement:  why it does not apply or is accepted, and who accepted it;
+#   expired_at: a date after which the finding fails the gate again.
+# Trivy prints this file in the job log, so every run records the exceptions in
+# force. Misconfigurations in Terraform are better suppressed next to the
+# resource, with a reason: `#trivy:ignore:AWS-0053 <reason>` on the line above.
+#
+# Example (not active; review before enabling):
+#   - id: CVE-2026-31789
+#     # libssl3 3.0.18 in gcr.io/distroless/nodejs22-debian12 (fixed in 3.0.19).
+#     statement: >-
+#       Heap overflow reachable only on 32-bit platforms; the images are built
+#       for amd64/arm64. Remove once distroless nodejs22 ships libssl3 >= 3.0.19.
+#       Accepted by <name>, <date>.
+#     expired_at: 2026-12-31
+
+vulnerabilities: []

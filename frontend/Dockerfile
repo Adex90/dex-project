@@ -10,9 +10,11 @@
 # NEXT_PUBLIC_API_URL is the public origin itself, without a path.
 #
 # Run it with a read-only root filesystem; the only writable path Next.js may use is
-# /app/.next/cache (tmpfs or volume):
-#   docker run --read-only --tmpfs /app/.next/cache --cap-drop ALL \
-#     --security-opt no-new-privileges --user 65532 -p 3000:3000 synthetic-capital-frontend
+# /app/.next/cache. A plain `--tmpfs` is root-owned (0755), so give it to uid 65532
+# (a named volume works too: Docker seeds it with the image's 65532-owned directory):
+#   docker run --read-only --tmpfs /app/.next/cache:uid=65532,gid=65532,mode=0700,size=64m \
+#     --cap-drop ALL --security-opt no-new-privileges --user 65532 -p 3000:3000 \
+#     synthetic-capital-frontend
 #
 # Base images: canonical name + digest. Digests are content addresses, so a pull-through
 # mirror serves the same bytes: override the registry part only, e.g.
@@ -58,9 +60,9 @@ COPY --from=deps /app/node_modules ./node_modules
 COPY . .
 # The browser bundle builds absolute API URLs from NEXT_PUBLIC_API_URL, so an empty or
 # relative value would only fail later, in the customer's browser: refuse it here.
-# sharp (an optional dependency of next, ~30 MB with libvips) is removed before the
+# sharp (an optional dependency of next, ~20 MB with libvips) is removed before the
 # build so output tracing leaves it out: the app has no next/image and no public/ dir,
-# and the edge does not route /_next/image.
+# and the nginx edge answers 404 for /_next/image.
 RUN case "${NEXT_PUBLIC_API_URL:-}" in \
       http://?*|https://?*) ;; \
       *) echo "error: build arg NEXT_PUBLIC_API_URL must be an absolute http(s) URL (the public origin behind the edge)" >&2; exit 1 ;; \
@@ -78,10 +80,12 @@ RUN case "${NEXT_PUBLIC_API_URL:-}" in \
 
 # ---------------------------------------------------------------------------------------
 # runtime: distroless Node.js 22 (no shell, no package manager), uid/gid 65532.
-# Application files stay root-owned and read-only for the service user.
 # ---------------------------------------------------------------------------------------
 FROM ${RUNTIME_IMAGE} AS runtime
 ARG RUNTIME_IMAGE
+# The base image's default user is 65532: create /app and its files as root, so the
+# service user can neither modify nor replace application code even on a writable rootfs.
+USER 0:0
 ARG VCS_REF=unknown
 LABEL org.opencontainers.image.title="synthetic-capital-frontend" \
       org.opencontainers.image.description="Synthetic Capital web frontend (Next.js standalone server)" \
@@ -93,9 +97,12 @@ ENV NODE_ENV=production \
     HOSTNAME=0.0.0.0 \
     PORT=3000
 COPY --from=build /out/ /app/
-# The one path Next.js may write to. With --read-only, mount a tmpfs or volume here;
-# the directory is pre-created for the service user so a writable rootfs works too.
+# The one path Next.js may write to, pre-created for the service user. VOLUME makes
+# runtimes that seed volumes from the image keep that ownership: an ECS Fargate bind
+# mount at this path, or Docker's anonymous/named volume when no tmpfs is given (so
+# --read-only works without extra flags). An explicit tmpfs mount takes precedence.
 COPY --from=build --chown=65532:65532 /cache /app/.next/cache
+VOLUME ["/app/.next/cache"]
 USER 65532:65532
 EXPOSE 3000
 # No shell or curl in distroless: probe with Node's built-in fetch.

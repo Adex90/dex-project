@@ -1,0 +1,80 @@
+# Vulnerability audit of the dependency lockfiles (backend/Cargo.lock,
+# frontend/package-lock.json, .github/e2e-tools/package-lock.json).
+#
+# Runs on every PR and push to main, so a new dependency with a known critical
+# vulnerability fails, and every Monday, so advisories published after a change
+# merged are caught although nothing changed. The same policy as the image scans
+# in ci.yml: report CRITICAL and HIGH vulnerabilities that have a fix, fail on
+# CRITICAL. The image scan cannot see Rust crates (a Rust binary carries no
+# dependency list unless it is built with cargo-auditable), so this is where
+# they are checked.
+#
+# Secrets: none. This workflow reads no repository, environment or organization
+# secrets; the automatic GITHUB_TOKEN is limited to `contents: read`.
+
+name: Security
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  schedule:
+    # Mondays 07:23 UTC (01:23 in Mexico City).
+    - cron: "23 7 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref == 'refs/heads/main' && github.run_id || github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  # Keep in step with ci.yml.
+  TRIVY_VERSION: v0.76.0
+
+jobs:
+  dependencies:
+    name: Dependency vulnerabilities (lockfiles)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Trivy - CRITICAL and HIGH vulnerabilities that have a fix (report)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          version: ${{ env.TRIVY_VERSION }}
+          scan-type: fs
+          scan-ref: .
+          scanners: vuln
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: "0"
+          cache-dir: ${{ runner.temp }}/trivy
+          trivyignores: .github/trivyignore.yaml
+
+      - name: Trivy - fail on CRITICAL vulnerabilities that have a fix
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        env:
+          # The previous step installed Trivy and downloaded today's database.
+          TRIVY_SKIP_DB_UPDATE: "true"
+          TRIVY_SKIP_JAVA_DB_UPDATE: "true"
+        with:
+          skip-setup-trivy: true
+          cache: false
+          scan-type: fs
+          scan-ref: .
+          scanners: vuln
+          severity: CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+          cache-dir: ${{ runner.temp }}/trivy
+          trivyignores: .github/trivyignore.yaml

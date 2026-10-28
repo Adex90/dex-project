@@ -5,8 +5,12 @@ mod comun;
 use std::{net::SocketAddr, time::Duration};
 
 use comun::*;
-use sqlx::PgPool;
-use synthetic_capital::{config::LimitesHttp, routes, servidor, AppState};
+use sqlx::{postgres::PgPoolOptions, PgPool};
+use synthetic_capital::{
+    cli,
+    config::{Config, LimitesHttp},
+    routes, servidor, AppState,
+};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
@@ -24,7 +28,11 @@ struct Servidor {
 async fn arrancar(pool: &PgPool, limites: LimitesHttp) -> Servidor {
     let mut cfg = preparar(pool).await;
     cfg.http = limites.clone();
-    let app = routes::router(AppState::nuevo(pool.clone(), cfg));
+    arrancar_con(AppState::nuevo(pool.clone(), cfg), limites).await
+}
+
+async fn arrancar_con(estado: AppState, limites: LimitesHttp) -> Servidor {
+    let app = routes::router(estado);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let dir = listener.local_addr().unwrap();
     let (apagar, senal) = oneshot::channel::<()>();
@@ -129,4 +137,45 @@ async fn apagado_con_plazo(pool: PgPool) {
     timeout(Duration::from_secs(5), srv.tarea).await.expect("el apagado no terminó").unwrap();
     assert!(inicio.elapsed() < Duration::from_secs(3), "apagado tardó {:?}", inicio.elapsed());
     drop(lento);
+}
+
+/// GET con `Connection: close`; devuelve la respuesta completa.
+async fn obtener(dir: SocketAddr, ruta: &str) -> String {
+    let mut s = TcpStream::connect(dir).await.unwrap();
+    s.write_all(format!("GET {ruta} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n").as_bytes()).await.unwrap();
+    leer_hasta_cierre(&mut s, Duration::from_secs(5)).await.expect("sin respuesta")
+}
+
+/// Las sondas de `synthetic-capital salud` contra el router real.
+#[sqlx::test(migrations = "../migrations")]
+async fn vivo_y_salud_responden_200(pool: PgPool) {
+    let srv = arrancar(&pool, limites()).await;
+    for ruta in ["/vivo", "/salud"] {
+        let dir = srv.dir;
+        let codigo = tokio::task::spawn_blocking(move || cli::sondear(dir, ruta, Duration::from_secs(3)))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(codigo, 200, "{ruta}");
+    }
+    let vivo = obtener(srv.dir, "/vivo").await;
+    assert!(vivo.starts_with("HTTP/1.1 200") && vivo.contains(r#"{"estado":"ok"}"#), "{vivo}");
+}
+
+/// /vivo (salud del contenedor) no toca la base de datos: con PostgreSQL
+/// inalcanzable responde 200, mientras /salud (preparado) responde 503.
+#[tokio::test]
+async fn vivo_no_consulta_la_base_de_datos() {
+    let puerto = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+    let pool = PgPoolOptions::new()
+        .acquire_timeout(Duration::from_secs(1))
+        .connect_lazy(&format!("postgres://nadie@127.0.0.1:{puerto}/nada"))
+        .unwrap();
+    let srv = arrancar_con(AppState::nuevo(pool, Config::para_pruebas("")), limites()).await;
+    let inicio = Instant::now();
+    let vivo = obtener(srv.dir, "/vivo").await;
+    assert!(vivo.starts_with("HTTP/1.1 200"), "{vivo}");
+    assert!(inicio.elapsed() < Duration::from_millis(500), "{:?}", inicio.elapsed());
+    let salud = obtener(srv.dir, "/salud").await;
+    assert!(salud.starts_with("HTTP/1.1 503") && salud.contains(r#""base_de_datos":"error""#), "{salud}");
 }

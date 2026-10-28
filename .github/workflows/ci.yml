@@ -1,0 +1,678 @@
+# Continuous integration for Synthetic Capital.
+#
+# Secrets: this workflow needs NO repository, environment or organization
+# secrets. The only credentials in it are throwaway passwords for PostgreSQL
+# service containers that live for one job, and the automatic GITHUB_TOKEN,
+# limited to `contents: read` below.
+#
+# Supply chain: every action is pinned to a full commit SHA (the release is in
+# the trailing comment; Dependabot updates both). Tools downloaded by `run`
+# steps are pinned by version and SHA-256 in `env` below; bump the version and
+# the checksum together.
+#
+# Paths owned by the infrastructure work (backend/Dockerfile, terraform/,
+# scripts/) are optional here: when one is missing, its checks are skipped with
+# a warning annotation instead of failing the run.
+
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  # PRs and other branches: a new push cancels the run it supersedes. main: the
+  # group is unique per run, so every commit keeps its own result (and saves
+  # the caches that PRs restore).
+  group: ${{ github.workflow }}-${{ github.ref == 'refs/heads/main' && github.run_id || github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    # Explicit bash runs steps with -eo pipefail (the implicit default has no pipefail).
+    shell: bash
+
+env:
+  CARGO_TERM_COLOR: always
+  # CI starts from rust-cache, not from an earlier incremental state; incremental
+  # artifacts would only bloat the cache.
+  CARGO_INCREMENTAL: "0"
+  RUST_BACKTRACE: short
+  # Pinned, not `stable`: it matches the local toolchain and the backend image's
+  # builder (rust:1.97.x). With `clippy -D warnings`, a floating stable turns the
+  # new lints of every Rust release (each 6 weeks) into failures unrelated to the
+  # change under review. Bump it deliberately, together with backend/Dockerfile.
+  RUST_TOOLCHAIN: "1.97"
+  # package.json needs Node >= 22.18 (the unit tests rely on type stripping) and
+  # production runs distroless nodejs22.
+  NODE_VERSION: "22"
+  NEXT_TELEMETRY_DISABLED: "1"
+  # Playwright is pinned in .github/e2e-tools/package-lock.json (1.56.1, the
+  # version the e2e scripts are written and verified against).
+  # Scanner and linter pins (see the supply-chain note above).
+  TRIVY_VERSION: v0.76.0
+  TERRAFORM_VERSION: "1.16.7"
+  TFLINT_VERSION: v0.64.0
+  HADOLINT_VERSION: v2.14.0
+  HADOLINT_SHA256: 6bf226944684f56c84dd014e8b979d27425c0148f61b3bd99bcc6f39e9dc5a47
+  SHELLCHECK_VERSION: v0.11.0
+  SHELLCHECK_SHA256: 8c3be12b05d5c177a04c29e3c78ce89ac86f1595681cab149b65b97c4e227198
+  ACTIONLINT_VERSION: "1.7.12"
+  ACTIONLINT_SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
+
+jobs:
+  # ---------------------------------------------------------------------------
+  frontend:
+    name: Frontend (lint, typecheck, unit tests, build)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Restore the Next.js build cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: frontend/.next/cache
+          key: nextjs-${{ runner.os }}-${{ hashFiles('frontend/package-lock.json') }}-${{ hashFiles('frontend/src/**', 'frontend/*.ts', 'frontend/*.mjs', 'frontend/*.json') }}
+          restore-keys: |
+            nextjs-${{ runner.os }}-${{ hashFiles('frontend/package-lock.json') }}-
+
+      - name: Install dependencies
+        run: npm ci --no-audit --no-fund
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Unit tests
+        run: npm test
+
+      - name: Build
+        run: npm run build
+
+  # ---------------------------------------------------------------------------
+  backend:
+    name: Backend (fmt, clippy, tests)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          # Bootstrap superuser of a throwaway cluster; only the next step uses it.
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      PGHOST: localhost
+      PGPORT: "5432"
+      DATABASE_URL: postgres://synthetic:synthetic@localhost:5432/synthetic_capital
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Create the test role (CREATEDB and CREATEROLE, not a superuser)
+        env:
+          PGUSER: postgres
+          PGPASSWORD: postgres
+        run: |
+          command -v psql >/dev/null || { sudo apt-get update -q && sudo apt-get install -yq postgresql-client; }
+          psql -X -v ON_ERROR_STOP=1 -d postgres <<'SQL'
+          -- The same privileges as the local development role and the RDS master
+          -- user: CREATEDB and CREATEROLE but not SUPERUSER, so CI does not mask
+          -- permission errors that production would hit.
+          CREATE ROLE synthetic LOGIN PASSWORD 'synthetic' CREATEDB CREATEROLE;
+          CREATE DATABASE synthetic_capital OWNER synthetic;
+          -- Throwaway cluster: trade crash durability for speed. No effect on
+          -- SQL semantics, constraints or triggers.
+          ALTER SYSTEM SET fsync = off;
+          ALTER SYSTEM SET synchronous_commit = off;
+          ALTER SYSTEM SET full_page_writes = off;
+          SELECT pg_reload_conf();
+          SQL
+
+      - name: Install Rust ${{ env.RUST_TOOLCHAIN }}
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --component rustfmt,clippy --no-self-update
+          rustup default "$RUST_TOOLCHAIN"
+          rustc --version
+          cargo --version
+
+      - name: Restore the Cargo cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: backend -> target
+          # Shared with the e2e job (same debug profile). This job is the only writer.
+          shared-key: debug
+
+      - name: cargo fmt --check
+        working-directory: backend
+        run: cargo fmt --check
+
+      - name: cargo clippy
+        working-directory: backend
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: cargo test
+        working-directory: backend
+        # sqlx::test gives every test a fresh database with all migrations applied.
+        run: cargo test --locked --no-fail-fast
+
+  # ---------------------------------------------------------------------------
+  sql-suites:
+    name: SQL suite ${{ matrix.suite }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - suite: 0001_invariantes
+            expect: ">>> Todas las invariantes del esquema 0001 se cumplen."
+          - suite: 0006_kyc
+            expect: "tests/db/0006_kyc.sql: todas las pruebas pasaron (ROLLBACK)"
+          - suite: 0007_kyc
+            expect: "tests/db/0007_kyc.sql: todas las pruebas pasaron (ROLLBACK)"
+          - suite: 0008_spei
+            expect: "tests/db/0008_spei.sql: todas las pruebas pasaron (ROLLBACK)"
+          - suite: 0009_aml
+            expect: "tests/db/0009_aml.sql: todas las pruebas pasaron (ROLLBACK)"
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          # Bootstrap superuser of a throwaway cluster; only the next step uses it.
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      PGHOST: localhost
+      PGPORT: "5432"
+      PGUSER: synthetic
+      PGPASSWORD: synthetic
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Create the test role (CREATEDB and CREATEROLE, not a superuser)
+        env:
+          PGUSER: postgres
+          PGPASSWORD: postgres
+        run: |
+          command -v psql >/dev/null || { sudo apt-get update -q && sudo apt-get install -yq postgresql-client; }
+          psql -X -v ON_ERROR_STOP=1 -d postgres <<'SQL'
+          -- The same privileges as the local development role and the RDS master
+          -- user: CREATEDB and CREATEROLE but not SUPERUSER, so CI does not mask
+          -- permission errors that production would hit.
+          CREATE ROLE synthetic LOGIN PASSWORD 'synthetic' CREATEDB CREATEROLE;
+          CREATE DATABASE synthetic_capital OWNER synthetic;
+          -- Throwaway cluster: trade crash durability for speed. No effect on
+          -- SQL semantics, constraints or triggers.
+          ALTER SYSTEM SET fsync = off;
+          ALTER SYSTEM SET synchronous_commit = off;
+          ALTER SYSTEM SET full_page_writes = off;
+          SELECT pg_reload_conf();
+          SQL
+
+      - name: Fresh database, all migrations, then tests/db/${{ matrix.suite }}.sql
+        env:
+          SUITE: ${{ matrix.suite }}
+          EXPECTED: ${{ matrix.expect }}
+        run: |
+          suite_file="tests/db/${SUITE}.sql"
+          db="ci_${SUITE}"
+          psql -X -q -v ON_ERROR_STOP=1 -d postgres \
+            -c "DROP DATABASE IF EXISTS ${db}" \
+            -c "CREATE DATABASE ${db} ENCODING 'UTF8' TEMPLATE template0"
+
+          # One transaction per file, like sqlx::migrate! (none of them needs to run outside one).
+          echo "::group::Apply migrations/0*.sql to ${db}"
+          for migration in migrations/0*.sql; do
+            echo "${migration}"
+            psql -X -q -v ON_ERROR_STOP=1 --single-transaction -d "${db}" -f "${migration}" >/dev/null
+          done
+          echo "::endgroup::"
+
+          # NOTICE lines (one per check) go to stderr and the verdict line to stdout: keep both.
+          log="${RUNNER_TEMP}/${SUITE}.log"
+          status=0
+          psql -X -v ON_ERROR_STOP=1 -d "${db}" -f "${suite_file}" >"${log}" 2>&1 || status=$?
+          cat "${log}"
+
+          if [ "${status}" -ne 0 ]; then
+            echo "::error file=${suite_file}::psql exited with status ${status}"
+            exit 1
+          fi
+          if grep -nE 'FALLO|ERROR' "${log}"; then
+            echo "::error file=${suite_file}::the output contains FALLO or ERROR"
+            exit 1
+          fi
+          if ! grep -qxF -- "${EXPECTED}" "${log}"; then
+            echo "::error file=${suite_file}::success line missing: ${EXPECTED}"
+            exit 1
+          fi
+          echo "${suite_file}: passed"
+
+  # ---------------------------------------------------------------------------
+  e2e:
+    name: End-to-end (smoke + AML console, Playwright)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          # Bootstrap superuser of a throwaway cluster; only the next step uses it.
+          POSTGRES_PASSWORD: postgres
+        ports:
+          # frontend/e2e/aml-stack.sh writes port 5432 into the backend's DATABASE_URL.
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      # Read by frontend/e2e/aml-stack.sh (psql and the backend's DATABASE_URL).
+      PGHOST: localhost
+      PGPORT: "5432"
+      PGUSER: synthetic
+      PGPASSWORD: synthetic
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Choose output directories
+        run: |
+          # aml-stack.sh keeps PIDs, the generated stack.env and the server logs in AML_E2E_DIR.
+          echo "AML_E2E_DIR=${RUNNER_TEMP}/aml-e2e" >> "$GITHUB_ENV"
+          echo "E2E_OUT=${RUNNER_TEMP}/e2e-out" >> "$GITHUB_ENV"
+
+      - name: Create the test role (CREATEDB and CREATEROLE, not a superuser)
+        env:
+          PGUSER: postgres
+          PGPASSWORD: postgres
+        run: |
+          command -v psql >/dev/null || { sudo apt-get update -q && sudo apt-get install -yq postgresql-client; }
+          psql -X -v ON_ERROR_STOP=1 -d postgres <<'SQL'
+          -- The same privileges as the local development role and the RDS master
+          -- user: CREATEDB and CREATEROLE but not SUPERUSER.
+          CREATE ROLE synthetic LOGIN PASSWORD 'synthetic' CREATEDB CREATEROLE;
+          SQL
+
+      - name: Install Rust ${{ env.RUST_TOOLCHAIN }}
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --no-self-update
+          rustup default "$RUST_TOOLCHAIN"
+          rustc --version
+
+      - name: Restore the Cargo cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: backend -> target
+          shared-key: debug
+          # The backend job writes this cache (it compiles a superset: clippy and tests).
+          save-if: false
+
+      - name: Build the backend (debug)
+        working-directory: backend
+        run: cargo build --locked
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: |
+            frontend/package-lock.json
+            .github/e2e-tools/package-lock.json
+
+      - name: Restore the Next.js build cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: frontend/.next/cache
+          key: nextjs-${{ runner.os }}-${{ hashFiles('frontend/package-lock.json') }}-${{ hashFiles('frontend/src/**', 'frontend/*.ts', 'frontend/*.mjs', 'frontend/*.json') }}
+          restore-keys: |
+            nextjs-${{ runner.os }}-${{ hashFiles('frontend/package-lock.json') }}-
+
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: npm ci --no-audit --no-fund
+
+      - name: Build the frontend
+        working-directory: frontend
+        env:
+          # What aml-stack.sh would build with; the next step reuses this build.
+          NEXT_PUBLIC_API_URL: http://localhost:8080
+        run: npm run build
+
+      - name: Install Playwright (pinned in .github/e2e-tools) and Chromium
+        # The scripts load "playwright" with createRequire, which honours NODE_PATH
+        # (the README's documented setup). A separate, lockfile-pinned install
+        # (exact version and sha512 integrity) leaves frontend/package-lock.json and
+        # node_modules exactly as `npm ci` made them. Browsers are not cached:
+        # Playwright advises against it (restoring takes about as long as
+        # downloading, and the OS packages cannot be cached).
+        run: |
+          tools="${GITHUB_WORKSPACE}/.github/e2e-tools"
+          npm ci --prefix "${tools}" --no-audit --no-fund
+          echo "NODE_PATH=${tools}/node_modules" >> "$GITHUB_ENV"
+          "${tools}/node_modules/.bin/playwright" --version
+          "${tools}/node_modules/.bin/playwright" install --with-deps chromium
+
+      - name: Start the stack (fresh database, backend on :8080, next start on :3000)
+        id: stack
+        working-directory: frontend
+        env:
+          # Reuse the build from "Build the frontend" (same commit).
+          SKIP_FRONTEND_BUILD: "1"
+        run: e2e/aml-stack.sh start
+
+      - name: Smoke test (sign-up, KYC onboarding, deposit, investment, Proof of Reserve)
+        working-directory: frontend
+        timeout-minutes: 10
+        run: node e2e/smoke.mjs "${E2E_OUT}/smoke"
+
+      - name: AML/PLD console test (structuring, freeze, four-eyes unfreeze, roles)
+        # Runs even if the smoke test failed, as long as the stack is up.
+        if: ${{ !cancelled() && steps.stack.outcome == 'success' }}
+        working-directory: frontend
+        timeout-minutes: 15
+        run: node e2e/aml.mjs "${E2E_OUT}/aml"
+
+      - name: Stop the stack
+        if: ${{ always() && steps.stack.outcome != 'skipped' }}
+        working-directory: frontend
+        run: e2e/aml-stack.sh stop
+
+      - name: Upload screenshots, results and server logs
+        if: ${{ failure() && env.E2E_OUT != '' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: e2e-attempt-${{ github.run_attempt }}
+          # stack.env (throwaway per-run secrets) stays out of the artifact.
+          path: |
+            ${{ env.E2E_OUT }}
+            ${{ env.AML_E2E_DIR }}/*.log
+          if-no-files-found: ignore
+          retention-days: 7
+
+  # ---------------------------------------------------------------------------
+  docker:
+    name: Docker image (${{ matrix.image }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: backend
+            # Migrations are embedded from ../migrations: the context is the repo root.
+            context: .
+            dockerfile: backend/Dockerfile
+            build-args: ""
+          - image: frontend
+            context: frontend
+            dockerfile: frontend/Dockerfile
+            # NEXT_PUBLIC_* are inlined at build time; CI uses a reserved .example origin.
+            build-args: |
+              NEXT_PUBLIC_API_URL=https://synthetic-capital.example
+              NEXT_PUBLIC_COMPLIANCE_EMAIL=compliance@synthetic-capital.example
+    env:
+      IMAGE: synthetic-capital-${{ matrix.image }}:ci
+      DOCKERFILE: ${{ matrix.dockerfile }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Check that ${{ matrix.dockerfile }} exists
+        id: dockerfile
+        run: |
+          if [ -f "${DOCKERFILE}" ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::${DOCKERFILE} does not exist yet: image build and scan skipped"
+          fi
+
+      - name: Lint the Dockerfile (hadolint ${{ env.HADOLINT_VERSION }})
+        if: steps.dockerfile.outputs.present == 'true'
+        run: |
+          bin="${RUNNER_TEMP}/hadolint"
+          curl -fsSL --retry 3 -o "${bin}" \
+            "https://github.com/hadolint/hadolint/releases/download/${HADOLINT_VERSION}/hadolint-linux-x86_64"
+          echo "${HADOLINT_SHA256}  ${bin}" | sha256sum --check --strict -
+          chmod +x "${bin}"
+          "${bin}" "${DOCKERFILE}"
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        if: steps.dockerfile.outputs.present == 'true'
+
+      - name: Build ${{ env.IMAGE }} (not pushed)
+        if: steps.dockerfile.outputs.present == 'true'
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: ${{ matrix.context }}
+          file: ${{ matrix.dockerfile }}
+          build-args: |
+            VCS_REF=${{ github.sha }}
+            ${{ matrix.build-args }}
+          tags: ${{ env.IMAGE }}
+          push: false
+          # Into the local Docker engine, for the scans below.
+          load: true
+          provenance: false
+          cache-from: type=gha,scope=${{ matrix.image }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.image }},ignore-error=true
+
+      - name: Trivy - CRITICAL and HIGH vulnerabilities that have a fix (report)
+        if: steps.dockerfile.outputs.present == 'true'
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          version: ${{ env.TRIVY_VERSION }}
+          image-ref: ${{ env.IMAGE }}
+          scanners: vuln
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: "0"
+          cache-dir: ${{ runner.temp }}/trivy
+          trivyignores: .github/trivyignore.yaml
+
+      - name: Trivy - fail on CRITICAL vulnerabilities that have a fix
+        if: steps.dockerfile.outputs.present == 'true'
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        env:
+          # The previous step installed Trivy and downloaded today's database.
+          TRIVY_SKIP_DB_UPDATE: "true"
+          TRIVY_SKIP_JAVA_DB_UPDATE: "true"
+        with:
+          skip-setup-trivy: true
+          cache: false
+          image-ref: ${{ env.IMAGE }}
+          scanners: vuln
+          severity: CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+          cache-dir: ${{ runner.temp }}/trivy
+          trivyignores: .github/trivyignore.yaml
+
+  # ---------------------------------------------------------------------------
+  iac-and-scripts:
+    name: IaC, secrets, shell scripts and workflows
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      TF_IN_AUTOMATION: "1"
+      TF_INPUT: "0"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Before `terraform init`, so the scans see only the checkout (no provider
+      # binaries). Trivy parses Terraform and Dockerfiles; it has no parser for
+      # docker-compose.yml or nginx configuration, which the secret scan covers.
+      - name: Trivy - misconfigurations in Terraform and Dockerfiles (fail on HIGH and CRITICAL)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          version: ${{ env.TRIVY_VERSION }}
+          scan-type: config
+          scan-ref: .
+          severity: HIGH,CRITICAL
+          exit-code: "1"
+          cache-dir: ${{ runner.temp }}/trivy
+          trivyignores: .github/trivyignore.yaml
+
+      - name: Trivy - hardcoded secrets anywhere in the repository (fail on any)
+        # Runs even when the misconfiguration scan failed: both results matter.
+        if: ${{ !cancelled() }}
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          # Installed by the previous step; secret scanning needs no database.
+          skip-setup-trivy: true
+          cache: false
+          scan-type: fs
+          scan-ref: .
+          scanners: secret
+          exit-code: "1"
+          cache-dir: ${{ runner.temp }}/trivy
+          trivyignores: .github/trivyignore.yaml
+
+      - name: Look for Terraform configuration
+        id: terraform
+        run: |
+          if compgen -G "terraform/*.tf" >/dev/null; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::terraform/ has no .tf files yet: Terraform checks skipped"
+          fi
+
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        if: steps.terraform.outputs.present == 'true'
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+          terraform_wrapper: false
+
+      - name: terraform fmt -check
+        if: steps.terraform.outputs.present == 'true'
+        working-directory: terraform
+        run: terraform fmt -check -recursive -diff
+
+      - name: terraform init -backend=false
+        if: steps.terraform.outputs.present == 'true'
+        working-directory: terraform
+        run: terraform init -backend=false -input=false
+
+      - name: terraform validate
+        if: steps.terraform.outputs.present == 'true'
+        working-directory: terraform
+        run: terraform validate
+
+      - uses: terraform-linters/setup-tflint@6ffdbaa3be476b3431f7275c26966ef32ff60337 # v6.3.2
+        if: steps.terraform.outputs.present == 'true'
+        with:
+          tflint_version: ${{ env.TFLINT_VERSION }}
+
+      - name: tflint
+        if: steps.terraform.outputs.present == 'true'
+        env:
+          # `tflint --init` downloads the AWS ruleset from GitHub releases; the
+          # read-only token only lifts the anonymous API rate limit.
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          config="${GITHUB_WORKSPACE}/.github/linters/.tflint.hcl"
+          if [ -f terraform/.tflint.hcl ]; then config="${GITHUB_WORKSPACE}/terraform/.tflint.hcl"; fi
+          echo "Using ${config}"
+          tflint --chdir=terraform --config="${config}" --init
+          tflint --chdir=terraform --config="${config}" --format=compact
+
+      - name: Install ShellCheck ${{ env.SHELLCHECK_VERSION }} and actionlint ${{ env.ACTIONLINT_VERSION }}
+        run: |
+          bin="${RUNNER_TEMP}/bin"
+          mkdir -p "${bin}"
+          cd "${RUNNER_TEMP}"
+
+          sc="shellcheck-${SHELLCHECK_VERSION}.linux.x86_64.tar.xz"
+          curl -fsSL --retry 3 -O "https://github.com/koalaman/shellcheck/releases/download/${SHELLCHECK_VERSION}/${sc}"
+          echo "${SHELLCHECK_SHA256}  ${sc}" | sha256sum --check --strict -
+          tar -xJf "${sc}" --strip-components=1 -C "${bin}" "shellcheck-${SHELLCHECK_VERSION}/shellcheck"
+
+          al="actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+          curl -fsSL --retry 3 -O "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/${al}"
+          echo "${ACTIONLINT_SHA256}  ${al}" | sha256sum --check --strict -
+          tar -xzf "${al}" -C "${bin}" actionlint
+
+          echo "${bin}" >> "$GITHUB_PATH"
+          "${bin}/shellcheck" --version
+          "${bin}/actionlint" -version
+
+      - name: ShellCheck (scripts/*.sh, frontend/e2e/*.sh)
+        run: |
+          shopt -s nullglob
+          files=(scripts/*.sh frontend/e2e/*.sh)
+          if [ "${#files[@]}" -eq 0 ]; then
+            echo "::warning::no shell scripts found"
+            exit 0
+          fi
+          printf '%s\n' "${files[@]}"
+          # SC1091 ("not following"): files sourced at run time, such as the
+          # stack.env that aml-stack.sh generates, do not exist at lint time.
+          shellcheck --external-sources --exclude=SC1091 -- "${files[@]}"
+
+      - name: actionlint (runs ShellCheck on every `run:` block too)
+        run: actionlint -color
+
+  # ---------------------------------------------------------------------------
+  # One stable check for branch protection: require "CI result" instead of
+  # every (matrix) job name.
+  ci-ok:
+    name: CI result
+    if: ${{ always() }}
+    needs: [frontend, backend, sql-suites, e2e, docker, iac-and-scripts]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Require every job to succeed
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          echo "Job results: ${RESULTS}"
+          read -r -a results <<<"${RESULTS}"
+          for result in "${results[@]}"; do
+            if [ "${result}" != "success" ]; then
+              echo "::error::a required job finished with '${result}'"
+              exit 1
+            fi
+          done

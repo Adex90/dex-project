@@ -8,6 +8,7 @@
 //! - [`reserva`]: cortes de Proof of Reserve y pruebas de inclusión por cliente.
 //! - [`aml`]: monitoreo PLD/FT en línea (el esquema `aml` califica; Rust pasa hechos).
 //! - [`routes`]: API HTTP (Axum).
+//! - [`cli`]: comandos del binario (servir, migrar, salud).
 //!
 //! Las reglas de negocio inviolables se hacen cumplir dos veces: aquí, con
 //! errores claros, y en la base de datos (triggers, CHECKs y privilegios por
@@ -16,6 +17,7 @@
 pub mod aml;
 pub mod auth;
 pub mod bootstrap;
+pub mod cli;
 pub mod config;
 pub mod crypto;
 pub mod db;

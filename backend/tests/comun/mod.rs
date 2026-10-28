@@ -626,3 +626,40 @@ pub async fn como(pool: &PgPool, rol: db::Rol, sql: &str) -> Result<(), String> 
     }
     tx.commit().await.map_err(|e| e.to_string())
 }
+
+/// Login temporal con nombre único: los roles son de todo el clúster y las
+/// pruebas corren en paralelo. Se borra al soltarlo, también si la prueba falla.
+pub struct LoginTemporal {
+    pub usuario: String,
+    opciones: sqlx::postgres::PgConnectOptions,
+}
+
+impl LoginTemporal {
+    pub fn nuevo(pool: &PgPool) -> Self {
+        Self {
+            usuario: format!("sc_app_{}", &Uuid::new_v4().simple().to_string()[..12]),
+            opciones: pool.connect_options().as_ref().clone(),
+        }
+    }
+}
+
+impl Drop for LoginTemporal {
+    fn drop(&mut self) {
+        use sqlx::{ConnectOptions, Executor};
+        let opciones = self.opciones.clone();
+        let sql = format!("DROP ROLE IF EXISTS \"{}\"", self.usuario);
+        // Drop no puede esperar un futuro: un hilo con su propio runtime.
+        let borrado = std::thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async move {
+                let mut conexion = opciones.connect().await?;
+                conexion.execute(sql.as_str()).await.map(|_| ())
+            })
+        })
+        .join();
+        match borrado {
+            Ok(Ok(())) => {}
+            otro if std::thread::panicking() => eprintln!("no se pudo borrar el rol {}: {otro:?}", self.usuario),
+            otro => panic!("no se pudo borrar el rol {}: {otro:?}", self.usuario),
+        }
+    }
+}

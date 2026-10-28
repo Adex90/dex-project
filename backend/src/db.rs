@@ -45,6 +45,12 @@ pub enum Rol {
 }
 
 impl Rol {
+    /// Todos los roles transaccionales: el login de la aplicación es miembro
+    /// de cada uno (sin heredar sus privilegios) y actúa con `SET LOCAL ROLE`.
+    /// `sc_auditor_pld` no está: es para un verificador externo de la bitácora PLD.
+    pub const TODOS: [Rol; 8] =
+        [Rol::Ifpe, Rol::Sofom, Rol::Puente, Rol::Auditor, Rol::Kyc, Rol::KycVerificador, Rol::Spei, Rol::Aml];
+
     pub const fn nombre(self) -> &'static str {
         match self {
             Rol::Ifpe => "sc_ifpe",
