@@ -56,6 +56,7 @@ output "migrate_run_task_command" {
     "--platform-version LATEST",
     "--task-definition ${aws_ecs_task_definition.migrate.arn}",
     "--started-by migrate",
+    "--enable-ecs-managed-tags --propagate-tags TASK_DEFINITION",
     "--network-configuration 'awsvpcConfiguration={subnets=[${join(",", [for s in aws_subnet.app : s.id])}],securityGroups=[${aws_security_group.migrate.id}],assignPublicIp=DISABLED}'",
     "--query 'tasks[0].taskArn' --output text",
   ])

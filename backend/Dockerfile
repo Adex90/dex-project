@@ -55,7 +55,7 @@ RUN --mount=type=secret,id=extra_ca,required=false \
         cat /etc/ssl/certs/ca-certificates.crt /run/secrets/extra_ca > /tmp/ca-bundle.crt; \
         export CARGO_HTTP_CAINFO=/tmp/ca-bundle.crt; \
     fi; \
-    cargo fetch --locked --target "$(rustc -vV | sed -n 's/^host: //p')"; \
+    cargo fetch --locked --target "$(rustc --print host-tuple)"; \
     rm -f /tmp/ca-bundle.crt
 
 RUN cargo build --release --frozen --bin synthetic-capital

@@ -70,6 +70,14 @@ map $uri $edge_cache_control {
     /salud  $api_cache_control;
 }
 
+# /_next/static/ holds content-hashed, immutable files: cached for a year when served,
+# never on errors (a 404 for a chunk during a deploy must not stick in caches).
+map $status $static_cache_control {
+    200     "public, max-age=31536000, immutable";
+    304     "public, max-age=31536000, immutable";
+    default "no-store";
+}
+
 # ---------------------------------------------------------------------------------------
 # Port 8080 (host 80): ACME http-01 challenges and the redirect to HTTPS.
 # ---------------------------------------------------------------------------------------
@@ -156,9 +164,25 @@ server {
         proxy_pass http://frontend;
     }
 
-    # Next.js image optimizer: unused (no next/image; sharp is not in the image) and a
-    # classic resource-exhaustion target, so it is not exposed.
-    location = /_next/image {
+    # Hashed build assets (JS, CSS, fonts). Next.js already sends a year-long immutable
+    # Cache-Control on them; the edge pins it (map $static_cache_control: errors get
+    # no-store). Own add_header/proxy_hide_header here, so both snippets are re-included.
+    location ^~ /_next/static/ {
+        limit_req zone=site burst=200 nodelay;
+        error_page 429 @pagina_429;
+        error_page 502 503 504 =503 @pagina_no_disponible;
+        include /etc/nginx/snippets/security-headers.conf;
+        include /etc/nginx/snippets/proxy.conf;
+        proxy_hide_header Cache-Control;
+        add_header Cache-Control $static_cache_control always;
+        proxy_pass http://frontend;
+    }
+
+    # Next.js Image Optimization API: unused (no next/image; sharp is not in the image)
+    # and a recurring vulnerability and resource-exhaustion target (e.g. GHSA-2464-fhr4-w9xw,
+    # RCE in next <= 15.5.27), so it is not exposed at all. A prefix match also catches
+    # /_next/image/ and /_next/image;... (nginx decodes %-escapes before matching).
+    location ^~ /_next/image {
         return 404;
     }
 

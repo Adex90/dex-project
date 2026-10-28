@@ -3,3 +3,19 @@ backend/target/
 frontend/node_modules/
 frontend/.next/
 .claude/
+
+# Terraform (terraform/): provider cache, local state and plans, crash logs and operator
+# inputs. Commit terraform/.terraform.lock.hcl and the *.example files.
+terraform/.terraform/
+terraform/*.tfstate
+terraform/*.tfstate.*
+terraform/*.tfplan
+terraform/crash.log
+terraform/crash.*.log
+terraform/*.tfvars
+terraform/*.tfvars.json
+terraform/backend.hcl
+terraform/override.tf
+terraform/override.tf.json
+terraform/*_override.tf
+terraform/*_override.tf.json

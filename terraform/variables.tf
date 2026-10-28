@@ -29,8 +29,8 @@ variable "project" {
 
   validation {
     # Load balancer and target group names are limited to 32 characters.
-    condition     = can(regex("^[a-z][a-z0-9-]{1,16}[a-z0-9]$", var.project))
-    error_message = "project must be 3-18 characters: lowercase letters, digits and hyphens, starting with a letter."
+    condition     = can(regex("^[a-z][a-z0-9-]{1,16}[a-z0-9]$", var.project)) && !strcontains(var.project, "--")
+    error_message = "project must be 3-18 characters: lowercase letters, digits and single hyphens, starting with a letter (RDS identifiers reject '--')."
   }
 }
 
@@ -187,9 +187,9 @@ variable "strict_transport_security" {
 }
 
 variable "content_security_policy" {
-  description = "Content-Security-Policy header the HTTPS listener adds to every response. Same policy as the nginx edge: Next.js static pages need 'unsafe-inline' scripts (no nonces); camera frames are blob:/data: images."
+  description = "Content-Security-Policy header the HTTPS listener adds to every response. Same policy as the nginx edge (nginx/snippets/security-headers.conf, checked in Chromium): prerendered Next.js pages need 'unsafe-inline' scripts (no nonces); onboarding previews are data:/blob: images."
   type        = string
-  default     = "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; media-src 'self' blob:; font-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'; upgrade-insecure-requests"
+  default     = "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self'; connect-src 'self'; media-src 'self'; object-src 'none'; frame-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'; upgrade-insecure-requests"
 }
 
 # -----------------------------------------------------------------------------------------
@@ -317,6 +317,17 @@ variable "frontend_image_tag" {
   validation {
     condition     = can(regex("^(sha256:[a-f0-9]{64}|[A-Za-z0-9_][A-Za-z0-9_.-]{0,127})$", var.frontend_image_tag)) && var.frontend_image_tag != "latest"
     error_message = "frontend_image_tag must be an image tag other than 'latest', or a sha256:<64 hex> digest."
+  }
+}
+
+variable "migrate_image_tag" {
+  description = "Backend image tag or digest for the migrate task only. Null: backend_image_tag. A release with migrations sets it to the new tag first (register and run the migrate task), then moves backend_image_tag."
+  type        = string
+  default     = null
+
+  validation {
+    condition     = var.migrate_image_tag == null || (can(regex("^(sha256:[a-f0-9]{64}|[A-Za-z0-9_][A-Za-z0-9_.-]{0,127})$", coalesce(var.migrate_image_tag, "x"))) && var.migrate_image_tag != "latest")
+    error_message = "migrate_image_tag must be null, an image tag other than 'latest', or a sha256:<64 hex> digest."
   }
 }
 

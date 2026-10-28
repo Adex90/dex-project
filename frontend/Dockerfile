@@ -86,10 +86,10 @@ ARG RUNTIME_IMAGE
 # The base image's default user is 65532: create /app and its files as root, so the
 # service user can neither modify nor replace application code even on a writable rootfs.
 USER 0:0
-ARG VCS_REF=unknown
+ARG REVISION=unknown
 LABEL org.opencontainers.image.title="synthetic-capital-frontend" \
       org.opencontainers.image.description="Synthetic Capital web frontend (Next.js standalone server)" \
-      org.opencontainers.image.revision="${VCS_REF}" \
+      org.opencontainers.image.revision="${REVISION}" \
       org.opencontainers.image.base.name="${RUNTIME_IMAGE}"
 WORKDIR /app
 ENV NODE_ENV=production \

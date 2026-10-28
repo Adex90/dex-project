@@ -45,8 +45,10 @@ locals {
   })
 
   # ECR image reference: an immutable tag, or a digest (sha256:...).
-  backend_image  = "${aws_ecr_repository.this["backend"].repository_url}${startswith(var.backend_image_tag, "sha256:") ? "@" : ":"}${var.backend_image_tag}"
-  frontend_image = "${aws_ecr_repository.this["frontend"].repository_url}${startswith(var.frontend_image_tag, "sha256:") ? "@" : ":"}${var.frontend_image_tag}"
+  migrate_image_tag = coalesce(var.migrate_image_tag, var.backend_image_tag)
+  backend_image     = "${aws_ecr_repository.this["backend"].repository_url}${startswith(var.backend_image_tag, "sha256:") ? "@" : ":"}${var.backend_image_tag}"
+  migrate_image     = "${aws_ecr_repository.this["backend"].repository_url}${startswith(local.migrate_image_tag, "sha256:") ? "@" : ":"}${local.migrate_image_tag}"
+  frontend_image    = "${aws_ecr_repository.this["frontend"].repository_url}${startswith(var.frontend_image_tag, "sha256:") ? "@" : ":"}${var.frontend_image_tag}"
 
   public_url = "https://${var.domain_name}"
 }

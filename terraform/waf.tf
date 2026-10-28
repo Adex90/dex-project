@@ -2,6 +2,7 @@
 #
 # Rule order (lower priority number first):
 #    0-1  provider webhook IP allowlists (only when the CIDR lists are set)
+#    2    /_next/image (Next.js image optimizer, unused by the app) answers 404
 #   10    AWS IP reputation list
 #   11    AWS anonymous IP list (Tor/anonymising proxies blocked, hosting providers counted)
 #   20-23 rate limits per client IP: auth, KYC upload, webhooks, rest of the API
@@ -39,13 +40,18 @@ locals {
       status = 403
       body   = jsonencode({ error = { codigo = "PROHIBIDO", mensaje = "solicitud rechazada" } })
     }
+    # Same body as the nginx edge's API 429; the frontend already translates REINTENTAR.
     demasiadas_peticiones = {
       status = 429
-      body   = jsonencode({ error = { codigo = "DEMASIADAS_PETICIONES", mensaje = "demasiadas solicitudes; intenta más tarde" } })
+      body   = jsonencode({ error = { codigo = "REINTENTAR", mensaje = "demasiadas peticiones; espera unos segundos y reintenta" } })
     }
     cuerpo_demasiado_grande = {
       status = 413
       body   = jsonencode({ error = { codigo = "CUERPO_DEMASIADO_GRANDE", mensaje = "el cuerpo de la petición excede el máximo permitido" } })
+    }
+    ruta_inexistente = {
+      status = 404
+      body   = jsonencode({ error = { codigo = "RUTA_INEXISTENTE", mensaje = "la ruta no existe" } })
     }
   }
 
@@ -210,6 +216,53 @@ resource "aws_wafv2_web_acl" "this" {
         metric_name                = "${local.name}-kyc-webhook-allowlist"
         sampled_requests_enabled   = true
       }
+    }
+  }
+
+  # --- 2: Next.js image optimizer ---------------------------------------------------------
+  # The app uses no next/image (no public/ dir, sharp removed from the image), so the
+  # optimizer endpoint only adds attack surface (Next.js advisories have targeted it).
+  # Next.js decodes and normalises paths, so this match does too.
+
+  rule {
+    name     = "next-image-optimizer-disabled"
+    priority = 2
+
+    action {
+      block {
+        custom_response {
+          response_code            = local.waf_responses.ruta_inexistente.status
+          custom_response_body_key = "ruta_inexistente"
+        }
+      }
+    }
+
+    statement {
+      byte_match_statement {
+        positional_constraint = "STARTS_WITH"
+        search_string         = "/_next/image"
+        field_to_match {
+          uri_path {}
+        }
+        text_transformation {
+          priority = 0
+          type     = "URL_DECODE"
+        }
+        text_transformation {
+          priority = 1
+          type     = "NORMALIZE_PATH"
+        }
+        text_transformation {
+          priority = 2
+          type     = "LOWERCASE"
+        }
+      }
+    }
+
+    visibility_config {
+      cloudwatch_metrics_enabled = true
+      metric_name                = "${local.name}-next-image-optimizer"
+      sampled_requests_enabled   = true
     }
   }
 

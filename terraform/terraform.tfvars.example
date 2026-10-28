@@ -1,0 +1,66 @@
+# Copy to terraform.tfvars (git-ignored). No secret goes here: every secret value lives in
+# AWS Secrets Manager (see README.md, "Secrets"). All values below are placeholders.
+
+# --- Required -------------------------------------------------------------------------
+region             = "mx-central-1" # data residency: customer data stays in Mexico
+aws_account_id     = "123456789012"
+domain_name        = "bank.example.mx"
+backend_image_tag  = "4a97a96" # immutable tag (git SHA) or sha256:<digest> in this stack's ECR
+frontend_image_tag = "4a97a96" # built with NEXT_PUBLIC_API_URL=https://bank.example.mx
+
+# --- Recommended ----------------------------------------------------------------------
+environment        = "prod"
+availability_zones = ["mx-central-1a", "mx-central-1b", "mx-central-1c"] # pin the zones
+
+# TLS certificate: either an existing ACM certificate in the same region...
+# acm_certificate_arn = "arn:aws:acm:mx-central-1:123456789012:certificate/00000000-0000-0000-0000-000000000000"
+# ...or let Terraform request one; with a Route 53 public zone the DNS records are created too.
+route53_zone_id = "Z0123456789EXAMPLE"
+
+# Provider API ranges the backend may call on 443 (STP / SPEI participant, biometric
+# provider). Empty = no internet egress at all.
+backend_egress_cidrs = [
+  "203.0.113.0/24",  # SPEI provider API (placeholder)
+  "198.51.100.0/24", # biometric provider API (placeholder)
+]
+
+# Provider webhook source addresses (WAF allowlists). Empty = no allowlist.
+spei_webhook_allowed_cidrs = ["203.0.113.0/24"]
+kyc_webhook_allowed_cidrs  = ["198.51.100.0/24"]
+
+# Non-secret business settings (.env.example names), shared by the service and the
+# migrate task (the bootstrap writes them to the database).
+app_environment = {
+  CLABE_PREFIJO        = "999180" # bank code + plaza (+ up to 4 digits): set the real one
+  SPEI_PREFIJO_RASTREO = "SC"
+  RESERVA_INSTITUCION  = "Banco de México"
+  RESERVA_CUENTA       = "SC-IFPE-RESERVA-001"
+  CAJA_INSTITUCION     = "Banco Custodio SOFOM"
+  CAJA_CUENTA          = "SC-SOFOM-CAJA-001"
+  # KYC_SCORE_MINIMO   = "0.85"
+  # KYC_SCORE_REVISION = "0.70"
+  # KYC_MAX_INTENTOS   = "3"
+}
+
+# First operator, created by the migrate task (its password goes to Secrets Manager).
+bootstrap_operator_email = "operaciones@bank.example.mx"
+
+tags = {
+  Owner              = "platform-team"
+  CostCenter         = "banking-core"
+  DataClassification = "confidential"
+}
+
+# --- First deployment only ------------------------------------------------------------
+# Start with no tasks; raise to >= 2 after images, secrets and migrations are in place.
+# backend_min_tasks  = 0
+# frontend_min_tasks = 0
+
+# --- Sizing (defaults shown) ------------------------------------------------------------
+# db_instance_class          = "db.m7g.large"
+# db_allocated_storage       = 100
+# db_max_allocated_storage   = 1000
+# backend_cpu                = 512
+# backend_memory             = 1024
+# backend_max_tasks          = 6
+# backend_db_max_connections = 20

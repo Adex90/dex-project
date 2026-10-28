@@ -255,7 +255,7 @@ locals {
 
   migrate_container = merge(local.container_hardening, {
     name        = "migrate"
-    image       = local.backend_image
+    image       = local.migrate_image
     essential   = true
     command     = ["migrar"]
     environment = [for k in sort(keys(local.migrate_environment)) : { name = k, value = local.migrate_environment[k] }]
