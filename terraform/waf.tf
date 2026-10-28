@@ -3,6 +3,7 @@
 # Rule order (lower priority number first):
 #    0-1  provider webhook IP allowlists (only when the CIDR lists are set)
 #   10    AWS IP reputation list
+#   11    AWS anonymous IP list (Tor/anonymising proxies blocked, hosting providers counted)
 #   20-23 rate limits per client IP: auth, KYC upload, webhooks, rest of the API
 #   30    AWS common rule set, with SizeRestrictions_BODY switched to COUNT
 #   31-33 body size, scoped (see below)
@@ -232,6 +233,50 @@ resource "aws_wafv2_web_acl" "this" {
     visibility_config {
       cloudwatch_metrics_enabled = true
       metric_name                = "${local.name}-aws-ip-reputation"
+      sampled_requests_enabled   = true
+    }
+  }
+
+  # --- 11: anonymising networks ---------------------------------------------------------
+  # Tor exit nodes and anonymising proxies are blocked (var.waf_block_anonymous_ips);
+  # data-centre addresses are only counted, because the SPEI and KYC providers call the
+  # webhooks from hosting networks.
+
+  rule {
+    name     = "aws-anonymous-ip"
+    priority = 11
+
+    override_action {
+      none {}
+    }
+
+    statement {
+      managed_rule_group_statement {
+        vendor_name = "AWS"
+        name        = "AWSManagedRulesAnonymousIpList"
+
+        rule_action_override {
+          name = "HostingProviderIPList"
+          action_to_use {
+            count {}
+          }
+        }
+
+        dynamic "rule_action_override" {
+          for_each = var.waf_block_anonymous_ips ? [] : [1]
+          content {
+            name = "AnonymousIPList"
+            action_to_use {
+              count {}
+            }
+          }
+        }
+      }
+    }
+
+    visibility_config {
+      cloudwatch_metrics_enabled = true
+      metric_name                = "${local.name}-aws-anonymous-ip"
       sampled_requests_enabled   = true
     }
   }

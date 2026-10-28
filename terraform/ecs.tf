@@ -376,7 +376,7 @@ resource "aws_ecs_service" "backend" {
   task_definition                   = aws_ecs_task_definition.backend.arn
   desired_count                     = var.backend_min_tasks
   launch_type                       = "FARGATE"
-  platform_version                  = "1.4.0"
+  platform_version                  = "LATEST"
   enable_execute_command            = false
   enable_ecs_managed_tags           = true
   propagate_tags                    = "SERVICE"
@@ -424,7 +424,7 @@ resource "aws_ecs_service" "frontend" {
   task_definition                   = aws_ecs_task_definition.frontend.arn
   desired_count                     = var.frontend_min_tasks
   launch_type                       = "FARGATE"
-  platform_version                  = "1.4.0"
+  platform_version                  = "LATEST"
   enable_execute_command            = false
   enable_ecs_managed_tags           = true
   propagate_tags                    = "SERVICE"

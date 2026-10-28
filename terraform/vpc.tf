@@ -31,8 +31,8 @@ resource "aws_vpc" "this" {
 
   lifecycle {
     precondition {
-      condition     = length(local.azs) == var.availability_zone_count
-      error_message = "The region does not have ${var.availability_zone_count} available availability zones."
+      condition     = length(local.azs) == var.availability_zone_count && length(setsubtract(local.azs, local.region_azs)) == 0
+      error_message = "Need ${var.availability_zone_count} regular availability zones of ${var.region} (check availability_zones)."
     }
   }
 }

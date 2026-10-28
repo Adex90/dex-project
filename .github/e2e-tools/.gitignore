@@ -1,0 +1,2 @@
+# `npm ci --prefix .github/e2e-tools` (the e2e job) installs here.
+node_modules/

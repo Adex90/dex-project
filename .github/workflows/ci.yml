@@ -5,10 +5,11 @@
 # service containers that live for one job, and the automatic GITHUB_TOKEN,
 # limited to `contents: read` below.
 #
-# Supply chain: every action is pinned to a full commit SHA (the release is in
-# the trailing comment; Dependabot updates both). Tools downloaded by `run`
-# steps are pinned by version and SHA-256 in `env` below; bump the version and
-# the checksum together.
+# Supply chain: actions are referenced by their documented major tag (trivy-action,
+# which publishes no major tag, by its exact release); Dependabot proposes new
+# majors and releases weekly. Pinning to full commit SHAs is stronger and
+# Dependabot maintains those too. Tools downloaded by `run` steps are pinned by
+# version and SHA-256 in `env` below; bump the version and the checksum together.
 #
 # Paths owned by the infrastructure work (backend/Dockerfile, terraform/,
 # scripts/) are optional here: when one is missing, its checks are skipped with
@@ -75,18 +76,18 @@ jobs:
       run:
         working-directory: frontend
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
 
-      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+      - uses: actions/setup-node@v7
         with:
           node-version: ${{ env.NODE_VERSION }}
           cache: npm
           cache-dependency-path: frontend/package-lock.json
 
       - name: Restore the Next.js build cache
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        uses: actions/cache@v6
         with:
           path: frontend/.next/cache
           key: nextjs-${{ runner.os }}-${{ hashFiles('frontend/package-lock.json') }}-${{ hashFiles('frontend/src/**', 'frontend/*.ts', 'frontend/*.mjs', 'frontend/*.json') }}
@@ -94,18 +95,25 @@ jobs:
             nextjs-${{ runner.os }}-${{ hashFiles('frontend/package-lock.json') }}-
 
       - name: Install dependencies
+        id: deps
         run: npm ci --no-audit --no-fund
 
+      # Each check below needs only the dependencies, so one failure does not
+      # hide the others' results.
       - name: Lint
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
         run: npm run lint
 
       - name: Typecheck
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
         run: npm run typecheck
 
       - name: Unit tests
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
         run: npm test
 
       - name: Build
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
         run: npm run build
 
   # ---------------------------------------------------------------------------
@@ -131,11 +139,12 @@ jobs:
       PGPORT: "5432"
       DATABASE_URL: postgres://synthetic:synthetic@localhost:5432/synthetic_capital
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
 
       - name: Create the test role (CREATEDB and CREATEROLE, not a superuser)
+        id: role
         env:
           PGUSER: postgres
           PGPASSWORD: postgres
@@ -156,6 +165,7 @@ jobs:
           SQL
 
       - name: Install Rust ${{ env.RUST_TOOLCHAIN }}
+        id: rust
         run: |
           rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --component rustfmt,clippy --no-self-update
           rustup default "$RUST_TOOLCHAIN"
@@ -163,21 +173,25 @@ jobs:
           cargo --version
 
       - name: Restore the Cargo cache
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        uses: Swatinem/rust-cache@v2
         with:
           workspaces: backend -> target
           # Shared with the e2e job (same debug profile). This job is the only writer.
           shared-key: debug
 
+      # fmt, clippy and tests are independent: one failure does not hide the others.
       - name: cargo fmt --check
+        if: ${{ !cancelled() && steps.rust.outcome == 'success' }}
         working-directory: backend
         run: cargo fmt --check
 
       - name: cargo clippy
+        if: ${{ !cancelled() && steps.rust.outcome == 'success' }}
         working-directory: backend
         run: cargo clippy --all-targets --locked -- -D warnings
 
       - name: cargo test
+        if: ${{ !cancelled() && steps.rust.outcome == 'success' && steps.role.outcome == 'success' }}
         working-directory: backend
         # sqlx::test gives every test a fresh database with all migrations applied.
         run: cargo test --locked --no-fail-fast
@@ -220,7 +234,7 @@ jobs:
       PGUSER: synthetic
       PGPASSWORD: synthetic
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
 
@@ -309,7 +323,7 @@ jobs:
       PGUSER: synthetic
       PGPASSWORD: synthetic
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
 
@@ -338,7 +352,7 @@ jobs:
           rustc --version
 
       - name: Restore the Cargo cache
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        uses: Swatinem/rust-cache@v2
         with:
           workspaces: backend -> target
           shared-key: debug
@@ -349,7 +363,7 @@ jobs:
         working-directory: backend
         run: cargo build --locked
 
-      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+      - uses: actions/setup-node@v7
         with:
           node-version: ${{ env.NODE_VERSION }}
           cache: npm
@@ -358,7 +372,7 @@ jobs:
             .github/e2e-tools/package-lock.json
 
       - name: Restore the Next.js build cache
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        uses: actions/cache@v6
         with:
           path: frontend/.next/cache
           key: nextjs-${{ runner.os }}-${{ hashFiles('frontend/package-lock.json') }}-${{ hashFiles('frontend/src/**', 'frontend/*.ts', 'frontend/*.mjs', 'frontend/*.json') }}
@@ -417,7 +431,7 @@ jobs:
 
       - name: Upload screenshots, results and server logs
         if: ${{ failure() && env.E2E_OUT != '' }}
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        uses: actions/upload-artifact@v7
         with:
           name: e2e-attempt-${{ github.run_attempt }}
           # stack.env (throwaway per-run secrets) stays out of the artifact.
@@ -440,19 +454,22 @@ jobs:
             # Migrations are embedded from ../migrations: the context is the repo root.
             context: .
             dockerfile: backend/Dockerfile
-            build-args: ""
+            # Each Dockerfile names its revision-label argument differently.
+            build-args: |
+              REVISION=${{ github.sha }}
           - image: frontend
             context: frontend
             dockerfile: frontend/Dockerfile
             # NEXT_PUBLIC_* are inlined at build time; CI uses a reserved .example origin.
             build-args: |
+              VCS_REF=${{ github.sha }}
               NEXT_PUBLIC_API_URL=https://synthetic-capital.example
               NEXT_PUBLIC_COMPLIANCE_EMAIL=compliance@synthetic-capital.example
     env:
       IMAGE: synthetic-capital-${{ matrix.image }}:ci
       DOCKERFILE: ${{ matrix.dockerfile }}
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
 
@@ -476,18 +493,18 @@ jobs:
           chmod +x "${bin}"
           "${bin}" "${DOCKERFILE}"
 
-      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
-        if: steps.dockerfile.outputs.present == 'true'
+      # Build and scan even when hadolint has findings: both results matter.
+      - uses: docker/setup-buildx-action@v4
+        if: ${{ !cancelled() && steps.dockerfile.outputs.present == 'true' }}
 
       - name: Build ${{ env.IMAGE }} (not pushed)
-        if: steps.dockerfile.outputs.present == 'true'
-        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        id: build
+        if: ${{ !cancelled() && steps.dockerfile.outputs.present == 'true' }}
+        uses: docker/build-push-action@v7
         with:
           context: ${{ matrix.context }}
           file: ${{ matrix.dockerfile }}
-          build-args: |
-            VCS_REF=${{ github.sha }}
-            ${{ matrix.build-args }}
+          build-args: ${{ matrix.build-args }}
           tags: ${{ env.IMAGE }}
           push: false
           # Into the local Docker engine, for the scans below.
@@ -497,8 +514,9 @@ jobs:
           cache-to: type=gha,mode=max,scope=${{ matrix.image }},ignore-error=true
 
       - name: Trivy - CRITICAL and HIGH vulnerabilities that have a fix (report)
-        if: steps.dockerfile.outputs.present == 'true'
-        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        id: trivy-report
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           version: ${{ env.TRIVY_VERSION }}
           image-ref: ${{ env.IMAGE }}
@@ -510,8 +528,8 @@ jobs:
           trivyignores: .github/trivyignore.yaml
 
       - name: Trivy - fail on CRITICAL vulnerabilities that have a fix
-        if: steps.dockerfile.outputs.present == 'true'
-        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        if: ${{ !cancelled() && steps.trivy-report.outcome == 'success' }}
+        uses: aquasecurity/trivy-action@v0.36.0
         env:
           # The previous step installed Trivy and downloaded today's database.
           TRIVY_SKIP_DB_UPDATE: "true"
@@ -536,7 +554,7 @@ jobs:
       TF_IN_AUTOMATION: "1"
       TF_INPUT: "0"
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
 
@@ -544,7 +562,7 @@ jobs:
       # binaries). Trivy parses Terraform and Dockerfiles; it has no parser for
       # docker-compose.yml or nginx configuration, which the secret scan covers.
       - name: Trivy - misconfigurations in Terraform and Dockerfiles (fail on HIGH and CRITICAL)
-        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           version: ${{ env.TRIVY_VERSION }}
           scan-type: config
@@ -557,7 +575,7 @@ jobs:
       - name: Trivy - hardcoded secrets anywhere in the repository (fail on any)
         # Runs even when the misconfiguration scan failed: both results matter.
         if: ${{ !cancelled() }}
-        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           # Installed by the previous step; secret scanning needs no database.
           skip-setup-trivy: true
@@ -569,8 +587,12 @@ jobs:
           cache-dir: ${{ runner.temp }}/trivy
           trivyignores: .github/trivyignore.yaml
 
+      # The checks below are independent of each other and of the scans above:
+      # each runs when its own prerequisite succeeded, so one failure does not
+      # hide the other results.
       - name: Look for Terraform configuration
         id: terraform
+        if: ${{ !cancelled() }}
         run: |
           if compgen -G "terraform/*.tf" >/dev/null; then
             echo "present=true" >> "$GITHUB_OUTPUT"
@@ -579,34 +601,37 @@ jobs:
             echo "::warning::terraform/ has no .tf files yet: Terraform checks skipped"
           fi
 
-      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
-        if: steps.terraform.outputs.present == 'true'
+      - uses: hashicorp/setup-terraform@v4
+        id: setup-terraform
+        if: ${{ !cancelled() && steps.terraform.outputs.present == 'true' }}
         with:
           terraform_version: ${{ env.TERRAFORM_VERSION }}
           terraform_wrapper: false
 
       - name: terraform fmt -check
-        if: steps.terraform.outputs.present == 'true'
+        if: ${{ !cancelled() && steps.setup-terraform.outcome == 'success' }}
         working-directory: terraform
         run: terraform fmt -check -recursive -diff
 
       - name: terraform init -backend=false
-        if: steps.terraform.outputs.present == 'true'
+        id: init
+        if: ${{ !cancelled() && steps.setup-terraform.outcome == 'success' }}
         working-directory: terraform
         run: terraform init -backend=false -input=false
 
       - name: terraform validate
-        if: steps.terraform.outputs.present == 'true'
+        if: ${{ !cancelled() && steps.init.outcome == 'success' }}
         working-directory: terraform
         run: terraform validate
 
-      - uses: terraform-linters/setup-tflint@6ffdbaa3be476b3431f7275c26966ef32ff60337 # v6.3.2
-        if: steps.terraform.outputs.present == 'true'
+      - uses: terraform-linters/setup-tflint@v6
+        id: setup-tflint
+        if: ${{ !cancelled() && steps.terraform.outputs.present == 'true' }}
         with:
           tflint_version: ${{ env.TFLINT_VERSION }}
 
       - name: tflint
-        if: steps.terraform.outputs.present == 'true'
+        if: ${{ !cancelled() && steps.setup-tflint.outcome == 'success' }}
         env:
           # `tflint --init` downloads the AWS ruleset from GitHub releases; the
           # read-only token only lifts the anonymous API rate limit.
@@ -619,6 +644,8 @@ jobs:
           tflint --chdir=terraform --config="${config}" --format=compact
 
       - name: Install ShellCheck ${{ env.SHELLCHECK_VERSION }} and actionlint ${{ env.ACTIONLINT_VERSION }}
+        id: linters
+        if: ${{ !cancelled() }}
         run: |
           bin="${RUNNER_TEMP}/bin"
           mkdir -p "${bin}"
@@ -639,6 +666,7 @@ jobs:
           "${bin}/actionlint" -version
 
       - name: ShellCheck (scripts/*.sh, frontend/e2e/*.sh)
+        if: ${{ !cancelled() && steps.linters.outcome == 'success' }}
         run: |
           shopt -s nullglob
           files=(scripts/*.sh frontend/e2e/*.sh)
@@ -652,6 +680,7 @@ jobs:
           shellcheck --external-sources --exclude=SC1091 -- "${files[@]}"
 
       - name: actionlint (runs ShellCheck on every `run:` block too)
+        if: ${{ !cancelled() && steps.linters.outcome == 'success' }}
         run: actionlint -color
 
   # ---------------------------------------------------------------------------

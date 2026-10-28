@@ -55,42 +55,96 @@ resource "aws_db_subnet_group" "this" {
 # idle_in_transaction_session_timeout 60s) when it opens a connection.
 # -----------------------------------------------------------------------------------------
 
-locals {
-  db_parameters = {
-    # Transport and authentication.
-    "rds.force_ssl"                     = { value = "1", apply_method = "pending-reboot" }
-    "rds.accepted_password_auth_method" = { value = "scram", apply_method = "pending-reboot" }
-    "password_encryption"               = { value = "scram-sha-256", apply_method = "immediate" }
-    "ssl_min_protocol_version"          = { value = "TLSv1.2", apply_method = "immediate" }
-
-    # Logging: connections, DDL, slow statements, lock waits, temp files, autovacuum.
-    "log_connections"             = { value = "1", apply_method = "immediate" }
-    "log_disconnections"          = { value = "1", apply_method = "immediate" }
-    "log_statement"               = { value = "ddl", apply_method = "immediate" }
-    "log_min_duration_statement"  = { value = tostring(var.db_log_min_duration_ms), apply_method = "immediate" }
-    "log_parameter_max_length"    = { value = "0", apply_method = "immediate" } # never log bind values (PII)
-    "log_lock_waits"              = { value = "1", apply_method = "immediate" }
-    "log_temp_files"              = { value = "10240", apply_method = "immediate" } # KB
-    "log_autovacuum_min_duration" = { value = "10000", apply_method = "immediate" } # ms
-    "track_io_timing"             = { value = "1", apply_method = "immediate" }
-
-    # Backstop for sessions that leave a transaction open (the backend sets 60s itself).
-    "idle_in_transaction_session_timeout" = { value = "300000", apply_method = "immediate" } # ms
-  }
-}
-
 resource "aws_db_parameter_group" "postgres16" {
   name        = "${local.name}-postgres16"
   family      = "postgres16"
   description = "${local.name}: TLS required, SCRAM only, audit logging"
 
-  dynamic "parameter" {
-    for_each = local.db_parameters
-    content {
-      name         = parameter.key
-      value        = parameter.value.value
-      apply_method = parameter.value.apply_method
-    }
+  # --- Transport and authentication ---------------------------------------------------
+  parameter {
+    name         = "rds.force_ssl" # reject non-TLS connections
+    value        = "1"
+    apply_method = "pending-reboot"
+  }
+
+  parameter {
+    name         = "rds.accepted_password_auth_method" # SCRAM only, never md5
+    value        = "scram"
+    apply_method = "pending-reboot"
+  }
+
+  parameter {
+    name         = "password_encryption"
+    value        = "scram-sha-256"
+    apply_method = "immediate"
+  }
+
+  parameter {
+    name         = "ssl_min_protocol_version"
+    value        = "TLSv1.2"
+    apply_method = "immediate"
+  }
+
+  # --- Logging: connections, DDL, slow statements, lock waits, temp files, autovacuum --
+  parameter {
+    name         = "log_connections"
+    value        = "1"
+    apply_method = "immediate"
+  }
+
+  parameter {
+    name         = "log_disconnections"
+    value        = "1"
+    apply_method = "immediate"
+  }
+
+  parameter {
+    name         = "log_statement"
+    value        = "ddl"
+    apply_method = "immediate"
+  }
+
+  parameter {
+    name         = "log_min_duration_statement"
+    value        = tostring(var.db_log_min_duration_ms)
+    apply_method = "immediate"
+  }
+
+  parameter {
+    name         = "log_parameter_max_length" # never log bind values (customer data)
+    value        = "0"
+    apply_method = "immediate"
+  }
+
+  parameter {
+    name         = "log_lock_waits"
+    value        = "1"
+    apply_method = "immediate"
+  }
+
+  parameter {
+    name         = "log_temp_files" # KB
+    value        = "10240"
+    apply_method = "immediate"
+  }
+
+  parameter {
+    name         = "log_autovacuum_min_duration" # ms
+    value        = "10000"
+    apply_method = "immediate"
+  }
+
+  parameter {
+    name         = "track_io_timing"
+    value        = "1"
+    apply_method = "immediate"
+  }
+
+  # --- Backstop for sessions that leave a transaction open (the backend sets 60s) ------
+  parameter {
+    name         = "idle_in_transaction_session_timeout" # ms
+    value        = "300000"
+    apply_method = "immediate"
   }
 
   tags = { Name = "${local.name}-postgres16" }
@@ -137,6 +191,7 @@ resource "aws_iam_role_policy_attachment" "rds_monitoring" {
 # Instance
 # -----------------------------------------------------------------------------------------
 
+#trivy:ignore:AWS-0176 IAM database authentication is not used: SCRAM through RDS Proxy for the service, the RDS-managed secret for the owner.
 resource "aws_db_instance" "this" {
   #checkov:skip=CKV_AWS_161:IAM database authentication is not used: the service authenticates with SCRAM through RDS Proxy and the owner with the RDS-managed secret. Leaving it off avoids an unused login path.
   identifier     = local.db_identifier

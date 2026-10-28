@@ -92,6 +92,8 @@ locals {
   ]
 }
 
+#trivy:ignore:AWS-0089 Access-log destination; logging it into a further bucket adds no audit value (CloudTrail data events cover object access).
+#trivy:ignore:AWS-0132 Elastic Load Balancing delivers access logs only to SSE-S3 (AES-256) buckets; SSE-KMS is rejected.
 resource "aws_s3_bucket" "alb_logs" {
   #checkov:skip=CKV_AWS_18:This bucket is the access-log destination; logging it into itself or a further bucket adds no audit value. CloudTrail data events (account baseline) cover object access.
   #checkov:skip=CKV_AWS_144:Cross-region replication would copy client IPs and request paths out of the data-residency region. Versioning and the lifecycle rule protect the logs in-region.

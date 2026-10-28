@@ -44,12 +44,12 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
 
       - name: Trivy - CRITICAL and HIGH vulnerabilities that have a fix (report)
-        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           version: ${{ env.TRIVY_VERSION }}
           scan-type: fs
@@ -62,7 +62,7 @@ jobs:
           trivyignores: .github/trivyignore.yaml
 
       - name: Trivy - fail on CRITICAL vulnerabilities that have a fix
-        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        uses: aquasecurity/trivy-action@v0.36.0
         env:
           # The previous step installed Trivy and downloaded today's database.
           TRIVY_SKIP_DB_UPDATE: "true"

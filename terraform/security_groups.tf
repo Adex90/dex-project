@@ -42,6 +42,7 @@ resource "aws_security_group" "frontend" {
 }
 
 resource "aws_security_group" "migrate" {
+  #checkov:skip=CKV2_AWS_5:Attached at run time: the one-off migrate task is launched with aws ecs run-task using this group (see the migrate_run_task_command output).
   name        = "${local.name}-migrate"
   description = "One-off migrate task: no inbound; out to the RDS instance and AWS endpoints"
   vpc_id      = aws_vpc.this.id
@@ -50,6 +51,7 @@ resource "aws_security_group" "migrate" {
 }
 
 resource "aws_security_group" "db_proxy" {
+  #checkov:skip=CKV2_AWS_5:Attached to aws_db_proxy.this (vpc_security_group_ids); checkov does not model RDS Proxy as an attachment.
   name        = "${local.name}-db-proxy"
   description = "RDS Proxy: 5432 from the backend only; out to the RDS instance"
   vpc_id      = aws_vpc.this.id
@@ -91,6 +93,7 @@ resource "aws_vpc_security_group_ingress_rule" "alb_https" {
 }
 
 resource "aws_vpc_security_group_ingress_rule" "alb_http" {
+  #checkov:skip=CKV_AWS_260:Port 80 only answers a 301 redirect to HTTPS (aws_lb_listener.http has no forward action); it is kept so first visits by host name reach the HTTPS site, after which HSTS applies.
   for_each = toset(var.alb_ingress_cidrs)
 
   security_group_id = aws_security_group.alb.id

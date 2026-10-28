@@ -53,7 +53,7 @@ output "migrate_run_task_command" {
     "--region ${var.region}",
     "--cluster ${aws_ecs_cluster.this.name}",
     "--launch-type FARGATE",
-    "--platform-version 1.4.0",
+    "--platform-version LATEST",
     "--task-definition ${aws_ecs_task_definition.migrate.arn}",
     "--started-by migrate",
     "--network-configuration 'awsvpcConfiguration={subnets=[${join(",", [for s in aws_subnet.app : s.id])}],securityGroups=[${aws_security_group.migrate.id}],assignPublicIp=DISABLED}'",

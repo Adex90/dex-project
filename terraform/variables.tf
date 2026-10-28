@@ -66,6 +66,17 @@ variable "availability_zone_count" {
   }
 }
 
+variable "availability_zones" {
+  description = "Zone names to use, pinned (recommended for production, e.g. [\"mx-central-1a\", \"mx-central-1b\", \"mx-central-1c\"]). Null: the first availability_zone_count zones of the region in name order, whatever their current health."
+  type        = list(string)
+  default     = null
+
+  validation {
+    condition     = var.availability_zones == null || (try(length(var.availability_zones), 0) == var.availability_zone_count && try(length(distinct(var.availability_zones)), 0) == try(length(var.availability_zones), -1) && alltrue([for z in coalesce(var.availability_zones, []) : startswith(z, var.region)]))
+    error_message = "availability_zones must list availability_zone_count distinct zones of the chosen region."
+  }
+}
+
 variable "vpc_cidr" {
   description = "VPC CIDR block, /16 to /18. Split per zone into /19 app, /22 public and /22 data subnets (for a /16)."
   type        = string
@@ -271,6 +282,12 @@ variable "kyc_webhook_allowed_cidrs" {
     condition     = alltrue([for c in var.kyc_webhook_allowed_cidrs : can(cidrnetmask(c))])
     error_message = "kyc_webhook_allowed_cidrs must contain IPv4 CIDR blocks."
   }
+}
+
+variable "waf_block_anonymous_ips" {
+  description = "Block Tor exit nodes and anonymising proxies (AWS AnonymousIPList). False: count only. Hosting-provider addresses are always only counted, so provider webhooks keep working."
+  type        = bool
+  default     = true
 }
 
 variable "waf_log_all_requests" {
@@ -542,19 +559,24 @@ variable "app_environment" {
   default     = {}
 
   validation {
-    condition = alltrue([
-      for k in keys(var.app_environment) :
-      can(regex("^[A-Z][A-Z0-9_]*$", k))
-      && !can(regex("(SECRET|PASSWORD|TOKEN|DATABASE_URL|_FILE$)", k))
-      && !contains([
-        "BIND_ADDR", "DB_MAX_CONEXIONES", "JWT_TTL_MINUTOS", "FRONTEND_ORIGIN", "RUST_LOG",
-        "MIGRAR_AL_INICIO", "ARRANQUE_AL_INICIO", "MODO_DEMO", "HTTP_PROXY_CONFIABLE",
-        "HTTP_CABECERAS_SEG", "HTTP_CUERPO_SEG", "HTTP_PETICION_SEG", "HTTP_MAX_CONEXIONES",
-        "HTTP_APAGADO_SEG", "DB_APP_USUARIO", "BOOTSTRAP_OPERADOR_EMAIL",
-        "BOOTSTRAP_CUMPLIMIENTO_EMAILS", "PGSSLROOTCERT", "PGSSLMODE", "PGHOST", "PGUSER",
-      ], k)
-    ])
-    error_message = "app_environment keys must be UPPER_SNAKE_CASE, must not look like secrets or database URLs, and must not override settings managed by this configuration."
+    condition     = alltrue([for k in keys(var.app_environment) : can(regex("^[A-Z][A-Z0-9_]*$", k))])
+    error_message = "app_environment keys must be UPPER_SNAKE_CASE environment variable names."
+  }
+
+  validation {
+    # Secrets go to Secrets Manager, never into tfvars or task definition environments.
+    condition     = alltrue([for k in keys(var.app_environment) : !can(regex("(SECRET|PASSWORD|TOKEN|DATABASE_URL|_FILE$|^PG)", k))])
+    error_message = "app_environment must not contain secrets, database URLs, *_FILE indirections or libpq PG* variables."
+  }
+
+  validation {
+    condition = length(setintersection(keys(var.app_environment), [
+      "BIND_ADDR", "DB_MAX_CONEXIONES", "JWT_TTL_MINUTOS", "FRONTEND_ORIGIN", "RUST_LOG",
+      "MIGRAR_AL_INICIO", "ARRANQUE_AL_INICIO", "MODO_DEMO", "HTTP_PROXY_CONFIABLE",
+      "HTTP_CABECERAS_SEG", "HTTP_CUERPO_SEG", "HTTP_PETICION_SEG", "HTTP_MAX_CONEXIONES",
+      "HTTP_APAGADO_SEG", "DB_APP_USUARIO", "BOOTSTRAP_OPERADOR_EMAIL", "BOOTSTRAP_CUMPLIMIENTO_EMAILS",
+    ])) == 0
+    error_message = "app_environment must not override settings managed by this configuration (BIND_ADDR, DB_MAX_CONEXIONES, JWT_TTL_MINUTOS, FRONTEND_ORIGIN, RUST_LOG, MIGRAR_AL_INICIO, ARRANQUE_AL_INICIO, MODO_DEMO, HTTP_*, DB_APP_USUARIO, BOOTSTRAP_OPERADOR_EMAIL, BOOTSTRAP_CUMPLIMIENTO_EMAILS)."
   }
 }
 
@@ -576,9 +598,9 @@ variable "enable_previous_webhook_secrets" {
 }
 
 variable "backend_egress_cidrs" {
-  description = "IPv4 CIDR blocks the backend may reach on 443 through the NAT gateways (SPEI and KYC provider APIs). Narrow it to the providers' published ranges; [] removes internet egress entirely (the current backend makes no outbound calls). AWS APIs go through VPC endpoints and are not affected."
+  description = "IPv4 CIDR blocks the backend may reach on 443 through the NAT gateways: the SPEI and KYC providers' API ranges. Empty by default (deny): the current backend makes no outbound calls, and a compromised task cannot reach the internet. [\"0.0.0.0/0\"] opens all of it, an explicit risk decision. AWS APIs go through VPC endpoints and are not affected."
   type        = list(string)
-  default     = ["0.0.0.0/0"]
+  default     = []
 
   validation {
     condition     = alltrue([for c in var.backend_egress_cidrs : can(cidrnetmask(c))])

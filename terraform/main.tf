@@ -15,9 +15,10 @@ data "aws_caller_identity" "current" {}
 
 data "aws_partition" "current" {}
 
-data "aws_availability_zones" "available" {
-  state = "available"
-
+# Every regular zone of the region, whatever its current state: a zone that is impaired
+# at plan time must not drop out of the list and move subnets.
+data "aws_availability_zones" "region" {
+  #checkov:skip=CKV_AWS_394:Zones are pinned with var.availability_zones (set in production). Without it, the first N zones in name order are used: AWS appends new zones with later letters and the list ignores zone health, so the selection never changes silently.
   # Local Zones and Wavelength Zones are opt-in; the bank runs only in regular zones.
   filter {
     name   = "opt-in-status"
@@ -30,10 +31,11 @@ locals {
   account_id = data.aws_caller_identity.current.account_id
   partition  = data.aws_partition.current.partition
 
-  azs = slice(
-    data.aws_availability_zones.available.names,
+  region_azs = sort(data.aws_availability_zones.region.names)
+  azs = var.availability_zones != null ? var.availability_zones : slice(
+    local.region_azs,
     0,
-    min(var.availability_zone_count, length(data.aws_availability_zones.available.names)),
+    min(var.availability_zone_count, length(local.region_azs)),
   )
 
   tags = merge(var.tags, {

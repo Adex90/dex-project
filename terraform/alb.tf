@@ -5,6 +5,7 @@
 # TLS 1.3 only by default, HTTP -> HTTPS redirect, invalid header fields dropped,
 # strictest desync mitigation, WAF in front (waf.tf), access and connection logs to S3.
 
+#trivy:ignore:AWS-0053 Internet-facing by design: the public entry point of the bank, behind WAF, TLS 1.3 only, ingress limited to alb_ingress_cidrs.
 resource "aws_lb" "this" {
   name               = "${local.name}-alb"
   load_balancer_type = "application"

@@ -79,10 +79,12 @@ server {
     limit_conn conn_ip 50;
 
     # Container healthcheck, local only: wget -q -O /dev/null http://127.0.0.1:8080/nginx-salud
+    # (`return` runs before allow/deny would, hence the explicit address check).
     location = /nginx-salud {
         access_log off;
-        allow 127.0.0.1;
-        deny all;
+        if ($remote_addr != "127.0.0.1") {
+            return 403;
+        }
         default_type text/plain;
         return 200 "ok\n";
     }
@@ -150,7 +152,7 @@ server {
     location / {
         limit_req zone=site burst=200 nodelay;
         error_page 429 @pagina_429;
-        error_page 502 503 504 @pagina_no_disponible;
+        error_page 502 503 504 =503 @pagina_no_disponible;
         proxy_pass http://frontend;
     }
 
@@ -165,7 +167,7 @@ server {
     location = /salud {
         limit_req zone=api burst=50 nodelay;
         error_page 429 @api_429;
-        error_page 502 503 @api_no_disponible;
+        error_page 502 503 =503 @api_no_disponible;
         error_page 504 @api_504;
         proxy_pass http://backend;
     }
@@ -175,7 +177,7 @@ server {
         error_page 403 @api_403;
         error_page 413 @api_413;
         error_page 429 @api_429;
-        error_page 502 503 @api_no_disponible;
+        error_page 502 503 =503 @api_no_disponible;
         error_page 504 @api_504;
         proxy_pass http://backend;
 
@@ -213,7 +215,8 @@ server {
     }
 
     # Errors nginx itself produces on API paths, in the backend's JSON shape and with codes
-    # the frontend already translates (src/lib/api/client.ts).
+    # the frontend already translates (src/lib/api/client.ts). The status is the original
+    # error's unless error_page says "=<code>" (an unreachable upstream answers 503).
     location @api_403 {
         default_type application/json;
         return 403 '{"error":{"codigo":"PROHIBIDO","mensaje":"origen no autorizado"}}';

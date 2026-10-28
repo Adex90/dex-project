@@ -22,6 +22,15 @@ resource "random_password" "db_app" {
   min_lower   = 4
   min_upper   = 4
   min_numeric = 4
+
+  lifecycle {
+    postcondition {
+      # The migrate task validates DB_APP_PASSWORD like any secret (config.rs
+      # validar_secreto) and rejects values that contain these words.
+      condition     = !can(regex("(?i)(change-?me|cambiame|secret|password|example)", self.result))
+      error_message = "The generated password contains a word the backend rejects; run: terraform apply -replace=random_password.db_app"
+    }
+  }
 }
 
 resource "aws_secretsmanager_secret" "db_app" {

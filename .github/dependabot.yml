@@ -14,8 +14,9 @@
 version: 2
 
 updates:
-  # Actions are pinned by commit SHA; Dependabot updates the SHA and the
-  # trailing version comment together.
+  # Actions use their major tag (trivy-action an exact release): Dependabot
+  # proposes new majors and trivy-action releases. It also maintains SHA pins
+  # with a version comment, should the workflows move to those.
   - package-ecosystem: github-actions
     directory: /
     schedule:
