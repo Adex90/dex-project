@@ -3,6 +3,7 @@
 #   docker build -t synthetic-capital-frontend \
 #     --build-arg NEXT_PUBLIC_API_URL=https://bank.example.mx \
 #     --build-arg NEXT_PUBLIC_COMPLIANCE_EMAIL=compliance@bank.example.mx \
+#     --build-arg REVISION="$(git rev-parse --short HEAD)" \
 #     frontend/
 #
 # NEXT_PUBLIC_* values are inlined into the browser bundle at BUILD time: one image
@@ -16,23 +17,23 @@
 #     --cap-drop ALL --security-opt no-new-privileges --user 65532 -p 3000:3000 \
 #     synthetic-capital-frontend
 #
-# Base images: canonical name + digest. Digests are content addresses, so a pull-through
-# mirror serves the same bytes: override the registry part only, e.g.
-#   --build-arg NODE_IMAGE=mirror.example/library/node:22.23.4-bookworm-slim@sha256:de17...
+# Base images are pinned by digest in the FROM lines, where Dependabot keeps them current
+# (it cannot see an image named through an ARG). A digest is a content address: behind a
+# pull-through mirror (dockerd "registry-mirrors") the bytes are the same. Build and
+# runtime are both Debian 13 (trixie).
 #
 # Behind a TLS-intercepting proxy, pass its CA as a BuildKit secret (never baked in):
 #   --secret id=extra_ca,src=/path/to/corporate-ca.pem
 # plus the usual HTTPS_PROXY/HTTP_PROXY/NO_PROXY build args (predefined by BuildKit and
 # kept out of the image history).
 
-ARG NODE_IMAGE=docker.io/library/node:22.23.4-bookworm-slim@sha256:de170b39439eb0e5a3444ad7d60b015614a381e10fecae2e30ec9e735122f38d
-ARG RUNTIME_IMAGE=gcr.io/distroless/nodejs22-debian12:nonroot@sha256:13593b7570658e8477de39e2f4a1dd25db2f836d68a0ba771251572d23bb4f8e
+FROM docker.io/library/node:22.23.4-trixie-slim@sha256:2117f713a417f3aff682ac8f5bc2ebbdf1beed51f36e67ab1e0fd3866b6d2d8f AS node
 
 # ---------------------------------------------------------------------------------------
 # deps: exact dependency tree from package-lock.json (dev dependencies included: the
 # build needs TypeScript, Tailwind and ESLint; none of them reach the runtime image).
 # ---------------------------------------------------------------------------------------
-FROM ${NODE_IMAGE} AS deps
+FROM node AS deps
 WORKDIR /app
 ENV NEXT_TELEMETRY_DISABLED=1 \
     npm_config_audit=false \
@@ -49,7 +50,7 @@ RUN --mount=type=secret,id=extra_ca,required=false \
 # ---------------------------------------------------------------------------------------
 # build: `next build` with output: "standalone" (toggled by NEXT_OUTPUT in next.config.ts).
 # ---------------------------------------------------------------------------------------
-FROM ${NODE_IMAGE} AS build
+FROM node AS build
 WORKDIR /app
 ARG NEXT_PUBLIC_API_URL
 ARG NEXT_PUBLIC_COMPLIANCE_EMAIL
@@ -58,12 +59,14 @@ ENV NEXT_TELEMETRY_DISABLED=1 \
     NODE_ENV=production
 COPY --from=deps /app/node_modules ./node_modules
 COPY . .
-# The browser bundle builds absolute API URLs from NEXT_PUBLIC_API_URL, so an empty or
-# relative value would only fail later, in the customer's browser: refuse it here.
+# The browser bundle builds absolute API URLs from NEXT_PUBLIC_API_URL, so an empty,
+# relative or space-separated value (compose builds it as https://${PUBLIC_HOST}) would
+# only fail later, in the customer's browser: refuse it here.
 # sharp (an optional dependency of next, ~20 MB with libvips) is removed before the
 # build so output tracing leaves it out: the app has no next/image and no public/ dir,
 # and the nginx edge answers 404 for /_next/image.
 RUN case "${NEXT_PUBLIC_API_URL:-}" in \
+      *[[:space:]]*) echo "error: build arg NEXT_PUBLIC_API_URL contains whitespace (PUBLIC_HOST must be ONE host name)" >&2; exit 1 ;; \
       http://?*|https://?*) ;; \
       *) echo "error: build arg NEXT_PUBLIC_API_URL must be an absolute http(s) URL (the public origin behind the edge)" >&2; exit 1 ;; \
     esac; \
@@ -81,8 +84,7 @@ RUN case "${NEXT_PUBLIC_API_URL:-}" in \
 # ---------------------------------------------------------------------------------------
 # runtime: distroless Node.js 22 (no shell, no package manager), uid/gid 65532.
 # ---------------------------------------------------------------------------------------
-FROM ${RUNTIME_IMAGE} AS runtime
-ARG RUNTIME_IMAGE
+FROM gcr.io/distroless/nodejs22-debian13:nonroot@sha256:10747a1323be68f206aed893599d43e6697ad67257e7c42703553f99fbce3d33 AS runtime
 # The base image's default user is 65532: create /app and its files as root, so the
 # service user can neither modify nor replace application code even on a writable rootfs.
 USER 0:0
@@ -90,7 +92,7 @@ ARG REVISION=unknown
 LABEL org.opencontainers.image.title="synthetic-capital-frontend" \
       org.opencontainers.image.description="Synthetic Capital web frontend (Next.js standalone server)" \
       org.opencontainers.image.revision="${REVISION}" \
-      org.opencontainers.image.base.name="${RUNTIME_IMAGE}"
+      org.opencontainers.image.base.name="gcr.io/distroless/nodejs22-debian13:nonroot"
 WORKDIR /app
 ENV NODE_ENV=production \
     NEXT_TELEMETRY_DISABLED=1 \

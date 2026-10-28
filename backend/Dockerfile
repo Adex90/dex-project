@@ -5,11 +5,10 @@
 #
 #   docker build -f backend/Dockerfile -t synthetic-capital-backend .
 #
-# Base images are referenced by canonical name AND pinned by digest. Behind an
-# internal registry mirror, override the ARGs with the mirror's name and keep
-# the same digest (a digest is a content address, identical on every mirror):
-#
-#   --build-arg RUST_IMAGE=registry.example/library/rust:1.97.1-slim-bookworm@sha256:2775a09d...
+# Base images are pinned by digest in the FROM lines, where Dependabot keeps
+# them current (it cannot see an image named through an ARG). A digest is a
+# content address: behind a pull-through mirror (dockerd "registry-mirrors")
+# the bytes are the same. Builder and runtime are both Debian 13 (trixie).
 #
 # Behind a TLS-intercepting proxy, pass its CA as an optional BuildKit secret.
 # It is trusted only while crates are downloaded and never lands in a layer:
@@ -24,11 +23,8 @@
 # Every configuration variable NAME also accepts NAME_FILE (secrets files).
 # The process writes nothing to disk: run it with a read-only root filesystem.
 
-ARG RUST_IMAGE=docker.io/library/rust:1.97.1-slim-bookworm@sha256:2775a09d208ff0d7c1f50490c45b62db929e87ba1dcbc3f2132ac71a704bcdd3
-ARG RUNTIME_IMAGE=gcr.io/distroless/cc-debian12:nonroot@sha256:9dac0a79194e45a7da0158a9c6da57b217585af0786db3845d1f0ec1a0dd182f
-
 # --------------------------------------------------------------------------
-FROM ${RUST_IMAGE} AS builder
+FROM docker.io/library/rust:1.97.1-slim-trixie@sha256:8e8cf8f7fd54a2d23d5a743b3a03f56e26b6c774276c33fa0595111704ebb15c AS builder
 
 # Release profile for the image: fat LTO, one codegen unit, debuginfo stripped
 # (symbols stay, so panic messages and backtraces remain readable). panic stays
@@ -69,9 +65,8 @@ RUN touch src/main.rs src/lib.rs \
  && install -D -m 0755 target/release/synthetic-capital /out/synthetic-capital
 
 # --------------------------------------------------------------------------
-FROM ${RUNTIME_IMAGE}
+FROM gcr.io/distroless/cc-debian13:nonroot@sha256:3ee00291cf386ec52a552e6a858d555debd74776eb4bfa53fa3df2cd6677515e
 
-ARG RUNTIME_IMAGE
 ARG VERSION=0.1.0
 ARG REVISION=unknown
 ARG CREATED=unknown
@@ -82,7 +77,7 @@ LABEL org.opencontainers.image.title="synthetic-capital-backend" \
       org.opencontainers.image.revision="${REVISION}" \
       org.opencontainers.image.created="${CREATED}" \
       org.opencontainers.image.source="${SOURCE}" \
-      org.opencontainers.image.base.name="${RUNTIME_IMAGE}"
+      org.opencontainers.image.base.name="gcr.io/distroless/cc-debian13:nonroot"
 
 COPY --from=builder /out/synthetic-capital /usr/local/bin/synthetic-capital
 

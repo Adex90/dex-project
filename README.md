@@ -486,8 +486,8 @@ tests/db/     SQL invariant tests for the schema
 ## Running locally
 
 ```bash
-docker compose up -d postgres                 # or a local PostgreSQL 16
 cp .env.example .env                          # set JWT_SECRET; MODO_DEMO=true for the demo
+docker compose -f docker-compose.dev.yml up -d   # PostgreSQL 16 on 127.0.0.1:5432 (or a local one)
 cd backend && cargo run                       # applies migrations and starts on :8080
 ```
 

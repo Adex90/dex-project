@@ -11,6 +11,8 @@
 #                          (required: SSH is never opened to the world by default)
 #   --ssh-port PORT        SSH port (default 22)
 #   --deploy-dir DIR       docker compose deployment directory (default /opt/synthetic-capital)
+#   --nginx-uid UID        uid (= gid) the nginx container runs as (default 101, the image's
+#                          nginx user); owns logs/nginx and certs/privkey.pem on the host
 #   --allow-password-auth  keep SSH password logins (only to bootstrap keys; not recommended)
 #   --skip-docker          leave /etc/docker/daemon.json alone
 #   --dry-run              show what would change (with diffs) and change nothing
@@ -31,8 +33,6 @@ export LC_ALL=C
 
 readonly SCRIPT_NAME="sc-hardening"
 readonly TAG="sc-hardening"            # comment on the UFW rules this script owns
-readonly NGINX_UID=101                 # nginx user of the official nginx image
-readonly NGINX_GID=101
 readonly ORIG_ARGS=("$@")
 
 # ------------------------------------------------------------------------------------------
@@ -44,6 +44,7 @@ ALLOW_PASSWORD=0
 SKIP_DOCKER=0
 SSH_PORT=22
 DEPLOY_DIR=/opt/synthetic-capital
+NGINX_UID=101          # nginx user of the official nginx image (see --nginx-uid)
 ADMIN_USERS=()
 SSH_ALLOW=()
 
@@ -65,6 +66,7 @@ while [[ $# -gt 0 ]]; do
     --ssh-allow) [[ $# -ge 2 ]] || die "--ssh-allow needs a value"; mapfile -t -O "${#SSH_ALLOW[@]}" SSH_ALLOW < <(split_csv "$2"); shift 2 ;;
     --ssh-port) [[ $# -ge 2 ]] || die "--ssh-port needs a value"; SSH_PORT="$2"; shift 2 ;;
     --deploy-dir) [[ $# -ge 2 ]] || die "--deploy-dir needs a value"; DEPLOY_DIR="${2%/}"; shift 2 ;;
+    --nginx-uid) [[ $# -ge 2 ]] || die "--nginx-uid needs a value"; NGINX_UID="$2"; shift 2 ;;
     --allow-password-auth) ALLOW_PASSWORD=1; shift ;;
     --skip-docker) SKIP_DOCKER=1; shift ;;
     --dry-run) DRY_RUN=1; shift ;;
@@ -199,6 +201,8 @@ step "Preflight"
 [[ ${#SSH_ALLOW[@]} -gt 0 ]] || { usage >&2; die "--ssh-allow is required (SSH is never opened to everyone by default)"; }
 { [[ "$SSH_PORT" =~ ^[0-9]{1,5}$ ]] && (( SSH_PORT >= 1 && SSH_PORT <= 65535 )); } || die "--ssh-port must be 1-65535"
 [[ "$DEPLOY_DIR" == /?* ]] || die "--deploy-dir must be an absolute path other than /"
+{ [[ "$NGINX_UID" =~ ^[0-9]{1,7}$ ]] && (( NGINX_UID > 0 )); } || die "--nginx-uid must be a positive number"
+NGINX_GID="$NGINX_UID"
 if [[ $EUID -ne 0 ]]; then
   [[ $DRY_RUN -eq 1 ]] || die "run as root (sudo), or with --dry-run"
   warn "not root: the dry-run cannot read every file, results are partial"
@@ -338,7 +342,7 @@ say ""
 say "Plan ($([[ $DRY_RUN -eq 1 ]] && echo 'dry-run: nothing will be changed' || echo 'apply')):"
 info "SSH: port $SSH_PORT from ${SSH_ALLOW[*]}; users ${ADMIN_USERS[*]}; passwords $([[ $ALLOW_PASSWORD -eq 1 ]] && echo KEPT || echo off); root login off"
 info "firewall: UFW deny incoming; 80/443 open; SSH rate-limited from the allowed networks"
-info "deployment: $DEPLOY_DIR (secrets/ 0700, .env 0600, logs/nginx for uid $NGINX_UID)"
+info "deployment: $DEPLOY_DIR (secrets/ 0700, deploy/compose.env 0640, logs/nginx for uid $NGINX_UID)"
 info "fail2ban: sshd + nginx jails on $DEPLOY_DIR/logs/nginx, web bans in DOCKER-USER"
 info "also: unattended-upgrades, sysctl, docker daemon defaults$([[ $SKIP_DOCKER -eq 1 ]] && echo ' (skipped)'), chrony, auditd, logrotate"
 if [[ $DRY_RUN -eq 0 && $ASSUME_YES -eq 0 ]]; then
@@ -421,21 +425,28 @@ fi
 # 80/443 are opened to state intent (and for an nginx on the host network); the compose
 # file must publish nothing but nginx's 80/443. fail2ban bans web clients in DOCKER-USER.
 step "Firewall (UFW)"
+# UFW_SSH_OK=0 means the SSH rules could not all be put in place: UFW is then not enabled,
+# and the SSH step will not move sshd to another port (either could lock admins out).
+UFW_SSH_OK=1
+UFW_ACTIVE=0
 if ! have ufw; then
   if [[ $DRY_RUN -eq 1 ]]; then
     for c in "${SSH_ALLOW[@]}"; do info "would run: ufw limit proto tcp from $c to any port $SSH_PORT comment $TAG:ssh"; done
     info "would run: ufw allow 80/tcp, 443/tcp; ufw default deny incoming; ufw --force enable"
     record ufw would-change "ufw not installed yet (packages step)"
   else
+    UFW_SSH_OK=0
     record ufw failed "ufw not installed"
   fi
 else
   ufw_changed=0
+  ufw_errors=()
   before="$(ufw show added 2>/dev/null || true)"
+  [[ "$(ufw status 2>/dev/null | head -n 1 || true)" == *"Status: active"* ]] && UFW_ACTIVE=1
   if ! grep -q '^DEFAULT_INPUT_POLICY="DROP"' /etc/default/ufw || ! grep -q '^DEFAULT_OUTPUT_POLICY="ACCEPT"' /etc/default/ufw; then
     ufw_changed=1
     if [[ $DRY_RUN -eq 1 ]]; then info "would run: ufw default deny incoming; ufw default allow outgoing"
-    else ufw default deny incoming >/dev/null; ufw default allow outgoing >/dev/null; fi
+    else ufw default deny incoming >/dev/null 2>&1 && ufw default allow outgoing >/dev/null 2>&1 || ufw_errors+=("default policies"); fi
   fi
   want=()
   for c in "${SSH_ALLOW[@]}"; do want+=("limit proto tcp from $c to any port $SSH_PORT comment $TAG:ssh"); done
@@ -445,28 +456,44 @@ else
     # shellcheck disable=SC2086  # a rule is a list of words
     out="$(ufw --dry-run $r 2>&1 || true)"
     [[ "$out" == *"Skipping adding existing rule"* ]] && continue
+    if [[ "$out" == *"IPv6 support not enabled"* ]]; then
+      warn "IPv6 is not enabled on this host (or in UFW): skipped 'ufw $r'"
+      continue
+    fi
     ufw_changed=1
+    if [[ $DRY_RUN -eq 1 ]]; then info "would run: ufw $r"; continue; fi
     # shellcheck disable=SC2086
-    if [[ $DRY_RUN -eq 1 ]]; then info "would run: ufw $r"; else ufw $r >/dev/null; info "added: ufw $r"; fi
+    if err="$(ufw $r 2>&1 >/dev/null)"; then
+      info "added: ufw $r"
+    else
+      ufw_errors+=("ufw $r: $(tail -n 1 <<<"$err")")
+      [[ "$r" == *"comment $TAG:ssh" ]] && UFW_SSH_OK=0
+    fi
   done
-  # SSH rules this script added earlier for sources or ports that are no longer wanted.
+  # SSH rules this script added earlier for sources or ports that are no longer wanted
+  # (only once the wanted ones are in place).
   while IFS= read -r line; do
+    [[ $UFW_SSH_OK -eq 1 ]] || break
     [[ "$line" == "ufw "* && "$line" == *"comment '$TAG:ssh'"* ]] || continue
     src="$(sed -nE 's/.* from ([^ ]+) to any port ([0-9]+).*/\1/p' <<<"$line")"
     port="$(sed -nE 's/.* from ([^ ]+) to any port ([0-9]+).*/\2/p' <<<"$line")"
     if [[ "$port" == "$SSH_PORT" ]] && in_list "$src" "${SSH_ALLOW[@]}"; then continue; fi
     spec="${line#ufw }"; spec="${spec% comment *}"
     ufw_changed=1
+    if [[ $DRY_RUN -eq 1 ]]; then info "would remove stale rule: ufw delete $spec"; continue; fi
     # shellcheck disable=SC2086
-    if [[ $DRY_RUN -eq 1 ]]; then info "would remove stale rule: ufw delete $spec"; else ufw delete $spec >/dev/null; info "removed stale rule: $spec"; fi
+    if err="$(ufw delete $spec 2>&1 >/dev/null)"; then info "removed stale rule: $spec"; else ufw_errors+=("ufw delete $spec: $(tail -n 1 <<<"$err")"); fi
   done <<<"$before"
   detail="deny incoming; SSH $SSH_PORT/tcp rate-limited from ${SSH_ALLOW[*]}; 80,443/tcp open"
-  if [[ "$(ufw status 2>/dev/null | head -n 1 || true)" == *"Status: active"* ]]; then
+  if [[ ${#ufw_errors[@]} -gt 0 ]]; then
+    record ufw failed "${ufw_errors[*]}$([[ $UFW_ACTIVE -eq 0 ]] && echo '; UFW left disabled')"
+  elif [[ $UFW_ACTIVE -eq 1 ]]; then
     record ufw "$(outcome $ufw_changed)" "$detail; active"
   elif [[ $DRY_RUN -eq 1 ]]; then
     info "would run: ufw --force enable"
     record ufw would-change "$detail; would enable UFW"
   elif err="$(ufw --force enable 2>&1 >/dev/null)"; then
+    UFW_ACTIVE=1
     record ufw changed "$detail; enabled"
   else
     record ufw skipped "rules saved, but UFW could not be enabled here ($(tail -n 1 <<<"$err")); run 'ufw --force enable' on the host"
@@ -480,19 +507,29 @@ fi
 step "SSH daemon"
 SSHD_DROPIN=/etc/ssh/sshd_config.d/01-sc-hardening.conf
 pick_algorithms() { # pick_algorithms <ssh -Q type> <preferred...>: supported ones, in order
-  local type="$1" supported="" out=() a; shift
+  local type="$1" supported="" picked=() a; shift
   if have ssh; then supported="$(ssh -Q "$type" 2>/dev/null || true)"; fi
   for a in "$@"; do
-    if [[ -z "$supported" ]] || grep -qxF -- "$a" <<<"$supported"; then out+=("$a"); fi
+    if [[ -z "$supported" ]] || grep -qxF -- "$a" <<<"$supported"; then picked+=("$a"); fi
   done
-  local IFS=,; echo "${out[*]}"
+  local IFS=,; echo "${picked[*]}"
 }
+current_port=22
+if have sshd && [[ $EUID -eq 0 ]]; then
+  mkdir -p /run/sshd
+  current_port="$(sshd -T 2>/dev/null | awk '$1 == "port" { print $2; exit }' || true)"
+  current_port="${current_port:-22}"
+fi
 if [[ -f /etc/ssh/sshd_config ]] && ! grep -Eq '^[[:space:]]*Include[[:space:]]+/etc/ssh/sshd_config\.d/\*\.conf' /etc/ssh/sshd_config; then
   record sshd failed "/etc/ssh/sshd_config does not include sshd_config.d/*.conf; refusing to guess"
+elif [[ "$current_port" != "$SSH_PORT" && $UFW_SSH_OK -eq 0 ]]; then
+  record sshd failed "not moving sshd from port $current_port to $SSH_PORT: the firewall rules for the new port could not be added (lockout guard)"
 else
   KEX="$(pick_algorithms kex mlkem768x25519-sha256 sntrup761x25519-sha512 sntrup761x25519-sha512@openssh.com curve25519-sha256 curve25519-sha256@libssh.org diffie-hellman-group18-sha512 diffie-hellman-group16-sha512)"
   CIPHERS="$(pick_algorithms cipher chacha20-poly1305@openssh.com aes256-gcm@openssh.com aes128-gcm@openssh.com aes256-ctr aes192-ctr aes128-ctr)"
   MACS="$(pick_algorithms mac hmac-sha2-512-etm@openssh.com hmac-sha2-256-etm@openssh.com umac-128-etm@openssh.com)"
+  algo_note="filtered to what this OpenSSH supports"
+  have ssh || algo_note="not filtered yet: OpenSSH is not installed (the apply run filters them)"
   ssh_version="$(ssh -V 2>&1 | sed -nE 's/^OpenSSH_([0-9]+)\.([0-9]+).*/\1 \2/p' || true)"
   rsa_line="# RequiredRSASize needs OpenSSH >= 9.1; the lockout guard already requires RSA keys >= 2048 bits"
   if [[ -n "$ssh_version" ]]; then
@@ -543,7 +580,7 @@ Compression no
 # VERBOSE logs the fingerprint of the key used for each login (audit trail).
 LogLevel VERBOSE
 
-# Modern algorithms only, filtered to what this OpenSSH supports.
+# Modern algorithms only ($algo_note).
 KexAlgorithms $KEX
 Ciphers $CIPHERS
 MACs $MACS
@@ -588,12 +625,19 @@ fi
 # ------------------------------------------------------------------------------------------
 # 5. Deployment directory
 # ------------------------------------------------------------------------------------------
-# The compose CLI runs as the admin user; dockerd (root) bind-mounts secrets and certs.
-# secrets/ is 0700 so no other host user can reach the files, whose read bits are left as
-# generated: each container user (postgres, 65532) must read its own bind-mounted secret.
-# nginx (uid 101) writes logs/nginx and reads certs/; certbot (root) writes acme/.
+# The compose CLI runs as the admin user (docker compose --env-file deploy/compose.env, a
+# file without secrets); dockerd (root) bind-mounts secrets and certs. secrets/ is 0700 so
+# no other host user can reach the files, whose owners and read bits stay as
+# scripts/generate-secrets.sh made them (0400, owned by the container uid that reads each:
+# 70 postgres, 65532 backend). nginx (uid 101) writes logs/nginx and reads certs/;
+# certbot (root) writes acme/.
 step "Deployment directory ($DEPLOY_DIR)"
 NGINX_LOG_DIR="$DEPLOY_DIR/logs/nginx"
+# Bind mounts keep numeric ids: whatever host account has the nginx uid can read the logs
+# and the TLS key. Prefer a uid no host account uses (then set it in compose too).
+if host_account="$(getent passwd "$NGINX_UID" | cut -d: -f1)" && [[ -n "$host_account" ]]; then
+  warn "uid $NGINX_UID (nginx in the container) is the host account '$host_account', which can therefore read the nginx logs and TLS key; consider --nginx-uid with an unused uid and the same user: in docker-compose.yml"
+fi
 first_admin="${ADMIN_USERS[0]}"
 admin_group="$(id -gn "$first_admin")"
 deploy_changes=()
@@ -607,7 +651,7 @@ if [[ -d "$DEPLOY_DIR/secrets" ]]; then
     deploy_changes+=("${f#"$DEPLOY_DIR"/}")
   done < <(find "$DEPLOY_DIR/secrets" -type f -print0)
 fi
-ensure_mode "$DEPLOY_DIR/.env" 0600; note_change .env
+ensure_mode "$DEPLOY_DIR/deploy/compose.env" 0640 "$first_admin:$admin_group"; note_change deploy/compose.env
 ensure_dir "$DEPLOY_DIR/certs" 0755 root:root; note_change certs/
 ensure_mode "$DEPLOY_DIR/certs/privkey.pem" 0400 "$NGINX_UID:$NGINX_GID"; note_change certs/privkey.pem
 for d in acme acme/.well-known acme/.well-known/acme-challenge logs; do
@@ -623,7 +667,7 @@ done
 if [[ ${#deploy_changes[@]} -gt 0 ]]; then
   record deploy-dir "$(outcome 1)" "${deploy_changes[*]}"
 else
-  record deploy-dir unchanged "0750; secrets/ 0700; .env 0600; logs/nginx uid $NGINX_UID"
+  record deploy-dir unchanged "0750; secrets/ 0700; deploy/compose.env 0640; logs/nginx uid $NGINX_UID"
 fi
 
 # ------------------------------------------------------------------------------------------
@@ -901,7 +945,7 @@ audit_rules() {
 /etc/audit wa audit-config
 /etc/localtime wa time-change
 $DEPLOY_DIR/secrets rwa sc-secrets
-$DEPLOY_DIR/.env rwa sc-secrets
+$DEPLOY_DIR/deploy/compose.env wa sc-deploy
 $DEPLOY_DIR/docker-compose.yml wa sc-deploy
 $DEPLOY_DIR/certs wa sc-certs
 EOF

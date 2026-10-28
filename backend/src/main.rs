@@ -1,6 +1,6 @@
 //! Synthetic Capital — servidor HTTP y tareas de despliegue (ver [`cli`]).
 
-use std::{future::Future, process::ExitCode, time::Duration};
+use std::{future::Future, io::IsTerminal, process::ExitCode, time::Duration};
 
 use anyhow::Context;
 use sqlx::PgPool;
@@ -38,9 +38,12 @@ fn main() -> ExitCode {
 }
 
 /// Ejecuta un comando asíncrono; un error sale con código 1 y su cadena de causas.
+/// Colores ANSI solo en una terminal: en contenedores la salida va a un
+/// colector de logs (docker, CloudWatch) que guardaría los códigos de escape.
 fn ejecutar(comando: impl Future<Output = anyhow::Result<()>>) -> ExitCode {
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
+        .with_ansi(std::io::stdout().is_terminal())
         .init();
     let resultado = tokio::runtime::Builder::new_multi_thread()
         .enable_all()

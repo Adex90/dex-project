@@ -19,3 +19,11 @@ terraform/override.tf
 terraform/override.tf.json
 terraform/*_override.tf
 terraform/*_override.tf.json
+
+# Single-host deployment (docker-compose.yml): generated secrets, TLS material, the ACME
+# webroot, logs and the operator's settings. Commit deploy/compose.env.example only.
+/secrets/
+/certs/
+/acme/
+/logs/
+/deploy/compose.env

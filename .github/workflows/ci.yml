@@ -454,7 +454,6 @@ jobs:
             # Migrations are embedded from ../migrations: the context is the repo root.
             context: .
             dockerfile: backend/Dockerfile
-            # Each Dockerfile names its revision-label argument differently.
             build-args: |
               REVISION=${{ github.sha }}
           - image: frontend
@@ -462,7 +461,7 @@ jobs:
             dockerfile: frontend/Dockerfile
             # NEXT_PUBLIC_* are inlined at build time; CI uses a reserved .example origin.
             build-args: |
-              VCS_REF=${{ github.sha }}
+              REVISION=${{ github.sha }}
               NEXT_PUBLIC_API_URL=https://synthetic-capital.example
               NEXT_PUBLIC_COMPLIANCE_EMAIL=compliance@synthetic-capital.example
     env:

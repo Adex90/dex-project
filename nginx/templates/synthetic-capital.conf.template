@@ -1,7 +1,8 @@
 # Site config. The nginx image entrypoint (20-envsubst-on-templates.sh) renders this
 # template into /etc/nginx/conf.d/synthetic-capital.conf at every container start.
-# The only substitution is ${PUBLIC_HOST}: the public host name(s), space-separated
-# ("bank.example.mx" or "bank.example.mx www.bank.example.mx"). Set
+# The only substitution is ${PUBLIC_HOST}: the ONE public host name ("bank.example.mx").
+# server_name would take several, but docker-compose.yml also builds the frontend for
+# https://${PUBLIC_HOST}, and the frontend Dockerfile refuses a space-separated value. Set
 # NGINX_ENVSUBST_FILTER=^PUBLIC_HOST$ so no other environment variable is substituted;
 # nginx's own variables ($host, $uri, ...) are lowercase and never collide with it.
 #
@@ -18,8 +19,10 @@ map "" $sc_host_publico_definido {
 
 # Docker's embedded DNS. Upstream names are re-resolved at run time (`resolve`): nginx
 # starts even when the backend or frontend is not up yet (answering 503 until it is)
-# and follows their new addresses when the containers are recreated.
-resolver 127.0.0.11 valid=10s ipv6=off;
+# and follows their new addresses when the containers are recreated. An answer is kept
+# for `valid`, an empty one too: a lookup that lands in the instant a container is being
+# recreated would otherwise keep that upstream unavailable for the whole period.
+resolver 127.0.0.11 valid=2s ipv6=off;
 resolver_timeout 5s;
 
 upstream backend {
