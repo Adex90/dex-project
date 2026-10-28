@@ -1,6 +1,10 @@
 import type { NextConfig } from "next";
 
 const nextConfig: NextConfig = {
+  // Container builds (frontend/Dockerfile) set NEXT_OUTPUT=standalone: .next/standalone
+  // then holds a minimal server.js and only the node_modules it needs at runtime.
+  // Unset (the default), `next build` + `next start` work as before (the e2e scripts use them).
+  output: process.env.NEXT_OUTPUT === "standalone" ? "standalone" : undefined,
   reactStrictMode: true,
   poweredByHeader: false,
   async headers() {

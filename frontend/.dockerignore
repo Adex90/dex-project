@@ -1,0 +1,26 @@
+# Build context = frontend/ (docker build frontend/). Keep it to what `next build` needs.
+
+# Dependencies and build output are recreated inside the image.
+node_modules
+.next
+out
+*.tsbuildinfo
+next-env.d.ts
+
+# Environment files: Next.js loads .env* at build time, so a developer's .env.local
+# (e.g. NEXT_PUBLIC_API_URL=http://localhost:8080) would silently override the build
+# args. Builds are configured only through --build-arg.
+.env
+.env.*
+
+# End-to-end harness, its screenshots and the unit tests are not part of the app.
+e2e
+**/*.test.ts
+
+# Docker and tooling metadata.
+Dockerfile
+.dockerignore
+.git
+.gitignore
+npm-debug.log*
+coverage
