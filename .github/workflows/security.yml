@@ -149,3 +149,25 @@ jobs:
           exit-code: "1"
           cache-dir: ${{ runner.temp }}/trivy
           trivyignores: .github/trivyignore.yaml
+
+  # One stable check for branch protection (the matrix job names carry the image digest,
+  # which changes with every Dependabot bump).
+  security-ok:
+    name: Security result
+    if: ${{ always() }}
+    needs: [dependencies, compose-image-list, compose-images]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Require every job to succeed
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          echo "Job results: ${RESULTS}"
+          read -r -a results <<<"${RESULTS}"
+          for result in "${results[@]}"; do
+            if [ "${result}" != "success" ]; then
+              echo "::error::a required job finished with '${result}'"
+              exit 1
+            fi
+          done

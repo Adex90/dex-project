@@ -11,10 +11,15 @@
 #
 # Isolation:
 #   edge    nginx only. The ONLY published ports: host 80 -> 8080, host 443 -> 8443.
-#   app     internal: nginx <-> frontend, backend. No route to the outside.
+#   web     internal: nginx <-> frontend. The Next.js server never calls the API (the
+#           browser does, through nginx), so it has no route to the backend either.
+#   api     internal: nginx <-> backend.
 #   data    internal: db <-> migrate, backend. The database publishes nothing and only the
 #           backend (and the one-shot migrate job) can reach it.
-#   egress  backend only: outbound HTTPS to the SPEI and biometric providers.
+#   egress  backend only, for outbound HTTPS to the SPEI and biometric providers. Internal
+#           (no internet) unless EGRESS_NETWORK_INTERNAL=false: the backend calls no
+#           provider until one is integrated; then restrict destinations on the host
+#           (DEPLOYMENT.md, "Egress").
 #
 # Secrets are Docker secrets (files under ./secrets, mounted at /run/secrets): they never
 # appear in the environment, `docker inspect` or the image. The backend reads them through
@@ -189,7 +194,7 @@ services:
       - kyc_webhook_secret
       - kyc_webhook_secret_previous
     # The image's HEALTHCHECK (`salud vivo`, no database) applies.
-    networks: [data, app, egress]
+    networks: [data, api, egress]
     depends_on:
       migrate: {condition: service_completed_successfully}
     stop_grace_period: 30s
@@ -212,7 +217,7 @@ services:
     init: true
     tmpfs:
       - /app/.next/cache:uid=65532,gid=65532,mode=0700,size=64m
-    networks: [app]
+    networks: [web]
     stop_grace_period: 15s
     deploy:
       resources:
@@ -244,7 +249,7 @@ services:
     tmpfs:
       - /tmp:uid=101,gid=101,mode=0700,size=128m
       - /etc/nginx/conf.d:uid=101,gid=101,mode=0755,size=1m
-    networks: [edge, app]
+    networks: [edge, web, api]
     healthcheck:
       test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8080/nginx-salud"]
       interval: 15s
@@ -259,7 +264,10 @@ services:
 networks:
   edge:
     driver: bridge
-  app:
+  web:
+    driver: bridge
+    internal: true
+  api:
     driver: bridge
     internal: true
   data:
@@ -267,6 +275,11 @@ networks:
     internal: true
   egress:
     driver: bridge
+    internal: ${EGRESS_NETWORK_INTERNAL:-true}
+    driver_opts:
+      # A fixed host interface name for the firewall rules that restrict the backend's
+      # destinations once egress is enabled; empty: Docker's br-<id>.
+      com.docker.network.bridge.name: ${EGRESS_BRIDGE_NAME:-}
 
 volumes:
   pgdata:

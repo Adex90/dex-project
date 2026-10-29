@@ -481,7 +481,16 @@ backend/      Rust: axum + sqlx + tokio
   src/routes/            HTTP API (/api/v1)
 frontend/     Next.js dashboard (Task 3)
 tests/db/     SQL invariant tests for the schema
+terraform/    AWS reference architecture (VPC, RDS, ECS Fargate, ALB + WAF)
+nginx/        TLS edge for the single-host deployment
+deploy/       compose settings template; PostgreSQL schema-owner init script
+scripts/      host hardening, secrets generation and rotation, DB client, dev certificates
+docker-compose.yml       single hardened host (see DEPLOYMENT.md)
+docker-compose.dev.yml   local PostgreSQL for development
 ```
+
+Production provisioning, releases, migrations, DNS/TLS, secrets rotation and the
+launch checklist: [DEPLOYMENT.md](DEPLOYMENT.md).
 
 ## Running locally
 
