@@ -79,7 +79,7 @@ output "generated_secret_arns" {
 }
 
 output "db_master_user_secret_arn" {
-  description = "RDS-managed secret of the master user (schema owner); rotated by RDS, read only by the migrate task."
+  description = "RDS-managed secret of the master user (schema owner); rotated by RDS, read by the migrate task and by DBAs holding the dba-tunnel policy."
   value       = aws_db_instance.this.master_user_secret[0].secret_arn
 }
 
@@ -89,8 +89,28 @@ output "db_instance_identifier" {
 }
 
 output "db_instance_address" {
-  description = "RDS instance endpoint (reachable only from the migrate task's security group)."
+  description = "RDS instance endpoint (reachable only from the migrate task and the DBA bastion)."
   value       = aws_db_instance.this.address
+}
+
+output "dba_tunnel" {
+  description = "What scripts/db-tunnel.sh reads (nothing secret); null when dba_bastion_enabled is false. For a DBA without access to the state: terraform output -json dba_tunnel > dba-tunnel.json, then scripts/db-tunnel.sh --outputs dba-tunnel.json."
+  value = var.dba_bastion_enabled ? {
+    region              = var.region
+    bastion_instance_id = aws_instance.dba_bastion[0].id
+    session_document    = local.dba_session_document
+    db_host             = aws_db_instance.this.address
+    db_port             = aws_db_instance.this.port
+    db_name             = var.db_name
+    db_user             = var.db_master_username
+    db_secret_arn       = aws_db_instance.this.master_user_secret[0].secret_arn
+    rds_ca_bundle_url   = "https://truststore.pki.rds.amazonaws.com/${var.region}/${var.region}-bundle.pem"
+  } : null
+}
+
+output "dba_tunnel_policy_arn" {
+  description = "IAM policy for DBAs: port forwarding through the DBA bastion and the master user secret. Attach it to the DBA's role or IAM Identity Center permission set. Null when dba_bastion_enabled is false."
+  value       = one(aws_iam_policy.dba_tunnel[*].arn)
 }
 
 output "db_proxy_endpoint" {
@@ -128,6 +148,7 @@ output "kms_key_arns" {
     secrets = aws_kms_key.secrets.arn
     logs    = aws_kms_key.logs.arn
     ecr     = aws_kms_key.ecr.arn
+    ebs     = aws_kms_key.ebs.arn
   }
 }
 
@@ -148,12 +169,13 @@ output "subnet_ids" {
 output "security_group_ids" {
   description = "Security group IDs."
   value = {
-    alb       = aws_security_group.alb.id
-    backend   = aws_security_group.backend.id
-    frontend  = aws_security_group.frontend.id
-    migrate   = aws_security_group.migrate.id
-    db_proxy  = aws_security_group.db_proxy.id
-    db        = aws_security_group.db.id
-    endpoints = aws_security_group.endpoints.id
+    alb         = aws_security_group.alb.id
+    backend     = aws_security_group.backend.id
+    frontend    = aws_security_group.frontend.id
+    migrate     = aws_security_group.migrate.id
+    db_proxy    = aws_security_group.db_proxy.id
+    db          = aws_security_group.db.id
+    endpoints   = aws_security_group.endpoints.id
+    dba_bastion = one(aws_security_group.dba_bastion[*].id)
   }
 }

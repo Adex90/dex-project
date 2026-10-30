@@ -19,7 +19,8 @@ Contents:
 1. [Topologies and security invariants](#1-topologies-and-security-invariants)
 2. [Prerequisites](#2-prerequisites)
 3. [Release artifacts and CI gates](#3-release-artifacts-and-ci-gates)
-4. [First deployment on AWS](#4-first-deployment-on-aws)
+4. [First deployment on AWS](#4-first-deployment-on-aws), including
+   [4.1 Initial DBA Bootstrap & Admin Creation](#41-initial-dba-bootstrap--admin-creation)
 5. [First deployment on a single host](#5-first-deployment-on-a-single-host)
 6. [Database migrations](#6-database-migrations)
 7. [DNS and TLS](#7-dns-and-tls)
@@ -44,12 +45,15 @@ internet -> WAF -> ALB (public subnets, TLS 1.3 only, HTTP -> HTTPS)
                     `- everything else -> frontend  (ECS Fargate, app subnets, :3000)
 backend -> RDS Proxy (TLS) -> RDS PostgreSQL 16, Multi-AZ   (data subnets, no route out)
 migrate (one-off ECS task) -> RDS instance directly, as the schema owner
+DBA -> Session Manager port forwarding -> bastion (app subnet, no inbound) -> RDS instance
 ```
 
 `terraform/README.md` documents every resource, input and output. Key properties:
 
 - **Database.** The data subnets have only the local route. The database security group
-  accepts 5432 only from the RDS Proxy and from the migrate task.
+  accepts 5432 only from the RDS Proxy, the migrate task and the DBA bastion.
+- **Administrative access.** No inbound port anywhere: the DBA reaches the database
+  through Session Manager port forwarding (§4.1).
 - **Encryption.** Customer-managed KMS keys (yearly rotation) encrypt RDS, Performance
   Insights, the log groups, ECR and Secrets Manager.
 - **Backups.** 35-day automated backups with point-in-time recovery, deletion protection
@@ -89,10 +93,11 @@ internet -> host 80/443 (UFW, fail2ban) -> nginx (edge network)
 
 | Invariant | AWS | Single host | Verified by |
 |---|---|---|---|
-| The database has no direct internet access; only the backend (and the one-shot migrate job) reach it | Data subnets without a route out; security group matrix; NACL | No published port; internal `data` network shared only with backend and migrate | §5.7 isolation checks; Appendix C |
+| The database has no direct internet access; only the backend (and the one-shot migrate job) reach it | Data subnets without a route out; security group matrix; NACL; the DBA bastion is the one administrative path (no inbound rule, Session Manager only) | No published port; internal `data` network shared only with backend and migrate | §5.7 isolation checks; Appendix C |
+| No inbound administrative port (SSH, 5432) | DBA access only through Session Manager port forwarding: bastion without ingress rule, public address, key pair or sshd; `dba-tunnel` policy refuses shell sessions | SSH hardened by `hardening.sh` (keys only) | `terraform/bastion.tf`; Appendix C |
 | Services reach only what they need | Security groups per service; backend egress limited to `backend_egress_cidrs` (default none) | Separate internal networks per path (`web`, `api`, `data`); backend egress internal by default, then restricted on the host (§5.11) | Appendix C |
 | Staff authenticate with two factors; TOTP secrets never in clear | Same code on both: two-step verification (TOTP) is mandatory for `OPERADOR`, `AUDITOR` and `CUMPLIMIENTO` and re-checked on every request; secrets encrypted with `MFA_CLAVE_CIFRADO` (Secrets Manager) | Same; key in `secrets/mfa_encryption_key` | `tests/mfa.rs`, `tests/db/0010_auth_mfa.sql`, AML e2e (Appendix C) |
-| Least-privilege database identities | Service holds only `sc_app` (NOINHERIT, no owner rights); owner credentials only in the migrate task | Same, plus the schema owner is **not** a superuser (`deploy/postgres/10-schema-owner.sh`); the `postgres` superuser is break-glass only | `pg_authid` query in Appendix C |
+| Least-privilege database identities | Service holds only `sc_app` (NOINHERIT, no owner rights); owner credentials only in the migrate task and with DBAs holding the `dba-tunnel` policy | Same, plus the schema owner is **not** a superuser (`deploy/postgres/10-schema-owner.sh`); the `postgres` superuser is break-glass only | `pg_authid` query in Appendix C |
 | Containers non-root, read-only, least capability, resource-limited | uid 65532, read-only rootfs, `drop ALL`, task CPU/memory | uid 65532 / 70 / 101, `read_only`, `cap_drop: ALL`, `no-new-privileges`, CPU/memory/PID limits | `docker inspect` in Appendix C |
 | No secret in code, images, environment or state the operator does not control | Secrets Manager (CMK); RDS manages and rotates the owner password; Terraform state is CMK-encrypted | Docker secrets files (0400, owned by the reading uid); services read them through `NAME_FILE` | No secret value in `docker inspect` or image history (Appendix C) |
 | TLS 1.3 at the edge, HSTS, strict CSP, rate limits, body-size limits | ALB policy `ELBSecurityPolicy-TLS13-1-3-2021-06`; WAF | nginx (`nginx/`) | Edge tests in Appendix C |
@@ -105,8 +110,8 @@ internet -> host 80/443 (UFW, fail2ban) -> nginx (edge network)
 
 | Role | Holds | Never holds |
 |---|---|---|
-| Infrastructure administrator | AWS deployment role / host sudo; runs Terraform, compose, hardening | Compliance-officer accounts |
-| DBA (schema-owner custodian) | Owner credentials for staff provisioning and break-glass | Application deploy rights, without a second approver |
+| Infrastructure administrator | AWS deployment role / host sudo; runs Terraform, compose, hardening; grants the `dba-tunnel` policy | Compliance-officer accounts |
+| DBA (schema-owner custodian) | Owner credentials for staff provisioning and break-glass (on AWS: the `dba-tunnel` policy, §4.1) | Application deploy rights, without a second approver |
 | Release manager | Approves releases; checks the CI gates; signs the migration plan | Production secrets |
 | Compliance officers (at least two) | `CUMPLIMIENTO` accounts in the AML console | Infrastructure access |
 | Operator | `OPERADOR` account (back office) | AML console access (the app refuses it) |
@@ -280,13 +285,167 @@ This section expands `terraform/README.md`, "Deploying (summary)". Run it from
    `terraform output egress_public_ips`. Put their ranges in
    `spei_webhook_allowed_cidrs`, `kyc_webhook_allowed_cidrs` and `backend_egress_cidrs`,
    then apply again.
-9. **Staff.** See §10.3. On AWS this needs the DBA access path that §12 lists as an
-   open item.
+9. **Staff.** The DBA creates the first compliance officers through the Session Manager
+   tunnel (§4.1).
 
 **Where the schema owner differs on AWS.** The schema owner is the RDS master user
 (`db_master_username`, default `sc_owner`). It is a member of `rds_superuser` but not a
 real superuser: it cannot read server files or run programs. RDS rotates its password,
-and only the migrate task can read it.
+and only the migrate task and DBAs holding the `dba-tunnel` policy can read it.
+
+### 4.1 Initial DBA Bootstrap & Admin Creation
+
+The DBA reaches the database from their own machine through AWS Systems Manager
+Session Manager and creates the first `CUMPLIMIENTO` users. No port is open to the
+internet (neither SSH nor 5432), and every session is recorded.
+
+```
+DBA laptop --HTTPS + IAM--> Session Manager <--outbound channel-- bastion --5432--> RDS instance
+(local end 127.0.0.1:5432)                         (app subnet, no inbound rule)   (data subnet)
+```
+
+- **No inbound path.** The bastion (`terraform/bastion.tf`: Amazon Linux 2023,
+  `t4g.nano`) has no public address and no key pair. sshd is disabled, and its security
+  group has no ingress rule at all. Its SSM agent opens an outbound channel through the
+  VPC endpoints, and Session Manager carries the DBA's traffic over that channel.
+- **Only the database at the far end.** The bastion may send PostgreSQL to the RDS
+  instance and HTTPS to the VPC endpoints, nothing else. The database security group
+  admits it on 5432.
+- **Only port forwarding.** The `dba-tunnel` IAM policy lets its holder start
+  `AWS-StartPortForwardingSessionToRemoteHost` on the bastion and read the master user
+  secret. A shell session, or any other session document, is refused.
+- **Recorded.** CloudTrail, Session Manager history and the PostgreSQL connection log
+  ("Evidence of each session" below).
+
+**One-time setup (infrastructure administrator, ticket with a second approver)**
+
+1. **The bastion.** It exists by default (`dba_bastion_enabled = true`) and came up with
+   §4 step 3. Two or three minutes after creation it must be online:
+   ```bash
+   aws ssm describe-instance-information --query 'InstanceInformationList[0].PingStatus' \
+     --filters "Key=InstanceIds,Values=$(terraform output -json dba_tunnel | jq -r .bastion_instance_id)"
+   ```
+   The answer must be `"Online"`.
+2. **The policy.** Attach `terraform output -raw dba_tunnel_policy_arn` (named
+   `<project>-<environment>-dba-tunnel`) to the DBA's IAM Identity Center permission set
+   as a customer managed policy, or to the DBA's IAM role. Nobody else gets it.
+3. **The connection data.** It contains no secret. Hand it over instead of access to the
+   state, which holds the `sc_app` password:
+   ```bash
+   terraform output -json dba_tunnel > dba-tunnel.json
+   ```
+   Regenerate it whenever the bastion is replaced ("Patching" below).
+
+**DBA workstation.**
+
+- AWS CLI v2, signed in with the profile that carries the policy:
+  `aws sso login --profile <profile>`, then `export AWS_PROFILE=<profile>`.
+- The Session Manager plugin for the AWS CLI, `jq`, `curl`, and `psql` 16 or pgAdmin 4.
+- macOS and Linux work as they are. On Windows, use WSL.
+
+**Open the tunnel.**
+
+- **psql in one step (recommended).** The script opens the tunnel, runs psql as the
+  master user and closes the tunnel when psql exits. The password goes from Secrets
+  Manager into a private temporary file: never on screen, in the history or in a command
+  line.
+  ```bash
+  ./scripts/db-tunnel.sh --outputs dba-tunnel.json --psql
+  ```
+- **Tunnel only, for pgAdmin or your own psql.** It prints the psql command, the
+  pgAdmin settings and how to read the password, then forwards until Ctrl-C:
+  ```bash
+  ./scripts/db-tunnel.sh --outputs dba-tunnel.json
+  ```
+- **Port.** Add `--local-port 15432` when a local PostgreSQL already uses 5432. The
+  local end listens on 127.0.0.1 only.
+- **TLS.** Both modes use `sslmode=verify-full`. The client connects to `127.0.0.1`
+  (`hostaddr`) but checks the certificate against the RDS host name (`host`), with the
+  regional RDS CA bundle (downloaded once to `~/.cache/synthetic-capital/`). Never lower
+  the SSL mode to make a connection work.
+
+pgAdmin 4 (Register > Server):
+
+| Tab | Field | Value |
+|---|---|---|
+| Connection | Host name/address | `db_host` from `dba-tunnel.json` (the RDS endpoint) |
+| Connection | Port | the tunnel's local port (5432) |
+| Connection | Maintenance database, Username | `db_name`, `db_user` |
+| Connection | Password, Save password | from the command the script prints; off (RDS rotates it) |
+| Parameters (Advanced in older versions) | Host address | `127.0.0.1` |
+| Parameters | SSL mode, Root certificate | `verify-full`, the bundle path the script prints |
+
+Without a Host address field, map the RDS host name to 127.0.0.1 in the hosts file for
+the session instead. Keep `verify-full` either way.
+
+**Create the first compliance officers.** Staff are promoted, never inserted. Each person
+signs up in the app with their own password, so the DBA never chooses, sees or hashes one.
+An `INSERT` would need an Argon2id hash of a password the DBA picked and handed over, and
+no password can be changed without email until §12 item 1 is resolved.
+
+1. **The officer registers** at `https://<domain_name>` with their institutional email.
+2. **A second person approves the ticket**: name, email and role.
+3. **The DBA promotes the account.** The statement changes at most one row: the email is
+   unique, and only a `CLIENTE` is promoted.
+   ```bash
+   ./scripts/db-tunnel.sh --outputs dba-tunnel.json --psql -- -v ON_ERROR_STOP=1 -c "
+   UPDATE kyc.credenciales SET rol = 'CUMPLIMIENTO', tokens_validos_desde = now()
+    WHERE rol = 'CLIENTE'
+      AND cliente_id = (SELECT id FROM kyc.clientes WHERE lower(email) = lower('oficial1@bank.example.mx'))
+   RETURNING cliente_id, rol"
+   ```
+   - **Expected output:** one row and `UPDATE 1`.
+   - **`UPDATE 0`** changed nothing: no account has that email (not registered yet, or a
+     typo), or the account is already staff.
+   - **pgAdmin:** run the same `UPDATE` in the Query Tool, with auto-commit on.
+   - `tokens_validos_desde = now()` ends the sessions the person had as a client.
+4. **Repeat** for the second officer (the AML console's four-eyes rules need two), and
+   with `'AUDITOR'` for auditors.
+5. **Check the staff list:**
+   ```bash
+   ./scripts/db-tunnel.sh --outputs dba-tunnel.json --psql -- -c "
+   SELECT k.email, c.rol, c.mfa_enabled FROM kyc.credenciales c JOIN kyc.clientes k ON k.id = c.cliente_id
+    WHERE c.rol <> 'CLIENTE' ORDER BY k.email"
+   ```
+6. **The officer signs in at once.** The app demands two-step verification before
+   anything else (QR code, then the first code). Afterwards `mfa_enabled` is `t`, and
+   `kyc.eventos_autenticacion` holds an `MFA_ACTIVADO` row with the sign-in's address.
+   Whoever signs in first with the password binds the authenticator, so never leave a
+   promoted account unenrolled.
+7. **Record it.** Attach the commands and their output to the ticket.
+
+**Evidence of each session.**
+
+| Where | What |
+|---|---|
+| CloudTrail, Systems Manager | `StartSession` (who, target instance, document, host and ports) and `TerminateSession` |
+| CloudTrail, Secrets Manager | `GetSecretValue` on the master user secret |
+| Systems Manager, Session Manager, Session history | each session's owner, start and end |
+| CloudWatch Logs `/aws/rds/instance/<project>-<environment>-postgres/postgresql` | `connection authorized` for the master user from the bastion's address; every DDL statement |
+| `kyc.eventos_autenticacion` | each officer's enrollment |
+
+PostgreSQL does not log ordinary data changes such as the `UPDATE` above
+(`log_statement = ddl`). The ticket keeps them (§12).
+
+**Patching and switching it off.**
+
+- **Patching.** The bastion holds no state. Any apply after AWS publishes a new Amazon
+  Linux 2023 AMI replaces it; the plan shows the replacement. Refresh `dba-tunnel.json`
+  afterwards.
+- **Switching it off.** `dba_bastion_enabled = false` removes the bastion, its Session
+  Manager endpoints, its database rule and the policy until the next maintenance window.
+  `true` brings back a fresh one.
+
+**Troubleshooting.**
+
+| Symptom | Cause and fix |
+|---|---|
+| `not registered with Systems Manager` | the bastion was replaced: regenerate `dba-tunnel.json`; or it is still booting: wait two or three minutes |
+| `AccessDeniedException` on `StartSession` | the policy is not attached to the profile in use |
+| `TargetNotConnected` | the agent cannot reach Session Manager: check the `ssmmessages` and `ec2messages` endpoints and the bastion's security group |
+| `127.0.0.1:5432 is already in use` | `--local-port 15432` |
+| `certificate verify failed` | a stale CA bundle (delete `~/.cache/synthetic-capital/rds-ca-<region>.pem`) or a wrong endpoint; never lower `sslmode` |
+| every session fails, and the account's Session Manager preferences encrypt with KMS | set `dba_session_kms_key_arn` to that key and apply |
 
 ---
 
@@ -625,7 +784,7 @@ instead of opening 443 to everything.
 
 | Secret | AWS | Single host (`secrets/`) | Read by | Suggested rotation |
 |---|---|---|---|---|
-| Schema owner password | RDS-managed secret | `db_owner_password`, `database_url_owner` | migrate only | RDS automatic / every 90 days |
+| Schema owner password | RDS-managed secret | `db_owner_password`, `database_url_owner` | migrate; on AWS also DBAs holding the `dba-tunnel` policy (§4.1) | RDS automatic / every 90 days |
 | PostgreSQL superuser | — (RDS has none) | `postgres_password` | nobody (break-glass) | after any break-glass use; on staff change |
 | `sc_app` password | `db-app/credentials`, `backend/DATABASE_URL` | `db_app_password`, `database_url` | backend; migrate sets it | 90 days |
 | `JWT_SECRET` | Secrets Manager | `jwt_secret` | backend | 90 days (signs every session out) |
@@ -690,8 +849,10 @@ link).
 - [ ] Every secret generated fresh for production. Nothing reused from staging.
 - [ ] External penetration test of the deployed environment, with findings closed or
       accepted.
-- [ ] **Launch blockers in §12 resolved or formally accepted** (DBA access path on AWS;
-      an email provider for password resets).
+- [ ] **Launch blockers in §12 resolved or formally accepted** (an email provider for
+      password resets).
+- [ ] DBA access: the bastion is `Online` in Systems Manager, and the `dba-tunnel` policy
+      is attached only to the named DBAs (ticket with a second approver).
 - [ ] Every staff account enrolled two-step verification: one `MFA_ACTIVADO` row per staff
       member in `kyc.eventos_autenticacion`, and no staff row with `mfa_enabled = false`.
 
@@ -759,7 +920,9 @@ production.
    Enroll right after the promotion: whoever holds the password first binds the
    authenticator.
 
-- **AWS:** this needs the DBA access path listed in §12.
+- **AWS:** the same statements through the Session Manager tunnel:
+  `./scripts/db-tunnel.sh --outputs dba-tunnel.json --psql -- -v ON_ERROR_STOP=1 -c "..."`
+  (§4.1).
 - **Revoking access:** set the role back to `CLIENTE` and revoke the sessions in the
   same statement (`tokens_validos_desde = now()`). Staff sessions last at most
   `JWT_TTL_PERSONAL_MINUTOS` (default 30).
@@ -785,7 +948,9 @@ production.
   `postgres`. Use it only under an incident ticket, and rotate it afterwards
   (`generate-secrets.sh --rotate superuser`). Routine work uses the owner (without
   `--superuser`).
-- **AWS:** there is no standing path (no bastion, ECS Exec disabled). See §12.
+- **AWS:** the DBA tunnel (§4.1) as the master user, under an incident ticket. RDS has no
+  superuser to escalate to. Afterwards rotate the master user secret (Secrets Manager,
+  "Rotate secret immediately"). ECS Exec stays disabled.
 
 ### 10.5 Incidents worth a runbook
 
@@ -807,7 +972,7 @@ aid for the compliance team and the auditors, not a certification.
 | Control area | CNBV (fintech and AML/CFT provisions) | ISO/IEC 27001:2022 Annex A | SOC 2 (TSC 2017) | Implementation | Evidence |
 |---|---|---|---|---|---|
 | Network segregation | information-security requirements | 8.20, 8.21, 8.22 | CC6.6 | private data tier; internal Docker networks; security groups; WAF | Terraform; `docker-compose.yml`; §5.7 |
-| Least privilege, privileged access | access control | 5.15, 5.18, 8.2 | CC6.1, CC6.3 | `sc_app` NOINHERIT; non-superuser owner; superuser break-glass only; no task role | `pg_authid`; Terraform IAM |
+| Least privilege, privileged access | access control | 5.15, 5.18, 8.2 | CC6.1, CC6.3 | `sc_app` NOINHERIT; non-superuser owner; superuser break-glass only; no task role; DBA access only by Session Manager port forwarding (`dba-tunnel` policy) | `pg_authid`; Terraform IAM; CloudTrail `StartSession` |
 | Segregation of duties | internal control | 5.3 | CC5.1 | role matrix (§2.1); four-eyes in the AML console (database-enforced) | AML suite; tickets |
 | Authentication secrets | information security | 5.17 | CC6.1 | Secrets Manager / Docker secrets; SCRAM-SHA-256 everywhere; rotation (§8) | §8; rotation records |
 | Cryptography | information security | 8.24 | CC6.1, CC6.7 | TLS 1.3 at the edge; TLS to RDS (`verify-full` to the proxy); KMS CMKs | ALB/nginx config; KMS key policies |
@@ -831,7 +996,7 @@ to the specific provisions.
 | 1 | **Password-reset email is simulated** (no email provider integrated): outside `MODO_DEMO` the link is neither sent nor logged | people who forget their password need support | support resets passwords through the DBA; the flow itself (hashed single-use token, 30 minutes, every session revoked, same answer for unknown emails) is implemented and tested | connect an email provider in the residency region to `backend/src/auth/correo.rs` (backend) — **launch blocker** |
 | 2 | Two-step verification is TOTP only: no recovery codes, no WebAuthn/passkeys | a lost phone needs a DBA reset (identity check, second approver); a TOTP code can be phished in real time | replay protection, account lock after 5 failed codes or passwords, staff sessions of at most 30 minutes, every enrollment, code and reset in the immutable audit table | recovery codes and WebAuthn for staff (product, security) |
 | 3 | The first enrollment trusts whoever holds the password | someone with a new staff member's initial password could bind their own authenticator | promotion and enrollment in the same ticket (§10.3); the audit table records each enrollment's IP | deliver initial credentials out of band; check the `MFA_ACTIVADO` event |
-| 4 | **No DBA access path on AWS** (no bastion, ECS Exec disabled) | staff provisioning (§10.3) and break-glass need one | none | add a short-lived, audited path: for example a one-off ECS task with a PostgreSQL client image in the migrate security group, the owner secret injected, the reviewed SQL passed in the run-task overrides (recorded in CloudTrail) (infrastructure) — **launch blocker** |
+| 4 | PostgreSQL logs DDL but not the data changes a DBA makes through the tunnel (for example a role change) | the database itself keeps no record of who changed what | CloudTrail and the connection log show who connected and when (§4.1); the ticket holds each statement and its output | pgaudit for the master user (database) |
 | 5 | Single-host topology: no high availability; recovery point = backup interval | an outage, or data loss since the last dump | encrypted daily dumps, off-site copies, tested restore | use AWS for production; WAL archiving (e.g. pgBackRest) if the single host must carry production |
 | 6 | Single host: once egress is enabled, its restriction is a host firewall rule set (§5.11), not code | a mistake in the rules opens more than the providers | rules reviewed in the change ticket; default stays no egress | manage the rules with configuration management |
 | 7 | Single host: `sslmode=disable` between backend and database | traffic in clear on the host's internal bridge | internal network, same host, no other tenants | TLS in the PostgreSQL container if the host is shared |
@@ -846,6 +1011,7 @@ to the specific provisions.
 | 16 | WAF blocks Tor and anonymising proxies (`waf_block_anonymous_ips`) | some legitimate users cannot connect | — | business confirmation |
 | 17 | The CSP allows `'unsafe-inline'` scripts (Next.js inlines its bootstrap scripts), and the session JWT is in `sessionStorage` | an XSS bug would expose the session | React escapes all output; the frontend has no raw-HTML sinks (`dangerouslySetInnerHTML`, `innerHTML`, `eval`); `frame-ancestors 'none'`, `object-src 'none'`, `base-uri 'none'`; the JWT is short-lived and cleared when the tab closes | nonce-based CSP through Next.js middleware; HttpOnly, SameSite session cookies (frontend, backend) |
 | 18 | Images are not signed and carry no SBOM attestation | registry tampering is not detected at deploy time | digest pinning end to end; ECR tags are immutable | cosign signatures and an SBOM (Trivy or Syft) in the release pipeline, verified before deploy (infrastructure) |
+| 19 | The `dba-tunnel` policy restricts DBAs, not account administrators: a principal allowed `ssm:StartSession` on every instance could open a shell on the bastion | a shell inside the VPC with a path to the database port, still without the owner password | the instance role holds only `AmazonSSMManagedInstanceCore`, and the bastion holds no secret | an SCP that denies shell sessions on instances tagged `Component = dba-access` (account baseline) |
 
 ---
 
@@ -950,6 +1116,52 @@ request through the TLS edge:
   enrolling every staff account at its first sign-in and retrying after a wrong code;
   smoke suite 47/47.
 
+**DBA access path** (`terraform/bastion.tf`, `scripts/db-tunnel.sh`). No AWS account was
+available, so Session Manager itself was not exercised. Everything around it was:
+
+- **Terraform checks:**
+  - `terraform validate` passes.
+  - tflint is clean. Its AWS ruleset is active: it flags a misspelt instance type when
+    one is planted.
+  - checkov passes every check on the bastion: IMDSv2 only, no public address, encrypted
+    root volume, detailed monitoring, no ingress rule, rule descriptions, IAM least
+    privilege.
+  - Trivy finds nothing HIGH or CRITICAL. It flags `http_tokens = "optional"` when that
+    is planted.
+- **Mocked `terraform test`** (mock AWS provider; the test is not committed). Four runs
+  apply the whole configuration:
+  - **Default:** a `t4g.nano` in the first app subnet with the arm64 AMI; the
+    `ssmmessages` and `ec2messages` endpoints; 5432 from the bastion into the database
+    group; every `dba_tunnel` field.
+  - **Non-burstable x86 type in another zone, with a session KMS key:** the x86_64 AMI;
+    no CPU-credit setting; the KMS policy.
+  - **Unknown zone:** refused by the precondition.
+  - **Switched off:** no bastion resource, rule, endpoint or policy; null outputs; the
+    `ssm` endpoint and the EBS key kept.
+- **`scripts/db-tunnel.sh`:** 26 checks against PostgreSQL 16 with TLS and SCRAM. The
+  AWS CLI, the Session Manager plugin and Terraform were stubbed.
+  - **psql mode:** connected as the master user over TLS 1.3 with `verify-full`.
+    `start-session` received the instance, the document, the RDS host, 5432 and the
+    local port. Afterwards the tunnel, the plugin and the temporary password file were
+    gone.
+  - **Outputs:** read when saved alone, as the whole `terraform output -json`, and live.
+  - **TLS:** `verify-full` refused an unrelated CA and a certificate for another host
+    name.
+  - **Ctrl-C:** on a pseudo-terminal, Ctrl-C cancelled a running query, and the same
+    session ran the next query through the same tunnel.
+  - **Tunnel-only mode:** the printed psql command connected, and Ctrl-C closed the
+    tunnel.
+  - **Refusals:** a local port in use, a bastion unknown to Systems Manager or not
+    online, a disabled bastion, no access to the secret, malformed outputs.
+  - **CA bundle:** the regional RDS bundle was downloaded once into the cache.
+  - **Password:** it contained `:`, `\` and `!`, and appeared in no output and no
+    command line.
+  - ShellCheck is clean.
+- **Bootstrap SQL.** The database was migrated with every migration by an owner without
+  superuser, like the RDS master user. The §4.1 promotion through the tunnel printed one
+  row and `UPDATE 1`; repeated, it printed `UPDATE 0`. The check query listed the officer
+  with `mfa_enabled = f`.
+
 **Images and scans:**
 
 - **Images:** both rebuilt on Debian 13 bases, backend 58 MB and frontend 269 MB.
@@ -967,11 +1179,10 @@ migration `0010`):
   (`0010_auth_mfa`: 32 checks).
 - **Frontend:** lint and typecheck clean; 83 unit tests passed; `next build` succeeded.
 - **Terraform:** fmt, init and validate pass, with the lock file unchanged. tflint is
-  clean. checkov: 388 passed, 0 failed, 16 skipped (each skip justified inline). That
-  is two fewer of each than before `0010`, with no check lost: checkov no longer expands
-  the `for_each` of `aws_secretsmanager_secret.backend` (its `merge` now holds two
-  conditional maps), so it reports CKV_AWS_149 (passed) and CKV2_AWS_57 (skipped) once
-  for the resource instead of once per secret.
+  clean. checkov: 461 passed, 0 failed, 16 skipped (each skip justified inline). checkov
+  does not expand the `for_each` of `aws_secretsmanager_secret.backend` (its `merge`
+  holds two conditional maps), so it reports CKV_AWS_149 (passed) and CKV2_AWS_57
+  (skipped) once for the resource instead of once per secret.
 - **Trivy:** 0 HIGH or CRITICAL misconfigurations; the secret scan of the tracked tree
   is clean.
 

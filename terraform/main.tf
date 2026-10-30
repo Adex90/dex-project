@@ -5,11 +5,12 @@
 #                       `-- everything else -> frontend (ECS Fargate, private app subnets, :3000)
 #   backend -> RDS Proxy (TLS) -> RDS PostgreSQL 16 Multi-AZ   (private data subnets, no route out)
 #   migrate (one-off task)     -> RDS instance directly, as the schema owner
+#   DBA (Session Manager port forwarding) -> bastion (app subnet, no inbound) -> RDS instance
 #
 # File map: vpc.tf (network, endpoints, flow logs, NACLs), security_groups.tf, kms.tf,
 # logs.tf (log groups, ALB log bucket), secrets.tf, rds.tf (database + proxy), ecr.tf,
 # ecs.tf (cluster, task definitions, services, autoscaling), alb.tf (load balancer, TLS,
-# DNS), waf.tf, outputs.tf.
+# DNS), waf.tf, bastion.tf (DBA access path), outputs.tf.
 
 data "aws_caller_identity" "current" {}
 

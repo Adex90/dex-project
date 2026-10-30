@@ -19,7 +19,11 @@ locals {
   nat_azs = var.single_nat_gateway ? [local.azs[0]] : local.azs
 
   # AWS APIs used by the Fargate agent (image pulls, secrets, logs) stay inside the VPC.
-  interface_endpoints = ["secretsmanager", "ecr.api", "ecr.dkr", "logs", "kms", "sts", "ssm"]
+  # ssmmessages and ec2messages carry the DBA bastion's Session Manager channel (with ssm).
+  interface_endpoints = concat(
+    ["secretsmanager", "ecr.api", "ecr.dkr", "logs", "kms", "sts", "ssm"],
+    var.dba_bastion_enabled ? ["ssmmessages", "ec2messages"] : [],
+  )
 }
 
 resource "aws_vpc" "this" {
@@ -294,7 +298,7 @@ resource "aws_flow_log" "vpc" {
 # Network ACL for the data subnets (defence in depth behind the security groups)
 #
 # Allowed, and nothing else:
-#   app  -> data  tcp/5432           backend -> RDS Proxy, migrate task -> RDS
+#   app  -> data  tcp/5432           backend -> RDS Proxy; migrate task and DBA bastion -> RDS
 #   data -> data  tcp/5432           RDS Proxy -> RDS across zones
 #   replies on ephemeral ports (1024-65535) in the opposite directions
 # NACLs only see traffic that crosses a subnet boundary.

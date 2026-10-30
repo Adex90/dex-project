@@ -10,6 +10,7 @@ internet -> WAF -> ALB (public subnets, TLS 1.3, HTTP -> HTTPS)
                     `- everything else -> frontend (ECS Fargate, app subnets, :3000)
 backend  -> RDS Proxy (TLS) -> RDS PostgreSQL 16 Multi-AZ   (data subnets: no route out)
 migrate  -> RDS instance directly, as the schema owner      (one-off ECS task)
+DBA      -> Session Manager port forwarding -> bastion (app subnet, no inbound) -> RDS instance
 ```
 
 | File | Contents |
@@ -19,13 +20,14 @@ migrate  -> RDS instance directly, as the schema owner      (one-off ECS task)
 | `main.tf` | data sources, names, tags, image references |
 | `vpc.tf` | VPC, 3 tiers x 2-3 zones, NAT per zone, VPC endpoints, flow logs, data-subnet NACL |
 | `security_groups.tf` | the security group matrix (documented at the top of the file) |
-| `kms.tf` | CMKs with yearly rotation: rds, secrets, logs, ecr |
+| `kms.tf` | CMKs with yearly rotation: rds, secrets, logs, ecr, ebs |
 | `logs.tf` | KMS-encrypted log groups, S3 bucket for ALB access/connection logs |
 | `secrets.tf` | Secrets Manager secrets (see "Secrets") |
 | `rds.tf` | parameter group, Multi-AZ instance, RDS Proxy |
 | `ecr.tf`, `ecs.tf` | repositories; cluster, task definitions (backend, frontend, migrate), services, autoscaling |
 | `alb.tf`, `waf.tf` | load balancer, certificate, DNS; web ACL |
-| `outputs.tf` | endpoints, secret ARNs, the migrate `run-task` command |
+| `bastion.tf` | DBA access path: Session Manager-only bastion, its security group rules, the `dba-tunnel` IAM policy (see "DBA access") |
+| `outputs.tf` | endpoints, secret ARNs, the migrate `run-task` command, `dba_tunnel` |
 
 ## Inputs
 
@@ -55,6 +57,9 @@ See `terraform.tfvars.example`. No secret is ever a variable.
    Logs: `/ecs/<project>-<env>/migrate`.
 6. Apply again without the `*_min_tasks=0` overrides; autoscaling raises the services to
    their minimum.
+7. Attach `dba_tunnel_policy_arn` to the DBAs (and nobody else), hand them
+   `terraform output -json dba_tunnel`, and create the first compliance officers through
+   `scripts/db-tunnel.sh` (DEPLOYMENT.md §4.1).
 
 Releases with migrations: set `migrate_image_tag` to the new tag and apply (only the
 migrate task definition changes), run the migrate task, then move `backend_image_tag`
@@ -107,7 +112,8 @@ Never drop the previous key before step 4: staff whose secret it still encrypts 
   proxy certificate is issued by ACM under Amazon Root CA 1, which the backend's sqlx
   (rustls + webpki roots) trusts.
 - The migrate task holds the owner credentials, which nothing else can read (separate
-  execution role). RDS rotates the owner password, so it cannot be embedded in a URL:
+  execution role) except DBAs holding the `dba-tunnel` policy ("DBA access"). RDS
+  rotates the owner password, so it cannot be embedded in a URL:
   `DATABASE_URL_PROPIETARIO` has no password and ECS injects `PGPASSWORD` from the
   RDS-managed secret; sqlx fills a password-less URL from `PGPASSWORD`. The instance
   certificate comes from the private RDS CA (`rds-ca-rsa2048-g1`), so the regional RDS
@@ -129,6 +135,40 @@ transaction-level multiplexing. It still gives faster, DNS-free failover, a cap 
 database connections (`db_proxy_max_connections_percent`, excess clients wait up to the
 borrow timeout) and TLS with a public-CA certificate. Size it as
 `backend_max_tasks x backend_db_max_connections < max_connections x percent / 100`.
+
+## DBA access
+
+`bastion.tf` gives DBAs a path to the RDS instance without opening a port: Session
+Manager port forwarding through a bastion that nothing can reach. DEPLOYMENT.md §4.1 is
+the runbook; `scripts/db-tunnel.sh` opens the tunnel.
+
+- **The bastion.** Amazon Linux 2023 (standard image, which ships the SSM agent) on
+  `dba_bastion_instance_type` (default `t4g.nano`; the AMI follows the type's
+  architecture), in an app subnet (`dba_bastion_availability_zone`, default the first
+  zone). It has no public address and no key pair, IMDSv2 only, sshd disabled, and a
+  KMS-encrypted root volume (`ebs` key). Its role holds only
+  `AmazonSSMManagedInstanceCore`.
+- **Network.** Its security group has no ingress rule. Egress: 5432 to the database
+  group and 443 to the endpoint group. The database group admits 5432 from it. The
+  `ssmmessages` and `ec2messages` interface endpoints (with `ssm`, already there) carry
+  the agent's channel, so the bastion never needs the internet. It sits in an app subnet,
+  whose CIDR the data-subnet NACL already admits on 5432.
+- **Who.** The `dba-tunnel` IAM policy (output `dba_tunnel_policy_arn`) allows
+  `ssm:StartSession` on this instance with `AWS-StartPortForwardingSessionToRemoteHost`
+  only (`ssm:SessionDocumentAccessCheck` refuses shells). It also allows reading the
+  master user secret (decrypted through Secrets Manager only) and checking that the
+  bastion is online. Terraform attaches it to nobody: the infrastructure administrator
+  attaches it to the DBA's IAM Identity Center permission set or role.
+- **What the script needs.** Output `dba_tunnel` (no secret): region, instance, document,
+  RDS endpoint and port, database, master user, its secret ARN, the RDS CA bundle URL.
+  `null` when the bastion is off.
+- **Patching.** The instance is replaced from the latest AMI on any apply after AWS
+  publishes one (`create_before_destroy`). It holds no state.
+- **Off switch.** `dba_bastion_enabled = false` removes the instance, its endpoints, its
+  rules and the policy. The `ebs` key stays, so the switch never schedules a key deletion.
+- **Session Manager preferences** are account-wide and not managed here. If they encrypt
+  session data with KMS, set `dba_session_kms_key_arn`: the instance may then decrypt and
+  DBAs may generate data keys with it.
 
 ## Edge
 
@@ -181,7 +221,9 @@ GuardDuty (with RDS Protection and ECS Runtime Monitoring), AWS Config and Secur
 encryption, SCPs restricting regions to the residency region and protecting the
 security services, AWS Backup with vault lock (cross-account copies of RDS snapshots),
 a log archive account, and alarms/notifications (ALB 5xx and target health, RDS
-CPU/storage/connections, proxy borrow timeouts, WAF blocks, ECS task failures).
+CPU/storage/connections, proxy borrow timeouts, WAF blocks, ECS task failures),
+Session Manager preferences (idle timeout, optional KMS encryption), and an SCP that
+denies shell sessions on instances tagged `Component = dba-access`.
 Optional: Shield Advanced on the ALB.
 
 ## Validation

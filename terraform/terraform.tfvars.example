@@ -51,6 +51,12 @@ tags = {
   DataClassification = "confidential"
 }
 
+# --- DBA access (bastion.tf; defaults shown) ---------------------------------------------
+# dba_bastion_enabled           = true       # false between maintenance windows
+# dba_bastion_instance_type     = "t4g.nano"
+# dba_bastion_availability_zone = null       # first zone
+# dba_session_kms_key_arn       = null       # only if Session Manager preferences use KMS
+
 # --- First deployment only ------------------------------------------------------------
 # Start with no tasks; raise to >= 2 after images, secrets and migrations are in place.
 # backend_min_tasks  = 0
