@@ -1,0 +1,50 @@
+# Local development: PostgreSQL 16 only. The backend and frontend run on the host
+# (README "Running locally").
+#
+#   cp .env.example .env                     # POSTGRES_* and DATABASE_URL must agree
+#   docker compose -f docker-compose.dev.yml up -d
+#
+# Bound to 127.0.0.1: the database is never reachable from the network. The
+# credentials come from .env (compose reads it for substitution); nothing has a
+# default. The role is a superuser of this throwaway cluster, so migrations can
+# create the sc_* roles and the tests can create databases.
+#
+# Production uses docker-compose.yml (secrets files, internal networks, the
+# one-shot migrate job) or terraform/. See DEPLOYMENT.md.
+
+name: synthetic-capital-dev
+
+services:
+  postgres:
+    image: docker.io/library/postgres:16.15-alpine@sha256:0cefaabd882e42bcb2a2f3dc56d3ce4770560ba62fd7f197f1a2e008fd5731ab
+    user: "70:70"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:?set POSTGRES_USER in .env}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: ${POSTGRES_DB:?set POSTGRES_DB in .env}
+      # UTF8 is required by the backend (it refuses any other server encoding).
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C --auth-host=scram-sha-256 --auth-local=scram-sha-256"
+      PGDATA: /var/lib/postgresql/data/pgdata
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    tmpfs:
+      - /var/run/postgresql:uid=70,gid=70,mode=0775,size=8m
+      - /tmp:uid=70,gid=70,mode=0700,size=64m
+    shm_size: 128m
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\""]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    deploy:
+      resources:
+        limits: {cpus: "2.0", memory: 1g, pids: 256}
+
+volumes:
+  pgdata:

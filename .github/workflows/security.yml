@@ -1,0 +1,173 @@
+# Vulnerability audit of the dependency lockfiles (backend/Cargo.lock,
+# frontend/package-lock.json, .github/e2e-tools/package-lock.json) and of the
+# third-party images the docker compose deployment runs (PostgreSQL, nginx).
+#
+# Runs on every PR and push to main, so a new dependency with a known critical
+# vulnerability fails, and every Monday, so advisories published after a change
+# merged are caught although nothing changed. The same policy as the image scans
+# in ci.yml: report CRITICAL and HIGH vulnerabilities that have a fix, fail on
+# CRITICAL. The image scan cannot see Rust crates (a Rust binary carries no
+# dependency list unless it is built with cargo-auditable), so this is where
+# they are checked.
+#
+# Secrets: none. This workflow reads no repository, environment or organization
+# secrets; the automatic GITHUB_TOKEN is limited to `contents: read`.
+
+name: Security
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  schedule:
+    # Mondays 07:23 UTC (01:23 in Mexico City).
+    - cron: "23 7 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref == 'refs/heads/main' && github.run_id || github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  # Keep in step with ci.yml.
+  TRIVY_VERSION: v0.76.0
+
+jobs:
+  dependencies:
+    name: Dependency vulnerabilities (lockfiles)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Trivy - CRITICAL and HIGH vulnerabilities that have a fix (report)
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          version: ${{ env.TRIVY_VERSION }}
+          scan-type: fs
+          scan-ref: .
+          scanners: vuln
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: "0"
+          cache-dir: ${{ runner.temp }}/trivy
+          trivyignores: .github/trivyignore.yaml
+
+      - name: Trivy - fail on CRITICAL vulnerabilities that have a fix
+        uses: aquasecurity/trivy-action@v0.36.0
+        env:
+          # The previous step installed Trivy and downloaded today's database.
+          TRIVY_SKIP_DB_UPDATE: "true"
+          TRIVY_SKIP_JAVA_DB_UPDATE: "true"
+        with:
+          skip-setup-trivy: true
+          cache: false
+          scan-type: fs
+          scan-ref: .
+          scanners: vuln
+          severity: CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+          cache-dir: ${{ runner.temp }}/trivy
+          trivyignores: .github/trivyignore.yaml
+
+  # The images ci.yml builds are scanned there; these are the upstream ones pinned by
+  # digest in docker-compose*.yml. Dependabot proposes new digests when upstream
+  # rebuilds; this job says when one is urgent.
+  compose-image-list:
+    name: Third-party images (list)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      images: ${{ steps.list.outputs.images }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Digest-pinned images in docker-compose*.yml
+        id: list
+        run: |
+          images="$(grep -hoE 'image: *[a-z0-9.-]+(/[a-z0-9._-]+)+:[A-Za-z0-9._-]+@sha256:[0-9a-f]{64}' docker-compose*.yml \
+            | sed -E 's/^image: *//' | sort -u | jq -R -s -c 'split("\n") | map(select(length > 0))')"
+          if [ "${images}" = "[]" ]; then
+            echo "::error::no digest-pinned image found in docker-compose*.yml"
+            exit 1
+          fi
+          echo "images=${images}" >> "$GITHUB_OUTPUT"
+          echo "${images}" | jq -r '.[]'
+
+  compose-images:
+    name: Third-party image (${{ matrix.image }})
+    needs: compose-image-list
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        image: ${{ fromJSON(needs.compose-image-list.outputs.images) }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Trivy - CRITICAL and HIGH vulnerabilities that have a fix (report)
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          version: ${{ env.TRIVY_VERSION }}
+          scan-type: image
+          image-ref: ${{ matrix.image }}
+          scanners: vuln
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: "0"
+          cache-dir: ${{ runner.temp }}/trivy
+          trivyignores: .github/trivyignore.yaml
+
+      - name: Trivy - fail on CRITICAL vulnerabilities that have a fix
+        uses: aquasecurity/trivy-action@v0.36.0
+        env:
+          TRIVY_SKIP_DB_UPDATE: "true"
+          TRIVY_SKIP_JAVA_DB_UPDATE: "true"
+        with:
+          skip-setup-trivy: true
+          cache: false
+          scan-type: image
+          image-ref: ${{ matrix.image }}
+          scanners: vuln
+          severity: CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+          cache-dir: ${{ runner.temp }}/trivy
+          trivyignores: .github/trivyignore.yaml
+
+  # One stable check for branch protection (the matrix job names carry the image digest,
+  # which changes with every Dependabot bump).
+  security-ok:
+    name: Security result
+    if: ${{ always() }}
+    needs: [dependencies, compose-image-list, compose-images]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Require every job to succeed
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          echo "Job results: ${RESULTS}"
+          read -r -a results <<<"${RESULTS}"
+          for result in "${results[@]}"; do
+            if [ "${result}" != "success" ]; then
+              echo "::error::a required job finished with '${result}'"
+              exit 1
+            fi
+          done

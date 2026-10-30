@@ -1,0 +1,280 @@
+# Site config. The nginx image entrypoint (20-envsubst-on-templates.sh) renders this
+# template into /etc/nginx/conf.d/synthetic-capital.conf at every container start.
+# The only substitution is ${PUBLIC_HOST}: the ONE public host name ("bank.example.mx").
+# server_name would take several, but docker-compose.yml also builds the frontend for
+# https://${PUBLIC_HOST}, and the frontend Dockerfile refuses a space-separated value. Set
+# NGINX_ENVSUBST_FILTER=^PUBLIC_HOST$ so no other environment variable is substituted;
+# nginx's own variables ($host, $uri, ...) are lowercase and never collide with it.
+#
+# Routing (same origin, so the frontend is built with NEXT_PUBLIC_API_URL=https://<host>):
+#   /api/*, /salud  -> backend:8080 (axum)
+#   everything else -> frontend:3000 (Next.js)
+
+# Fail fast: rendered without PUBLIC_HOST, this line still reads ${PUBLIC_HOST}, which
+# nginx parses as an unknown variable and refuses to start (an empty value fails at
+# server_name). Without it nginx would start and answer no request at all.
+map "" $sc_host_publico_definido {
+    default "${PUBLIC_HOST}";
+}
+
+# Docker's embedded DNS. Upstream names are re-resolved at run time (`resolve`): nginx
+# starts even when the backend or frontend is not up yet (answering 503 until it is)
+# and follows their new addresses when the containers are recreated. An answer is kept
+# for `valid`, an empty one too: a lookup that lands in the instant a container is being
+# recreated would otherwise keep that upstream unavailable for the whole period.
+resolver 127.0.0.11 valid=2s ipv6=off;
+resolver_timeout 5s;
+
+upstream backend {
+    zone upstream_backend 64k;
+    server backend:8080 resolve;
+    keepalive 32;
+    # Shorter than the backend's idle keep-alive limit (HTTP_CABECERAS_SEG, 10 s), so
+    # nginx never reuses a connection the backend is closing.
+    keepalive_timeout 5s;
+}
+
+upstream frontend {
+    zone upstream_frontend 64k;
+    server frontend:3000 resolve;
+    keepalive 16;
+    # Shorter than Node's default server keep-alive (5 s).
+    keepalive_timeout 4s;
+}
+
+# Optional source allowlists for the provider webhooks (see the files: the default
+# allows everyone, since the backend's HMAC signature is the authentication). Fail
+# closed: an address that does not map to exactly 1 is refused.
+geo $spei_webhook_permitido {
+    include /etc/nginx/allowlist/spei-webhook.conf;
+}
+geo $kyc_webhook_permitido {
+    include /etc/nginx/allowlist/kyc-webhook.conf;
+}
+
+# The API and the pages use GET and POST only (plus HEAD, and OPTIONS for preflights).
+map $request_method $metodo_permitido {
+    default 0;
+    GET     1;
+    HEAD    1;
+    POST    1;
+    OPTIONS 1;
+}
+
+# API answers (balances, tokens, KYC data) never land in a browser or proxy cache unless
+# the backend sets its own Cache-Control. Used by snippets/security-headers.conf.
+map $upstream_http_cache_control $api_cache_control {
+    ""      "no-store";
+    default "";
+}
+map $uri $edge_cache_control {
+    default "";
+    ~^/api/ $api_cache_control;
+    /salud  $api_cache_control;
+}
+
+# /_next/static/ holds content-hashed, immutable files: cached for a year when served,
+# never on errors (a 404 for a chunk during a deploy must not stick in caches).
+map $status $static_cache_control {
+    200     "public, max-age=31536000, immutable";
+    304     "public, max-age=31536000, immutable";
+    default "no-store";
+}
+
+# ---------------------------------------------------------------------------------------
+# Port 8080 (host 80): ACME http-01 challenges and the redirect to HTTPS.
+# ---------------------------------------------------------------------------------------
+server {
+    listen 8080 default_server;
+    server_name _;
+    limit_conn conn_ip 50;
+
+    # Container healthcheck, local only: wget -q -O /dev/null http://127.0.0.1:8080/nginx-salud
+    # (`return` runs before allow/deny would, hence the explicit address check).
+    location = /nginx-salud {
+        access_log off;
+        if ($remote_addr != "127.0.0.1") {
+            return 403;
+        }
+        default_type text/plain;
+        return 200 "ok\n";
+    }
+
+    # Unknown Host (scanners walking IP ranges): close the connection without an answer.
+    location / {
+        return 444;
+    }
+}
+
+server {
+    listen 8080;
+    server_name ${PUBLIC_HOST};
+    limit_conn conn_ip 50;
+
+    # certbot on the host writes the tokens into the mounted webroot:
+    #   certbot certonly --webroot -w <deploy dir>/acme -d <public host>
+    location ^~ /.well-known/acme-challenge/ {
+        root /var/www/acme;
+        default_type text/plain;
+        limit_except GET HEAD {
+            deny all;
+        }
+        try_files $uri =404;
+    }
+
+    location / {
+        return 301 https://$host$request_uri;
+    }
+}
+
+# ---------------------------------------------------------------------------------------
+# Port 8443 (host 443): HTTPS.
+# ---------------------------------------------------------------------------------------
+
+# Unknown or missing SNI (direct IP access, other names): abort the TLS handshake, so
+# neither the certificate nor the site is shown for names it does not belong to.
+server {
+    listen 8443 ssl default_server;
+    http2 on;
+    server_name _;
+    ssl_reject_handshake on;
+
+    # A request whose Host header names another site than its SNI did.
+    location / {
+        return 421;
+    }
+}
+
+server {
+    listen 8443 ssl;
+    http2 on;
+    server_name ${PUBLIC_HOST};
+
+    include /etc/nginx/snippets/security-headers.conf;
+    include /etc/nginx/snippets/proxy.conf;
+
+    limit_conn conn_ip 100;
+
+    if ($metodo_permitido = 0) {
+        return 405;
+    }
+
+    # ---- frontend (Next.js) -------------------------------------------------------
+    location / {
+        limit_req zone=site burst=200 nodelay;
+        error_page 429 @pagina_429;
+        error_page 502 503 504 =503 @pagina_no_disponible;
+        proxy_pass http://frontend;
+    }
+
+    # Hashed build assets (JS, CSS, fonts). Next.js already sends a year-long immutable
+    # Cache-Control on them; the edge pins it (map $static_cache_control: errors get
+    # no-store). Own add_header/proxy_hide_header here, so both snippets are re-included.
+    location ^~ /_next/static/ {
+        limit_req zone=site burst=200 nodelay;
+        error_page 429 @pagina_429;
+        error_page 502 503 504 =503 @pagina_no_disponible;
+        include /etc/nginx/snippets/security-headers.conf;
+        include /etc/nginx/snippets/proxy.conf;
+        proxy_hide_header Cache-Control;
+        add_header Cache-Control $static_cache_control always;
+        proxy_pass http://frontend;
+    }
+
+    # Next.js Image Optimization API: unused (no next/image; sharp is not in the image)
+    # and a recurring vulnerability and resource-exhaustion target (e.g. GHSA-2464-fhr4-w9xw,
+    # RCE in next <= 15.5.27), so it is not exposed at all. A prefix match also catches
+    # /_next/image/ and /_next/image;... (nginx decodes %-escapes before matching).
+    location ^~ /_next/image {
+        return 404;
+    }
+
+    # ---- backend (axum) -----------------------------------------------------------
+    # Readiness probe (checks the database). Liveness (/vivo) stays internal.
+    location = /salud {
+        limit_req zone=api burst=50 nodelay;
+        error_page 429 @api_429;
+        error_page 502 503 =503 @api_no_disponible;
+        error_page 504 @api_504;
+        proxy_pass http://backend;
+    }
+
+    location /api/ {
+        limit_req zone=api burst=50 nodelay;
+        error_page 403 @api_403;
+        error_page 413 @api_413;
+        error_page 429 @api_429;
+        error_page 502 503 =503 @api_no_disponible;
+        error_page 504 @api_504;
+        proxy_pass http://backend;
+
+        # Sign-in and sign-up (credential stuffing, account enumeration).
+        location /api/v1/auth/ {
+            limit_req zone=auth burst=10 nodelay;
+            proxy_pass http://backend;
+        }
+
+        # INE photos + liveness frames: the one large body (backend limit 12 MB).
+        location = /api/v1/kyc/verificar {
+            limit_req zone=kyc burst=4 nodelay;
+            limit_conn conn_ip 100;
+            limit_conn conn_kyc 2;
+            client_max_body_size 13m;
+            proxy_pass http://backend;
+        }
+
+        # Provider webhooks (HMAC-signed): their own zone and optional source allowlists.
+        location /api/v1/spei/webhook/ {
+            if ($spei_webhook_permitido != 1) {
+                return 403;
+            }
+            limit_req zone=webhook burst=200 nodelay;
+            proxy_pass http://backend;
+        }
+
+        location = /api/v1/kyc/webhook {
+            if ($kyc_webhook_permitido != 1) {
+                return 403;
+            }
+            limit_req zone=webhook burst=200 nodelay;
+            proxy_pass http://backend;
+        }
+    }
+
+    # Errors nginx itself produces on API paths, in the backend's JSON shape and with codes
+    # the frontend already translates (src/lib/api/client.ts). The status is the original
+    # error's unless error_page says "=<code>" (an unreachable upstream answers 503).
+    location @api_403 {
+        default_type application/json;
+        return 403 '{"error":{"codigo":"PROHIBIDO","mensaje":"origen no autorizado"}}';
+    }
+    location @api_413 {
+        default_type application/json;
+        return 413 '{"error":{"codigo":"CUERPO_DEMASIADO_GRANDE","mensaje":"el cuerpo de la petición excede el máximo permitido"}}';
+    }
+    location @api_429 {
+        include /etc/nginx/snippets/security-headers.conf;
+        add_header Retry-After 10 always;
+        default_type application/json;
+        return 429 '{"error":{"codigo":"REINTENTAR","mensaje":"demasiadas peticiones; espera unos segundos y reintenta"}}';
+    }
+    location @api_no_disponible {
+        default_type application/json;
+        return 503 '{"error":{"codigo":"REINTENTAR","mensaje":"el servicio no está disponible; reintenta en unos momentos"}}';
+    }
+    location @api_504 {
+        default_type application/json;
+        return 504 '{"error":{"codigo":"TIEMPO_AGOTADO","mensaje":"la operación tardó demasiado; reintenta con la misma clave de idempotencia"}}';
+    }
+
+    location @pagina_429 {
+        include /etc/nginx/snippets/security-headers.conf;
+        add_header Retry-After 10 always;
+        default_type text/html;
+        return 429 '<!doctype html><html lang="en"><meta charset="utf-8"><title>Synthetic Capital</title><p>Too many requests. Please wait a few seconds and try again.</p></html>';
+    }
+    location @pagina_no_disponible {
+        default_type text/html;
+        return 503 '<!doctype html><html lang="en"><meta charset="utf-8"><title>Synthetic Capital</title><p>The service is temporarily unavailable. Please try again in a moment.</p></html>';
+    }
+}

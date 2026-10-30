@@ -1,1 +1,334 @@
+# Synthetic Capital: production-style single-host deployment.
+#
+#   scripts/generate-secrets.sh                      # ./secrets/*, once (see the script)
+#   cp deploy/compose.env.example deploy/compose.env # non-secret settings: PUBLIC_HOST, ...
+#   docker compose --env-file deploy/compose.env up -d --build
+#
+# The AWS reference deployment (terraform/) runs the same images on ECS Fargate behind an
+# ALB + WAF with RDS. This file is for a single hardened host (scripts/hardening.sh), a
+# staging environment, or an on-premises site. Local development uses
+# docker-compose.dev.yml (PostgreSQL only). See DEPLOYMENT.md.
+#
+# Isolation:
+#   edge    nginx only. The ONLY published ports: host 80 -> 8080, host 443 -> 8443.
+#   web     internal: nginx <-> frontend. The Next.js server never calls the API (the
+#           browser does, through nginx), so it has no route to the backend either.
+#   api     internal: nginx <-> backend.
+#   data    internal: db <-> migrate, backend. The database publishes nothing and only the
+#           backend (and the one-shot migrate job) can reach it.
+#   egress  backend only, for outbound HTTPS to the SPEI and biometric providers. Internal
+#           (no internet) unless EGRESS_NETWORK_INTERNAL=false: the backend calls no
+#           provider until one is integrated; then restrict destinations on the host
+#           (DEPLOYMENT.md, "Egress").
+#
+# Secrets are Docker secrets (files under ./secrets, mounted at /run/secrets): they never
+# appear in the environment, `docker inspect` or the image. The backend reads them through
+# NAME_FILE variables; PostgreSQL through POSTGRES_PASSWORD_FILE.
+#
+# Least privilege: the long-running backend holds only the sc_app login (DATABASE_URL);
+# the schema owner's credentials go to the one-shot `migrate` job alone, and the schema
+# owner is not a superuser (deploy/postgres/10-schema-owner.sh). The superuser password
+# is for break-glass administration only.
 
+name: synthetic-capital
+
+x-hardening: &hardening
+  read_only: true
+  cap_drop: [ALL]
+  security_opt: ["no-new-privileges:true"]
+  restart: unless-stopped
+  logging:
+    driver: local
+    options:
+      max-size: "20m"
+      max-file: "5"
+
+x-backend-image: &backend-image
+  image: ${BACKEND_IMAGE:-synthetic-capital-backend:local}
+  build:
+    context: .
+    dockerfile: backend/Dockerfile
+    args:
+      REVISION: ${REVISION:-unknown}
+
+# Settings the bootstrap writes to the database: `migrate` and the service must agree.
+x-bootstrap-env: &bootstrap-env
+  MODO_DEMO: ${MODO_DEMO:-false}
+  CLABE_PREFIJO: ${CLABE_PREFIJO:?set CLABE_PREFIJO (bank code + plaza)}
+  RESERVA_INSTITUCION: ${RESERVA_INSTITUCION:-Banco de México}
+  RESERVA_CUENTA: ${RESERVA_CUENTA:?set RESERVA_CUENTA}
+  CAJA_INSTITUCION: ${CAJA_INSTITUCION:?set CAJA_INSTITUCION}
+  CAJA_CUENTA: ${CAJA_CUENTA:?set CAJA_CUENTA}
+  KYC_SCORE_MINIMO: ${KYC_SCORE_MINIMO:-}
+  KYC_SCORE_REVISION: ${KYC_SCORE_REVISION:-}
+  KYC_MAX_INTENTOS: ${KYC_MAX_INTENTOS:-}
+  RUST_LOG: ${RUST_LOG:-info}
+
+services:
+  db:
+    <<: *hardening
+    image: docker.io/library/postgres:16.15-alpine@sha256:0cefaabd882e42bcb2a2f3dc56d3ce4770560ba62fd7f197f1a2e008fd5731ab
+    user: "70:70"
+    environment:
+      # Bootstrap superuser: break-glass administration only, used by no service.
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+      POSTGRES_DB: ${POSTGRES_DB:-synthetic_capital}
+      # Schema owner the migrate job connects as (LOGIN CREATEROLE, not a superuser),
+      # created by the init script when the volume is initialised.
+      DB_OWNER: ${DB_OWNER:-synthetic_owner}
+      DB_OWNER_PASSWORD_FILE: /run/secrets/db_owner_password
+      # UTF8 is required by the backend (it refuses any other server encoding).
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C --auth-host=scram-sha-256 --auth-local=scram-sha-256"
+      PGDATA: /var/lib/postgresql/data/pgdata
+    # Conservative settings for a 2 GB container; tune shared_buffers to ~25% of its memory.
+    command:
+      - postgres
+      - -c
+      - password_encryption=scram-sha-256
+      - -c
+      - shared_buffers=512MB
+      - -c
+      - effective_cache_size=1536MB
+      - -c
+      - work_mem=8MB
+      - -c
+      - maintenance_work_mem=128MB
+      - -c
+      - max_connections=100
+      - -c
+      - wal_compression=on
+      - -c
+      - idle_in_transaction_session_timeout=300000
+      - -c
+      - log_connections=on
+      - -c
+      - log_disconnections=on
+      - -c
+      - log_min_duration_statement=1000
+      - -c
+      - log_lock_waits=on
+    secrets: [postgres_password, db_owner_password]
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      # Runs once, on an empty volume.
+      - ./deploy/postgres/10-schema-owner.sh:/docker-entrypoint-initdb.d/10-schema-owner.sh:ro
+    tmpfs:
+      - /var/run/postgresql:uid=70,gid=70,mode=0775,size=8m
+      - /tmp:uid=70,gid=70,mode=0700,size=64m
+    shm_size: 256m
+    networks: [data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\""]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    stop_grace_period: 60s
+    deploy:
+      resources:
+        limits: {cpus: "2.0", memory: 2g, pids: 256}
+        reservations: {memory: 1g}
+
+  # One-shot job: migrations + bootstrap as the schema owner, then the sc_app login
+  # (password set as a SCRAM verifier). The service starts only after it exits 0.
+  migrate:
+    <<: [*hardening, *backend-image]
+    command: ["migrar"]
+    user: "65532:65532"
+    restart: "no"
+    environment:
+      <<: *bootstrap-env
+      DATABASE_URL_PROPIETARIO_FILE: /run/secrets/database_url_owner
+      DB_APP_USUARIO: sc_app
+      DB_APP_PASSWORD_FILE: /run/secrets/db_app_password
+      BOOTSTRAP_OPERADOR_EMAIL: ${BOOTSTRAP_OPERADOR_EMAIL:-}
+      BOOTSTRAP_OPERADOR_PASSWORD_FILE: /run/secrets/bootstrap_operador_password
+      # Demo compliance officers, honoured only with MODO_DEMO=true (in production the DBA
+      # creates officers). Set both in the env file only for a demo stack.
+      BOOTSTRAP_CUMPLIMIENTO_EMAILS: ${BOOTSTRAP_CUMPLIMIENTO_EMAILS:-}
+      BOOTSTRAP_CUMPLIMIENTO_PASSWORD_FILE: ${BOOTSTRAP_CUMPLIMIENTO_PASSWORD_FILE:-}
+      # With both keys (a rotation, generate-secrets.sh --rotate mfa), migrate re-encrypts
+      # every TOTP secret with the current one.
+      MFA_CLAVE_CIFRADO_FILE: /run/secrets/mfa_encryption_key
+      MFA_CLAVE_CIFRADO_ANTERIOR_FILE: /run/secrets/mfa_encryption_key_previous
+    secrets:
+      - database_url_owner
+      - db_app_password
+      - bootstrap_operador_password
+      - bootstrap_cumplimiento_password
+      - mfa_encryption_key
+      - mfa_encryption_key_previous
+    networks: [data]
+    depends_on:
+      db: {condition: service_healthy}
+    healthcheck:
+      disable: true
+    deploy:
+      resources:
+        limits: {cpus: "1.0", memory: 256m, pids: 64}
+
+  backend:
+    <<: [*hardening, *backend-image]
+    user: "65532:65532"
+    environment:
+      <<: *bootstrap-env
+      BIND_ADDR: 0.0.0.0:8080
+      FRONTEND_ORIGIN: https://${PUBLIC_HOST:?set PUBLIC_HOST (the public host name)}
+      MIGRAR_AL_INICIO: "false"
+      ARRANQUE_AL_INICIO: "false"
+      # nginx is the edge: the client IP is the last X-Forwarded-For hop it sets.
+      HTTP_PROXY_CONFIABLE: "true"
+      DB_MAX_CONEXIONES: ${DB_MAX_CONEXIONES:-20}
+      JWT_TTL_MINUTOS: ${JWT_TTL_MINUTOS:-60}
+      JWT_TTL_PERSONAL_MINUTOS: ${JWT_TTL_PERSONAL_MINUTOS:-30}
+      SPEI_PREFIJO_RASTREO: ${SPEI_PREFIJO_RASTREO:-SC}
+      SPEI_DESPACHO_INTERVALO_MS: ${SPEI_DESPACHO_INTERVALO_MS:-1000}
+      SPEI_HORA_CORTE: ${SPEI_HORA_CORTE:-17:30}
+      CORTE_INTERVALO_SEG: ${CORTE_INTERVALO_SEG:-300}
+      CORTE_MIN_INTERVALO_SEG: ${CORTE_MIN_INTERVALO_SEG:-60}
+      LIQUIDACION_INTERVALO_SEG: ${LIQUIDACION_INTERVALO_SEG:-3600}
+      AML_MONITOREO_INTERVALO_SEG: ${AML_MONITOREO_INTERVALO_SEG:-300}
+      DATABASE_URL_FILE: /run/secrets/database_url
+      JWT_SECRET_FILE: /run/secrets/jwt_secret
+      SPEI_WEBHOOK_SECRETO_FILE: /run/secrets/spei_webhook_secret
+      KYC_WEBHOOK_SECRETO_FILE: /run/secrets/kyc_webhook_secret
+      # Still accepted during a rotation (generate-secrets.sh --rotate spei|kyc); empty
+      # files mean none.
+      SPEI_WEBHOOK_SECRETO_ANTERIOR_FILE: /run/secrets/spei_webhook_secret_previous
+      KYC_WEBHOOK_SECRETO_ANTERIOR_FILE: /run/secrets/kyc_webhook_secret_previous
+      # AES-256-GCM key of the staff's TOTP secrets (two-step verification); during a
+      # rotation the previous one still decrypts.
+      MFA_CLAVE_CIFRADO_FILE: /run/secrets/mfa_encryption_key
+      MFA_CLAVE_CIFRADO_ANTERIOR_FILE: /run/secrets/mfa_encryption_key_previous
+    secrets:
+      - database_url
+      - jwt_secret
+      - mfa_encryption_key
+      - mfa_encryption_key_previous
+      - spei_webhook_secret
+      - spei_webhook_secret_previous
+      - kyc_webhook_secret
+      - kyc_webhook_secret_previous
+    # The image's HEALTHCHECK (`salud vivo`, no database) applies.
+    networks: [data, api, egress]
+    depends_on:
+      migrate: {condition: service_completed_successfully}
+    stop_grace_period: 30s
+    deploy:
+      resources:
+        limits: {cpus: "2.0", memory: 768m, pids: 256}
+        reservations: {memory: 256m}
+
+  frontend:
+    <<: *hardening
+    image: ${FRONTEND_IMAGE:-synthetic-capital-frontend:local}
+    build:
+      context: frontend
+      args:
+        # Inlined into the browser bundle at build time: one image per public origin.
+        NEXT_PUBLIC_API_URL: https://${PUBLIC_HOST:?set PUBLIC_HOST}
+        NEXT_PUBLIC_COMPLIANCE_EMAIL: ${NEXT_PUBLIC_COMPLIANCE_EMAIL:-}
+        REVISION: ${REVISION:-unknown}
+    user: "65532:65532"
+    init: true
+    tmpfs:
+      - /app/.next/cache:uid=65532,gid=65532,mode=0700,size=64m
+    networks: [web]
+    stop_grace_period: 15s
+    deploy:
+      resources:
+        limits: {cpus: "1.0", memory: 512m, pids: 128}
+
+  nginx:
+    <<: *hardening
+    image: docker.io/library/nginx:1.30.6-alpine@sha256:47928bf67eb62a1863cb08d9ecb52d3e704304ba614eaee17884204677702951
+    user: "101:101"
+    environment:
+      PUBLIC_HOST: ${PUBLIC_HOST:?set PUBLIC_HOST}
+      NGINX_ENVSUBST_FILTER: ^PUBLIC_HOST$$
+      NGINX_ENTRYPOINT_QUIET_LOGS: "1"
+    ports:
+      - "${EDGE_BIND:-0.0.0.0}:80:8080"
+      - "${EDGE_BIND:-0.0.0.0}:443:8443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/snippets:/etc/nginx/snippets:ro
+      - ./nginx/templates:/etc/nginx/templates:ro
+      - ./nginx/allowlist:/etc/nginx/allowlist:ro
+      # fullchain.pem + privkey.pem, readable by uid 101 (certbot deploy hook or
+      # scripts/dev-certs.sh for testing).
+      - ${CERTS_DIR:-./certs}:/etc/nginx/certs:ro
+      # ACME http-01 webroot written by certbot on the host.
+      - ${ACME_DIR:-./acme}:/var/www/acme:ro
+      # Access and error logs, read by the host's fail2ban (scripts/hardening.sh).
+      - ${NGINX_LOG_DIR:-./logs/nginx}:/var/log/nginx
+    tmpfs:
+      - /tmp:uid=101,gid=101,mode=0700,size=128m
+      - /etc/nginx/conf.d:uid=101,gid=101,mode=0755,size=1m
+    networks: [edge, web, api]
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8080/nginx-salud"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    stop_grace_period: 15s
+    deploy:
+      resources:
+        limits: {cpus: "1.0", memory: 256m, pids: 128}
+
+networks:
+  edge:
+    driver: bridge
+  web:
+    driver: bridge
+    internal: true
+  api:
+    driver: bridge
+    internal: true
+  data:
+    driver: bridge
+    internal: true
+  egress:
+    driver: bridge
+    internal: ${EGRESS_NETWORK_INTERNAL:-true}
+    driver_opts:
+      # A fixed host interface name for the firewall rules that restrict the backend's
+      # destinations once egress is enabled; empty: Docker's br-<id>.
+      com.docker.network.bridge.name: ${EGRESS_BRIDGE_NAME:-}
+
+volumes:
+  pgdata:
+
+# Generated by scripts/generate-secrets.sh; each file is readable only by the uid that
+# uses it (70 = postgres, 65532 = backend and migrate).
+secrets:
+  postgres_password:
+    file: ${SECRETS_DIR:-./secrets}/postgres_password
+  db_owner_password:
+    file: ${SECRETS_DIR:-./secrets}/db_owner_password
+  database_url_owner:
+    file: ${SECRETS_DIR:-./secrets}/database_url_owner
+  db_app_password:
+    file: ${SECRETS_DIR:-./secrets}/db_app_password
+  database_url:
+    file: ${SECRETS_DIR:-./secrets}/database_url
+  jwt_secret:
+    file: ${SECRETS_DIR:-./secrets}/jwt_secret
+  spei_webhook_secret:
+    file: ${SECRETS_DIR:-./secrets}/spei_webhook_secret
+  spei_webhook_secret_previous:
+    file: ${SECRETS_DIR:-./secrets}/spei_webhook_secret_previous
+  kyc_webhook_secret:
+    file: ${SECRETS_DIR:-./secrets}/kyc_webhook_secret
+  kyc_webhook_secret_previous:
+    file: ${SECRETS_DIR:-./secrets}/kyc_webhook_secret_previous
+  mfa_encryption_key:
+    file: ${SECRETS_DIR:-./secrets}/mfa_encryption_key
+  mfa_encryption_key_previous:
+    file: ${SECRETS_DIR:-./secrets}/mfa_encryption_key_previous
+  bootstrap_operador_password:
+    file: ${SECRETS_DIR:-./secrets}/bootstrap_operador_password
+  bootstrap_cumplimiento_password:
+    file: ${SECRETS_DIR:-./secrets}/bootstrap_cumplimiento_password

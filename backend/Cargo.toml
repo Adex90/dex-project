@@ -1,0 +1,91 @@
+[package]
+name = "synthetic-capital-backend"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+description = "Synthetic Capital — motor transaccional con reserva del 100% (IFPE) y crédito con calce de plazos (SOFOM)"
+publish = false
+
+[lib]
+name = "synthetic_capital"
+path = "src/lib.rs"
+
+[[bin]]
+name = "synthetic-capital"
+path = "src/main.rs"
+
+[dependencies]
+# HTTP
+axum = { version = "0.8", features = ["macros"] }
+# Servidor HTTP/1.1 propio (en vez de axum::serve) para fijar tiempos máximos
+# de cabeceras, tope de conexiones y apagado con plazo.
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio", "service"] }
+tower-http = { version = "0.6", features = ["cors", "trace", "timeout"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
+
+# Base de datos
+sqlx = { version = "0.8", default-features = false, features = [
+    "runtime-tokio",
+    "tls-rustls",
+    "postgres",
+    "macros",
+    "migrate",
+    "uuid",
+    "chrono",
+    "rust_decimal",
+    "json",
+] }
+
+# Dinero: decimal exacto (nunca f64) — se mapea a NUMERIC(18, 8)
+rust_decimal = { version = "1", features = ["serde-with-str"] }
+
+# Criptografía
+sha2 = "0.10"
+# Firma de webhooks SPEI (HMAC-SHA256, comparación en tiempo constante).
+hmac = "0.12"
+hex = "0.4"
+# Imágenes del onboarding KYC (base64 en JSON).
+base64 = "0.22"
+jsonwebtoken = "9"
+argon2 = "0.5"
+rand = "0.8"
+# Segundo factor: TOTP (RFC 6238) y su URL otpauth://; el secreto se guarda
+# cifrado con AES-256-GCM; el QR de inscripción se dibuja como SVG.
+totp-rs = { version = "5", features = ["otpauth", "zeroize"] }
+aes-gcm = "0.10"
+qrcodegen = "1"
+# Comparaciones en tiempo constante (códigos TOTP, hashes de tokens).
+subtle = "2"
+# Secretos descifrados que se borran de la memoria al soltarlos.
+zeroize = "1"
+
+# Serialización y utilidades
+serde = { version = "1", features = ["derive"] }
+# raw_value: el monto de un webhook SPEI se lee del texto JSON exacto, sin f64.
+serde_json = { version = "1", features = ["raw_value"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+thiserror = "2"
+# IP del cliente (ConnectInfo) en cada petición.
+tower = { version = "0.5", features = ["util", "limit"] }
+# Nombres en NFC antes de cotejarlos (CURP, OCR, MRZ).
+unicode-normalization = "0.1"
+anyhow = "1"
+dotenvy = "0.15"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+http-body-util = "0.1"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+
+# Argon2 es deliberadamente costoso; sin optimizar, las pruebas en debug tardan segundos por hash.
+[profile.dev.package.argon2]
+opt-level = 3
+
+[profile.dev.package.blake2]
+opt-level = 3

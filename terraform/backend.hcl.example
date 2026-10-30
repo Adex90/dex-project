@@ -1,0 +1,20 @@
+# S3 backend settings: copy to backend.hcl (git-ignored) and run
+#   terraform init -backend-config=backend.hcl
+#
+# The state contains generated credentials (the sc_app password and the DATABASE_URL
+# built from it), so the bucket must be created beforehand, outside this configuration:
+#   - in the same account and region as the deployment, dedicated to Terraform state;
+#   - SSE-KMS with a customer managed key, bucket keys on, versioning on;
+#   - Block Public Access on, ACLs disabled (BucketOwnerEnforced), TLS-only bucket policy;
+#   - readable and writable only by the deployment role (and break-glass admins), with
+#     kms:Decrypt/GenerateDataKey on the key limited to the same principals;
+#   - CloudTrail data events on the bucket.
+# use_lockfile keeps a lock object next to the state (S3 conditional writes), so no
+# DynamoDB table is needed (Terraform >= 1.10; generally available since 1.11).
+
+bucket       = "example-tfstate-123456789012-mx-central-1"
+key          = "synthetic-capital/prod/terraform.tfstate"
+region       = "mx-central-1"
+encrypt      = true
+kms_key_id   = "arn:aws:kms:mx-central-1:123456789012:key/00000000-0000-0000-0000-000000000000"
+use_lockfile = true

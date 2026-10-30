@@ -1,0 +1,34 @@
+# Exceptions for the Trivy gates in .github/workflows/ci.yml and security.yml.
+#
+# Prefer fixing: bump the package, or the digest-pinned base image. Use this
+# file only for a finding that cannot be fixed yet (no patched upstream image)
+# or does not apply, and only with:
+#   statement:  why it does not apply or is accepted, and who accepted it;
+#   expired_at: a date after which the finding fails the gate again.
+# Trivy prints this file in the job log, so every run records the exceptions in
+# force. Misconfigurations in Terraform are better suppressed next to the
+# resource, with a reason: `#trivy:ignore:AWS-0053 <reason>` on the line above.
+#
+# Example (not active):
+#   - id: CVE-YYYY-NNNNN
+#     paths: [usr/lib/example]      # optional: only this file of the image
+#     statement: >-
+#       What is affected and why it does not apply here, or why it is accepted until a
+#       patched upstream image exists. Accepted by <name>, <date>.
+#     expired_at: YYYY-MM-DD
+
+vulnerabilities:
+  - id: CVE-2025-68121
+    paths:
+      - usr/local/bin/gosu
+    # Go standard library v1.24.6 compiled into gosu 1.19, inside the official
+    # postgres:16.15-alpine image pinned in docker-compose.yml (security.yml scans it).
+    statement: >-
+      gosu is only executed by the image's entrypoint when the container starts as
+      root, to drop to the postgres user. docker-compose.yml starts the db container
+      as uid 70 (user: "70:70", cap_drop: ALL, no-new-privileges), so gosu never runs
+      and its Go runtime is unreachable. The image is the newest postgres 16 build.
+      Remove this entry when Dependabot bumps the postgres digest to one whose gosu
+      is built with a fixed Go. Proposed 2026-10-28 with the docker compose
+      deployment; accepted by whoever approves that change.
+    expired_at: 2027-01-31
