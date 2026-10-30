@@ -5,7 +5,12 @@
 //! | GET  | `/salud` | público: preparado (consulta la base de datos; balanceador) |
 //! | GET  | `/vivo` | público: vivo (no consulta la base de datos; salud del contenedor) |
 //! | POST | `/api/v1/auth/registro` | público |
-//! | POST | `/api/v1/auth/login` | público |
+//! | POST | `/api/v1/auth/login` | público: `OK`, `2FA_REQUIRED` (desafío) o `MFA_ENROLLMENT_REQUIRED` (personal sin segundo factor) |
+//! | POST | `/api/v1/auth/verify-mfa` | desafío de `login` + código TOTP: la sesión |
+//! | POST | `/api/v1/auth/mfa/setup` | token de inscripción o sesión: secreto TOTP, URL otpauth y QR |
+//! | POST | `/api/v1/auth/mfa/enable` | token de inscripción o sesión: primer código; activa el segundo factor |
+//! | POST | `/api/v1/auth/password/forgot` | público: enlace de restablecimiento (siempre 202) |
+//! | POST | `/api/v1/auth/password/reset` | público: token del enlace + contraseña nueva; revoca las sesiones |
 //! | GET  | `/api/v1/yo` | cualquier rol (sin nivel de riesgo PLD) |
 //! | GET  | `/api/v1/kyc/expediente` | cliente: estado del onboarding |
 //! | POST | `/api/v1/kyc/perfil` | cliente: datos personales (paso 1) |
@@ -48,6 +53,12 @@
 //! | POST | `/api/v1/operaciones/spei/recibidos/{id}/anulacion` | operador: anula una captura manual errónea |
 //! | POST | `/api/v1/operaciones/spei/enviados/{id}/reembolso` | operador: reembolsa una orden en revisión que el proveedor no tiene |
 //! | POST | `/api/v1/operaciones/spei/en-revision/{id}/descarte` | operador: descarta como duplicado una notificación retenida |
+//!
+//! El personal interno (operador, auditor, cumplimiento) solo opera con una
+//! sesión que verificó el segundo factor (`MFA_REQUERIDO` si no).
+//!
+//! | Método | Ruta | Acceso |
+//! |---|---|---|
 //! | GET  | `/api/v1/aml/resumen` | cumplimiento / auditor: contadores de la consola PLD |
 //! | GET  | `/api/v1/aml/alertas` | cumplimiento / auditor: bandeja de alertas PLD (filtros, cursor, sondeo) |
 //! | GET  | `/api/v1/aml/alertas/{id}` | cumplimiento / auditor: expediente de la alerta (queda en la bitácora) |

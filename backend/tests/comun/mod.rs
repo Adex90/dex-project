@@ -663,3 +663,156 @@ impl Drop for LoginTemporal {
         }
     }
 }
+
+// -----------------------------------------------------------------------------
+// Segundo factor (TOTP)
+// -----------------------------------------------------------------------------
+
+/// Código TOTP (SHA-1, 6 dígitos, 30 s) de `secreto` en el paso `paso`, como
+/// lo calcula una app autenticadora.
+pub fn codigo_totp(secreto: &[u8], paso: u64) -> String {
+    totp_rs::TOTP::new_unchecked(totp_rs::Algorithm::SHA1, 6, 1, 30, secreto.to_vec(), None, String::new())
+        .generate(paso * 30)
+}
+
+pub fn paso_totp_actual() -> u64 {
+    u64::try_from(chrono::Utc::now().timestamp()).unwrap() / 30
+}
+
+/// Secreto en bytes de la URL/base32 que devuelve `/auth/mfa/setup`.
+pub fn secreto_base32(base32: &str) -> Vec<u8> {
+    totp_rs::Secret::Encoded(base32.to_owned()).to_bytes().unwrap()
+}
+
+/// La app autenticadora de una prueba: el secreto de cada persona que inscribió
+/// su segundo factor y el último paso que usó (el servidor no acepta un código
+/// dos veces).
+#[derive(Default)]
+pub struct Autenticadora {
+    personas: std::sync::Mutex<std::collections::HashMap<String, (Vec<u8>, u64)>>,
+}
+
+impl Autenticadora {
+    pub fn guardar(&self, email: &str, secreto: Vec<u8>) {
+        self.personas.lock().unwrap().insert(email.to_lowercase(), (secreto, 0));
+    }
+
+    pub fn secreto(&self, email: &str) -> Option<Vec<u8>> {
+        self.personas.lock().unwrap().get(&email.to_lowercase()).map(|(s, _)| s.clone())
+    }
+
+    /// Código de un paso que el servidor todavía no vio: el actual o, si ya se
+    /// usó, el siguiente (tolerado); si también se usó, espera al cambio de paso.
+    pub async fn codigo(&self, email: &str) -> String {
+        loop {
+            let actual = paso_totp_actual();
+            {
+                let mut personas = self.personas.lock().unwrap();
+                let (secreto, ultimo) = personas.get_mut(&email.to_lowercase()).expect("sin segundo factor inscrito");
+                let paso = actual.max(*ultimo + 1);
+                if paso <= actual + 1 {
+                    *ultimo = paso;
+                    return codigo_totp(secreto, paso);
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        }
+    }
+}
+
+/// Petición JSON al router (sin cabeceras extra).
+pub async fn llamar_json(
+    app: &axum::Router,
+    metodo: &str,
+    ruta: &str,
+    token: Option<&str>,
+    cuerpo: Option<serde_json::Value>,
+) -> (axum::http::StatusCode, serde_json::Value) {
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
+    let mut req = axum::http::Request::builder().method(metodo).uri(ruta);
+    if let Some(t) = token {
+        req = req.header("authorization", format!("Bearer {t}"));
+    }
+    let body = match cuerpo {
+        Some(v) => {
+            req = req.header("content-type", "application/json");
+            axum::body::Body::from(v.to_string())
+        }
+        None => axum::body::Body::empty(),
+    };
+    let resp = app.clone().oneshot(req.body(body).unwrap()).await.unwrap();
+    let status = resp.status();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let valor =
+        if bytes.is_empty() { serde_json::Value::Null } else { serde_json::from_slice(&bytes).unwrap_or_default() };
+    (status, valor)
+}
+
+/// Inicio de sesión por la API, como el frontend: la primera vez, el personal
+/// interno inscribe su segundo factor (setup y primer código); después contesta
+/// el desafío TOTP. Devuelve la sesión (`estado` = `OK`, `token`, `rol`, ...).
+pub async fn iniciar_sesion(
+    app: &axum::Router,
+    totp: &Autenticadora,
+    email: &str,
+    password: &str,
+) -> serde_json::Value {
+    use axum::http::StatusCode;
+    let (s, v) = llamar_json(
+        app,
+        "POST",
+        "/api/v1/auth/login",
+        None,
+        Some(serde_json::json!({ "email": email, "password": password })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "login {email}: {v}");
+    let sesion = match v["estado"].as_str() {
+        Some("OK") => v,
+        Some("MFA_ENROLLMENT_REQUIRED") => {
+            let t = v["token_inscripcion"].as_str().unwrap();
+            let (s, conf) = llamar_json(app, "POST", "/api/v1/auth/mfa/setup", Some(t), None).await;
+            assert_eq!(s, StatusCode::OK, "setup {email}: {conf}");
+            totp.guardar(email, secreto_base32(conf["secreto"].as_str().unwrap()));
+            let codigo = totp.codigo(email).await;
+            let (s, sesion) = llamar_json(
+                app,
+                "POST",
+                "/api/v1/auth/mfa/enable",
+                Some(t),
+                Some(serde_json::json!({ "codigo": codigo })),
+            )
+            .await;
+            assert_eq!(s, StatusCode::OK, "enable {email}: {sesion}");
+            sesion
+        }
+        Some("2FA_REQUIRED") => {
+            let t = v["token_mfa"].as_str().unwrap().to_string();
+            let codigo = totp.codigo(email).await;
+            let (s, sesion) = llamar_json(
+                app,
+                "POST",
+                "/api/v1/auth/verify-mfa",
+                None,
+                Some(serde_json::json!({ "token_mfa": t, "codigo": codigo })),
+            )
+            .await;
+            assert_eq!(s, StatusCode::OK, "verify-mfa {email}: {sesion}");
+            sesion
+        }
+        otro => panic!("login {email}: estado inesperado {otro:?}: {v}"),
+    };
+    assert_eq!(sesion["estado"], "OK", "{sesion}");
+    sesion
+}
+
+/// Segundo factor activo por el flujo real (secreto cifrado y primer código),
+/// sin HTTP: para pruebas que emiten sus tokens directamente. Devuelve el secreto.
+pub async fn activar_mfa(estado: &synthetic_capital::AppState, cliente_id: Uuid) -> Vec<u8> {
+    use synthetic_capital::auth::mfa;
+    let conf = mfa::configurar(estado, cliente_id, None).await.unwrap();
+    let secreto = secreto_base32(&conf.secreto);
+    mfa::activar(estado, cliente_id, &codigo_totp(&secreto, paso_totp_actual()), None).await.unwrap();
+    secreto
+}

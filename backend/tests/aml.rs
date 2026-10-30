@@ -40,6 +40,7 @@ use uuid::Uuid;
 
 struct Api {
     app: Router,
+    totp: Autenticadora,
 }
 
 impl Api {
@@ -104,19 +105,17 @@ impl Api {
         self.llamar("POST", ruta, Some(token), Some(cuerpo)).await
     }
 
+    /// Sesión por la API; el personal inscribe y verifica su segundo factor.
     async fn token(&self, email: &str, password: &str) -> String {
-        let (s, v) = self
-            .llamar("POST", "/api/v1/auth/login", None, Some(json!({ "email": email, "password": password })))
-            .await;
-        assert_eq!(s, StatusCode::OK, "login {email}: {v}");
-        v["token"].as_str().unwrap().to_string()
+        let sesion = iniciar_sesion(&self.app, &self.totp, email, password).await;
+        sesion["token"].as_str().unwrap().to_string()
     }
 }
 
 async fn api(pool: &PgPool) -> (Api, Config) {
     let cfg = preparar(pool).await;
     bootstrap::asegurar_operador(pool, "operador@synthetic.mx", "operador-de-pruebas-123").await.unwrap();
-    (Api { app: routes::router(AppState::nuevo(pool.clone(), cfg.clone())) }, cfg)
+    (Api { app: routes::router(AppState::nuevo(pool.clone(), cfg.clone())), totp: Autenticadora::default() }, cfg)
 }
 
 /// Cuerpo de una notificación de abono al estilo STP (como en `spei.rs`), con
@@ -179,7 +178,7 @@ fn clave_api() -> String {
 
 /// Oficial de cumplimiento como `Usuario` (para llamar a `aml::oficial` directamente).
 async fn usuario_oficial(pool: &PgPool, nombre: &str) -> Usuario {
-    Usuario { cliente_id: oficial(pool, nombre).await.0, rol: RolUsuario::Cumplimiento }
+    Usuario { cliente_id: oficial(pool, nombre).await.0, rol: RolUsuario::Cumplimiento, mfa: true }
 }
 
 /// Operador de mesa (capturas, correcciones, retenciones).

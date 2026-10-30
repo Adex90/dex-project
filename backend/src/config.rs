@@ -9,7 +9,7 @@ use std::{env, fmt, io::Read, net::SocketAddr, str::FromStr};
 use anyhow::{bail, Context};
 use rust_decimal::Decimal;
 
-use crate::db::Rol;
+use crate::{crypto::cifrado::Clave, db::Rol};
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -22,6 +22,11 @@ pub struct Config {
     pub bind_addr: SocketAddr,
     pub jwt_secret: String,
     pub jwt_ttl_minutos: i64,
+    /// Vida máxima de la sesión del personal interno (operador, auditor,
+    /// cumplimiento): la menor entre esta y `jwt_ttl_minutos`.
+    pub jwt_ttl_personal_minutos: i64,
+    /// Cifrado de los secretos TOTP en reposo.
+    pub mfa: ConfigMfa,
     pub frontend_origin: String,
     /// Habilita depósitos simulados por el propio cliente (solo con KYC
     /// verificado). Nunca en producción.
@@ -51,6 +56,17 @@ pub struct Config {
     pub http: LimitesHttp,
     pub spei: ConfigSpei,
     pub kyc: ConfigKyc,
+}
+
+/// Segundo factor: claves AES-256-GCM de los secretos TOTP (fuera de la base
+/// de datos). La vigente cifra y descifra; la anterior, durante una rotación,
+/// solo descifra (`migrar` vuelve a cifrar con la vigente).
+#[derive(Debug, Clone, Default)]
+pub struct ConfigMfa {
+    /// Obligatoria para el servidor (`MFA_CLAVE_CIFRADO`); `migrar` solo la
+    /// usa para volver a cifrar durante una rotación.
+    pub clave: Option<Clave>,
+    pub clave_anterior: Option<Clave>,
 }
 
 /// Onboarding y KYC biométrico.
@@ -390,6 +406,27 @@ impl Config {
             bind_addr: direccion_de_escucha()?,
             jwt_secret,
             jwt_ttl_minutos: var_o("JWT_TTL_MINUTOS", 60)?,
+            jwt_ttl_personal_minutos: var_o("JWT_TTL_PERSONAL_MINUTOS", 30_i64)?.max(1),
+            mfa: {
+                let leer_clave = |nombre: &str| -> anyhow::Result<Option<Clave>> {
+                    var(nombre)?.map(|v| Clave::desde_hex(nombre, &v)).transpose()
+                };
+                let clave = leer_clave("MFA_CLAVE_CIFRADO")?;
+                let clave_anterior = leer_clave("MFA_CLAVE_CIFRADO_ANTERIOR")?;
+                if clave.is_none() && uso == Uso::Servidor {
+                    bail!(
+                        "MFA_CLAVE_CIFRADO es obligatoria: cifra los secretos del segundo factor \
+                         (genera una con: openssl rand -hex 32)"
+                    );
+                }
+                if clave.is_none() && clave_anterior.is_some() {
+                    bail!("MFA_CLAVE_CIFRADO_ANTERIOR sin MFA_CLAVE_CIFRADO");
+                }
+                if clave.is_some() && clave == clave_anterior {
+                    bail!("MFA_CLAVE_CIFRADO y MFA_CLAVE_CIFRADO_ANTERIOR son iguales");
+                }
+                ConfigMfa { clave, clave_anterior }
+            },
             frontend_origin: var("FRONTEND_ORIGIN")?.unwrap_or_else(|| "http://localhost:3000".into()),
             modo_demo,
             migrar_al_inicio: var_o("MIGRAR_AL_INICIO", true)?,
@@ -504,6 +541,8 @@ impl Config {
             bind_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
             jwt_secret: "secreto-de-pruebas-con-al-menos-32-caracteres".into(),
             jwt_ttl_minutos: 60,
+            jwt_ttl_personal_minutos: 30,
+            mfa: ConfigMfa { clave: Some(Clave(*b"clave-de-pruebas-mfa-32-bytes!!!")), clave_anterior: None },
             frontend_origin: "http://localhost:3000".into(),
             modo_demo: true,
             migrar_al_inicio: false,

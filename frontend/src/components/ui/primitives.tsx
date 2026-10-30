@@ -180,7 +180,11 @@ export function Field({
   );
 }
 
-export function Input({ className, invalid, ...rest }: InputHTMLAttributes<HTMLInputElement> & { invalid?: boolean }) {
+export function Input({
+  className,
+  invalid,
+  ...rest
+}: InputHTMLAttributes<HTMLInputElement> & { invalid?: boolean; ref?: Ref<HTMLInputElement> }) {
   return (
     <input
       className={cx(

@@ -466,6 +466,72 @@ into `aml.alertas` and `GET /api/v1/operaciones/alertas` was removed.
   alert (as a transfer counterparty or as a member of an R25-R27 network) can
   still open that alert.
 
+## Authentication and two-step verification (migration `0010`)
+
+- **Who.** Two-step verification (TOTP, RFC 6238: SHA-1, 6 digits, 30 s) is
+  **mandatory for every staff role**: `OPERADOR` (the back-office
+  administrator), `AUDITOR` and `CUMPLIMIENTO`. Clients may turn it on.
+- **Sign-in.** `POST /api/v1/auth/login` answers `estado`:
+  - `OK`: a session (clients without two-step verification);
+  - `2FA_REQUIRED`: the password was right; `token_mfa` (5 minutes) and the
+    code go to `POST /api/v1/auth/verify-mfa`;
+  - `MFA_ENROLLMENT_REQUIRED`: staff without two-step verification;
+    `token_inscripcion` (15 minutes) calls `POST /api/v1/auth/mfa/setup`
+    (secret, `otpauth://` URL and its QR code as an SVG) and
+    `POST /api/v1/auth/mfa/enable` with the first code, which starts the
+    session.
+
+  A password alone never gives staff a session.
+- **Enforcement.**
+  - Access tokens carry `mfa`, and every request re-checks the database (role,
+    revocation, two-step verification still on).
+  - Staff without a verified second step get `403 MFA_REQUERIDO` on every
+    endpoint, and the AML console checks it again at its boundary.
+  - The partial tokens have their own audiences and a key derived from
+    `JWT_SECRET`, so they never pass as access tokens.
+- **Codes.** A code is accepted within ±1 step and never twice
+  (`totp_ultimo_paso`). Wrong codes count with wrong passwords: the fifth
+  failure locks the account for 15 minutes. A correct password does not reset
+  the counter while the code is missing, so repeating it buys no extra guesses.
+- **Secrets at rest.**
+  - The TOTP secret is encrypted by the backend (AES-256-GCM, key
+    `MFA_CLAVE_CIFRADO`, kept outside the database). The associated data binds
+    the ciphertext to its owner.
+  - The database rejects any other format, so a cleartext secret does not fit,
+    and stores password-reset tokens only as SHA-256 hashes.
+  - Only the `sc_auth` role reads these columns; `sc_kyc` lost its table-wide
+    `SELECT`.
+  - Once two-step verification is on, only the schema owner can turn it off or
+    change the secret (trigger). That change, like every enrollment, code and
+    reset, is recorded in `kyc.eventos_autenticacion` (immutable).
+- **Lost device.** The DBA, as the schema owner (`scripts/db-client.sh` on a
+  single host), runs:
+
+  ```sql
+  UPDATE kyc.credenciales
+     SET mfa_enabled = FALSE, totp_secret = NULL, totp_ultimo_paso = NULL, tokens_validos_desde = now()
+   WHERE cliente_id = '<id>';
+  ```
+
+  The person enrolls again at the next sign-in.
+- **Password reset.**
+  - `POST /api/v1/auth/password/forgot` always answers 202 with the same body.
+  - The emailed link carries a 256-bit token in its URL fragment
+    (`/auth/reset-password#token=...`), so it never reaches server logs.
+  - The token expires in 30 minutes and works once. Requests less than a minute
+    apart send no new email.
+  - `POST /api/v1/auth/password/reset` sets the new password, unlocks the
+    account and **revokes every session**. Two-step verification stays on.
+  - Email is simulated: with `MODO_DEMO` the link is logged (`target:
+    "correo"`); otherwise nothing is sent or logged, and production needs an
+    email provider (DEPLOYMENT.md).
+- **Sessions.** Staff sessions last `JWT_TTL_PERSONAL_MINUTOS` (default 30).
+  Turning on two-step verification or resetting the password revokes every
+  other session.
+- **Key rotation.** Set the old key as `MFA_CLAVE_CIFRADO_ANTERIOR` and the new
+  one as `MFA_CLAVE_CIFRADO`, then run `synthetic-capital migrar`: it
+  re-encrypts every secret with the new key. Then remove the old one.
+
 ## Layout
 
 ```
@@ -495,7 +561,7 @@ launch checklist: [DEPLOYMENT.md](DEPLOYMENT.md).
 ## Running locally
 
 ```bash
-cp .env.example .env                          # set JWT_SECRET; MODO_DEMO=true for the demo
+cp .env.example .env                          # set JWT_SECRET and MFA_CLAVE_CIFRADO; MODO_DEMO=true for the demo
 docker compose -f docker-compose.dev.yml up -d   # PostgreSQL 16 on 127.0.0.1:5432 (or a local one)
 cd backend && cargo run                       # applies migrations and starts on :8080
 ```
@@ -512,6 +578,7 @@ psql "$EMPTY_DATABASE_URL" -f tests/db/0006_kyc.sql
 psql "$EMPTY_DATABASE_URL" -f tests/db/0007_kyc.sql
 psql "$EMPTY_DATABASE_URL" -f tests/db/0008_spei.sql
 psql "$EMPTY_DATABASE_URL" -f tests/db/0009_aml.sql
+psql "$EMPTY_DATABASE_URL" -f tests/db/0010_auth_mfa.sql
 cd frontend && npm test && npm run build
 FRONTEND_URL=http://localhost:3000 node e2e/smoke.mjs   # needs backend (MODO_DEMO=true) + next start
 # AML/PLD console against the real stack (structuring -> freeze -> four-eyes unfreeze, roles, no tipping off):
@@ -532,7 +599,7 @@ The backend uses two database identities:
 | Identity | Variable | Used by |
 |---|---|---|
 | Schema owner (needs `CREATEROLE` the first time; on RDS, the master user) | `DATABASE_URL_PROPIETARIO` | only the one-shot `synthetic-capital migrar` |
-| App login `sc_app`: `NOINHERIT`, member of `sc_ifpe`, `sc_sofom`, `sc_puente`, `sc_auditor`, `sc_kyc`, `sc_kyc_verificador`, `sc_spei` and `sc_aml` | `DATABASE_URL` | the long-running service |
+| App login `sc_app`: `NOINHERIT`, member of `sc_ifpe`, `sc_sofom`, `sc_puente`, `sc_auditor`, `sc_kyc`, `sc_kyc_verificador`, `sc_spei`, `sc_aml` and `sc_auth` | `DATABASE_URL` | the long-running service |
 
 The owner can disable triggers; the app login has no privileges of its own and
 acts only through `SET LOCAL ROLE` to one `sc_*` role per transaction. By
@@ -563,7 +630,7 @@ it then does the following in one transaction:
   `LOGIN NOINHERIT`, setting the password as a SCRAM-SHA-256 verifier
   (PBKDF2-HMAC-SHA-256, 4096 iterations, random 16-byte salt) computed by the
   backend, so the plaintext never reaches the server or its logs;
-- grants the eight `sc_*` roles above (`WITH INHERIT FALSE, SET TRUE` on
+- grants the nine `sc_*` roles above (`WITH INHERIT FALSE, SET TRUE` on
   PostgreSQL 16+, where inheritance is set per grant), never `sc_auditor_pld`;
 - checks the result, and rolls everything back if the login is the owner, a
   member of the owner, a superuser, has `CREATEROLE`, `CREATEDB`,
@@ -646,7 +713,9 @@ the password is hashed, so a parallel burst cannot test more than 5 passwords.
 
 | Method | Route | Access |
 |---|---|---|
-| POST | `/api/v1/auth/registro`, `/api/v1/auth/login` | public (sign-up starts with KYC `PENDIENTE`) |
+| POST | `/api/v1/auth/registro`, `/api/v1/auth/login` | public (sign-up starts with KYC `PENDIENTE`; staff sign-in needs the second step) |
+| POST | `/api/v1/auth/verify-mfa`, `/api/v1/auth/mfa/setup`, `/api/v1/auth/mfa/enable` | two-step verification (see above) |
+| POST | `/api/v1/auth/password/forgot`, `/api/v1/auth/password/reset` | public: password reset by single-use link |
 | GET | `/api/v1/kyc/expediente` | client: onboarding state, attempts, last biometric result |
 | POST | `/api/v1/kyc/perfil` | client: step 1, personal data, CURP, RFC and address |
 | POST | `/api/v1/kyc/verificar` | client: steps 2-3, INE images and data + liveness frames + consent (up to 12 MB) |

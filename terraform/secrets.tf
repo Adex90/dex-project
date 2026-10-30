@@ -8,6 +8,7 @@
 #      backend/DATABASE_URL postgres://sc_app:...@<proxy endpoint>:5432/<db>?sslmode=verify-full
 # 2. Created EMPTY here, populated out of band (never in state; see README.md):
 #      backend/JWT_SECRET, backend/SPEI_WEBHOOK_SECRETO, backend/KYC_WEBHOOK_SECRETO,
+#      backend/MFA_CLAVE_CIFRADO (AES-256-GCM key of the staff's TOTP secrets),
 #      optional backend/*_ANTERIOR (rotation) and migrate/BOOTSTRAP_OPERADOR_PASSWORD.
 #    ECS cannot start a task whose secret has no value: populate them before the
 #    services scale above zero.
@@ -68,7 +69,8 @@ resource "aws_secretsmanager_secret_version" "backend_database_url" {
   secret_string = "postgres://${var.db_app_username}:${urlencode(random_password.db_app.result)}@${aws_db_proxy.this.endpoint}:5432/${var.db_name}?sslmode=verify-full"
 }
 
-# Populated out of band. Values must pass the backend's checks (>= 32 characters, random):
+# Populated out of band. Values must pass the backend's checks (>= 32 characters, random;
+# MFA_CLAVE_CIFRADO: exactly 64 hex characters, `openssl rand -hex 32`):
 #   openssl rand -hex 64 | tr -d '\n' | aws secretsmanager put-secret-value \
 #     --secret-id <arn> --secret-string file:///dev/stdin
 locals {
@@ -77,16 +79,20 @@ locals {
       JWT_SECRET           = "JWT_SECRET: HS256 signing key of the backend"
       SPEI_WEBHOOK_SECRETO = "SPEI_WEBHOOK_SECRETO: HMAC-SHA256 key shared with the SPEI provider"
       KYC_WEBHOOK_SECRETO  = "KYC_WEBHOOK_SECRETO: HMAC-SHA256 key shared with the biometric provider"
+      MFA_CLAVE_CIFRADO    = "MFA_CLAVE_CIFRADO: AES-256-GCM key of the staff's TOTP secrets (64 hex characters)"
     },
     var.enable_previous_webhook_secrets ? {
       SPEI_WEBHOOK_SECRETO_ANTERIOR = "SPEI_WEBHOOK_SECRETO_ANTERIOR: previous SPEI webhook key, accepted during a rotation"
       KYC_WEBHOOK_SECRETO_ANTERIOR  = "KYC_WEBHOOK_SECRETO_ANTERIOR: previous KYC webhook key, accepted during a rotation"
     } : {},
+    var.enable_previous_mfa_key ? {
+      MFA_CLAVE_CIFRADO_ANTERIOR = "MFA_CLAVE_CIFRADO_ANTERIOR: previous TOTP encryption key, decrypts during a rotation"
+    } : {},
   )
 }
 
 resource "aws_secretsmanager_secret" "backend" {
-  #checkov:skip=CKV2_AWS_57:JWT and webhook HMAC keys are rotated by a coordinated procedure (the *_ANTERIOR overlap keeps provider webhooks valid); automatic rotation would break the providers' copies. See README.md.
+  #checkov:skip=CKV2_AWS_57:JWT, webhook HMAC and TOTP encryption keys are rotated by coordinated procedures (the *_ANTERIOR overlap keeps provider webhooks valid; the migrate task re-encrypts TOTP secrets); automatic rotation would break the providers' copies and leave TOTP secrets undecryptable. See README.md.
   for_each = local.backend_app_secrets
 
   name                    = "${local.name}/backend/${each.key}"

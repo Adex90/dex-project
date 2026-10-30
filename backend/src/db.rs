@@ -42,14 +42,26 @@ pub enum Rol {
     /// Cumplimiento: consola PLD y monitoreo por lotes; solo lee `aml` y
     /// ejecuta funciones definer (sin DML directo sobre ninguna tabla).
     Aml,
+    /// Autenticación fuerte: segundo factor (secretos TOTP cifrados) y
+    /// restablecimiento de contraseña. El único rol que lee esos secretos.
+    Auth,
 }
 
 impl Rol {
     /// Todos los roles transaccionales: el login de la aplicación es miembro
     /// de cada uno (sin heredar sus privilegios) y actúa con `SET LOCAL ROLE`.
     /// `sc_auditor_pld` no está: es para un verificador externo de la bitácora PLD.
-    pub const TODOS: [Rol; 8] =
-        [Rol::Ifpe, Rol::Sofom, Rol::Puente, Rol::Auditor, Rol::Kyc, Rol::KycVerificador, Rol::Spei, Rol::Aml];
+    pub const TODOS: [Rol; 9] = [
+        Rol::Ifpe,
+        Rol::Sofom,
+        Rol::Puente,
+        Rol::Auditor,
+        Rol::Kyc,
+        Rol::KycVerificador,
+        Rol::Spei,
+        Rol::Aml,
+        Rol::Auth,
+    ];
 
     pub const fn nombre(self) -> &'static str {
         match self {
@@ -61,6 +73,7 @@ impl Rol {
             Rol::KycVerificador => "sc_kyc_verificador",
             Rol::Spei => "sc_spei",
             Rol::Aml => "sc_aml",
+            Rol::Auth => "sc_auth",
         }
     }
 
@@ -76,6 +89,7 @@ impl Rol {
             Rol::KycVerificador => "SET LOCAL ROLE sc_kyc_verificador",
             Rol::Spei => "SET LOCAL ROLE sc_spei",
             Rol::Aml => "SET LOCAL ROLE sc_aml",
+            Rol::Auth => "SET LOCAL ROLE sc_auth",
         }
     }
 }
@@ -160,12 +174,12 @@ pub async fn verificar_usuario_de_aplicacion(pool: &PgPool) -> Result<(), sqlx::
                 AND pg_has_role(current_user, 'sc_puente', 'MEMBER') AND pg_has_role(current_user, 'sc_auditor', 'MEMBER') \
                 AND pg_has_role(current_user, 'sc_kyc', 'MEMBER') AND pg_has_role(current_user, 'sc_spei', 'MEMBER') \
                 AND pg_has_role(current_user, 'sc_kyc_verificador', 'MEMBER') \
-                AND pg_has_role(current_user, 'sc_aml', 'MEMBER')",
+                AND pg_has_role(current_user, 'sc_aml', 'MEMBER') AND pg_has_role(current_user, 'sc_auth', 'MEMBER')",
     )
     .fetch_one(pool)
     .await?;
     if !miembro {
-        tracing::error!(%usuario, "el usuario de la aplicación no es miembro de sc_ifpe, sc_sofom, sc_puente, sc_auditor, sc_kyc, sc_kyc_verificador, sc_spei y sc_aml");
+        tracing::error!(%usuario, "el usuario de la aplicación no es miembro de sc_ifpe, sc_sofom, sc_puente, sc_auditor, sc_kyc, sc_kyc_verificador, sc_spei, sc_aml y sc_auth");
     }
     if superusuario || dueno {
         tracing::warn!(

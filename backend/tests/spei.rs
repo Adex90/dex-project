@@ -107,8 +107,21 @@ impl Banco {
         (status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
     }
 
-    fn token(&self, id: Uuid, rol: RolUsuario) -> String {
-        self.estado.jwt.emitir(id, rol).unwrap().0
+    /// Token de acceso emitido directamente. El personal interno no opera sin
+    /// segundo factor: se activa por el flujo real la primera vez.
+    async fn token(&self, id: Uuid, rol: RolUsuario) -> String {
+        let mfa = rol != RolUsuario::Cliente;
+        if mfa {
+            let activo: bool = sqlx::query_scalar("SELECT mfa_enabled FROM kyc.credenciales WHERE cliente_id = $1")
+                .bind(id)
+                .fetch_one(&self.pool)
+                .await
+                .unwrap();
+            if !activo {
+                activar_mfa(&self.estado, id).await;
+            }
+        }
+        self.estado.jwt.emitir(id, rol, mfa).unwrap().0
     }
 
     /// Petición autenticada a la API.
@@ -416,7 +429,7 @@ async fn transferencia_saliente_ciclo_completo(pool: PgPool) {
     let ana = cliente(&pool, &b.cfg, "Ana").await;
     depositar(&pool, &b.cfg, ana.cuenta_ifpe.id, "1000").await;
     b.pasarela.fijar_saldo_custodio(reserva_total(&pool).await);
-    let (token, _) = b.estado.jwt.emitir(ana.cliente.id, RolUsuario::Cliente).unwrap();
+    let (token, _) = b.estado.jwt.emitir(ana.cliente.id, RolUsuario::Cliente, false).unwrap();
     let cuerpo = json!({
         "clabe_destino": EXTERNA_A,
         "beneficiario_nombre": "Beto Núñez",
@@ -1182,9 +1195,9 @@ async fn revision_manual_se_resuelve_con_reembolso_del_operador(pool: PgPool) {
 
     let ruta = |id: Uuid| format!("/api/v1/operaciones/spei/enviados/{id}/reembolso");
     let cuerpo = json!({ "motivo": "STP confirma que nunca recibió la orden", "clave_idempotencia": "reembolso-0001" });
-    let (s, _) = b.llamar(&b.token(ana.cliente.id, RolUsuario::Cliente), &ruta(o.id), cuerpo.clone()).await;
+    let (s, _) = b.llamar(&b.token(ana.cliente.id, RolUsuario::Cliente).await, &ruta(o.id), cuerpo.clone()).await;
     assert_eq!(s, StatusCode::FORBIDDEN, "solo operadores");
-    let token = b.token(op, RolUsuario::Operador);
+    let token = b.token(op, RolUsuario::Operador).await;
     let (s, r) = b.llamar(&token, &ruta(o.id), cuerpo.clone()).await;
     assert_eq!(s, StatusCode::CREATED, "{r}");
     assert_eq!(r["orden"]["estado"], "RECHAZADA");
@@ -1439,7 +1452,7 @@ async fn incidente_en_orden_rechazada_queda_registrado(pool: PgPool) {
     assert!(incidentes[1].2.contains("Liquidada"));
     assert_eq!(conciliacion_total(&pool, |c| c.incidentes_conciliacion).await, 1);
     let op = operador(&pool).await;
-    let (_, cuerpo) = b.obtener(&b.token(op, RolUsuario::Operador), "/api/v1/spei/conciliacion").await;
+    let (_, cuerpo) = b.obtener(&b.token(op, RolUsuario::Operador).await, "/api/v1/spei/conciliacion").await;
     let total: i64 = cuerpo.as_array().unwrap().iter().map(|c| c["incidentes_conciliacion"].as_i64().unwrap()).sum();
     assert_eq!(total, 1, "{cuerpo}");
     assert_eq!(saldo_ifpe(&pool, ana.cuenta_ifpe.id).await.0, d("1000"), "no se movió dinero");
@@ -1505,7 +1518,7 @@ async fn devolucion_de_cualquier_tipo_reembolsa_una_vez(pool: PgPool) {
     // proveedor ya la informa devuelta).
     b.pasarela.devolver(&o3.clave_rastreo, 1);
     let op = operador(&pool).await;
-    let token = b.token(op, RolUsuario::Operador);
+    let token = b.token(op, RolUsuario::Operador).await;
     let captura = |devuelto: &str| {
         json!({
             "clabe": clabe, "monto": "100", "banco_emisor": "40012", "fecha_operacion": hoy_cdmx(),
@@ -1586,7 +1599,7 @@ async fn operador_confirma_pago_distinto(pool: PgPool) {
     let b = banco(&pool).await;
     let ana = cliente(&pool, &b.cfg, "Ana").await;
     let op = operador(&pool).await;
-    let token = b.token(op, RolUsuario::Operador);
+    let token = b.token(op, RolUsuario::Operador).await;
     let clabe = ana.cuenta_ifpe.clabe.clone();
     let semana = |fecha: NaiveDate, extra: Value| {
         let mut c = json!({
@@ -1604,7 +1617,7 @@ async fn operador_confirma_pago_distinto(pool: PgPool) {
     let (s, r) = b.webhook("/api/v1/spei/webhook/inbound", real.clone()).await;
     assert_eq!((s, &r["mensaje"], &r["estado"]), (StatusCode::OK, &json!("confirmar"), &json!("EN_REVISION")), "{r}");
     assert_eq!(saldo_ifpe(&pool, ana.cuenta_ifpe.id).await.0, d("500"));
-    let (s, _) = b.obtener(&b.token(ana.cliente.id, RolUsuario::Cliente), "/api/v1/spei/en-revision").await;
+    let (s, _) = b.obtener(&b.token(ana.cliente.id, RolUsuario::Cliente).await, "/api/v1/spei/en-revision").await;
     assert_eq!(s, StatusCode::FORBIDDEN);
     let (s, cola) = b.obtener(&token, "/api/v1/spei/en-revision").await;
     assert_eq!(s, StatusCode::OK, "{cola}");
@@ -1760,7 +1773,7 @@ async fn captura_equivocada_se_anula_y_libera_la_identidad(pool: PgPool) {
     let ana = cliente(&pool, &b.cfg, "Ana").await;
     let beto = cliente(&pool, &b.cfg, "Beto").await;
     let op = operador(&pool).await;
-    let token = b.token(op, RolUsuario::Operador);
+    let token = b.token(op, RolUsuario::Operador).await;
     let captura = |clabe: &str| {
         json!({
             "clabe": clabe, "monto": "500", "banco_emisor": "40012", "fecha_operacion": hoy_cdmx(),
@@ -1779,7 +1792,8 @@ async fn captura_equivocada_se_anula_y_libera_la_identidad(pool: PgPool) {
     // Solo un operador anula, y solo capturas (no lo que informó el proveedor).
     let anular = |id: &str| format!("/api/v1/operaciones/spei/recibidos/{id}/anulacion");
     let cuerpo = json!({ "motivo": "abonado a la CLABE equivocada", "clave_idempotencia": "anulacion-0001" });
-    let (s, _) = b.llamar(&b.token(beto.cliente.id, RolUsuario::Cliente), &anular(&erronea), cuerpo.clone()).await;
+    let (s, _) =
+        b.llamar(&b.token(beto.cliente.id, RolUsuario::Cliente).await, &anular(&erronea), cuerpo.clone()).await;
     assert_eq!(s, StatusCode::FORBIDDEN);
     let (s, r) = b.llamar(&token, &anular(&erronea), cuerpo.clone()).await;
     assert_eq!(s, StatusCode::CREATED, "{r}");
@@ -1869,7 +1883,7 @@ async fn devolucion_capturada_por_el_operador_se_verifica(pool: PgPool) {
     let o3 = b.enviar_spei(&ana, EXTERNA_A, "1000").await; // PENDIENTE: el proveedor pudo registrarla
     b.pasarela.devolver(&o1.clave_rastreo, 1); // el custodio recibió la devolución de la orden de Ana
     let op = operador(&pool).await;
-    let token = b.token(op, RolUsuario::Operador);
+    let token = b.token(op, RolUsuario::Operador).await;
     let ruta = "/api/v1/operaciones/depositos";
     let (ana_clabe, beto_clabe) = (ana.cuenta_ifpe.clabe.clone(), beto.cuenta_ifpe.clabe.clone());
 
@@ -2186,12 +2200,12 @@ async fn abono_legado_con_rastreo_solo_se_acota_y_el_retenido_se_descarta(pool: 
     assert_eq!(saldo_ifpe(&pool, ana.cuenta_ifpe.id).await.0, d("1000"));
 
     let op = operador(&pool).await;
-    let token = b.token(op, RolUsuario::Operador);
+    let token = b.token(op, RolUsuario::Operador).await;
     let (_, cola) = b.obtener(&token, "/api/v1/spei/en-revision").await;
     assert_eq!(cola.as_array().map(Vec::len), Some(1), "{cola}");
     let ruta = format!("/api/v1/operaciones/spei/en-revision/{}/descarte", cola[0]["id"].as_str().unwrap());
     let cuerpo = json!({ "motivo": "duplicado del abono legado PAGOSEMANAL", "clave_idempotencia": "descarte-0001" });
-    let (s, _) = b.llamar(&b.token(ana.cliente.id, RolUsuario::Cliente), &ruta, cuerpo.clone()).await;
+    let (s, _) = b.llamar(&b.token(ana.cliente.id, RolUsuario::Cliente).await, &ruta, cuerpo.clone()).await;
     assert_eq!(s, StatusCode::FORBIDDEN);
     let (s, r) = b.llamar(&token, &ruta, cuerpo.clone()).await;
     assert_eq!((s, &r["descarte"]["autorizado_por"]), (StatusCode::CREATED, &json!(op)), "{r}");

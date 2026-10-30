@@ -5,11 +5,16 @@ import { useRouter } from "next/navigation";
 
 import { useSession } from "@/hooks/use-session";
 import { request } from "@/lib/api/client";
-import type { Cliente, EstatusKyc, Rol } from "@/lib/api/types";
+import type { Cliente, EstatusKyc, Rol, Sesion } from "@/lib/api/types";
 
 export const DASHBOARD_PATH = "/dashboard";
 export const ONBOARDING_PATH = "/auth/onboarding";
 export const ADMIN_AML_PATH = "/admin/aml";
+export const MFA_SETUP_PATH = "/auth/mfa-setup";
+
+/** For signed-in roles that have no console in this app. */
+export const NO_CONSOLE_MESSAGE =
+  "This app is for account holders and the compliance team. Operators use the operations console.";
 
 /**
  * Where staff with a console in this app belong: compliance officers and
@@ -41,6 +46,18 @@ export async function resolveClientHome(token: string, signal?: AbortSignal): Pr
     if (error instanceof DOMException && error.name === "AbortError") throw error;
     return DASHBOARD_PATH;
   }
+}
+
+/**
+ * Where a session that just started belongs: the compliance console for
+ * officers and auditors, the dashboard or onboarding for account holders (by
+ * KYC status), and null for roles without a console here (operators).
+ */
+export async function homeAfterSignIn(session: Sesion): Promise<string | null> {
+  const staff = homeForStaff(session.rol);
+  if (staff) return staff;
+  if (session.rol !== "CLIENTE") return null;
+  return resolveClientHome(session.token);
 }
 
 /**

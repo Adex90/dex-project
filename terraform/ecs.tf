@@ -81,6 +81,8 @@ locals {
     migrate = concat(
       [aws_db_instance.this.master_user_secret[0].secret_arn, aws_secretsmanager_secret.db_app.arn],
       aws_secretsmanager_secret.bootstrap_operator_password[*].arn,
+      # Only during a rotation of the TOTP encryption key: migrate re-encrypts.
+      [for k in local.migrate_mfa_keys : aws_secretsmanager_secret.backend[k].arn],
     )
   }
 }
@@ -167,15 +169,16 @@ locals {
   # Backend service (.env.example names). Business settings come from app_environment;
   # the keys below are managed here and cannot be overridden (see its validation).
   backend_environment = merge(var.app_environment, {
-    BIND_ADDR            = "0.0.0.0:8080"
-    DB_MAX_CONEXIONES    = tostring(var.backend_db_max_connections)
-    JWT_TTL_MINUTOS      = tostring(var.jwt_ttl_minutes)
-    FRONTEND_ORIGIN      = local.public_url
-    RUST_LOG             = var.backend_rust_log
-    MODO_DEMO            = "false"
-    MIGRAR_AL_INICIO     = "false" # migrations run only in the migrate task
-    ARRANQUE_AL_INICIO   = "false" # bootstrap runs only in the migrate task
-    HTTP_PROXY_CONFIABLE = "true"  # client IP = last X-Forwarded-For hop, appended by the ALB
+    BIND_ADDR                = "0.0.0.0:8080"
+    DB_MAX_CONEXIONES        = tostring(var.backend_db_max_connections)
+    JWT_TTL_MINUTOS          = tostring(var.jwt_ttl_minutes)
+    JWT_TTL_PERSONAL_MINUTOS = tostring(var.jwt_ttl_staff_minutes)
+    FRONTEND_ORIGIN          = local.public_url
+    RUST_LOG                 = var.backend_rust_log
+    MODO_DEMO                = "false"
+    MIGRAR_AL_INICIO         = "false" # migrations run only in the migrate task
+    ARRANQUE_AL_INICIO       = "false" # bootstrap runs only in the migrate task
+    HTTP_PROXY_CONFIABLE     = "true"  # client IP = last X-Forwarded-For hop, appended by the ALB
     # Idle keep-alive limit above the ALB idle timeout, so the ALB never sends a request
     # on a connection the backend has just closed (502). Slow-header attacks stop at the
     # ALB, which only forwards complete request heads.
@@ -209,12 +212,16 @@ locals {
     var.bootstrap_operator_email == null ? {} : { BOOTSTRAP_OPERADOR_EMAIL = var.bootstrap_operator_email },
   )
 
+  # With both TOTP encryption keys, migrate re-encrypts every secret with the current one.
+  migrate_mfa_keys = var.enable_previous_mfa_key ? ["MFA_CLAVE_CIFRADO", "MFA_CLAVE_CIFRADO_ANTERIOR"] : []
+
   migrate_secrets = merge(
     {
       PGPASSWORD      = "${aws_db_instance.this.master_user_secret[0].secret_arn}:password::"
       DB_APP_PASSWORD = "${aws_secretsmanager_secret.db_app.arn}:password::"
     },
     { for s in aws_secretsmanager_secret.bootstrap_operator_password : "BOOTSTRAP_OPERADOR_PASSWORD" => s.arn },
+    { for k in local.migrate_mfa_keys : k => aws_secretsmanager_secret.backend[k].arn },
   )
 
   frontend_environment = {

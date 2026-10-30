@@ -15,10 +15,21 @@ export class ApiError extends Error {
     this.code = code;
   }
 
+  /**
+   * The session can no longer be used: expired or revoked (401), or a staff
+   * session without verified two-step verification (MFA_REQUERIDO). Either way
+   * the person signs in again, and signing in asks for the authenticator code.
+   * A wrong password or authenticator code is also a 401, but the person just
+   * tries again: those are not a lost session.
+   */
   get isUnauthorized(): boolean {
-    return this.status === 401;
+    if (this.code === "MFA_REQUERIDO") return true;
+    return this.status === 401 && !RETRYABLE_401.has(this.code);
   }
 }
+
+/** 401 answers to a wrong secret (password, authenticator code): retry, keep the sign-in. */
+const RETRYABLE_401 = new Set(["CREDENCIALES_INVALIDAS", "CODIGO_MFA_INVALIDO"]);
 
 export interface RequestOptions {
   method?: "GET" | "POST";
@@ -89,6 +100,12 @@ const MESSAGES: Record<string, string> = {
   NO_AUTENTICADO: "Your session has expired. Please sign in again.",
   CREDENCIALES_INVALIDAS: "Incorrect email or password.",
   BLOQUEADO: "Too many failed attempts. Your access is temporarily locked; try again in 15 minutes.",
+  MFA_REQUERIDO: "Your role requires two-step verification. Please sign in again.",
+  CODIGO_MFA_INVALIDO: "That code is not valid. Enter the current 6-digit code from your authenticator app.",
+  DESAFIO_MFA_VENCIDO: "Your sign-in attempt expired. Please sign in again.",
+  MFA_YA_ACTIVO: "Two-step verification is already turned on for this account.",
+  MFA_SIN_CONFIGURAR: "Set up your authenticator app first.",
+  TOKEN_RESTABLECIMIENTO_INVALIDO: "This reset link is invalid or has expired. Please request a new one.",
   PROHIBIDO: "You are not allowed to perform this operation.",
   EMAIL_REGISTRADO: "That email is already registered.",
   IDENTIDAD_REGISTRADA: "That CURP/RFC is already registered.",

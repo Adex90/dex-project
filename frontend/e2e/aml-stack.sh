@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Stack for e2e/aml.mjs: a fresh database, the backend on :8080 (MODO_DEMO, two
 # CUMPLIMIENTO officers, an operator and an auditor) and `next start` on :3000.
+# Staff enroll two-step verification on their first sign-in (aml.mjs does it).
 #
 #   e2e/aml-stack.sh start   # SKIP_FRONTEND_BUILD=1 reuses frontend/.next from the same commit
 #   e2e/aml-stack.sh stop    # kills both servers by PID and drops the database
@@ -40,6 +41,7 @@ CORTE_MIN_INTERVALO_SEG=0
 SPEI_DESPACHO_INTERVALO_MS=0
 RUST_LOG=info
 JWT_SECRET=$(openssl rand -hex 32)
+MFA_CLAVE_CIFRADO=$(openssl rand -hex 32)
 SPEI_WEBHOOK_SECRETO=$(openssl rand -hex 32)
 BOOTSTRAP_CUMPLIMIENTO_EMAILS=oficial1@cumplimiento.mx,oficial2@cumplimiento.mx
 BOOTSTRAP_CUMPLIMIENTO_PASSWORD=cumplimiento-e2e-2026

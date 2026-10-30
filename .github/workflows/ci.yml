@@ -215,6 +215,8 @@ jobs:
             expect: "tests/db/0008_spei.sql: todas las pruebas pasaron (ROLLBACK)"
           - suite: 0009_aml
             expect: "tests/db/0009_aml.sql: todas las pruebas pasaron (ROLLBACK)"
+          - suite: 0010_auth_mfa
+            expect: "tests/db/0010_auth_mfa.sql: todas las pruebas pasaron (ROLLBACK)"
     services:
       postgres:
         image: postgres:16

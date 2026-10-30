@@ -198,12 +198,24 @@ async fn migrar_aprovisiona_y_el_servicio_corre_solo_con_el_login(pool: PgPool) 
     let opciones = pool.connect_options().as_ref().clone().username(usuario).password(&segunda);
     let url_app = Archivo::nuevo(opciones.to_url_lossy().as_str());
     let jwt = Archivo::nuevo(&hex::encode(rand::random::<[u8; 32]>()));
+    let mfa = Archivo::nuevo(&hex::encode(rand::random::<[u8; 32]>()));
     let bind = SocketAddr::from(([127, 0, 0, 1], puerto_libre())).to_string();
+    // Sin la clave de los secretos TOTP el servicio no arranca (falla cerrado).
+    let sin_clave =
+        correr(&[], &[("DATABASE_URL_FILE", url_app.ruta()), ("JWT_SECRET_FILE", jwt.ruta()), ("BIND_ADDR", &bind)])
+            .await;
+    assert_eq!(sin_clave.status.code(), Some(1), "{}", texto(&sin_clave));
+    assert!(
+        String::from_utf8_lossy(&sin_clave.stderr).contains("MFA_CLAVE_CIFRADO es obligatoria"),
+        "{}",
+        texto(&sin_clave)
+    );
     let servicio = binario(
         &[],
         &[
             ("DATABASE_URL_FILE", url_app.ruta()),
             ("JWT_SECRET_FILE", jwt.ruta()),
+            ("MFA_CLAVE_CIFRADO_FILE", mfa.ruta()),
             ("BIND_ADDR", &bind),
             ("MIGRAR_AL_INICIO", "false"),
             ("ARRANQUE_AL_INICIO", "false"),

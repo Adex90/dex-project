@@ -31,6 +31,15 @@ pub enum AppError {
     CredencialesInvalidas(String),
     #[error("no tienes permiso para esta operación")]
     Prohibido,
+    /// El rol exige una sesión con segundo factor verificado (personal interno).
+    #[error("tu rol exige verificar el segundo factor (TOTP) para esta operación")]
+    MfaRequerido,
+    /// Código TOTP incorrecto, vencido o ya usado.
+    #[error("el código de verificación no es válido; usa el código actual de tu app autenticadora")]
+    CodigoMfaInvalido,
+    /// Token parcial (desafío MFA o de inscripción) vencido, revocado o ajeno.
+    #[error("el inicio de sesión venció; vuelve a iniciar sesión")]
+    DesafioVencido,
     #[error("{0}")]
     NoEncontrado(String),
     #[error("{0}")]
@@ -97,6 +106,9 @@ impl AppError {
             Self::NoAutenticado => "NO_AUTENTICADO",
             Self::CredencialesInvalidas(_) => "CREDENCIALES_INVALIDAS",
             Self::Prohibido => "PROHIBIDO",
+            Self::MfaRequerido => "MFA_REQUERIDO",
+            Self::CodigoMfaInvalido => "CODIGO_MFA_INVALIDO",
+            Self::DesafioVencido => "DESAFIO_MFA_VENCIDO",
             Self::NoEncontrado(_) => "NO_ENCONTRADO",
             Self::Validacion(_) => "VALIDACION",
             Self::Negocio { codigo, .. } | Self::Conflicto { codigo, .. } => codigo,
@@ -111,8 +123,10 @@ impl AppError {
 
     pub fn status(&self) -> StatusCode {
         match self {
-            Self::NoAutenticado | Self::CredencialesInvalidas(_) => StatusCode::UNAUTHORIZED,
-            Self::Prohibido => StatusCode::FORBIDDEN,
+            Self::NoAutenticado | Self::CredencialesInvalidas(_) | Self::CodigoMfaInvalido | Self::DesafioVencido => {
+                StatusCode::UNAUTHORIZED
+            }
+            Self::Prohibido | Self::MfaRequerido => StatusCode::FORBIDDEN,
             Self::NoEncontrado(_) => StatusCode::NOT_FOUND,
             Self::Validacion(_) => StatusCode::BAD_REQUEST,
             Self::Negocio { .. } | Self::OperacionNoDisponible => StatusCode::UNPROCESSABLE_ENTITY,
@@ -171,6 +185,8 @@ fn es_invariante(codigo: &str) -> bool {
             | "AML_REGLA_SIN_APROBACION"
             | "AML_LEVANTAMIENTO_SIN_APROBACION"
             | "AML_LIBERACION_SIN_APROBACION"
+            | "MFA_SIN_SECRETO"
+            | "MFA_SOLO_DUENO"
     ) || codigo.ends_with("_INMUTABLE")
 }
 

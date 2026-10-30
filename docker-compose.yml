@@ -148,7 +148,17 @@ services:
       # creates officers). Set both in the env file only for a demo stack.
       BOOTSTRAP_CUMPLIMIENTO_EMAILS: ${BOOTSTRAP_CUMPLIMIENTO_EMAILS:-}
       BOOTSTRAP_CUMPLIMIENTO_PASSWORD_FILE: ${BOOTSTRAP_CUMPLIMIENTO_PASSWORD_FILE:-}
-    secrets: [database_url_owner, db_app_password, bootstrap_operador_password, bootstrap_cumplimiento_password]
+      # With both keys (a rotation, generate-secrets.sh --rotate mfa), migrate re-encrypts
+      # every TOTP secret with the current one.
+      MFA_CLAVE_CIFRADO_FILE: /run/secrets/mfa_encryption_key
+      MFA_CLAVE_CIFRADO_ANTERIOR_FILE: /run/secrets/mfa_encryption_key_previous
+    secrets:
+      - database_url_owner
+      - db_app_password
+      - bootstrap_operador_password
+      - bootstrap_cumplimiento_password
+      - mfa_encryption_key
+      - mfa_encryption_key_previous
     networks: [data]
     depends_on:
       db: {condition: service_healthy}
@@ -171,6 +181,7 @@ services:
       HTTP_PROXY_CONFIABLE: "true"
       DB_MAX_CONEXIONES: ${DB_MAX_CONEXIONES:-20}
       JWT_TTL_MINUTOS: ${JWT_TTL_MINUTOS:-60}
+      JWT_TTL_PERSONAL_MINUTOS: ${JWT_TTL_PERSONAL_MINUTOS:-30}
       SPEI_PREFIJO_RASTREO: ${SPEI_PREFIJO_RASTREO:-SC}
       SPEI_DESPACHO_INTERVALO_MS: ${SPEI_DESPACHO_INTERVALO_MS:-1000}
       SPEI_HORA_CORTE: ${SPEI_HORA_CORTE:-17:30}
@@ -186,9 +197,15 @@ services:
       # files mean none.
       SPEI_WEBHOOK_SECRETO_ANTERIOR_FILE: /run/secrets/spei_webhook_secret_previous
       KYC_WEBHOOK_SECRETO_ANTERIOR_FILE: /run/secrets/kyc_webhook_secret_previous
+      # AES-256-GCM key of the staff's TOTP secrets (two-step verification); during a
+      # rotation the previous one still decrypts.
+      MFA_CLAVE_CIFRADO_FILE: /run/secrets/mfa_encryption_key
+      MFA_CLAVE_CIFRADO_ANTERIOR_FILE: /run/secrets/mfa_encryption_key_previous
     secrets:
       - database_url
       - jwt_secret
+      - mfa_encryption_key
+      - mfa_encryption_key_previous
       - spei_webhook_secret
       - spei_webhook_secret_previous
       - kyc_webhook_secret
@@ -307,6 +324,10 @@ secrets:
     file: ${SECRETS_DIR:-./secrets}/kyc_webhook_secret
   kyc_webhook_secret_previous:
     file: ${SECRETS_DIR:-./secrets}/kyc_webhook_secret_previous
+  mfa_encryption_key:
+    file: ${SECRETS_DIR:-./secrets}/mfa_encryption_key
+  mfa_encryption_key_previous:
+    file: ${SECRETS_DIR:-./secrets}/mfa_encryption_key_previous
   bootstrap_operador_password:
     file: ${SECRETS_DIR:-./secrets}/bootstrap_operador_password
   bootstrap_cumplimiento_password:

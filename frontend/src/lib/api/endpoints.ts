@@ -2,6 +2,7 @@ import { request } from "./client";
 import type {
   AmlAlertsQuery,
   Cliente,
+  ConfiguracionMfa,
   CongelamientoManualAml,
   CongelarClienteInput,
   CorteReserva,
@@ -32,12 +33,12 @@ import type {
   ReporteUifInput,
   ResolucionAlertaAml,
   ResolverAlertaInput,
+  ResultadoLogin,
   ResultadoLiquidacion,
   ResultadoMutuo,
   ResultadoVerificacionPrueba,
   ResumenAml,
   RevisionClienteAml,
-  Sesion,
   SolicitudCreadaAml,
   SolicitudLevantamientoInput,
   SolicitudVerificacion,
@@ -55,7 +56,23 @@ export const api = {
   register: (input: RegistroInput) => request<RegistroRespuesta>("/api/v1/auth/registro", { method: "POST", body: input }),
 
   login: (email: string, password: string) =>
-    request<Sesion>("/api/v1/auth/login", { method: "POST", body: { email, password } }),
+    request<ResultadoLogin>("/api/v1/auth/login", { method: "POST", body: { email, password } }),
+
+  verifyMfa: (tokenMfa: string, codigo: string) =>
+    request<ResultadoLogin>("/api/v1/auth/verify-mfa", { method: "POST", body: { token_mfa: tokenMfa, codigo } }),
+
+  /** `token`: the enrollment token from sign-in, or a session's own token. */
+  mfaSetup: (token: string) => request<ConfiguracionMfa>("/api/v1/auth/mfa/setup", { method: "POST", token }),
+
+  mfaEnable: (token: string, codigo: string) =>
+    request<ResultadoLogin>("/api/v1/auth/mfa/enable", { method: "POST", token, body: { codigo } }),
+
+  /** Always answers the same, whether or not the email has an account. */
+  forgotPassword: (email: string) =>
+    request<{ estado: string; mensaje: string }>("/api/v1/auth/password/forgot", { method: "POST", body: { email } }),
+
+  resetPassword: (token: string, password: string) =>
+    request<{ estado: "OK" }>("/api/v1/auth/password/reset", { method: "POST", body: { token, password } }),
 
   dashboard: (token: string, signal?: AbortSignal) => request<Tablero>("/api/v1/tablero", { token, signal }),
 

@@ -204,15 +204,9 @@ async fn autorizacion_por_rol(pool: PgPool) {
         assert_eq!(s, StatusCode::FORBIDDEN, "{ruta}");
     }
 
-    let (s, sesion) = api
-        .llamar(
-            "POST",
-            "/api/v1/auth/login",
-            None,
-            Some(json!({ "email": "operador@synthetic.mx", "password": "operador-de-pruebas-123" })),
-        )
-        .await;
-    assert_eq!(s, StatusCode::OK);
+    // El personal inicia sesión con segundo factor (la primera vez, lo inscribe).
+    let totp = Autenticadora::default();
+    let sesion = iniciar_sesion(&api.app, &totp, "operador@synthetic.mx", "operador-de-pruebas-123").await;
     assert_eq!(sesion["rol"], "OPERADOR");
     let operador = sesion["token"].as_str().unwrap();
     let (s, auditoria) = api.llamar("GET", "/api/v1/auditoria/ledger/ifpe", Some(operador), None).await;
@@ -245,14 +239,8 @@ async fn operador_deposita_por_spei_y_origina_credito(pool: PgPool) {
     let api = api(&pool).await;
     let (ana, registro) = registrar(&api, "Ana").await;
     let (_, taller) = registrar(&api, "Taller").await;
-    let (_, sesion) = api
-        .llamar(
-            "POST",
-            "/api/v1/auth/login",
-            None,
-            Some(json!({ "email": "operador@synthetic.mx", "password": "operador-de-pruebas-123" })),
-        )
-        .await;
+    let totp = Autenticadora::default();
+    let sesion = iniciar_sesion(&api.app, &totp, "operador@synthetic.mx", "operador-de-pruebas-123").await;
     let operador = sesion["token"].as_str().unwrap();
 
     let (s, r) = api
@@ -273,14 +261,7 @@ async fn operador_deposita_por_spei_y_origina_credito(pool: PgPool) {
 
     // Un segundo operador registra el mismo SPEI: no se acredita otra vez.
     bootstrap::asegurar_operador(&pool, "operador2@synthetic.mx", "operador-de-pruebas-456").await.unwrap();
-    let (_, sesion2) = api
-        .llamar(
-            "POST",
-            "/api/v1/auth/login",
-            None,
-            Some(json!({ "email": "operador2@synthetic.mx", "password": "operador-de-pruebas-456" })),
-        )
-        .await;
+    let sesion2 = iniciar_sesion(&api.app, &totp, "operador2@synthetic.mx", "operador-de-pruebas-456").await;
     let (s, r2) = api
         .llamar(
             "POST",
@@ -342,14 +323,8 @@ async fn operador_deposita_por_spei_y_origina_credito(pool: PgPool) {
 async fn sesiones_revocables_y_rol_verificado(pool: PgPool) {
     let api = api(&pool).await;
     let (cliente, registro) = registrar(&api, "Ana").await;
-    let (_, sesion) = api
-        .llamar(
-            "POST",
-            "/api/v1/auth/login",
-            None,
-            Some(json!({ "email": "operador@synthetic.mx", "password": "operador-de-pruebas-123" })),
-        )
-        .await;
+    let totp = Autenticadora::default();
+    let sesion = iniciar_sesion(&api.app, &totp, "operador@synthetic.mx", "operador-de-pruebas-123").await;
     let operador = sesion["token"].as_str().unwrap().to_string();
     let operador_id = sesion["cliente_id"].as_str().unwrap().to_string();
 

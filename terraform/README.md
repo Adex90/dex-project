@@ -68,6 +68,7 @@ need the backend drained first.
 | `<name>/db-app/credentials` | `{"username":"sc_app","password":...}`: RDS Proxy auth, `DB_APP_PASSWORD` of the migrate task | yes (generated) |
 | `<name>/backend/DATABASE_URL` | `postgres://sc_app:...@<proxy>:5432/<db>?sslmode=verify-full` | yes (generated) |
 | `<name>/backend/JWT_SECRET`, `SPEI_WEBHOOK_SECRETO`, `KYC_WEBHOOK_SECRETO` (+ `*_ANTERIOR` with `enable_previous_webhook_secrets`) | put out of band | no |
+| `<name>/backend/MFA_CLAVE_CIFRADO` (+ `MFA_CLAVE_CIFRADO_ANTERIOR` with `enable_previous_mfa_key`): AES-256-GCM key of the staff's TOTP secrets, 64 hex characters (`openssl rand -hex 32`) | put out of band | no |
 | `<name>/migrate/BOOTSTRAP_OPERADOR_PASSWORD` (with `bootstrap_operator_email`) | put out of band | no |
 | RDS-managed master secret (`db_master_user_secret_arn`) | generated and rotated by RDS | no |
 
@@ -89,6 +90,16 @@ password: `terraform apply -replace=random_password.db_app`, run the migrate tas
 (it sets the new SCRAM verifier), then force a new backend deployment; until the
 redeploy, old tasks cannot open new connections through the proxy, so do it in a quiet
 window. The owner password is rotated by RDS; the migrate task reads it at start.
+`MFA_CLAVE_CIFRADO` (the staff's TOTP secrets are stored encrypted with it, never in clear):
+1. `terraform apply -var enable_previous_mfa_key=true -target='aws_secretsmanager_secret.backend["MFA_CLAVE_CIFRADO_ANTERIOR"]'`
+   creates the empty secret (ECS cannot start a task whose secret is empty, so nothing deploys yet).
+2. Put the current key in `MFA_CLAVE_CIFRADO_ANTERIOR`, then a new one (`openssl rand -hex 32`)
+   in `MFA_CLAVE_CIFRADO`, and at once:
+3. `terraform apply -var enable_previous_mfa_key=true`: the backend redeploys decrypting with
+   either key, and the migrate task gets both.
+4. Run the migrate task: it re-encrypts every TOTP secret with the new key (its log says how many).
+5. `terraform apply` (the flag back to `false`): the backend redeploys with the new key only.
+Never drop the previous key before step 4: staff whose secret it still encrypts could not sign in.
 
 ## Database access and TLS
 

@@ -4,7 +4,10 @@
  * funds held, while the client sees nothing (no tipping off) -> officer 1
  * proposes a false positive -> officer 2 approves -> the client operates again.
  * Also: manual freeze, escalate, confirm, UIF folio, four-eyes requests, the
- * AUDITOR read-only and CLIENTE / OPERADOR locked out of the console.
+ * AUDITOR read-only and CLIENTE / OPERADOR locked out of the console. Staff sign
+ * in with two-step verification (TOTP): the first sign-in of each one enrolls
+ * an authenticator through the UI or the API, as a person would, and every
+ * later sign-in answers the code (RFC 6238, computed here).
  *
  *   e2e/aml-stack.sh start          # fresh database, backend :8080 (MODO_DEMO + officers), next start :3000
  *   NODE_PATH=/opt/node22/lib/node_modules PLAYWRIGHT_BROWSERS_PATH=/opt/pw-browsers \
@@ -18,8 +21,10 @@
  * Checks are soft: a failure is recorded and the run continues when it can.
  * Exit code 1 if any check failed. The only expected console errors are the
  * browser's own lines for the deliberate 4xx calls (refused operations, the
- * AUDITOR POST, CLIENTE / OPERADOR calls).
+ * AUDITOR POST, CLIENTE / OPERADOR calls, the deliberately wrong authenticator
+ * codes).
  */
+import { createHmac } from "node:crypto";
 import { createRequire } from "node:module";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
@@ -86,10 +91,92 @@ async function apiCall(method, path, { token, body } = {}) {
   }
   return { status: res.status, body: json };
 }
+// ---------------------------------------------------------------------------
+// Two-step verification: the authenticator app of each staff member.
+// ---------------------------------------------------------------------------
+function base32Decode(text) {
+  const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+  let bits = 0;
+  let value = 0;
+  const out = [];
+  for (const ch of text.replace(/[\s=]/g, "").toUpperCase()) {
+    const v = alphabet.indexOf(ch);
+    if (v < 0) throw new Error(`not base32: ${ch}`);
+    value = ((value << 5) | v) & 0xffff;
+    bits += 5;
+    if (bits >= 8) {
+      out.push((value >>> (bits - 8)) & 0xff);
+      bits -= 8;
+    }
+  }
+  return Buffer.from(out);
+}
+/** RFC 6238 (HMAC-SHA1, 6 digits, 30 s): what any authenticator app shows for `step`. */
+function totpCode(secret, step) {
+  const counter = Buffer.alloc(8);
+  counter.writeBigUInt64BE(BigInt(step));
+  const h = createHmac("sha1", secret).update(counter).digest();
+  const off = h[h.length - 1] & 15;
+  const bin = ((h[off] & 0x7f) << 24) | (h[off + 1] << 16) | (h[off + 2] << 8) | h[off + 3];
+  return String(bin % 1_000_000).padStart(6, "0");
+}
+const authenticators = new Map(); // email -> { secret, last }
+function enrollAuthenticator(email, base32) {
+  authenticators.set(email, { secret: base32Decode(base32), last: 0 });
+}
+/** A code for a step the server has not seen yet: it never accepts a code twice. */
+async function nextCode(email) {
+  const app = authenticators.get(email);
+  if (!app) throw new Error(`no authenticator for ${email}`);
+  for (;;) {
+    const now = Math.floor(Date.now() / 30_000);
+    const step = Math.max(now, app.last + 1);
+    if (step <= now + 1) {
+      app.last = step;
+      return totpCode(app.secret, step);
+    }
+    await new Promise((r) => setTimeout(r, 500));
+  }
+}
+
+/** A 6-digit code that is valid for none of the steps the server accepts. */
+function wrongCode(email) {
+  const app = authenticators.get(email);
+  const now = Math.floor(Date.now() / 30_000);
+  const valid = new Set([-2, -1, 0, 1, 2].map((d) => totpCode(app.secret, now + d)));
+  for (let n = 0; ; n++) {
+    const candidate = String(n).padStart(6, "0");
+    if (!valid.has(candidate)) return candidate;
+  }
+}
+/** Enters a wrong code first: it must be refused with a message, on the same screen. */
+async function wrongCodeIsRefused(page, email, where) {
+  await page.fill("#totp-code", wrongCode(email));
+  await page.click("button[type=submit]");
+  const alert = page.getByRole("alert");
+  await alert.waitFor({ timeout: 10_000 }).catch(() => undefined);
+  const text = (await alert.count()) > 0 ? ((await alert.first().textContent()) ?? "") : "";
+  check(/not valid/i.test(text), `${where}: a wrong code is refused (${JSON.stringify(text)})`);
+  check((await page.locator("#totp-code").count()) > 0, `${where}: the same screen asks for the code again`);
+}
+
+/** Sign-in by API: enrolls the authenticator the first time, then answers the code. */
 async function apiLogin({ email, password }) {
   const r = await apiCall("POST", "/api/v1/auth/login", { body: { email, password } });
   if (r.status !== 200) throw new Error(`login ${email}: ${r.status} ${JSON.stringify(r.body)}`);
-  return r.body;
+  let session = r.body;
+  if (r.body.estado === "MFA_ENROLLMENT_REQUIRED") {
+    const token = r.body.token_inscripcion;
+    const setup = await apiCall("POST", "/api/v1/auth/mfa/setup", { token });
+    if (setup.status !== 200) throw new Error(`mfa setup ${email}: ${setup.status} ${JSON.stringify(setup.body)}`);
+    enrollAuthenticator(email, setup.body.secreto);
+    session = (await apiCall("POST", "/api/v1/auth/mfa/enable", { token, body: { codigo: await nextCode(email) } })).body;
+  } else if (r.body.estado === "2FA_REQUIRED") {
+    const body = { token_mfa: r.body.token_mfa, codigo: await nextCode(email) };
+    session = (await apiCall("POST", "/api/v1/auth/verify-mfa", { body })).body;
+  }
+  if (session?.estado !== "OK") throw new Error(`login ${email}: ${JSON.stringify(session)}`);
+  return session;
 }
 function clabeWithCheck(d17) {
   const w = [3, 7, 1];
@@ -137,11 +224,37 @@ async function newContext(label, options = {}) {
   });
   return ctx;
 }
+/**
+ * Sign-in through the UI. Staff then either answer the code on the sign-in
+ * page or, the first time, enroll an authenticator: the e2e reads the
+ * manual-entry key from the page, as a person would type it into an app.
+ */
 async function uiLogin(page, { email, password }) {
   await page.goto(`${BASE}/auth/login`);
   await page.fill("#email", email);
   await page.fill("#password", password);
   await page.click("button[type=submit]");
+  await page
+    .waitForFunction(() => location.pathname !== "/auth/login" || document.querySelector("#totp-code"), null, {
+      timeout: 15_000,
+    })
+    .catch(() => undefined);
+  if (new URL(page.url()).pathname === "/auth/mfa-setup") {
+    const key = page.getByTestId("mfa-secret");
+    await key.waitFor({ timeout: 15_000 });
+    enrollAuthenticator(email, (await key.textContent()) ?? "");
+    await wrongCodeIsRefused(page, email, `${email} enrollment`);
+    await page.fill("#totp-code", await nextCode(email));
+    await page.click("button[type=submit]");
+    return "enrolled";
+  }
+  if ((await page.locator("#totp-code").count()) > 0) {
+    await wrongCodeIsRefused(page, email, `${email} two-step sign-in`);
+    await page.fill("#totp-code", await nextCode(email));
+    await page.click("button[type=submit]");
+    return "verified";
+  }
+  return "password";
 }
 /** fetch() from inside the page with the page's own session (what a curious client could do from devtools). */
 async function pageFetch(page, method, path, body) {

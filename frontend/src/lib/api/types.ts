@@ -28,6 +28,30 @@ export interface Sesion {
 }
 
 /**
+ * POST /api/v1/auth/login, and the steps that complete a session
+ * (verify-mfa, mfa/enable). Staff never get a session from a password alone.
+ */
+export type ResultadoLogin =
+  | ({ estado: "OK" } & Sesion)
+  /** Password accepted; the authenticator code is still missing (POST /auth/verify-mfa). */
+  | { estado: "2FA_REQUIRED"; token_mfa: string; expira_en: IsoDateTime }
+  /** Staff without two-step verification: enroll it first (mfa/setup, mfa/enable). */
+  | { estado: "MFA_ENROLLMENT_REQUIRED"; token_inscripcion: string; expira_en: IsoDateTime };
+
+/** POST /api/v1/auth/mfa/setup. Shown once: the secret is never sent again. */
+export interface ConfiguracionMfa {
+  /** Base32, for typing into the app when the QR code cannot be scanned. */
+  secreto: string;
+  otpauth_url: string;
+  /** The QR code of `otpauth_url`, as an SVG data URL. */
+  qr_svg: string;
+  emisor: string;
+  cuenta: string;
+  digitos: number;
+  periodo_seg: number;
+}
+
+/**
  * The client's own view (`ClienteVista`): no risk tier, PEP flag or risk
  * review date. Those are staff-only (see `ClienteAml`).
  */

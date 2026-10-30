@@ -564,6 +564,17 @@ variable "jwt_ttl_minutes" {
   }
 }
 
+variable "jwt_ttl_staff_minutes" {
+  description = "Session lifetime of staff (operator, auditor, compliance officer) in minutes: the shorter of this and jwt_ttl_minutes (JWT_TTL_PERSONAL_MINUTOS). Staff sessions always verified two-step authentication."
+  type        = number
+  default     = 30
+
+  validation {
+    condition     = var.jwt_ttl_staff_minutes >= 5 && var.jwt_ttl_staff_minutes <= 480
+    error_message = "jwt_ttl_staff_minutes must be between 5 and 480."
+  }
+}
+
 variable "app_environment" {
   description = "Non-secret business settings from .env.example passed to both the backend service and the migrate task (bootstrap runs there): CLABE_PREFIJO, SPEI_PREFIJO_RASTREO, RESERVA_*, CAJA_*, KYC_SCORE_*, SPEI_*/CORTE_*/AML_* tuning. Secrets, database URLs and the settings managed by this configuration are rejected."
   type        = map(string)
@@ -604,6 +615,12 @@ variable "bootstrap_operator_email" {
 
 variable "enable_previous_webhook_secrets" {
   description = "Also inject SPEI_WEBHOOK_SECRETO_ANTERIOR and KYC_WEBHOOK_SECRETO_ANTERIOR (secrets created empty; populate them before the next deployment). Enable during a webhook secret rotation."
+  type        = bool
+  default     = false
+}
+
+variable "enable_previous_mfa_key" {
+  description = "Rotation of MFA_CLAVE_CIFRADO (the AES-256-GCM key of the staff's TOTP secrets): also inject MFA_CLAVE_CIFRADO_ANTERIOR (secret created empty; put the old key there and the new one in MFA_CLAVE_CIFRADO) into the backend, and both keys into the migrate task, which re-encrypts every secret with the new key. Disable once the migrate task has run."
   type        = bool
   default     = false
 }

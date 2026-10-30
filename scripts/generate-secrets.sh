@@ -17,13 +17,17 @@
 #                      spei, kyc  webhook HMAC secrets. The replaced value moves to
 #                                 *_previous, which the backend keeps accepting
 #                                 (SPEI/KYC_WEBHOOK_SECRETO_ANTERIOR) until --clear-previous.
+#                      mfa        AES-256-GCM key of the staff's TOTP secrets. The old key
+#                                 moves to mfa_encryption_key_previous; recreate migrate (it
+#                                 re-encrypts every TOTP secret) and the backend, and only
+#                                 then --clear-previous mfa.
 #                      owner      schema owner password (+ database_url_owner)
 #                      superuser  postgres superuser password (break-glass only)
 #                    owner and superuser also live in the database: when its volume exists,
 #                    the db container must be running, and the new password is set there
 #                    first (psql \password, authenticated with the old one).
-#   --clear-previous LIST   spei and/or kyc: empties *_previous once the provider signs
-#                    with the new secret
+#   --clear-previous LIST   spei, kyc and/or mfa: empties *_previous once the provider
+#                    signs with the new secret (mfa: once migrate re-encrypted with the new key)
 #   --dev            local testing without root: files are 0444 instead of being owned by
 #                    the container users (world-readable on this host; never in production)
 #
@@ -111,8 +115,8 @@ if [[ -n "$rotate" ]]; then
   IFS=',' read -r -a items <<<"$rotate"
   for item in "${items[@]}"; do
     case "$item" in
-      app|jwt|spei|kyc|owner|superuser) rotating[$item]=1 ;;
-      *) die "unknown secret to rotate: $item (app, jwt, spei, kyc, owner, superuser)" ;;
+      app|jwt|spei|kyc|mfa|owner|superuser) rotating[$item]=1 ;;
+      *) die "unknown secret to rotate: $item (app, jwt, spei, kyc, mfa, owner, superuser)" ;;
     esac
   done
 fi
@@ -120,9 +124,9 @@ if [[ -n "$clear_previous" ]]; then
   IFS=',' read -r -a items <<<"$clear_previous"
   for item in "${items[@]}"; do
     case "$item" in
-      spei|kyc) [[ -z "${rotating[$item]:-}" ]] || die "--rotate $item and --clear-previous $item together would drop the live secret's predecessor at once; run them separately"
+      spei|kyc|mfa) [[ -z "${rotating[$item]:-}" ]] || die "--rotate $item and --clear-previous $item together would drop the live secret's predecessor at once; run them separately"
                 clearing[$item]=1 ;;
-      *) die "unknown previous secret to clear: $item (spei, kyc)" ;;
+      *) die "unknown previous secret to clear: $item (spei, kyc, mfa)" ;;
     esac
   done
 fi
@@ -130,7 +134,8 @@ fi
 # Files, in display order, and the uid that reads each one inside its container.
 files=(postgres_password db_owner_password database_url_owner db_app_password database_url
        jwt_secret spei_webhook_secret spei_webhook_secret_previous kyc_webhook_secret
-       kyc_webhook_secret_previous bootstrap_operador_password bootstrap_cumplimiento_password)
+       kyc_webhook_secret_previous mfa_encryption_key mfa_encryption_key_previous
+       bootstrap_operador_password bootstrap_cumplimiento_password)
 declare -A uid_of=()
 for name in "${files[@]}"; do uid_of[$name]=65532; done
 uid_of[postgres_password]=70
@@ -233,11 +238,12 @@ db_password db_owner_password "$owner_user" owner
 ensure db_app_password 32 app
 ensure jwt_secret 64 jwt
 
-# Webhook secrets: on rotation the replaced value becomes *_previous, which the backend
-# still accepts, so deliveries signed by the provider keep verifying while it switches.
-# An empty *_previous file means there is none.
-for key in spei kyc; do
-  name="${key}_webhook_secret"
+# Webhook secrets and the MFA key: on rotation the replaced value becomes *_previous,
+# which the backend still accepts (webhooks: deliveries the provider signed with it;
+# mfa: TOTP secrets not re-encrypted yet). An empty *_previous file means there is none.
+declare -A rotable=([spei]=spei_webhook_secret [kyc]=kyc_webhook_secret [mfa]=mfa_encryption_key)
+for key in spei kyc mfa; do
+  name="${rotable[$key]}"
   if [[ -n "${rotating[$key]:-}" && -s "$dir/$name" ]]; then
     old="$(read_secret "$name")"
     write_secret "${name}_previous" "$old"
@@ -292,6 +298,9 @@ fi
 if [[ -n "${rotating[jwt]:-}${rotating[spei]:-}${rotating[kyc]:-}" ]]; then
   info "apply the new secrets with: $compose up -d --force-recreate backend"
 fi
+if [[ -n "${rotating[mfa]:-}" ]]; then
+  info "MFA key rotated. Run: $compose up -d --force-recreate migrate backend (migrate re-encrypts the TOTP secrets); check its log says so, then: $0 --clear-previous mfa and recreate the backend"
+fi
 webhooks=""
 for key in spei kyc; do
   if [[ -n "${rotating[$key]:-}" ]]; then webhooks+="${webhooks:+,}$key"; fi
@@ -299,6 +308,6 @@ done
 if [[ -n "$webhooks" ]]; then
   info "give the provider its new webhook secret; once it signs with it, run $0 --clear-previous $webhooks and recreate the backend"
 fi
-if [[ -n "${clearing[spei]:-}${clearing[kyc]:-}" ]]; then
-  info "previous webhook secret cleared: $compose up -d --force-recreate backend"
+if [[ -n "${clearing[spei]:-}${clearing[kyc]:-}${clearing[mfa]:-}" ]]; then
+  info "previous secret cleared: $compose up -d --force-recreate backend"
 fi

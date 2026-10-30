@@ -13,6 +13,7 @@ use sqlx::PgPool;
 use crate::{
     auth::password,
     config::{Config, LoginAplicacion},
+    crypto::cifrado::Cifrador,
     crypto::scram,
     db::{self, Rol},
     error::AppResult,
@@ -38,6 +39,15 @@ pub async fn ejecutar(pool: &PgPool, cfg: &Config) -> AppResult<()> {
     } else if !cfg.pld.bootstrap_emails.is_empty() || cfg.pld.bootstrap_password.is_some() {
         // En producción el DBA da de alta a los oficiales como dueño del esquema.
         tracing::warn!("BOOTSTRAP_CUMPLIMIENTO_* solo se usa con MODO_DEMO; se ignora");
+    }
+    // Rotación de la clave de los secretos TOTP: con las dos claves, todo queda
+    // cifrado con la vigente y la anterior puede retirarse.
+    if let (Some(clave), Some(anterior)) = (&cfg.mfa.clave, &cfg.mfa.clave_anterior) {
+        let n = crate::auth::mfa::recifrar_secretos(pool, &Cifrador::nuevo(clave, Some(anterior))).await?;
+        tracing::info!(
+            recifrados = n,
+            "secretos TOTP cifrados con la clave vigente; MFA_CLAVE_CIFRADO_ANTERIOR ya puede retirarse"
+        );
     }
     Ok(())
 }

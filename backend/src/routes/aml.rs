@@ -21,6 +21,8 @@
 //! | GET  | `/aml/relevantes` | cumplimiento / auditor: registro trimestral de operaciones relevantes |
 //! | GET  | `/aml/bitacora/verificacion` | cumplimiento / auditor: recalcula hashes y sellos de la bitácora |
 //!
+//! Toda ruta exige una sesión con segundo factor (TOTP) verificado.
+//!
 //! CLIENTE y OPERADOR reciben 403 en toda ruta y AUDITOR en todo POST. El rol
 //! se comprueba en una capa de las rutas ([`exigir_rol`]) **antes** de leer la
 //! ruta, la query o el cuerpo: quien no es de cumplimiento recibe 403 aunque la
@@ -81,8 +83,11 @@ pub fn rutas(estado: AppState) -> Router<AppState> {
 
 /// Capa de las rutas de la consola: autentica y exige el rol antes que
 /// cualquier extractor del handler (ruta, query, cuerpo). GET: cumplimiento o
-/// auditor; cualquier otro método: cumplimiento. El `Usuario` validado viaja en
-/// las extensiones de la petición, así que el handler no vuelve a consultar la
+/// auditor; cualquier otro método: cumplimiento. Además, la sesión debe haber
+/// verificado el segundo factor (`MFA_REQUERIDO`): el extractor ya rechaza al
+/// personal sin él, y esta comprobación lo garantiza en la frontera de la
+/// consola aunque esa política cambiara. El `Usuario` validado viaja en las
+/// extensiones de la petición, así que el handler no vuelve a consultar la
 /// base de datos para extraerlo.
 async fn exigir_rol(u: Usuario, mut req: Request, next: Next) -> Result<Response, AppError> {
     if req.method() == Method::GET || req.method() == Method::HEAD {
@@ -90,6 +95,7 @@ async fn exigir_rol(u: Usuario, mut req: Request, next: Next) -> Result<Response
     } else {
         u.exigir_cumplimiento()?;
     }
+    u.exigir_mfa()?;
     req.extensions_mut().insert(u);
     Ok(next.run(req).await)
 }
