@@ -27,7 +27,7 @@
 # plus the usual HTTPS_PROXY/HTTP_PROXY/NO_PROXY build args (predefined by BuildKit and
 # kept out of the image history).
 
-FROM docker.io/library/node:22.23.4-trixie-slim@sha256:2117f713a417f3aff682ac8f5bc2ebbdf1beed51f36e67ab1e0fd3866b6d2d8f AS node
+FROM docker.io/library/node:26.12.0-trixie-slim@sha256:e556a144463cc8dc53afe8de6d2fa0db5c132fd39ffa232c17641bd40df2bf11 AS node
 
 # ---------------------------------------------------------------------------------------
 # deps: exact dependency tree from package-lock.json (dev dependencies included: the
