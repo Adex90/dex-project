@@ -67,7 +67,7 @@ x-bootstrap-env: &bootstrap-env
 services:
   db:
     <<: *hardening
-    image: docker.io/library/postgres:16.15-alpine@sha256:0cefaabd882e42bcb2a2f3dc56d3ce4770560ba62fd7f197f1a2e008fd5731ab
+    image: docker.io/library/postgres:18.4-alpine@sha256:9a8afca54e7861fd90fab5fdf4c42477a6b1cb7d293595148e674e0a3181de15
     user: "70:70"
     environment:
       # Bootstrap superuser: break-glass administration only, used by no service.
@@ -242,7 +242,7 @@ services:
 
   nginx:
     <<: *hardening
-    image: docker.io/library/nginx:1.30.6-alpine@sha256:47928bf67eb62a1863cb08d9ecb52d3e704304ba614eaee17884204677702951
+    image: docker.io/library/nginx:1.31.0-alpine@sha256:2f07d83bf561b506400dc183b1b2003803e39efbd22451f848adaba14d28c7c7
     user: "101:101"
     environment:
       PUBLIC_HOST: ${PUBLIC_HOST:?set PUBLIC_HOST}
