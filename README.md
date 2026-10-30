@@ -505,7 +505,7 @@ into `aml.alertas` and `GET /api/v1/operaciones/alertas` was removed.
     change the secret (trigger). That change, like every enrollment, code and
     reset, is recorded in `kyc.eventos_autenticacion` (immutable).
 - **Lost device.** The DBA, as the schema owner (`scripts/db-client.sh` on a
-  single host), runs:
+  single host, `scripts/db-tunnel.sh --psql` on AWS), runs:
 
   ```sql
   UPDATE kyc.credenciales
@@ -758,7 +758,8 @@ ledger audit; read-only on `/api/v1/aml`) and `CUMPLIMIENTO` (compliance
 officer: the AML/PLD console under `/api/v1/aml`). Unfreezing a client,
 releasing AML holds and changing risk rules need a second officer (four-eyes,
 enforced in the database), so staff at least two `CUMPLIMIENTO` users.
-Internal users are provisioned by the schema owner, like operators; with
+Internal users are provisioned by the schema owner, like operators (on AWS
+through the Session Manager tunnel, DEPLOYMENT.md §4.1); with
 `MODO_DEMO=true`, `BOOTSTRAP_CUMPLIMIENTO_EMAILS` / `_PASSWORD` create demo
 officers on startup, each named after the local part of their email
 ("Cumplimiento oficial1").

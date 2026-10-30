@@ -835,6 +835,39 @@ variable "rds_ca_bundle_pem" {
 }
 
 # -----------------------------------------------------------------------------------------
+# DBA access (bastion.tf)
+# -----------------------------------------------------------------------------------------
+
+variable "dba_bastion_enabled" {
+  description = "Create the DBA access path: a bastion reachable only through Session Manager (no inbound rule, no public address), its ssmmessages and ec2messages endpoints, the database rule that admits it and the dba-tunnel IAM policy. false removes all of it, for example between maintenance windows; true recreates it from the latest Amazon Linux 2023 AMI."
+  type        = bool
+  default     = true
+}
+
+variable "dba_bastion_instance_type" {
+  description = "Instance type of the DBA bastion. It only relays the port forward, so the smallest burstable type is enough. Graviton (t4g) and x86 (t3) types both work: the AMI follows the type's architecture."
+  type        = string
+  default     = "t4g.nano"
+}
+
+variable "dba_bastion_availability_zone" {
+  description = "Zone of the DBA bastion's app subnet (one of the VPC's zones). Null: the first zone. The bastion holds no state, so an apply moves it out of an impaired zone."
+  type        = string
+  default     = null
+}
+
+variable "dba_session_kms_key_arn" {
+  description = "KMS key the account's Session Manager preferences use to encrypt session data, if they set one. The bastion's role may decrypt with it and DBAs may generate data keys with it; sessions fail without that. Null when the preferences set no key."
+  type        = string
+  default     = null
+
+  validation {
+    condition     = var.dba_session_kms_key_arn == null || can(regex("^arn:aws[a-z-]*:kms:[a-z0-9-]+:[0-9]{12}:key/", var.dba_session_kms_key_arn))
+    error_message = "dba_session_kms_key_arn must be a KMS key ARN (arn:aws:kms:<region>:<account>:key/<id>)."
+  }
+}
+
+# -----------------------------------------------------------------------------------------
 # Keys, secrets and logs
 # -----------------------------------------------------------------------------------------
 

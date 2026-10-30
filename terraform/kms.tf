@@ -4,10 +4,11 @@
 #   secrets Secrets Manager: application secrets and the RDS-managed master user secret
 #   logs    CloudWatch Logs (ECS, VPC flow, RDS, RDS Proxy, WAF)
 #   ecr     ECR image encryption
+#   ebs     EBS volumes (the DBA bastion's root volume)
 #
 # Key policies delegate to IAM in this account (the root statement); IAM policies in this
-# configuration then grant each role only the key it needs. RDS, ECR and Secrets Manager
-# use the keys through grants created on behalf of the deploying principal. Only
+# configuration then grant each role only the key it needs. RDS, ECR, Secrets Manager and
+# EC2 (EBS) use the keys through grants created on behalf of the deploying principal. Only
 # CloudWatch Logs needs an explicit service statement.
 
 locals {
@@ -114,4 +115,25 @@ resource "aws_kms_key" "ecr" {
 resource "aws_kms_alias" "ecr" {
   name          = "alias/${local.name}/ecr"
   target_key_id = aws_kms_key.ecr.key_id
+}
+
+# Kept when dba_bastion_enabled is false: switching the bastion off and on must not
+# schedule a key deletion every time.
+resource "aws_kms_key" "ebs" {
+  description             = "${local.name}: EBS volumes (DBA bastion)"
+  enable_key_rotation     = true
+  rotation_period_in_days = 365
+  deletion_window_in_days = var.kms_deletion_window_days
+
+  policy = jsonencode({
+    Version   = "2012-10-17"
+    Statement = [local.kms_root_statement]
+  })
+
+  tags = { Name = "${local.name}-ebs" }
+}
+
+resource "aws_kms_alias" "ebs" {
+  name          = "alias/${local.name}/ebs"
+  target_key_id = aws_kms_key.ebs.key_id
 }

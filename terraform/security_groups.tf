@@ -8,14 +8,19 @@
 #             out: VPC endpoints 443; S3 (ECR layers) 443
 #   migrate   in : none
 #             out: db 5432; VPC endpoints 443; S3 (ECR layers) 443
+#   dba_bastion (bastion.tf, only with dba_bastion_enabled)
+#             in : none (Session Manager uses the agent's outbound channel)
+#             out: db 5432; VPC endpoints 443
 #   db_proxy  in : 5432 from backend
 #             out: db 5432
-#   db        in : 5432 from db_proxy and migrate only
+#   db        in : 5432 from db_proxy, migrate and dba_bastion only
 #             out: none
-#   endpoints in : 443 from backend, frontend, migrate
+#   endpoints in : 443 from backend, frontend, migrate, dba_bastion
 #             out: none
 #
 # A security group created by Terraform starts without the default allow-all egress rule.
+# The db and endpoints group descriptions predate the bastion: an EC2 group description
+# cannot change in place (Terraform would replace the group), so they stay as they are.
 
 resource "aws_security_group" "alb" {
   name        = "${local.name}-alb"
