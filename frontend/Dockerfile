@@ -27,7 +27,7 @@
 # plus the usual HTTPS_PROXY/HTTP_PROXY/NO_PROXY build args (predefined by BuildKit and
 # kept out of the image history).
 
-FROM docker.io/library/node:22.23.4-trixie-slim@sha256:2117f713a417f3aff682ac8f5bc2ebbdf1beed51f36e67ab1e0fd3866b6d2d8f AS node
+FROM docker.io/library/node:26.12.0-trixie-slim@sha256:e556a144463cc8dc53afe8de6d2fa0db5c132fd39ffa232c17641bd40df2bf11 AS node
 
 # ---------------------------------------------------------------------------------------
 # deps: exact dependency tree from package-lock.json (dev dependencies included: the
@@ -84,7 +84,7 @@ RUN case "${NEXT_PUBLIC_API_URL:-}" in \
 # ---------------------------------------------------------------------------------------
 # runtime: distroless Node.js 22 (no shell, no package manager), uid/gid 65532.
 # ---------------------------------------------------------------------------------------
-FROM gcr.io/distroless/nodejs22-debian13:nonroot@sha256:10747a1323be68f206aed893599d43e6697ad67257e7c42703553f99fbce3d33 AS runtime
+FROM gcr.io/distroless/nodejs22-debian13:nonroot@sha256:8ad9cc935b7843c4024b7e1487b5ef472c354ea847b97c667023e2618552607e AS runtime
 # The base image's default user is 65532: create /app and its files as root, so the
 # service user can neither modify nor replace application code even on a writable rootfs.
 USER 0:0
