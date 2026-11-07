@@ -179,7 +179,7 @@ func orDefault(s, d string) string {
 
 type stateFile struct {
 	Leaves   []string          `json:"leaves"`
-	Pool     map[string]string `json:"pool"` // X, Y, R0, R1
+	Pool     map[string]string `json:"pool"` // X, Y, R0, R1, and the fresh oracle "price" (absent = stale: refunds only)
 	TNow     uint64            `json:"tNow"`
 	N        int               `json:"batchSize"`
 	MinSwaps int               `json:"minSwaps"`
@@ -211,6 +211,9 @@ func batchWitness(args []string) error {
 	}
 	pb := func(k string) *big.Int { v, _ := new(big.Int).SetString(st.Pool[k], 10); return v }
 	pool := batcher.Pool{X: pb("X"), Y: pb("Y"), R0: pb("R0"), R1: pb("R1")}
+	if _, ok := st.Pool["price"]; ok {
+		pool.Price = pb("price")
+	}
 	var cands []batcher.Candidate
 	for i := range st.Intents {
 		it := &st.Intents[i]

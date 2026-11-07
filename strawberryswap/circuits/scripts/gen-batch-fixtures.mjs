@@ -83,7 +83,8 @@ for (const u of users) {
 }
 
 // ---- 3. the Go Automator plans the batch and proves it
-const pool = { X: 3_000_000n * U, Y: 6_000_000n * U, R0: 1_000_000n * U, R1: 2_000_000n * U };
+// price: the fresh zk-oracle price the batch is checked against (DarkPool I5); BatchSwapE2E sets the same value.
+const pool = { X: 3_000_000n * U, Y: 6_000_000n * U, R0: 1_000_000n * U, R1: 2_000_000n * U, price: 2n * U };
 const state = {
   leaves: T.leaves.map(String), pool: Object.fromEntries(Object.entries(pool).map(([a, b]) => [a, b.toString()])), tNow: Number(TNOW), batchSize: N, minSwaps: 2,
   intents: users.map((u) => ({ dir: u.dir, value: u.amount.toString(), destPubKey: u.pub.toString(), refundPubKey: u.pub.toString(), destBlinding: det(u.label + ".dest").toString(), minOut: u.minOut.toString(), deadline: Number(u.deadline) })),
