@@ -9,3 +9,4 @@ infra/terraform/**/.terraform/
 *.tfvars
 !*.tfvars.example
 .env*
+__pycache__/

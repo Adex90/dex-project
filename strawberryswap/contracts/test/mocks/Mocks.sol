@@ -81,13 +81,13 @@ contract MockERC20 is IERC20Min {
         return true;
     }
 
-    function transfer(address to, uint256 a) external override returns (bool) {
+    function transfer(address to, uint256 a) external virtual override returns (bool) {
         balanceOf[msg.sender] -= a;
         balanceOf[to] += a;
         return true;
     }
 
-    function transferFrom(address f, address to, uint256 a) external override returns (bool) {
+    function transferFrom(address f, address to, uint256 a) external virtual override returns (bool) {
         uint256 al = allowance[f][msg.sender];
         if (al != type(uint256).max) allowance[f][msg.sender] = al - a;
         balanceOf[f] -= a;

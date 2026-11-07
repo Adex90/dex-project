@@ -75,7 +75,7 @@ contract SearcherExecutor is IFlashRebalancer, ReentrancyGuard {
         if (!_inFlight) revert NoActiveRebalance();
         if (initiator != address(this)) revert NotInitiator();
 
-        (uint256 pay0, uint256 pay1, uint256 treasuryPay) = abi.decode(data, (uint256, uint256, uint256));
+        (uint256 pay0, uint256 pay1,) = abi.decode(data, (uint256, uint256, uint256)); // the Treasury cut is pulled by the pool
         if (pay0 > 0) token0.safeTransfer(address(pool), pay0);
         if (pay1 > 0) token1.safeTransfer(address(pool), pay1);
     }
