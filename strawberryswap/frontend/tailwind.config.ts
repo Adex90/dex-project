@@ -1,30 +1,26 @@
 import type { Config } from "tailwindcss";
 
-// Palette: bank-terminal blacks + risograph zine accents. All contrast pairs below clear WCAG AA on `ink`.
+// Sober midnight palette. Contrast (on `bg`): text 13.6:1, muted 6.2:1, accent 8.1:1 — all clear WCAG AA.
 const config: Config = {
   content: ["./src/**/*.{ts,tsx}"],
   theme: {
     extend: {
       colors: {
-        ink: "#0a0a0b", // page
-        slab: "#141416", // panels
-        rule: "#2c2d33", // hairlines
-        paper: "#ece6d6", // zine paper / primary text
-        ash: "#9a9aa3", // secondary text
-        berry: "#ff2d55", // strawberry red: danger / brand
-        acid: "#d4ff3a", // acid yellow: positive / action
-        ice: "#7df9ff", // data highlight
+        bg: "#0b0e14", // page
+        surface: "#0f131b", // panels / inputs
+        rule: "#232a36", // hairlines
+        text: "#d9dde5",
+        muted: "#8d95a6",
+        accent: "#8fb4ff", // links, focus, primary action
+        pos: "#86b98f", // positive / confirmed
+        neg: "#d98585", // errors
+        warn: "#d1b06b", // cautions
       },
       fontFamily: {
-        // System stacks only: an "indestructible" site must not depend on a font CDN.
-        mono: ["ui-monospace", "SFMono-Regular", "Menlo", "Consolas", "monospace"],
-        slab: ["Impact", "Haettenschweiler", "Arial Narrow Bold", "Arial Black", "sans-serif"],
-        sans: ["system-ui", "-apple-system", "Segoe UI", "Helvetica Neue", "Arial", "sans-serif"],
-      },
-      boxShadow: {
-        punk: "6px 6px 0 0 #ff2d55",
-        acid: "6px 6px 0 0 #d4ff3a",
-        paper: "6px 6px 0 0 #ece6d6",
+        // System stacks only: the site must not depend on a font CDN. Serifs resolve to Latin/Computer
+        // Modern when installed, otherwise to the platform's book serif.
+        serif: ['"Latin Modern Roman"', '"CMU Serif"', '"Computer Modern Serif"', '"Iowan Old Style"', '"Palatino Linotype"', "Palatino", "Georgia", "serif"],
+        mono: ['"Latin Modern Mono"', "ui-monospace", "SFMono-Regular", "Menlo", "Consolas", "monospace"],
       },
     },
   },

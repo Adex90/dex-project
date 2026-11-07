@@ -28,47 +28,48 @@ export function DarkPoolPanel({ account, ready }: { account: Address | undefined
   const canSend = ready && !!amountIn && !!pool.quote && !!config.automatorUrl && pool.status.kind !== "signing";
 
   return (
-    <Panel title="Dark Pool · swap" tag="fee 0.00%">
+    <Panel no="1" title="Dark Pool" tag="Retail fee 0.00%">
       {!pool.configured ? (
         <Notice tone="warn">No DarkPool address in this build. Set NEXT_PUBLIC_DARKPOOL_ADDRESS and rebuild.</Notice>
       ) : (
         <>
-          <div className="grid grid-cols-2 gap-4 md:grid-cols-4">
+          <div className="grid grid-cols-2 gap-x-8 gap-y-5">
             <Stat label={`Reserve ${s?.symbol0 ?? "T0"}`} value={fmt(s?.reserve0)} />
             <Stat label={`Reserve ${s?.symbol1 ?? "T1"}`} value={fmt(s?.reserve1)} />
-            <Stat label="Spot" value={fmt(price, 18, 6)} sub={s ? `${s.symbol1}/${s.symbol0}` : undefined} tone="ice" />
+            <Stat label="Spot" value={fmt(price, 18, 6)} sub={s ? `${s.symbol1}/${s.symbol0}` : undefined} tone="info" />
             <Stat
               label="MEV bounty"
               value={!s ? "—" : s.extractable === undefined ? "oracle stale" : fmt(s.extractable)}
               sub={s ? `${Number(s.extractionBps) / 100}% → Treasury` : undefined}
-              tone="acid"
+              tone="pos"
             />
           </div>
 
-          <div className="mt-5 grid gap-3">
+          <div className="mt-8 grid gap-4">
             <div className="flex items-end gap-3">
               <label className="flex-1">
-                <span className="label">You sell · {inSym || "—"}</span>
+                <span className="label">Sell · {inSym || "—"}</span>
                 <input className="field" inputMode="decimal" placeholder="0.0" value={amount} onChange={(e) => setAmount(e.target.value)} aria-label="Amount to sell" />
               </label>
               <button className="btn-ghost !px-3 !py-2" onClick={() => setZeroForOne((v) => !v)} aria-label="Flip direction" title="Flip direction">⇅</button>
             </div>
-            <div className="border-2 border-rule bg-ink px-3 py-2">
-              <div className="label">You receive (quote, before slippage) · {outSym || "—"}</div>
+            <div className="border border-rule px-3 py-2">
+              <div className="label">Receive (quote, before slippage) · {outSym || "—"}</div>
               <div className="num text-lg">{amountIn ? fmt(pool.quote) : "—"}</div>
             </div>
             <label className="flex items-center gap-3">
               <span className="label">Max slippage (bps)</span>
-              <input className="field !w-28 !py-1 !text-sm" inputMode="numeric" value={slippage} onChange={(e) => setSlippage(e.target.value)} aria-label="Max slippage in basis points" />
+              <input className="field !w-24 !py-1 !text-sm" inputMode="numeric" value={slippage} onChange={(e) => setSlippage(e.target.value)} aria-label="Max slippage in basis points" />
             </label>
             <button className="btn" disabled={!canSend} onClick={() => amountIn && void pool.submitIntent(amountIn, zeroForOne, slipBps)}>
-              {pool.status.kind === "signing" ? "Signing…" : "Sign & submit intent"}
+              {pool.status.kind === "signing" ? "Signing…" : "Sign and submit intent"}
             </button>
           </div>
 
           <Notice tone="warn">
-            PROOF LAYER NOT LIVE. This intent is a signed plaintext message to the Automator. Batch settlement hides your
-            trade on-chain, but the Automator can see it until the ZK note circuits ship. Do not treat this as private yet.
+            Proof layer not yet live. An intent is a signed plaintext message to the Automator. Batch settlement keeps
+            individual trades off the public chain, but the Automator can read them until the zero-knowledge note circuits
+            ship. Do not treat this as private.
           </Notice>
           {!config.automatorUrl ? <Notice tone="warn">No Automator URL in this build: quoting works, submission is disabled.</Notice> : null}
           {pool.status.kind === "sent" ? <Notice tone="ok">Intent queued · id {pool.status.id}. It settles with the next batch.</Notice> : null}

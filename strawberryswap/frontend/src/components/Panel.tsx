@@ -1,33 +1,43 @@
 import type { ReactNode } from "react";
 
-export function Panel({ title, tag, children, className = "" }: { title: string; tag?: string; children: ReactNode; className?: string }) {
+/** A numbered, ruled section (§ n Title). `tag` is a right-aligned caption. */
+export function Panel({ title, tag, no, children, className = "" }: { title: string; tag?: string; no?: string; children: ReactNode; className?: string }) {
   return (
-    <section className={`panel ${className}`}>
-      <header className="panel-head">
-        <h2>{title}</h2>
-        {tag ? <span className="opacity-70">{tag}</span> : null}
+    <section className={className}>
+      <header className="section-title">
+        {no ? <span className="section-no">§ {no}</span> : null}
+        <h2 className="font-normal">{title}</h2>
+        {tag ? <span className="label ml-auto">{tag}</span> : null}
       </header>
-      <div className="p-4">{children}</div>
+      <div className="pt-4">{children}</div>
     </section>
   );
 }
 
-export function Stat({ label, value, sub, tone = "paper" }: { label: string; value: string; sub?: string; tone?: "paper" | "acid" | "berry" | "ice" }) {
-  const color = { paper: "text-paper", acid: "text-acid", berry: "text-berry", ice: "text-ice" }[tone];
+type Tone = "default" | "pos" | "neg" | "info" | "warn";
+
+/** One figure: small-caps label, tabular value, optional sub-caption. */
+export function Stat({ label, value, sub, tone = "default" }: { label: string; value: string; sub?: string; tone?: Tone }) {
+  const color = { default: "text-text", pos: "text-pos", neg: "text-neg", info: "text-accent", warn: "text-warn" }[tone];
   return (
-    <div className="border-l-4 border-rule pl-3">
+    <div>
       <div className="label">{label}</div>
-      <div className={`num text-xl font-bold ${color}`}>{value}</div>
-      {sub ? <div className="num text-xs text-ash">{sub}</div> : null}
+      <div className={`num break-all text-xl ${color}`}>{value}</div>
+      {sub ? <div className="num text-xs text-muted">{sub}</div> : null}
     </div>
   );
 }
 
+/** Marginal note: thin coloured rule on the left, small body text. */
 export function Notice({ tone, children }: { tone: "warn" | "err" | "ok"; children: ReactNode }) {
   const style = {
-    warn: "border-acid text-acid",
-    err: "border-berry text-berry",
-    ok: "border-ice text-ice",
+    warn: "border-warn text-warn",
+    err: "border-neg text-neg",
+    ok: "border-pos text-pos",
   }[tone];
-  return <p role={tone === "err" ? "alert" : "status"} className={`mt-3 break-words border-2 border-dashed px-3 py-2 font-mono text-xs ${style}`}>{children}</p>;
+  return (
+    <p role={tone === "err" ? "alert" : "status"} className={`mt-4 break-words border-l-2 py-0.5 pl-3 text-[14px] leading-snug ${style}`}>
+      {children}
+    </p>
+  );
 }
