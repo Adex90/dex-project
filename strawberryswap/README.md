@@ -43,11 +43,11 @@ strawberryswap/
 │   │   └── derivatives/
 │   │       ├── OptionsMarket.sol   # MODULE 3  ZK-ERC1155 options, total coverage, European exercise
 │   │       └── SyntheticRWA.sol    # MODULE 4  capped-index long/short pairs + IZKDecoOracle
-│   ├── test/                       # (Phase 2) invariant + fuzz suites, mock verifiers
+│   ├── test/                       # unit / fuzz / invariant / real-proof integration suites + mocks + fixtures
 │   └── script/                     # (Phase 2) deterministic deploy
-├── circuits/                       # (Phase 2) Circom/Noir
+├── circuits/                       # Circom 2.1.9 (+ test harness, dev setup, fixture generator)
 │   ├── joinsplit/                  #   2-in/2-out note circuit (shield/transfer/unshield, assetId)
-│   ├── batch_swap/                 #   aggregated intent settlement
+│   ├── batch_swap/                 #   (NOT WRITTEN) aggregated intent settlement
 │   └── zkdeco_oracle/              #   TLS-session attestation for price feeds
 ├── frontend/                       # Next.js + TypeScript + Tailwind, `output: "export"` (static → IPFS)
 │   └── src/{app/{,trade},components,hooks,lib,styles}
@@ -110,6 +110,26 @@ cd bots/inventory-cpp && cmake -S . -B build && cmake --build build && ./build/s
 
 # infra
 cd infra/terraform/envs/prod && cp terraform.tfvars.example terraform.tfvars && terraform init && terraform plan
+```
+
+## Phase 5 deliverables
+
+| # | Deliverable | Status |
+|---|---|---|
+| 12 | `circuits/joinsplit` — Circom shielded-pool circuit (12,596 constraints) | 20 adversarial witness tests; **real Groth16 proofs verified on-chain** |
+| 13 | `circuits/zkdeco_oracle` — oracle circuit **skeleton** (21,637 constraints) | 22 witness tests; real proof settles a `SyntheticRWA` series. **Trust boundary: notary, not TLS** |
+| 14 | `contracts/src/verifiers/*`, `src/oracle/ZkDecoOracle.sol` — Groth16 + Poseidon adapters, notary-checked oracle | gas-capped verifier calls |
+| 15 | `contracts/test/` — 77 Foundry tests: unit, fuzz, **stateful invariants**, real-proof integration | all pass; 5/5 mutations caught |
+| 16 | `docs/INVARIANTS.md` — algebraic proofs of I-SUPPLY and I-K + findings | — |
+
+**Not delivered:** the `batch_swap` circuit (DarkPool's batch proofs are only mocked), an MPC ceremony (keys are
+single-party DEV keys), in-circuit TLS, an external audit. See `circuits/README.md` and `docs/INVARIANTS.md`.
+
+```bash
+# contracts: needs forge-std once, then everything runs offline
+cd contracts && forge install foundry-rs/forge-std --no-git && forge test
+# circuits (circom >= 2.1.9 on PATH or $CIRCOM)
+cd circuits && npm ci && npm run compile && node test/joinsplit.test.mjs && node test/zkdeco.test.mjs
 ```
 
 ## Known limitations (read before Phase 2)

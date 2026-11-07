@@ -10,6 +10,17 @@ optimizer = true
 optimizer_runs = 200
 via_ir = true
 bytecode_hash = "none"     # reproducible builds (verifiable against IPFS-published artifacts)
+fs_permissions = [{ access = "read", path = "./test/fixtures" }]
+
+[fuzz]
+runs = 1000                # per fuzz test; raise in CI (e.g. FOUNDRY_FUZZ_RUNS=10000)
+max_test_rejects = 200000
+
+[invariant]
+runs = 256
+depth = 64
+fail_on_revert = false     # handlers use try/catch and count reverts; unexpected reverts are not failures
+show_metrics = true
 
 [fmt]
 line_length = 110
