@@ -2,6 +2,8 @@
 
 import Link from "next/link";
 import { DarkPoolPanel } from "@/components/DarkPoolPanel";
+import { PrivateSwapPanel } from "@/components/PrivateSwapPanel";
+import { useDarkPool } from "@/hooks/useDarkPool";
 import { VaultPanel } from "@/components/VaultPanel";
 import { WalletBar } from "@/components/WalletBar";
 import { useWallet } from "@/hooks/useWallet";
@@ -9,6 +11,7 @@ import { useWallet } from "@/hooks/useWallet";
 export default function TradePage() {
   const wallet = useWallet();
   const ready = !!wallet.account && wallet.chainOk;
+  const pool = useDarkPool();
 
   return (
     <>
@@ -38,8 +41,12 @@ export default function TradePage() {
         ) : null}
 
         <div className="grid gap-x-16 gap-y-16 lg:grid-cols-2">
-          <DarkPoolPanel account={wallet.account} ready={ready} />
+          <DarkPoolPanel pool={pool} />
           <VaultPanel account={wallet.account} ready={ready} />
+        </div>
+
+        <div className="mt-16">
+          <PrivateSwapPanel account={wallet.account} ready={ready} pool={pool} />
         </div>
 
         <footer className="mt-20 border-t border-rule pt-4 text-[13px] text-muted">

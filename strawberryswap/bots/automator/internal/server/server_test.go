@@ -113,3 +113,25 @@ func (b blockingBackend) Submit(*intent.Intent) (string, error) {
 }
 func (b blockingBackend) Status(string) (service.Status, bool) { return service.Status{}, false }
 func (b blockingBackend) Info() service.Info                   { return service.Info{} }
+
+func TestCORSPreflightAndHeadersWithoutCredentials(t *testing.T) {
+	h := New(&fakeBackend{}, 4)
+	pre := do(h, "OPTIONS", "/v1/intents", "", "")
+	if pre.Code != 204 {
+		t.Fatalf("preflight status %d", pre.Code)
+	}
+	for k, want := range map[string]string{"Access-Control-Allow-Origin": "*", "Access-Control-Allow-Methods": "GET, POST, OPTIONS", "Access-Control-Allow-Headers": "Content-Type"} {
+		if got := pre.Header().Get(k); got != want {
+			t.Errorf("%s = %q, want %q", k, got, want)
+		}
+	}
+	post := do(h, "POST", "/v1/intents", "application/json", good)
+	if post.Header().Get("Access-Control-Allow-Origin") != "*" {
+		t.Error("actual responses must carry the CORS header too")
+	}
+	for _, r := range []*httptest.ResponseRecorder{pre, post} {
+		if r.Header().Get("Access-Control-Allow-Credentials") != "" {
+			t.Error("credentials must never be allowed")
+		}
+	}
+}

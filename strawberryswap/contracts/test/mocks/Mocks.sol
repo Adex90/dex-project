@@ -62,12 +62,14 @@ contract MockHasher is IPoseidonHasher {
 
 contract MockERC20 is IERC20Min {
     string public name;
+    string public symbol; // the frontend reads symbol(); same as the name for these dev tokens
     uint8 public override decimals = 18;
     mapping(address => uint256) public override balanceOf;
     mapping(address => mapping(address => uint256)) public allowance;
 
     constructor(string memory n) {
         name = n;
+        symbol = n;
     }
 
     function mint(address to, uint256 a) external {

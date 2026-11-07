@@ -1,8 +1,10 @@
 package intent
 
 import (
+	"encoding/hex"
 	"encoding/json"
 	"math/big"
+	"os"
 	"strings"
 	"testing"
 )
@@ -85,5 +87,43 @@ func TestSealedOutputOnlyOpensWithTheOwnersKey(t *testing.T) {
 	b2, _ := in.Seal(1, big.NewInt(1234567))
 	if string(b2) == string(blob) {
 		t.Fatal("sealing must be randomised")
+	}
+}
+
+// A sealed output produced by THIS code must stay openable by the browser wallet (frontend/src/zk/notes.ts
+// `openSealedOutput`). testdata/sealed.golden.json is read by both test suites; regenerate with UPDATE_GOLDEN=1.
+func TestSealedGoldenForTheBrowserWallet(t *testing.T) {
+	const path = "../../testdata/sealed.golden.json"
+	type golden struct {
+		Blinding string `json:"blinding"`
+		AssetOut int    `json:"assetOut"`
+		Value    string `json:"value"`
+		Blob     string `json:"blob"`
+	}
+	if os.Getenv("UPDATE_GOLDEN") != "" {
+		in := valid()
+		in.DestBlinding, _ = new(big.Int).SetString("123456789012345678901234567890123456789", 10)
+		blob, err := in.Seal(1, big.NewInt(1999433000000000000))
+		if err != nil {
+			t.Fatal(err)
+		}
+		b, _ := json.MarshalIndent(golden{in.DestBlinding.String(), 1, "1999433000000000000", "0x" + hex.EncodeToString(blob)}, "", " ")
+		if err := os.WriteFile(path, b, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("missing golden (run with UPDATE_GOLDEN=1): %v", err)
+	}
+	var g golden
+	if err := json.Unmarshal(raw, &g); err != nil {
+		t.Fatal(err)
+	}
+	blinding, _ := new(big.Int).SetString(g.Blinding, 10)
+	blob, _ := hex.DecodeString(strings.TrimPrefix(g.Blob, "0x"))
+	asset, v, err := OpenOutput(blinding, blob)
+	if err != nil || asset != g.AssetOut || v.String() != g.Value {
+		t.Fatalf("golden does not open: %v %d %v", err, asset, v)
 	}
 }

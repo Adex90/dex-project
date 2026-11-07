@@ -71,7 +71,28 @@ func New(b Backend, maxInflight int) http.Handler {
 	})
 	mux.HandleFunc("GET /v1/info", func(w http.ResponseWriter, r *http.Request) { writeJSON(w, http.StatusOK, b.Info()) })
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusNoContent) })
-	return mux
+	return cors(mux)
+}
+
+// cors lets the static frontend (served from any origin: an IPFS gateway, an ENS name, localhost) call this API from
+// the browser. The policy is a constant wildcard on purpose:
+//   - privacy.Middleware strips `Origin` (and every other identifying header) before handlers run, so the server
+//     CANNOT reflect an origin, and must not want to;
+//   - it is safe because the API is credential-free: no cookies, no ambient authority, no per-client state — an
+//     intent is only useful if its note exists on-chain, and "Allow-Credentials" is never sent.
+func cors(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		h := w.Header()
+		h.Set("Access-Control-Allow-Origin", "*")
+		h.Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+		h.Set("Access-Control-Allow-Headers", "Content-Type")
+		h.Set("Access-Control-Max-Age", "600")
+		if r.Method == http.MethodOptions { // preflight for the JSON POST
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 func writeJSON(w http.ResponseWriter, code int, v any) {

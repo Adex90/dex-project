@@ -12,6 +12,8 @@ const env = {
   darkPool: process.env.NEXT_PUBLIC_DARKPOOL_ADDRESS,
   vault: process.env.NEXT_PUBLIC_VAULT_ADDRESS,
   automator: process.env.NEXT_PUBLIC_AUTOMATOR_URL,
+  deployBlock: process.env.NEXT_PUBLIC_DEPLOY_BLOCK,
+  logChunk: process.env.NEXT_PUBLIC_LOG_CHUNK,
 };
 
 function addr(v: string | undefined): Address | undefined {
@@ -30,5 +32,9 @@ export const config = {
   darkPool: addr(env.darkPool),
   vault: addr(env.vault),
   automatorUrl: env.automator && env.automator.length > 0 ? env.automator.replace(/\/$/, "") : undefined,
+  /** First block to scan for NoteInserted (the pool's deployment block). */
+  deployBlock: BigInt(env.deployBlock && /^\d+$/.test(env.deployBlock) ? env.deployBlock : "0"),
+  /** Blocks per eth_getLogs request (public RPCs cap this). */
+  logChunk: BigInt(env.logChunk && /^\d+$/.test(env.logChunk) ? env.logChunk : "2000"),
   pollMs: 12_000,
 } as const;

@@ -1,0 +1,21 @@
+{
+  "circuit": "joinsplit",
+  "devKeys": true,
+  "artifacts": {
+    "wasm": {
+      "path": "zk/joinsplit.wasm",
+      "sha256": "1bd7a854eff4b5fd1d3268e3d260d2e49c2ccaadf198e7a949d5c3df0b9144dd",
+      "bytes": 3117567
+    },
+    "zkey": {
+      "path": "zk/joinsplit.zkey",
+      "sha256": "3b1987395385b14c4cb79fe4c15db1389b0a26441700b1a375beae7a37836d94",
+      "bytes": 8350173
+    },
+    "vkey": {
+      "path": "zk/joinsplit.vkey.json",
+      "sha256": "27df09c725c1b1b315d60205a7087bd49c3b5127f60f13862ef74ae1466664a3",
+      "bytes": 4393
+    }
+  }
+}

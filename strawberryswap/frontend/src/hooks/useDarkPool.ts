@@ -3,10 +3,8 @@
 import { useCallback, useEffect, useState } from "react";
 import type { Address } from "viem";
 import { darkPoolAbi, erc20Abi } from "@/lib/abi";
-import { publicClient, getWalletClient } from "@/lib/clients";
+import { publicClient } from "@/lib/clients";
 import { config } from "@/lib/config";
-import { errMsg } from "@/lib/format";
-import { intentDomain, intentTypes, minOut, postIntent, randomNonce, type SwapIntent } from "@/lib/intent";
 import { usePolling } from "./usePolling";
 
 export interface PoolState {
@@ -50,22 +48,15 @@ async function loadPool(pool: Address): Promise<PoolState> {
   return { token0, token1, symbol0, symbol1, reserve0, reserve1, virtual0, virtual1, spot, k, extractable, feeBps, extractionBps };
 }
 
-export type IntentStatus =
-  | { kind: "idle" }
-  | { kind: "signing" }
-  | { kind: "sent"; id: string }
-  | { kind: "error"; message: string };
-
 /**
- * DarkPool state + quote + intent submission.
- * Swaps are NEVER sent to the pool directly: they are signed intents settled in batches by an Automator
- * (DarkPool.settleBatch). That is what keeps individual size and counterparty off-chain and out of the mempool.
+ * DarkPool market state + indicative quote. Swaps are never sent to the pool directly: they are shielded intents
+ * created and submitted by usePrivateSwap and settled in batches (DarkPool.settleBatch), which is what keeps
+ * individual size and counterparty off-chain and out of the mempool.
  */
-export function useDarkPool(account: Address | undefined) {
+export function useDarkPool() {
   const pool = config.darkPool;
   const { data: state, error, refresh } = usePolling(() => loadPool(pool!), config.pollMs, !!pool);
   const [quote, setQuote] = useState<bigint>();
-  const [status, setStatus] = useState<IntentStatus>({ kind: "idle" });
 
   const requestQuote = useCallback(
     async (amountIn: bigint | undefined, zeroForOne: boolean) => {
@@ -84,37 +75,5 @@ export function useDarkPool(account: Address | undefined) {
     if (!pool) setQuote(undefined);
   }, [pool]);
 
-  const submitIntent = useCallback(
-    async (amountIn: bigint, zeroForOne: boolean, slippageBps: bigint) => {
-      try {
-        const wallet = getWalletClient();
-        if (!pool || !wallet || !account) throw new Error("Connect a wallet first");
-        if (!config.automatorUrl) throw new Error("No Automator configured in this build");
-        const q = await publicClient.readContract({ address: pool, abi: darkPoolAbi, functionName: "getAmountOut", args: [amountIn, zeroForOne] });
-        const intent: SwapIntent = {
-          pool,
-          zeroForOne,
-          amountIn,
-          minAmountOut: minOut(q, slippageBps),
-          deadline: BigInt(Math.floor(Date.now() / 1000) + 600),
-          nonce: randomNonce(),
-        };
-        setStatus({ kind: "signing" });
-        const signature = await wallet.signTypedData({
-          account,
-          domain: intentDomain(config.chain.id, pool),
-          types: intentTypes,
-          primaryType: "SwapIntent",
-          message: intent,
-        });
-        const { id } = await postIntent(config.automatorUrl, intent, signature);
-        setStatus({ kind: "sent", id });
-      } catch (e) {
-        setStatus({ kind: "error", message: errMsg(e) });
-      }
-    },
-    [pool, account],
-  );
-
-  return { configured: !!pool, state, error, refresh, quote, requestQuote, submitIntent, status };
+  return { configured: !!pool, state, error, refresh, quote, requestQuote };
 }

@@ -1,31 +1,12 @@
 "use client";
 
-import { useEffect, useState } from "react";
-import type { Address } from "viem";
-import { useDarkPool } from "@/hooks/useDarkPool";
-import { fmt, parseAmount } from "@/lib/format";
-import { config } from "@/lib/config";
+import type { useDarkPool } from "@/hooks/useDarkPool";
+import { fmt } from "@/lib/format";
 import { Notice, Panel, Stat } from "./Panel";
 
-export function DarkPoolPanel({ account, ready }: { account: Address | undefined; ready: boolean }) {
-  const pool = useDarkPool(account);
-  const [zeroForOne, setZeroForOne] = useState(true);
-  const [amount, setAmount] = useState("");
-  const [slippage, setSlippage] = useState("50"); // bps
+/** Market data for the pool. Trading happens privately in § 3 (shielded wallet), never from this panel. */
+export function DarkPoolPanel({ pool }: { pool: ReturnType<typeof useDarkPool> }) {
   const s = pool.state;
-  const amountIn = parseAmount(amount);
-  const slipBps = BigInt(Math.min(Math.max(Number.parseInt(slippage, 10) || 0, 0), 1000));
-
-  const { requestQuote } = pool;
-  useEffect(() => {
-    const t = setTimeout(() => void requestQuote(amountIn, zeroForOne), 250); // debounce keystrokes
-    return () => clearTimeout(t);
-  }, [amountIn, zeroForOne, requestQuote]);
-
-  const inSym = s ? (zeroForOne ? s.symbol0 : s.symbol1) : "";
-  const outSym = s ? (zeroForOne ? s.symbol1 : s.symbol0) : "";
-  const price = s ? s.spot : undefined;
-  const canSend = ready && !!amountIn && !!pool.quote && !!config.automatorUrl && pool.status.kind !== "signing";
 
   return (
     <Panel no="1" title="Dark Pool" tag="Retail fee 0.00%">
@@ -36,7 +17,7 @@ export function DarkPoolPanel({ account, ready }: { account: Address | undefined
           <div className="grid grid-cols-2 gap-x-8 gap-y-5">
             <Stat label={`Reserve ${s?.symbol0 ?? "T0"}`} value={fmt(s?.reserve0)} />
             <Stat label={`Reserve ${s?.symbol1 ?? "T1"}`} value={fmt(s?.reserve1)} />
-            <Stat label="Spot" value={fmt(price, 18, 6)} sub={s ? `${s.symbol1}/${s.symbol0}` : undefined} tone="info" />
+            <Stat label="Spot" value={fmt(s?.spot, 18, 6)} sub={s ? `${s.symbol1}/${s.symbol0}` : undefined} tone="info" />
             <Stat
               label="MEV bounty"
               value={!s ? "—" : s.extractable === undefined ? "oracle stale" : fmt(s.extractable)}
@@ -44,36 +25,10 @@ export function DarkPoolPanel({ account, ready }: { account: Address | undefined
               tone="pos"
             />
           </div>
-
-          <div className="mt-8 grid gap-4">
-            <div className="flex items-end gap-3">
-              <label className="flex-1">
-                <span className="label">Sell · {inSym || "—"}</span>
-                <input className="field" inputMode="decimal" placeholder="0.0" value={amount} onChange={(e) => setAmount(e.target.value)} aria-label="Amount to sell" />
-              </label>
-              <button className="btn-ghost !px-3 !py-2" onClick={() => setZeroForOne((v) => !v)} aria-label="Flip direction" title="Flip direction">⇅</button>
-            </div>
-            <div className="border border-rule px-3 py-2">
-              <div className="label">Receive (quote, before slippage) · {outSym || "—"}</div>
-              <div className="num text-lg">{amountIn ? fmt(pool.quote) : "—"}</div>
-            </div>
-            <label className="flex items-center gap-3">
-              <span className="label">Max slippage (bps)</span>
-              <input className="field !w-24 !py-1 !text-sm" inputMode="numeric" value={slippage} onChange={(e) => setSlippage(e.target.value)} aria-label="Max slippage in basis points" />
-            </label>
-            <button className="btn" disabled={!canSend} onClick={() => amountIn && void pool.submitIntent(amountIn, zeroForOne, slipBps)}>
-              {pool.status.kind === "signing" ? "Signing…" : "Sign and submit intent"}
-            </button>
-          </div>
-
-          <Notice tone="warn">
-            Proof layer not yet live. An intent is a signed plaintext message to the Automator. Batch settlement keeps
-            individual trades off the public chain, but the Automator can read them until the zero-knowledge note circuits
-            ship. Do not treat this as private.
-          </Notice>
-          {!config.automatorUrl ? <Notice tone="warn">No Automator URL in this build: quoting works, submission is disabled.</Notice> : null}
-          {pool.status.kind === "sent" ? <Notice tone="ok">Intent queued · id {pool.status.id}. It settles with the next batch.</Notice> : null}
-          {pool.status.kind === "error" ? <Notice tone="err">{pool.status.message}</Notice> : null}
+          <p className="mt-6 text-[15px] text-muted">
+            Swaps execute in <em>batches</em> at one uniform price derived from the curve; only the net flow per asset is public. To trade,
+            use the shielded wallet in § 3 — your keys and trade parameters stay on this device.
+          </p>
           {pool.error ? <Notice tone="err">Pool read failed: {pool.error}</Notice> : null}
         </>
       )}

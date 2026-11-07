@@ -145,6 +145,22 @@ cd circuits && npm ci && npm run compile && node test/joinsplit.test.mjs && node
 **Open:** the frontend still posts a legacy plaintext intent (client-side proving not wired); `settleBatch` costs ≈3.05M
 gas at N=4, dominated by on-chain Merkle insertions (SNARK verification is 297k); keys are single-party DEV keys.
 
+## Phase 7 deliverables
+
+| # | Deliverable | Status |
+|---|---|---|
+| 22 | `frontend/src/zk/` — in-browser crypto core: note/intent model, Poseidon tree, JoinSplit witness builder, stateful wallet `ZkEngine` | 9 wallet tests + 5 cross-language golden tests (vs Go + circuits); real-proof test (3 Groth16 proofs verify against the vkey) |
+| 23 | `prover.worker.ts` + typed `protocol.ts` / `client.ts` — Web Worker doing download, hash-verification, witness, proving; keys and notes never on the UI thread | static export builds clean; artifacts hash-pinned into the bundle |
+| 24 | Hooks `useProver`, `useShieldedWallet`, `usePrivateSwap`; `PrivateSwapPanel` (§ 3); legacy plaintext intent path removed | typechecks strictly |
+| 25 | `lib/automator.ts` — secure transport (URL policy, no credentials/referrer/redirects, batch-key check); Automator gains CORS | unit-tested; Go server tests |
+| 26 | `e2e/run.mjs` — anvil + real contracts + static site in real Chromium (mock wallet) + the Go Automator, through to withdrawal | passes: browser proofs accepted on-chain; Automator settles; payout received |
+| 27 | `docs/CLIENT_SIDE_PROVING.md` | — |
+
+```bash
+cd frontend && npm ci && npm run test:zk && npm run test:zk:proofs   # needs circuits/build (see circuits/README)
+cd e2e && AUTOMATOR_BIN=… SOLC=… node run.mjs                         # full stack, real browser
+```
+
 ## Known limitations (read before Phase 2)
 
 1. **Privacy edges leak.** `shield`/`unshield`/`depositNote`/`withdrawNote` reveal their amount. Berrycoin ↔
