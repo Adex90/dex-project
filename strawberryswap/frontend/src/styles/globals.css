@@ -1,0 +1,53 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root { color-scheme: dark; }
+
+html, body { background: #0a0a0b; }
+
+body {
+  @apply font-sans text-paper antialiased;
+  /* ledger-paper grid + photocopy grain, both inline so the page needs zero network requests */
+  background-image:
+    linear-gradient(rgba(236, 230, 214, 0.035) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(236, 230, 214, 0.035) 1px, transparent 1px),
+    url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='160' height='160'><filter id='n'><feTurbulence type='fractalNoise' baseFrequency='.9' numOctaves='2' stitchTiles='stitch'/><feColorMatrix values='0 0 0 0 1  0 0 0 0 1  0 0 0 0 1  0 0 0 .05 0'/></filter><rect width='100%' height='100%' filter='url(%23n)'/></svg>");
+  background-size: 32px 32px, 32px 32px, 160px 160px;
+}
+
+::selection { background: #d4ff3a; color: #0a0a0b; }
+
+@layer components {
+  /* Statement panel: bank-ledger header strip + hard-offset zine shadow */
+  .panel { @apply relative border-2 border-paper bg-slab shadow-punk; }
+  .panel-head {
+    @apply flex items-center justify-between border-b-2 border-paper bg-paper px-3 py-1.5
+           font-mono text-[11px] font-bold uppercase tracking-[0.18em] text-ink;
+  }
+  .label { @apply font-mono text-[10px] uppercase tracking-[0.2em] text-ash; }
+  .num { @apply font-mono tabular-nums; }
+  .field {
+    @apply w-full border-2 border-paper bg-ink px-3 py-2 font-mono text-lg tabular-nums text-paper
+           placeholder:text-ash/60 focus:border-acid focus:outline-none;
+  }
+  .btn {
+    @apply border-2 border-ink bg-acid px-4 py-2 font-slab text-lg uppercase tracking-wider text-ink
+           shadow-[4px_4px_0_0_#ece6d6] transition-transform
+           hover:translate-x-[2px] hover:translate-y-[2px] hover:shadow-[2px_2px_0_0_#ece6d6]
+           active:translate-x-[4px] active:translate-y-[4px] active:shadow-none
+           disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:translate-x-0 disabled:hover:translate-y-0
+           disabled:hover:shadow-[4px_4px_0_0_#ece6d6] focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ice;
+  }
+  .btn-ghost { @apply btn bg-ink text-paper border-paper shadow-[4px_4px_0_0_#ff2d55]; }
+  .sticker {
+    @apply inline-block border-2 border-ink bg-berry px-2 py-0.5 font-slab text-sm uppercase tracking-widest text-ink;
+  }
+  /* ransom-note headline fragments */
+  .ransom { @apply inline-block px-2 leading-none; }
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .ticker-track { animation: ticker 40s linear infinite; }
+  @keyframes ticker { from { transform: translateX(0); } to { transform: translateX(-50%); } }
+}

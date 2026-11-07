@@ -50,11 +50,11 @@ strawberryswap/
 │   ├── batch_swap/                 #   aggregated intent settlement
 │   └── zkdeco_oracle/              #   TLS-session attestation for price feeds
 ├── frontend/                       # Next.js + TypeScript + Tailwind, `output: "export"` (static → IPFS)
-│   └── src/{app,components,lib,styles}
+│   └── src/{app/{,trade},components,hooks,lib,styles}
 ├── bots/
 │   ├── automator-go/               # intent mempool, batching, proving orchestration, relayer (Go)
-│   ├── searcher-rust/              # flashRebalance searcher: LVR detection, tx building (Rust)
-│   └── inventory-cpp/              # low-latency inventory control / quoting core (C++20)
+│   ├── searcher-rust/              # (reserved) production RPC / signer adapters
+│   └── inventory-cpp/              # Searcher core: LOB signals, Avellaneda–Stoikov, curve planner (C++20)
 ├── mpc/tss-vault/                  # (Phase 4) threshold-ECDSA/EdDSA corporate vault coordinator
 ├── infra/
 │   ├── terraform/{modules/{network,ec2-bots,rds,s3-ipfs-pin},envs/prod}
@@ -86,6 +86,31 @@ strawberryswap/
 |---|---|---|
 | 6 | `contracts/src/banking/SovereignBank.sol` — `DemandDeposits` (pure custody) + `TimeDeposits` (fixed term, optional routing) + registry facade | written, compiles |
 | 7 | `contracts/src/funds/StrategyVault.sol` — non-custodial fund, `executeTrade()` only, per-share high-water-mark performance fee | written, compiles |
+
+## Phase 4 deliverables
+
+| # | Deliverable | Status |
+|---|---|---|
+| 8 | `frontend/` — Next.js 15 + TS + Tailwind, `/trade` dashboard, hooks for `DarkPool` and `StrategyVault`, **static export** | `next build` + `tsc` pass; export checked for third-party origins |
+| 9 | `bots/inventory-cpp/` — C++20 Searcher: LOB signals, Avellaneda–Stoikov, curve planner, `flashRebalance` caller | builds with `-Werror`; self-test: 178k checks pass |
+| 10 | `contracts/src/periphery/SearcherExecutor.sol` — on-chain callback the bot drives | compiles |
+| 11 | `infra/terraform/` — VPC, EC2 (t3.micro), RDS Postgres (db.t3.micro), S3 metadata bucket, budget alarm | `terraform validate` passes; **never applied** |
+
+### Run it
+```bash
+# contracts (compile check used in this repo: solc 0.8.26, evm paris, via-IR)
+cd contracts && forge build
+
+# frontend: static export for IPFS (addresses are inlined at build time)
+cd frontend && npm ci && NEXT_PUBLIC_DARKPOOL_ADDRESS=0x… NEXT_PUBLIC_VAULT_ADDRESS=0x… npm run build && npm run verify:static
+#   ./out is the directory to `ipfs add -r`; serve from an origin root (ipfs://, <cid>.ipfs.<gw>, ENS/DNSLink)
+
+# searcher: unit/property tests + dry run (no network, no keys)
+cd bots/inventory-cpp && cmake -S . -B build && cmake --build build && ./build/selftest && ./build/searcher_dryrun
+
+# infra
+cd infra/terraform/envs/prod && cp terraform.tfvars.example terraform.tfvars && terraform init && terraform plan
+```
 
 ## Known limitations (read before Phase 2)
 
