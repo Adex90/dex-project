@@ -27,8 +27,9 @@ interface IYieldAdapter {
         external
         returns (bytes32 handle);
 
-    /// @dev Return principal ± yield to msg.sender. Called only at/after maturity.
-    function recall(bytes32 handle) external;
+    /// @dev [audit H-6]: approve `amount` to msg.sender and return it; MUST revert unless msg.sender is the depositor
+    ///      recorded at `deploy`, and MUST NOT push tokens. TimeDeposits pulls exactly `amount` itself.
+    function recall(bytes32 handle) external returns (uint256 amount);
 }
 
 // -----------------------------------------------------------------------------------------------------
@@ -49,8 +50,10 @@ interface IYieldAdapter {
 ///   third party; the depositor can always withdraw their own balance on demand (that is what makes it a
 ///   demand deposit). The depositor earns exactly 0.
 ///
-/// INVARIANT (I-RES, 100 % reserve): for every token,  token.balanceOf(this) >= totalDeposits[token]
-///   and totalDeposits[token] == Σ balanceOf[token][user].
+/// INVARIANT (I-RES, 100 % reserve): totalDeposits[token] == Σ balanceOf[token][user], and nothing in this
+///   contract can make token.balanceOf(this) fall below totalDeposits[token]. If the TOKEN itself shrinks the
+///   balance (negative rebase, slashing, haircut), a withdrawal of `amount` pays amount · balance/totalDeposits:
+///   every depositor bears the same fraction and nobody is frozen [audit M-1].
 /// Per-token isolation: a hostile token can only corrupt accounting of ITSELF, never of another token.
 contract DemandDeposits is ReentrancyGuard {
     using SafeTransfer for IERC20Min;
@@ -65,7 +68,6 @@ contract DemandDeposits is ReentrancyGuard {
     error InvalidRecipient();
     error InsufficientBalance();
     error FeeOnTransferUnsupported();
-    error ReserveBreached();
 
     function deposit(IERC20Min token, uint256 amount) external nonReentrant {
         if (amount == 0) revert AmountZero();
@@ -88,11 +90,17 @@ contract DemandDeposits is ReentrancyGuard {
         unchecked {
             balanceOf[token][msg.sender] = bal - amount;
         }
-        totalDeposits[token] -= amount;
+        uint256 total = totalDeposits[token];
+        totalDeposits[token] = total - amount;
 
-        token.safeTransfer(to, amount);
-        if (token.balanceOf(address(this)) < totalDeposits[token]) revert ReserveBreached();
-        emit Withdrawn(token, msg.sender, to, amount);
+        // [audit M-1]: a shortfall caused by the TOKEN (negative rebase, slashing) is shared pro rata instead of
+        // freezing every account: pay amount·balance/total. balance/total is invariant under withdrawals, so the
+        // order of exits cannot matter. Outflow is verified exactly (sender-fee tokens rejected).
+        uint256 held = token.balanceOf(address(this));
+        uint256 pay = held >= total ? amount : amount * held / total;
+        token.safeTransfer(to, pay);
+        if (held - token.balanceOf(address(this)) != pay) revert FeeOnTransferUnsupported();
+        emit Withdrawn(token, msg.sender, to, pay);
     }
 }
 
@@ -107,8 +115,10 @@ contract DemandDeposits is ReentrancyGuard {
 /// MODES
 ///   * HOLD   (adapter == address(0)): funds sit idle until maturity; no external venue ever touches them.
 ///   * ROUTED (adapter != 0): the exact deposit is pushed to the chosen adapter, which lends it / provides
-///     liquidity. At maturity the owner calls `settle`; whatever the adapter returns (measured by balance
-///     delta, never trusted from a return value) is paid to the owner.
+///     liquidity. At maturity the owner calls `settle`: the adapter approves and returns the amount due, and
+///     this contract PULLS exactly that amount and pays it to the owner. Only that pull is measured, so money
+///     arriving from anywhere else can never be credited to the wrong deposit [audit H-6].
+///   HOLD exits are paid pro rata if the token itself shrank the held balance, exactly like DemandDeposits.
 ///
 /// RISK (explicit, not hidden): a ROUTED time deposit is risk capital. A credit default or adapter fault
 ///   reduces what the OWNER OF THAT DEPOSIT receives; it can never touch another depositor's funds or any
@@ -181,8 +191,9 @@ contract TimeDeposits is ReentrancyGuard {
             token.safeTransfer(address(adapter), amount);
             handle = adapter.deploy(token, amount, maturity, adapterData);
             deposits[id].handle = handle;
+            // local check: exactly the routed amount left; nothing held for anyone else moved
+            if (token.balanceOf(address(this)) < before) revert ReserveBreached();
         }
-        if (token.balanceOf(address(this)) < heldInContract[token]) revert ReserveBreached();
         emit Opened(id, msg.sender, address(token), amount, maturity, address(adapter), handle);
     }
 
@@ -202,20 +213,29 @@ contract TimeDeposits is ReentrancyGuard {
         d.closed = true;
 
         if (address(d.adapter) == address(0)) {
-            heldInContract[token] -= principal;
-            paid = principal;
+            uint256 held = heldInContract[token];
+            heldInContract[token] = held - principal;
+            uint256 bal = token.balanceOf(address(this));
+            paid = bal >= held ? principal : principal * bal / held; // [audit M-1]: pro rata, never frozen
         } else {
-            uint256 before = token.balanceOf(address(this));
-            try d.adapter.recall(d.handle) {
-                paid = token.balanceOf(address(this)) - before; // trust balances, not return values
+            try d.adapter.recall(d.handle) returns (uint256 amount) {
+                // [audit H-6]: credit ONLY what THIS deposit's adapter hands over, in a pull executed here. A balance
+                // delta around an arbitrary external call also captures anyone else's money that arrives meanwhile.
+                uint256 before = token.balanceOf(address(this));
+                if (amount > 0) token.safeTransferFrom(address(d.adapter), address(this), amount);
+                if (token.balanceOf(address(this)) - before != amount) revert FeeOnTransferUnsupported();
+                paid = amount;
             } catch {
                 if (block.timestamp < d.maturity + RECALL_GRACE) revert RecallFailed();
                 emit WrittenOff(id, msg.sender, principal);
                 return; // closed stays true: owner's claim is abandoned, nobody else's money is touched
             }
         }
-        if (paid > 0) token.safeTransfer(to, paid);
-        if (token.balanceOf(address(this)) < heldInContract[token]) revert ReserveBreached();
+        if (paid > 0) {
+            uint256 pre = token.balanceOf(address(this));
+            token.safeTransfer(to, paid);
+            if (pre - token.balanceOf(address(this)) != paid) revert FeeOnTransferUnsupported(); // exact outflow
+        }
         emit Settled(id, msg.sender, to, principal, paid);
     }
 }

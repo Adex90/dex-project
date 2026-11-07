@@ -130,6 +130,7 @@ contract MockSearcher is IFlashRebalancer {
 
     constructor(IERC20Min a, IERC20Min b, address pool_, address treasury_) {
         (t0, t1, pool, treasury) = (a, b, pool_, treasury_);
+        b.approve(pool_, type(uint256).max); // [audit H-1]: the pool pulls the Treasury cut from the initiator
     }
 
     function configure(uint256 p0, uint256 p1, uint256 pt) external {

@@ -24,9 +24,11 @@ import {IPoseidonHasher} from "../interfaces/IPoseidonHasher.sol";
 ///     collateral from the writer in the same call and reverts unless the contract actually received the
 ///     exact amount (fee-on-transfer tokens are rejected). There is no other mint path, no admin, no
 ///     credit, no margin, no re-hypothecation: collateral is never lent or swapped.
-///   * Solvency invariant, enforced after every entrypoint that moves tokens (I-SOLV):
-///         token.balanceOf(this) >= liabilities[token]
-///     where `liabilities` = Σ collateralHeld + Σ proceedsHeld of every series using that token.
+///   * Solvency invariant (I-SOLV):  token.balanceOf(this) >= liabilities[token]
+///     where `liabilities` = Σ collateralHeld + Σ proceedsHeld of every series using that token. Nothing in this
+///     contract can break it; it is REQUIRED on every inflow (no new liabilities against a short token). If the
+///     TOKEN itself shrinks the balance, pay-outs are pro rata (balance/liabilities) instead of every series of
+///     that token freezing [audit M-2].
 ///   * Supply invariant (until the post-expiry writer-claim phase begins) (I-SUPPLY):
 ///         totalSupply[id] + exercised[id] == written[id]
 ///     and  totalSupply[id] == Σ public balances + shieldedSupply[id].
@@ -178,8 +180,7 @@ contract OptionsMarket is NoteTree, ReentrancyGuard {
         collateralHeld[id] -= refund;
         liabilities[address(cToken)] -= refund;
 
-        cToken.safeTransfer(msg.sender, refund);
-        _requireSolvent(cToken);
+        _payOut(cToken, msg.sender, refund); // [audit M-2]
         emit TransferSingle(msg.sender, msg.sender, address(0), id, qty);
         emit Closed(id, msg.sender, qty, refund);
     }
@@ -214,9 +215,7 @@ contract OptionsMarket is NoteTree, ReentrancyGuard {
         uint256 before = pToken.balanceOf(address(this));
         pToken.safeTransferFrom(msg.sender, address(this), pay);
         if (pToken.balanceOf(address(this)) - before != pay) revert CollateralShortfall();
-        cToken.safeTransfer(to, receive_);
-        _requireSolvent(cToken);
-        _requireSolvent(pToken);
+        _payOut(cToken, to, receive_); // [audit M-2]
 
         emit TransferSingle(msg.sender, msg.sender, address(0), id, qty);
         emit Exercised(id, msg.sender, to, qty, pay, receive_);
@@ -246,10 +245,8 @@ contract OptionsMarket is NoteTree, ReentrancyGuard {
         liabilities[address(cToken)] -= cOut;
         liabilities[address(pToken)] -= pOut;
 
-        if (cOut > 0) cToken.safeTransfer(to, cOut);
-        if (pOut > 0) pToken.safeTransfer(to, pOut);
-        _requireSolvent(cToken);
-        _requireSolvent(pToken);
+        _payOut(cToken, to, cOut); // [audit M-2]
+        _payOut(pToken, to, pOut);
         emit WriterClaimed(id, msg.sender, cOut, pOut);
     }
 
@@ -348,7 +345,18 @@ contract OptionsMarket is NoteTree, ReentrancyGuard {
         return s.isCall ? s.quotePerContract : s.underlyingPerContract;
     }
 
-    /// @dev I-SOLV
+    /// @dev [audit M-2]: liabilities were already reduced by `owed`. If the token itself shrank the balance, every claimant
+    ///      is paid the same fraction balance/liabilities (order-independent) instead of every series freezing.
+    function _payOut(IERC20Min t, address to, uint256 owed) private {
+        if (owed == 0) return;
+        uint256 bal = t.balanceOf(address(this));
+        uint256 liab = liabilities[address(t)] + owed;
+        uint256 pay = bal >= liab ? owed : owed * bal / liab;
+        t.safeTransfer(to, pay);
+        if (bal - t.balanceOf(address(this)) != pay) revert CollateralShortfall();
+    }
+
+    /// @dev I-SOLV (kept on the INFLOW path only: no new liabilities against a token that is already short)
     function _requireSolvent(IERC20Min t) private view {
         if (t.balanceOf(address(this)) < liabilities[address(t)]) revert Insolvent();
     }

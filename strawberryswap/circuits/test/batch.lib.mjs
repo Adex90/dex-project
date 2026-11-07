@@ -5,7 +5,6 @@ import { FIELD, DEPTH, dummyNote } from "./lib.mjs";
 
 const lab = (s) => BigInt(keccak256(toBytes(s))) % FIELD;
 export const BATCH_PUBKEY = lab("StrawberrySwap.batch.pubkey");
-export const BATCH_NK = lab("StrawberrySwap.batch.nullifierKey");
 export const WAD = 10n ** 18n;
 
 /** Intent note: a note owned by the unspendable BATCH_PUBKEY whose blinding commits to the swap terms. */
@@ -19,7 +18,8 @@ export function intentNote(h, { dir, value, destPubKey, refundPubKey, destBlindi
   };
 }
 
-export const nullifierOf = (h, commitment, leafIndex) => h(commitment, BigInt(leafIndex), BATCH_NK);
+// The nullifier key is the intent's secret destBlinding, never a public constant (Phase-8 audit H-7).
+export const nullifierOf = (h, commitment, leafIndex, destBlinding) => h(commitment, BigInt(leafIndex), destBlinding);
 
 /** Pure clearing maths. swaps: [{dir, value}] -> price, payouts, nets. Mirrors the circuit and the Go batcher. */
 export function clear(X, Y, swaps, adv = {}) {
@@ -58,7 +58,7 @@ export function buildBatchInput(h, tree, items, { X, Y, tNow, N, adv = {} }) {
     const n = it.note;
     const idx = BigInt(it.index);
     const path = tree.path(it.index);
-    const nf = nullifierOf(h, n.commitment, it.index);
+    const nf = nullifierOf(h, n.commitment, it.index, n.destBlinding);
     const isSwap = it.mode === "swap";
     const { o, rem } = isSwap ? c.out[si++] : { o: 0n, rem: 0n };
     const outAsset = isSwap ? BigInt(1 - n.dir) : BigInt(n.dir);

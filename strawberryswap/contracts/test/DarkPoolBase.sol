@@ -100,6 +100,8 @@ abstract contract DarkPoolBase is Test {
         b.encryptedNotes = new bytes[](1);
         b.encryptedNotes[0] = "";
         (b.in0, b.in1, b.out0, b.out1) = (in0, in1, out0, out1);
+        (b.X, b.Y) = pool.effectiveReserves(); // [audit H-5]
+        oracle.set(pool.spotPrice());          // [audit C-1]
     }
 
     function _k() internal view returns (uint256) {

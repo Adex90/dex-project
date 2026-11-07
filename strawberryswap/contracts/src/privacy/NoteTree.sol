@@ -27,6 +27,12 @@ import {IPoseidonHasher} from "../interfaces/IPoseidonHasher.sol";
 ///   prefixed by the sender's ephemeral public key (ERC-5564 style). Wallets scan `NoteInserted` events
 ///   with their viewing key; no on-chain link between sender, recipient and receiving address exists.
 ///
+/// ROOTS: one root is published per TRANSACTION (not per leaf) and the last ROOT_HISTORY = 1024 stay valid, so a
+///   proof in flight survives 1023 later transactions [audit H-2].
+/// CAPACITY: a full tree (2^DEPTH leaves) rolls over to a fresh one; the completed tree's root stays a valid
+///   membership root forever, so no note is ever frozen by capacity [audit H-3]. Off-chain mirrors start a new tree
+///   on `TreeRolled`; leaf indices restart at 0.
+///
 /// PRIVACY BOUNDARY (honest statement): amounts and addresses are hidden *inside* the pool. Entering
 ///   (publicIn > 0) and leaving (publicOut > 0) reveal the public amount by definition. Origin/destination
 ///   hiding for those two edges relies on anonymity-set size, relayers and stealth addresses.
@@ -36,7 +42,7 @@ abstract contract NoteTree {
     uint256 internal constant FIELD =
         21888242871839275222246405745257275088548364400416034343698204186575808495617;
     uint8 public constant DEPTH = 20; // 2^20 ≈ 1.05M notes per pool
-    uint32 public constant ROOT_HISTORY = 128;
+    uint32 public constant ROOT_HISTORY = 1024; // [audit H-2]: and ONE root per transaction (was 128, one per leaf)
 
     // ---------------------------------------------------------------- immutables
     IZKVerifier public immutable joinSplitVerifier;
@@ -45,11 +51,14 @@ abstract contract NoteTree {
     // ---------------------------------------------------------------- storage
     uint32 public nextLeafIndex;
     uint32 private _rootCursor;
+    uint32 public treeId; // [audit H-3]: index of the current tree; full trees roll over instead of freezing
     bytes32[DEPTH] private _filled; // right-most filled node per level
     bytes32[DEPTH] private _zeros; // empty-subtree hashes per level
     bytes32[ROOT_HISTORY] private _rootRing;
     mapping(bytes32 => bool) public isKnownRoot;
     mapping(bytes32 => bool) public nullifierSpent;
+    mapping(bytes32 => bool) public isFinalRoot; // [audit H-3]: root of every completed tree, valid forever
+    bytes32 private _tip; // [audit H-3]: root after the last slot of the current tree (written once per tree)
 
     // ---------------------------------------------------------------- types
     struct JoinSplit {
@@ -63,12 +72,12 @@ abstract contract NoteTree {
     // ---------------------------------------------------------------- events / errors
     event NoteInserted(uint32 indexed leafIndex, bytes32 commitment, bytes encryptedNote);
     event Nullified(bytes32 indexed nullifier);
+    event TreeRolled(uint32 indexed treeId, bytes32 finalRoot);
 
     error UnknownRoot();
     error NullifierReuse();
     error NotInField();
     error InvalidProof();
-    error TreeFull();
     error ZeroAddress();
 
     constructor(IZKVerifier verifier_, IPoseidonHasher hasher_) {
@@ -96,7 +105,7 @@ abstract contract NoteTree {
         uint256 assetId
     ) internal {
         // ---- checks
-        if (!isKnownRoot[js.root]) revert UnknownRoot();
+        if (!_knownRoot(js.root)) revert UnknownRoot();
         bytes32 n0 = js.nullifiers[0];
         bytes32 n1 = js.nullifiers[1];
         if (n0 == n1 || nullifierSpent[n0] || nullifierSpent[n1]) revert NullifierReuse();
@@ -121,8 +130,12 @@ abstract contract NoteTree {
         // ---- effects
         _spend(n0);
         _spend(n1);
-        _insert(js.commitments[0], js.encryptedNotes[0]);
-        _insert(js.commitments[1], js.encryptedNotes[1]);
+        _append(js.commitments[0], js.encryptedNotes[0]);
+        _pushRoot(_append(js.commitments[1], js.encryptedNotes[1])); // [audit H-2]: one root per transaction
+    }
+
+    function _knownRoot(bytes32 r) internal view returns (bool) {
+        return isKnownRoot[r] || isFinalRoot[r];
     }
 
     function _spend(bytes32 nullifier) internal {
@@ -137,13 +150,17 @@ abstract contract NoteTree {
     }
 
     // ---------------------------------------------------------------- incremental Merkle tree
-    function _insert(bytes32 leaf, bytes calldata encryptedNote) internal {
+    /// @dev Appends a leaf and returns the new root WITHOUT publishing it; callers publish once per transaction.
+    function _append(bytes32 leaf, bytes calldata encryptedNote) internal returns (bytes32 node) {
         uint32 index = nextLeafIndex;
-        if (index >= uint32(1) << DEPTH) revert TreeFull();
+        if (index == uint32(1) << DEPTH) {
+            _rollover(); // [audit H-3]
+            index = 0;
+        }
         if (uint256(leaf) >= FIELD) revert NotInField();
 
         uint32 cur = index;
-        bytes32 node = leaf;
+        node = leaf;
         for (uint256 i; i < DEPTH; ++i) {
             if (cur & 1 == 0) {
                 _filled[i] = node;
@@ -154,11 +171,23 @@ abstract contract NoteTree {
             cur >>= 1;
         }
         nextLeafIndex = index + 1;
-        _pushRoot(node);
+        if (index == (uint32(1) << DEPTH) - 1) _tip = node;
         emit NoteInserted(index, leaf, encryptedNote);
     }
 
-    function _pushRoot(bytes32 root) private {
+    /// @dev [audit H-3]: The completed tree's root stays a valid membership root forever; a fresh empty tree starts.
+    ///      Nullifiers bind (commitment, leafIndex, key), so a note can only collide with an IDENTICAL commitment at the
+    ///      same index of another tree — which only its own owner can create.
+    function _rollover() private {
+        bytes32 fin = _tip;
+        isFinalRoot[fin] = true;
+        emit TreeRolled(treeId, fin);
+        treeId += 1;
+        for (uint256 i; i < DEPTH; ++i) _filled[i] = _zeros[i];
+        nextLeafIndex = 0;
+    }
+
+    function _pushRoot(bytes32 root) internal {
         uint32 c = (_rootCursor + 1) % ROOT_HISTORY;
         bytes32 evicted = _rootRing[c];
         if (evicted != bytes32(0)) isKnownRoot[evicted] = false;

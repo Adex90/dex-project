@@ -32,15 +32,18 @@ include "circomlib/circuits/comparators.circom";
  *   B2  Commitment    : bodyCommitment == Poseidon(pack24(body[0..23]), ..., pack24(body[72..95])).
  *   B3  Hidden query  : the response contains `"symbol":"<SYM>"` where SYM are the private symbol bytes and
  *                       queryCommitment == Poseidon(pack(SYM), salt). Verifier learns neither SYM nor salt.
- *   B4  Price field   : the text at a prover-chosen offset is exactly  "price":<int>.<frac>  followed by ','
- *                       or '}', with 1..12 integer and 1..10 fractional ASCII digits; `price` is that
- *                       decimal scaled to 1e18 and fits in 128 bits, and is non-zero.
- *   B5  Timestamp     : likewise  "ts":<10 digits>  followed by ',' or '}';  observedAt is that integer.
+ *   B4  Price field   : "price":<int>.<frac>  followed by ',', with 1..12 integer and 1..10 fractional ASCII
+ *                       digits; `price` is that decimal scaled to 1e18, fits in 128 bits, and is non-zero.
+ *   B5  Timestamp     : "ts":<10 digits>  followed by '}';  observedAt is that integer.
+ *   B6  Structure     : the body IS the single object  {"symbol":"<SYM>","price":<I>.<F>,"ts":<10 digits>}
+ *                       (zero-padded): every offset is pinned, so price and timestamp provably belong to the
+ *                       object that carries the symbol. Without B6 a body holding several objects (other
+ *                       instruments, bid/ask, history) let the prover pick any of their prices or timestamps
+ *                       (Phase-8 audit C-3).
  *
  * KNOWN LIMITATIONS of the skeleton (each is a TODO with an owner in docs/):
- *   * Fixed JSON layout and key names; no general JSON parser. A response that EMBEDS attacker-controlled
- *     text could contain a second `"price":` — providers whose bodies echo user input must not be used
- *     until a first-occurrence / structural check is added.
+ *   * One fixed layout and key order. A provider with another format needs its own pinned template; never
+ *     relax B6 into a "find the key anywhere" search.
  *   * Prices without a decimal point (e.g. `2345`) are rejected, by design, for a single parse path.
  *   * BODY_LEN = 96 bytes. Larger bodies need more chunks (cost grows ~ BODY_LEN × slice width).
  */
@@ -177,8 +180,8 @@ template ZkDecoOracle(BODY_LEN, SYMLEN) {
         dig[k] = IsDigit(); dig[k].c <== c;
         digBad[k] <== mask[k] * (1 - dig[k].out);  digBad[k] === 0;                                      // must be digits
         dotDiff[k] <== isDot[k].out * (c - 46);    dotDiff[k] === 0;                                     // must be '.'
-        termProd[k] <== (c - 44) * (c - 125);
-        termBad[k] <== isTerm[k].out * termProd[k];  termBad[k] === 0;                                    // ',' or '}'
+        termProd[k] <== (c - 44) * 1;                                                                    // ',' only: "ts" follows
+        termBad[k] <== isTerm[k].out * termProd[k];  termBad[k] === 0;
 
         factor[k] <== 1 + 9 * mask[k];
         digVal[k] <== mask[k] * (c - 48);
@@ -213,7 +216,15 @@ template ZkDecoOracle(BODY_LEN, SYMLEN) {
         tAcc[k + 1] <== tAcc[k] * 10 + (tSlice.out[5 + k] - 48);
     }
     observedAt === tAcc[10];
-    component tTerm = AssertTerminator(); tTerm.c <== tSlice.out[15];
+    tSlice.out[15] === 125;                                   // '}' closes THE object
+
+    // B6: canonical single-object layout  {"symbol":"<SYM>","price":<I>.<F>,"ts":<10 digits>}   [audit C-3]
+    // Every slice is pinned to the object that carries the symbol: no second "price"/"ts" can be selected.
+    body[0] === 123;                                          // '{'
+    offSymKey === 1;
+    body[1 + 10 + SYMLEN + 1] === 44;                         // ',' right after the closing quote of the symbol
+    offPriceKey === 1 + 10 + SYMLEN + 2;
+    offTsKey === offPriceKey + 8 + intLen + fracLen + 2;      // "price": + I + '.' + F + ','
 
     // Keep providerId in the constraint system (it is bound on-chain via the notary signature).
     signal providerSquare;

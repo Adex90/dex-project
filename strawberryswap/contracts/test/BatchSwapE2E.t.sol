@@ -30,6 +30,7 @@ contract BatchSwapE2ETest is Test {
     MockERC20 token0;
     MockERC20 token1;
     address lp = address(0x1111);
+    MockOracle oracle;
 
     function setUp() public {
         MockERC20 a = new MockERC20("A");
@@ -56,7 +57,7 @@ contract BatchSwapE2ETest is Test {
             joinSplit,
             batch,
             IPoseidonHasher(address(new PoseidonHasherAdapter(IPoseidonT3(poseidon)))),
-            IZKOracle(address(new MockOracle())),
+            IZKOracle(address(oracle = new MockOracle())),
             ITreasury(address(new MockTreasury())),
             4
         );
@@ -108,6 +109,7 @@ contract BatchSwapE2ETest is Test {
         b.commitments = F.batchCommitments();
         b.encryptedNotes = new bytes[](4);
         for (uint256 i; i < 4; ++i) b.encryptedNotes[i] = hex"aa"; // sealed blobs in production (see Go intent.Seal)
+        (b.X, b.Y) = (F.R0 + F.V0, F.R1 + F.V1); // [audit H-5]: the state the Go Automator proved against
         b.in0 = F.NET_IN0;
         b.in1 = F.NET_IN1;
         b.out0 = F.NET_OUT0;
@@ -116,6 +118,7 @@ contract BatchSwapE2ETest is Test {
 
     function _atSettlement() internal {
         vm.warp(uint256(F.TNOW) + 10); // tNow <= block.timestamp <= tNow + window
+        oracle.set(2e18); // [audit C-1]: a fresh zk-oracle price (== launch spot) is required for value-moving batches
     }
 
     // ------------------------------------------------------------------ the full loop
@@ -266,8 +269,13 @@ contract BatchSwapE2ETest is Test {
         vm.stopPrank();
         _atSettlement();
         DarkPool.Batch memory b = _batch();
-        b.root = pool.currentRoot(); // even with a fresh known root, X/Y no longer match
-        vm.expectRevert(NoteTree.InvalidProof.selector);
+        // [audit H-5]: the proof stays valid for STATE_WINDOW_BLOCKS after the state changed ...
+        uint256 snap = vm.snapshotState();
+        pool.settleBatch(b);
+        vm.revertToState(snap);
+        // ... and expires afterwards
+        vm.roll(block.number + pool.STATE_WINDOW_BLOCKS() + 1);
+        vm.expectRevert(DarkPool.StaleState.selector);
         pool.settleBatch(b);
     }
 

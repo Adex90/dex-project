@@ -22,6 +22,8 @@ contract DarkPoolTest is DarkPoolBase {
         r0 = bound(r0, 1e6, 1e30);
         r1 = bound(r1, 1e6, 1e30);
         _addLiquidity(lp, r0, r1);
+        // [audit C-1]: value-moving batches need an oracle price, which is bounded by MAX_PRICE
+        vm.assume(pool.spotPrice() <= pool.MAX_PRICE());
     }
 
     // ================================================================== axioms
@@ -76,6 +78,8 @@ contract DarkPoolTest is DarkPoolBase {
         uint256 n1 = uint256(pool.reserve1()) + in1 - out1;
         bool kOk = (n0 + pool.virtual0()) * (n1 + pool.virtual1()) >= kBefore;
         DarkPool.Batch memory b = _batch(in0, in1, out0, out1);
+        uint256 P = pool.spotPrice();
+        kOk = kOk && in0 * P + in1 * WAD >= out0 * P + out1 * WAD; // [audit C-1]: value at the oracle may not fall
 
         try pool.settleBatch(b) {
             assertTrue(kOk, "accepted a batch that lowers K");
@@ -212,9 +216,10 @@ contract DarkPoolTest is DarkPoolBase {
         (uint256 in0, uint256 out1, uint256 req,,) = _plan();
         token0.mint(address(s), in0);
         token1.mint(address(s), req);
-        s.configure(in0, 0, req - 1); // one wei short
-        vm.expectRevert(abi.encodeWithSelector(DarkPool.TreasuryUnderpaid.selector, req, req - 1));
+        s.configure(in0, 0, 0); // [audit H-1]: pays NOTHING in the callback ...
+        uint256 tBefore = token1.balanceOf(address(treasury));
         s.go(abi.encodeCall(DarkPool.flashRebalance, (0, out1, address(s), "")));
+        assertApproxEqAbs(token1.balanceOf(address(treasury)) - tBefore, req, 1, "... and the pool pulled exactly the cut");
     }
 
     function test_flashRebalance_takingValueWithoutRepayingBreaksK() public {
@@ -303,14 +308,12 @@ contract DarkPoolTest is DarkPoolBase {
         token1.mint(address(s), reqA);
         uint256 snap = vm.snapshotState();
 
-        // (1) with donation, paying slightly LESS than reqB reverts ...
+        // (1)+(2) [audit H-1]: with the donation present the pool pulls reqB (not reqA)
         token0.mint(address(pool), D);
-        s.configure(in0, 0, reqB - 1e6);
-        vm.expectRevert();
+        s.configure(in0, 0, 0);
+        uint256 tB = token1.balanceOf(address(treasury));
         s.go(abi.encodeCall(DarkPool.flashRebalance, (0, out1, address(s), "")));
-        // (2) ... and paying slightly MORE succeeds
-        s.configure(in0, 0, reqB + 1e6);
-        s.go(abi.encodeCall(DarkPool.flashRebalance, (0, out1, address(s), "")));
+        assertApproxEqAbs(token1.balanceOf(address(treasury)) - tB, reqB, 1e6);
 
         // (3) economics: donor pays D·P (value gifted to LPs) and saves `saving` < D·P
         assertLt(saving, D * P / WAD, "a donor always loses more than they save");
@@ -370,6 +373,7 @@ contract DarkPoolTest is DarkPoolBase {
 
         DarkPool.Batch memory b = _batch(1e20, 0, 0, 7);
         b.root = p.currentRoot();
+        (b.X, b.Y) = p.effectiveReserves();
         b.nullifiers = new bytes32[](2);
         b.commitments = new bytes32[](2);
         b.encryptedNotes = new bytes[](2);
@@ -386,6 +390,7 @@ contract DarkPoolTest is DarkPoolBase {
         ev.expect(e);
         DarkPool.Batch memory b2 = _batch(1e20, 0, 0, 7);
         b2.root = p.currentRoot();
+        (b2.X, b2.Y) = p.effectiveReserves();
         vm.expectRevert(NoteTree.InvalidProof.selector);
         p.settleBatch(b2);
     }

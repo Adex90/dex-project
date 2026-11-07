@@ -5,7 +5,7 @@
 import { writeFileSync, mkdirSync } from "node:fs";
 import { keccak256, toBytes } from "viem";
 import { init, Tree, stringify, FIELD } from "../test/lib.mjs";
-import { intentNote, buildBatchInput, clear, nullifierOf, BATCH_PUBKEY, BATCH_NK } from "../test/batch.lib.mjs";
+import { intentNote, buildBatchInput, clear, nullifierOf, BATCH_PUBKEY } from "../test/batch.lib.mjs";
 
 const h = await init();
 const det = (l) => BigInt(keccak256(toBytes(l))) % FIELD;
@@ -35,13 +35,13 @@ const input = buildBatchInput(h, tree, items, { X, Y, tNow: NOW, N });
 const c = clear(X, Y, swaps.map((n) => ({ dir: n.dir, value: n.value })));
 
 const out = {
-  constants: { batchPubKey: BATCH_PUBKEY.toString(), batchNK: BATCH_NK.toString(), zero: tree.zeros[0].toString() },
+  constants: { batchPubKey: BATCH_PUBKEY.toString(), zero: tree.zeros[0].toString() },
   poseidon: [[1n, 2n], [0n], [1n, 2n, 3n], [1n, 2n, 3n, 4n], [1n, 2n, 3n, 4n, 5n]].map((v) => ({ in: v.map(String), out: h(...v).toString() })),
   tree: { leaves: tree.leaves.map(String), root: tree.root.toString(), path3: tree.path(3).pathElements.map(String), bits3: tree.path(3).pathIndices },
   intents: notes.map((n) => ({
     label: n.label, index: n.index,
     json: { dir: n.dir, value: n.value.toString(), destPubKey: n.destPubKey.toString(), refundPubKey: n.refundPubKey.toString(), destBlinding: n.destBlinding.toString(), minOut: n.minOut.toString(), deadline: Number(n.deadline) },
-    commitment: n.commitment.toString(), nullifier: nullifierOf(h, n.commitment, n.index).toString(),
+    commitment: n.commitment.toString(), nullifier: nullifierOf(h, n.commitment, n.index, n.destBlinding).toString(),
   })),
   pool: { X: X.toString(), Y: Y.toString(), R0: R0.toString(), R1: R1.toString() },
   tNow: Number(NOW), N,

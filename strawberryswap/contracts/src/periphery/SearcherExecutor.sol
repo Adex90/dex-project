@@ -18,7 +18,7 @@ interface IDarkPoolSearcher {
 ///
 /// INVENTORY MODEL (why this contract holds tokens): the bot does not need an external venue inside the
 /// transaction. It rebalances the pool against its OWN pre-funded inventory (the pool hands out one token,
-/// the executor returns the other at the curve price plus the Treasury's cut) and hedges the resulting
+/// the executor returns the other at the curve price; the pool then pulls the Treasury's cut) and hedges the resulting
 /// inventory off-chain. Managing that inventory is exactly what the Avellaneda–Stoikov module does.
 ///
 /// SECURITY
@@ -26,8 +26,9 @@ interface IDarkPoolSearcher {
 ///     with more authority than "trade within this contract").
 ///   * The callback is accepted ONLY from the pool, ONLY while a `rebalance` this contract started is in
 ///     flight, and ONLY if the pool says this contract is the initiator: nobody can invoke it to drain funds.
-///   * Repayment amounts come from the operator's calldata, but the POOL enforces the invariant, the oracle
-///     deviation rule and the 80 % Treasury payment; an under-paying call simply reverts atomically.
+///   * Repayment amounts come from the operator's calldata, but the POOL enforces the invariant and the oracle
+///     deviation rule, and PULLS its exact 80 % Treasury cut. `treasuryPay` is the allowance granted for that
+///     pull (reset to 0 afterwards): a cap, so a stale plan reverts instead of over-paying.
 ///   * `sweep` lets the operator pull inventory out; there is no other exit and no third-party access.
 contract SearcherExecutor is IFlashRebalancer, ReentrancyGuard {
     using SafeTransfer for IERC20Min;
@@ -63,7 +64,9 @@ contract SearcherExecutor is IFlashRebalancer, ReentrancyGuard {
     {
         if (msg.sender != operator) revert NotOperator();
         _inFlight = true;
+        token1.approve(address(pool), treasuryPay); // [audit H-1]: the pool pulls its cut; this caps it (max-pay guard)
         pool.flashRebalance(amount0Out, amount1Out, address(this), abi.encode(pay0, pay1, treasuryPay));
+        token1.approve(address(pool), 0);
         _inFlight = false;
     }
 
@@ -75,7 +78,6 @@ contract SearcherExecutor is IFlashRebalancer, ReentrancyGuard {
         (uint256 pay0, uint256 pay1, uint256 treasuryPay) = abi.decode(data, (uint256, uint256, uint256));
         if (pay0 > 0) token0.safeTransfer(address(pool), pay0);
         if (pay1 > 0) token1.safeTransfer(address(pool), pay1);
-        if (treasuryPay > 0) token1.safeTransfer(treasury, treasuryPay);
     }
 
     /// @notice Operator withdraws inventory (their own capital).

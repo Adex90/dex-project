@@ -18,8 +18,10 @@ include "../lib/merkle.circom";
  *  (that circuit requires Poseidon(privKey) == pubKey). The ONLY way to spend it is this circuit, which can only
  *  pay `destPubKey` at least `minOut` (before the deadline) or return the funds to `refundPubKey` (after it).
  *  The Automator therefore learns the intent but can never redirect or keep the funds.
- *  Nullifier of an intent note: Poseidon(commitment, leafIndex, BATCH_NK) — safe to make derivable by anyone
- *  precisely because the note is unspendable elsewhere (no double-spend path through JoinSplit exists).
+ *  Nullifier of an intent note: Poseidon(commitment, leafIndex, destBlinding). destBlinding is bound inside the
+ *  commitment (through intentBlinding), so each note has exactly one nullifier; it is known only to the user and to
+ *  whoever holds the opening, so an observer cannot link a spent intent to the transaction that created it. (A
+ *  PUBLIC nullifier key made every batch slot linkable to its creator: Phase-8 audit H-7.)
  *
  * ═══ PRICE: closed form, no solver ═════════════════════════════════════════════════════════════════
  *  Let X, Y be the effective reserves, A0/A1 the gross amounts of token0/token1 SOLD into the pool, and
@@ -57,7 +59,6 @@ include "../lib/merkle.circom";
 
 // ---- constants (keccak256(label) mod BN254 field — nothing-up-my-sleeve; see circuits/test/batch.lib.mjs)
 function BATCH_PUBKEY() { return 133414396539581031856283141735652113376156359968225558936463889054923919661; }
-function BATCH_NK()     { return 13751787724388560630309404960166971921655704192150233860338172926954813920239; }
 function WAD()          { return 1000000000000000000; }
 
 template BatchSlot(levels) {
@@ -130,7 +131,7 @@ template BatchSlot(levels) {
     component nf = Poseidon(3);
     nf.inputs[0] <== cmIn.out;
     nf.inputs[1] <== idx.out;
-    nf.inputs[2] <== BATCH_NK();
+    nf.inputs[2] <== destBlinding;                       // secret nullifier key [audit H-7]
     nullifier === active * nf.out;                       // S4: padding => 0
 
     // deadline vs clock
