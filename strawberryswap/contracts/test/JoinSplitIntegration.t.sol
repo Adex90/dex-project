@@ -175,7 +175,7 @@ contract JoinSplitIntegrationTest is Test {
 
     /// A malformed proof must not be able to burn more than the verifier gas cap, however much gas the caller
     /// supplies (regression test for the all-gas-consumed behaviour of failed EC precompiles).
-    function testFuzz_malformedProofCannotBurnMoreThanGasCap(bytes32 a, bytes32 b) public {
+    function testFuzz_malformedProofCannotBurnMoreThanGasCap(bytes32 a, bytes32 b) public view {
         bytes memory junk = abi.encodePacked(a, b, a, b, a, b, a, b); // 256 bytes, almost surely off-curve
         uint256[] memory pub = new uint256[](9);
         uint256 g = gasleft();

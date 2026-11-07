@@ -1,0 +1,26 @@
+# Tor configuration for an Automator host (Tor >= 0.4.8).
+#
+# INBOUND  — the intent API is published ONLY as a v3 onion service, forwarded to a UNIX SOCKET. The host has no
+#            TCP listener for it at all, and the Automator never sees a client address (its peer is the Tor daemon).
+# OUTBOUND — the Automator reaches the chain RPC and the signer gateway ONLY through this SocksPort, with per-
+#            destination circuit isolation (the binary uses distinct SOCKS usernames: "automator-rpc", "automator-signer").
+
+DataDirectory /var/lib/tor
+SafeLogging 1                 # scrub addresses from Tor's own logs
+Log notice file /dev/null     # operational logs are not needed and would be metadata
+AvoidDiskWrites 1
+
+SocksPort 127.0.0.1:9050 IsolateSOCKSAuth
+
+HiddenServiceDir /var/lib/tor/automator/
+HiddenServiceVersion 3
+HiddenServicePort 80 unix:/run/automator/intents.sock
+
+# Resource / DoS controls that do NOT need to know who the client is
+HiddenServiceMaxStreams 64
+HiddenServiceMaxStreamsCloseCircuit 1
+HiddenServiceEnableIntroDoSDefense 1
+HiddenServicePoWDefensesEnabled 1
+
+# Do NOT enable HiddenServiceNonAnonymousMode / HiddenServiceSingleHopMode: they trade the SERVICE's anonymity
+# (this host's address) for speed.

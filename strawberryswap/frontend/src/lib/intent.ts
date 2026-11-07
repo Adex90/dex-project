@@ -3,6 +3,11 @@ import type { Address, Hex } from "viem";
 /**
  * Swap INTENT — what a trader hands to an Automator for batch settlement (DarkPool.settleBatch).
  *
+ * ⚠ LEGACY FORMAT — NOT WHAT THE AUTOMATOR NOW ACCEPTS. Phase 6's `bots/automator` takes the OPENING of an
+ * on-chain INTENT NOTE (see docs/BATCH_SETTLEMENT.md), created with a client-side JoinSplit proof. Producing that
+ * in the browser (wasm prover + note management) is not wired yet, so submissions made with this file will be
+ * rejected with 400 by a Phase-6 node. Kept so the quoting UI keeps working.
+ *
  * ⚠ PROOF LAYER NOT LIVE. The final design wraps this in (a) an encryption to the Automator batch key and
  * (b) a join-split note spend with a ZK proof, so the Automator never learns the trader's address. Those
  * circuits are a later phase. Until then an intent is a plain EIP-712 signature: it authenticates the

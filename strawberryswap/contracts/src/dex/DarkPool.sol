@@ -59,11 +59,17 @@ contract DarkPool is NoteTree, ReentrancyGuard {
     uint256 public constant MAX_PRICE = 1e24;
     uint256 public constant MAX_ORACLE_AGE = 60; // seconds
     uint256 public constant MINIMUM_LIQUIDITY = 1_000;
-    uint256 public constant MAX_BATCH = 16;
+    /// @notice Hard ceiling on the circuit's slot count (public inputs = 8 + 2·batchSize).
+    uint256 public constant MAX_BATCH_SIZE = 64;
+    /// @notice A batch proof carries a coarse prover-supplied clock `tNow` (deadline checks happen in-circuit).
+    ///         It must satisfy  tNow <= block.timestamp <= tNow + BATCH_CLOCK_WINDOW.
+    uint256 public constant BATCH_CLOCK_WINDOW = 300;
 
     IERC20Min public immutable token0;
     IERC20Min public immutable token1; // quote asset: Treasury is paid in token1
     IZKVerifier public immutable batchVerifier;
+    /// @notice Slot count N of the deployed `batch_swap` circuit (verifier key). Padding slots carry zeros.
+    uint256 public immutable batchSize;
     IZKOracle public immutable oracle;
     ITreasury public immutable treasury;
     uint256 public immutable virtual0;
@@ -78,15 +84,18 @@ contract DarkPool is NoteTree, ReentrancyGuard {
     mapping(address => uint256) public shares;
 
     // ------------------------------------------------------------------ types
+    /// @dev All flow fields are NET per asset (the circuit keeps gross volumes private): `inK` is value the pool
+    ///      RECEIVES of asset K, `outK` value it PAYS; for each asset at most one of the two is non-zero.
     struct Batch {
         bytes proof;
         bytes32 root;
-        bytes32[] nullifiers; // spent input notes, <= MAX_BATCH
-        bytes32[] commitments; // new output notes, <= MAX_BATCH
+        uint64 tNow; // prover's clock, see BATCH_CLOCK_WINDOW
+        bytes32[] nullifiers; // spent intent notes, active slots first, <= batchSize
+        bytes32[] commitments; // new output notes (one per intent), same length as nullifiers
         bytes[] encryptedNotes; // one ciphertext per commitment (stealth-addressed)
-        uint256 in0; // aggregate asset0 moving custody -> pool
+        uint256 in0;
         uint256 in1;
-        uint256 out0; // aggregate asset0 moving pool -> custody
+        uint256 out0;
         uint256 out1;
     }
 
@@ -112,6 +121,7 @@ contract DarkPool is NoteTree, ReentrancyGuard {
     error TreasuryUnderpaid(uint256 required, uint256 paid);
     error BalanceMismatch();
     error BadAsset();
+    error StaleBatchClock();
 
     constructor(
         IERC20Min token0_,
@@ -122,8 +132,10 @@ contract DarkPool is NoteTree, ReentrancyGuard {
         IZKVerifier batchVerifier_,
         IPoseidonHasher hasher_,
         IZKOracle oracle_,
-        ITreasury treasury_
+        ITreasury treasury_,
+        uint256 batchSize_
     ) NoteTree(joinSplitVerifier_, hasher_) {
+        if (batchSize_ == 0 || batchSize_ > MAX_BATCH_SIZE) revert BadBatch();
         if (address(token0_) >= address(token1_)) revert BadTokenOrder();
         if (token0_.decimals() != 18 || token1_.decimals() != 18) revert BadDecimals();
         if (virtual0_ == 0 || virtual1_ == 0 || virtual0_ > MAX_RESERVE || virtual1_ > MAX_RESERVE) {
@@ -137,6 +149,7 @@ contract DarkPool is NoteTree, ReentrancyGuard {
         virtual0 = virtual0_;
         virtual1 = virtual1_;
         batchVerifier = batchVerifier_;
+        batchSize = batchSize_;
         oracle = oracle_;
         treasury = treasury_;
     }
@@ -270,63 +283,84 @@ contract DarkPool is NoteTree, ReentrancyGuard {
     }
 
     // ================================================================== private batch settlement
-    /// @notice Settles an off-chain batch of encrypted swap intents with ONE proof.
-    /// @dev    Circuit statement (`batchVerifier`), public inputs:
-    ///           [root, reserve0, reserve1, in0, in1, out0, out1, H(nullifiers), H(commitments)]
-    ///         proving: every nullifier is a valid unspent input note under `root`; Σ inputs per asset ==
-    ///         (in0,in1); Σ outputs per asset == (out0,out1); every user's output satisfies their own
-    ///         signed `minOut` and the uniform clearing price implied by (reserve0, reserve1) — so the
-    ///         aggregator cannot skim individual users. The CONTRACT independently enforces the pool's
-    ///         economics (I1), so a malicious aggregator can at worst fail to include someone.
-    ///         H(x) = SHA-256(abi.encode(x)) >> 8  (248-bit, cheap in-circuit, fits the field).
+    /// @notice Settles an off-chain batch of shielded swap intents with ONE proof (`circuits/batch_swap`).
+    /// @dev    Public inputs, in the order the circuit declares them (8 + 2·batchSize):
+    ///           [root, tNow, X, Y, in0, in1, out0, out1, nullifier[0..N), commitment[0..N)]
+    ///         with X = reserve0 + virtual0 and Y = reserve1 + virtual1 read FROM STORAGE (so a proof is bound to the
+    ///         current pool state), and nullifier/commitment arrays zero-padded to N. NO hashing of the arrays: putting
+    ///         them straight into the public inputs costs ~7k verifier gas each instead of ~100k SNARK constraints each.
+    ///         The proof establishes (see the circuit header): every intent note exists under `root`; each user is paid
+    ///         ⌊value·price⌋ at the ONE uniform curve price implied by (X, Y, gross flows), at least their own `minOut`,
+    ///         to the destination they committed to (or refunded after their deadline); and the NET flow equals
+    ///         gross-in minus gross-out. This contract independently enforces the pool's economics (I1: K' >= K) and
+    ///         full backing (I2), so a malicious aggregator can at worst censor.
     function settleBatch(Batch calldata b) external nonReentrant {
-        uint256 n = b.nullifiers.length;
-        uint256 m = b.commitments.length;
-        if (n == 0 || n > MAX_BATCH || m > MAX_BATCH || b.encryptedNotes.length != m) revert BadBatch();
-        if (!isKnownRoot[b.root]) revert UnknownRoot();
-
+        _validateBatch(b);
         uint256 r0 = reserve0;
         uint256 r1 = reserve1;
         uint256 kBefore = (r0 + virtual0) * (r1 + virtual1);
 
-        // ---- checks: proof
-        uint256[] memory pub = new uint256[](9);
-        pub[0] = uint256(b.root);
-        pub[1] = r0; // binds the proof to the CURRENT state: stale/griefing proofs fail
-        pub[2] = r1;
-        pub[3] = b.in0;
-        pub[4] = b.in1;
-        pub[5] = b.out0;
-        pub[6] = b.out1;
-        pub[7] = uint256(sha256(abi.encode(b.nullifiers))) >> 8;
-        pub[8] = uint256(sha256(abi.encode(b.commitments))) >> 8;
-        if (!batchVerifier.verifyProof(b.proof, pub)) revert InvalidProof();
+        // ---- checks: proof (bound to the CURRENT pool state through X, Y)
+        if (!batchVerifier.verifyProof(b.proof, _batchInputs(b, r0, r1))) revert InvalidProof();
 
-        // ---- effects: nullifiers first (replay protection), then tree, then reserves
+        // ---- effects: nullifiers first (replay protection), then the tree, then reserves
+        uint32 firstLeaf = _consumeBatch(b);
+        _applyFlows(b, r0, r1, kBefore);
+
+        _checkBalances(); // I2 (no tokens move in a batch: pure re-labelling custody <-> reserve)
+        emit BatchSettled(b.in0, b.in1, b.out0, b.out1, firstLeaf);
+        emit Sync(reserve0, reserve1);
+        // TODO(Phase 3): treasury.reimburseRelayer(msg.sender, gasUsed) — gas subsidy paid from extraction.
+    }
+
+    function _validateBatch(Batch calldata b) private view {
+        uint256 n = b.nullifiers.length;
+        if (n == 0 || n > batchSize || b.commitments.length != n || b.encryptedNotes.length != n) revert BadBatch();
+        if (!isKnownRoot[b.root]) revert UnknownRoot();
+        if (b.tNow > block.timestamp || block.timestamp - b.tNow > BATCH_CLOCK_WINDOW) revert StaleBatchClock();
+    }
+
+    function _batchInputs(Batch calldata b, uint256 r0, uint256 r1) private view returns (uint256[] memory pub) {
+        uint256 size = batchSize;
+        pub = new uint256[](8 + 2 * size);
+        pub[0] = uint256(b.root);
+        pub[1] = b.tNow;
+        pub[2] = r0 + virtual0; // X
+        pub[3] = r1 + virtual1; // Y
+        pub[4] = b.in0;
+        pub[5] = b.in1;
+        pub[6] = b.out0;
+        pub[7] = b.out1;
+        uint256 n = b.nullifiers.length;
+        for (uint256 i; i < n; ++i) {
+            pub[8 + i] = uint256(b.nullifiers[i]);
+            pub[8 + size + i] = uint256(b.commitments[i]);
+        } // remaining entries stay 0 = padding slots
+    }
+
+    function _consumeBatch(Batch calldata b) private returns (uint32 firstLeaf) {
+        uint256 n = b.nullifiers.length;
         for (uint256 i; i < n; ++i) {
             if (uint256(b.nullifiers[i]) >= FIELD) revert NotInField();
             _spend(b.nullifiers[i]); // reverts on duplicate, also within the same batch
         }
-        uint32 firstLeaf = nextLeafIndex;
-        for (uint256 i; i < m; ++i) {
+        firstLeaf = nextLeafIndex;
+        for (uint256 i; i < n; ++i) {
             _insert(b.commitments[i], b.encryptedNotes[i]);
         }
+    }
 
-        // value moves between note custody and curve reserves (checked arithmetic = no free lunch)
+    /// @dev Moves NET value between note custody and curve reserves. Checked arithmetic = no free lunch.
+    function _applyFlows(Batch calldata b, uint256 r0, uint256 r1, uint256 kBefore) private {
         custody0 = uint128(uint256(custody0) - b.in0 + b.out0);
         custody1 = uint128(uint256(custody1) - b.in1 + b.out1);
         uint256 n0 = r0 + b.in0 - b.out0;
         uint256 n1 = r1 + b.in1 - b.out1;
         if (n0 > MAX_RESERVE || n1 > MAX_RESERVE) revert ReserveOverflow();
-        // I1: aggregate economics. Rounding in the circuit favours the pool => K never decreases.
+        // I1: aggregate economics. The circuit's rounding favours the pool => K never decreases.
         if ((n0 + virtual0) * (n1 + virtual1) < kBefore) revert InvariantBroken();
         reserve0 = uint128(n0);
         reserve1 = uint128(n1);
-
-        _checkBalances(); // I2 (no tokens move in a batch: pure re-labelling custody <-> reserve)
-        emit BatchSettled(b.in0, b.in1, b.out0, b.out1, firstLeaf);
-        emit Sync(n0, n1);
-        // TODO(Phase 3): treasury.reimburseRelayer(msg.sender, gasUsed) — gas subsidy paid from extraction.
     }
 
     // ================================================================== MEV internalisation

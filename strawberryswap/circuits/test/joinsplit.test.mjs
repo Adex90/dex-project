@@ -14,7 +14,11 @@ async function accepts(name, input) {
 }
 async function rejects(name, input) {
   try { await snarkjs.wtns.calculate(stringify(input), WASM, { type: "mem" }); fail++; console.log(`  FAIL rejects  ${name}: witness was accepted!`); }
-  catch (e) { pass++; console.log(`  ok   rejects  ${name}`); }
+  catch (e) {
+    // only a violated CONSTRAINT counts as a rejection; I/O or JS errors must never masquerade as one
+    if (!/Assert Failed|Error in template/.test(String(e.message))) { fail++; console.log(`  FAIL rejects  ${name}: not a constraint failure: ${String(e.message).split("\n")[0]}`); return; }
+    pass++; console.log(`  ok   rejects  ${name}`);
+  }
 }
 
 const h = await init();

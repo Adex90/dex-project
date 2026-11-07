@@ -38,7 +38,7 @@ function make(bodyStr, o = {}) {
 }
 const run = (i) => snarkjs.wtns.calculate(stringify(i), WASM, { type: "mem" });
 async function accepts(n, i) { try { await run(i); pass++; console.log("  ok   accepts ", n); } catch (e) { fail++; console.log("  FAIL accepts ", n, String(e.message).split("\n")[0]); } }
-async function rejects(n, i) { try { await run(i); fail++; console.log("  FAIL rejects ", n, "(accepted!)"); } catch (e) { pass++; const m = String(e.message).match(/template (\w+?)_\d+ line: (\d+)/); console.log("  ok   rejects ", n.padEnd(52), m ? `[${m[1]}:${m[2]}]` : `[${String(e.message).slice(0,60)}]`); } }
+async function rejects(n, i) { try { await run(i); fail++; console.log("  FAIL rejects ", n, "(accepted!)"); } catch (e) { if (!/Assert Failed|Error in template/.test(String(e.message))) { fail++; console.log("  FAIL rejects ", n, "not a constraint failure:", String(e.message).split("\n")[0]); return; } pass++; const m = String(e.message).match(/template (\w+?)_\d+ line: (\d+)/); console.log("  ok   rejects ", n.padEnd(52), m ? `[${m[1]}:${m[2]}]` : `[${String(e.message).slice(0,60)}]`); } }
 
 const GOOD = '{"symbol":"XAUUSD","price":2345.678912,"ts":1767225600}';
 console.log("positive");

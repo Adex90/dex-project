@@ -94,3 +94,9 @@ export function buildInput(h, tree, { assetId = 0n, ins, outs, publicIn = 0n, pu
 }
 
 export const stringify = (o) => JSON.parse(JSON.stringify(o, (_, v) => (typeof v === "bigint" ? v.toString() : v)));
+
+// DarkPool.transferNote binds ONLY the ciphertexts: extDataHash = keccak256(abi.encode(bytes, bytes)) % FIELD
+export function extDataHashNoAddr(enc0, enc1) {
+  const data = encodeAbiParameters(parseAbiParameters("bytes, bytes"), [enc0, enc1]);
+  return BigInt(keccak256(data)) % FIELD;
+}

@@ -64,6 +64,17 @@ Each of these single-line mutations makes the suite fail (run and recorded durin
 M1 delete the `amount > shieldedSupply` check · M2 round swap quotes **up** · M3 delete the `K' < K` check ·
 M4 lower `EXTRACTION_BPS` to 40 % · M5 remove the verifier gas cap.
 
+## I-BATCH  (DarkPool.settleBatch + circuits/batch_swap)
+
+> For a batch accepted by the verifier, every user receives ⌊value·price⌋ ≥ minOut at the single curve price
+> `pLo = ⌊WAD·(Y+A1)/(X+A0)⌋` (`pHi = pLo+1` for token1 sellers); the public net flow equals gross-in − gross-out; and
+> `K' >= K`. Proof of the last claim and the full threat table: `docs/BATCH_SETTLEMENT.md` §2, §4. The contract still
+> re-checks `K' >= K` and full backing independently, so these hold even if the circuit were unsound.
+
+Circuit mutation testing (`circuits/scripts/mutate-batch.sh`, 9 mutations) initially left two survivors — the two
+remainder bounds — because no test tried an attacker who shifts the remainder to keep every equation consistent;
+those attacks are now in `circuits/test/batch.test.mjs`, and all 9 mutations are killed.
+
 ## Findings made while testing (kept, not hidden)
 
 1. **Unbounded gas burn on malformed proofs** — real, fixed: a failed EC precompile consumes all forwarded
@@ -74,3 +85,11 @@ M4 lower `EXTRACTION_BPS` to 40 % · M5 remove the verifier gas cap.
 3. **Quotes vs real reserves.** `getAmountOut` prices against effective (real + virtual) reserves, so on a thin
    pool it can quote more than the *real* reserve; `settleBatch` then reverts. A liveness limit for
    aggregators, not a safety issue.
+4. **Prover timeout did not stop the process tree (Go Automator, fixed).** Killing only the direct child left an
+   orphaned grandchild holding the stderr pipe; the proof call hung until it exited. The prover now runs in its own
+   process group, is killed as a group, and has a bounded pipe wait (`TestTimeoutKillsTheProver`).
+5. **Relative circuit paths broke the prover (fixed).** The prover runs inside a private scratch directory; relative
+   `wasm`/`zkey` paths no longer resolved. Found by the end-to-end fixture run, not by a unit test — hence the E2E.
+6. **IPv6 scrubbing gap (fixed).** A regex cannot recognise compressed IPv6 (`2001:db8::1`); the log scrubber now
+   validates candidate tokens with `net.ParseIP`, without redacting times (`12:30:45`) or MAC addresses.
+7. **Settlement gas is dominated by Merkle insertions, not the proof** (≈2.75M of 3.05M at N=4; verification 297k).

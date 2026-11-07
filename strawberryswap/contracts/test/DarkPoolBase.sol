@@ -19,6 +19,7 @@ abstract contract DarkPoolBase is Test {
     uint256 constant WAD = 1e18;
     uint256 constant V0 = 1_000_000e18;
     uint256 constant V1 = 2_000_000e18;
+    uint256 constant BATCH_SIZE = 16; // mock-verifier suites; the real-proof suite uses the circuit's N
 
     MockERC20 token0;
     MockERC20 token1;
@@ -26,6 +27,7 @@ abstract contract DarkPoolBase is Test {
     MockTreasury treasury;
     MockVerifier joinSplitV;
     MockVerifier batchV;
+    MockHasher hasher;
     DarkPool pool;
     address lp = address(0x1111);
     address trader = address(0x2222);
@@ -39,6 +41,7 @@ abstract contract DarkPoolBase is Test {
         treasury = new MockTreasury();
         joinSplitV = new MockVerifier(true);
         batchV = new MockVerifier(true);
+        hasher = new MockHasher();
         pool = new DarkPool(
             IERC20Min(address(token0)),
             IERC20Min(address(token1)),
@@ -46,9 +49,10 @@ abstract contract DarkPoolBase is Test {
             V1,
             IZKVerifier(address(joinSplitV)),
             IZKVerifier(address(batchV)),
-            IPoseidonHasher(address(new MockHasher())),
+            IPoseidonHasher(address(hasher)),
             IZKOracle(address(oracle)),
-            ITreasury(address(treasury))
+            ITreasury(address(treasury)),
+            BATCH_SIZE
         );
     }
 
@@ -88,6 +92,7 @@ abstract contract DarkPoolBase is Test {
     function _batch(uint256 in0, uint256 in1, uint256 out0, uint256 out1) internal returns (DarkPool.Batch memory b) {
         b.proof = hex"01";
         b.root = pool.currentRoot();
+        b.tNow = uint64(block.timestamp);
         b.nullifiers = new bytes32[](1);
         b.nullifiers[0] = _fresh();
         b.commitments = new bytes32[](1);

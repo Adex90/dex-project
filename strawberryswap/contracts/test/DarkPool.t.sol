@@ -5,7 +5,9 @@ import {DarkPoolBase} from "./DarkPoolBase.sol";
 import {DarkPool} from "../src/dex/DarkPool.sol";
 import {NoteTree} from "../src/privacy/NoteTree.sol";
 import {Math} from "../src/utils/Math.sol";
-import {MockSearcher} from "./mocks/Mocks.sol";
+import {MockSearcher, ExpectingVerifier} from "./mocks/Mocks.sol";
+import {IZKVerifier} from "../src/interfaces/IZKVerifier.sol";
+import {IPoseidonHasher} from "../src/interfaces/IPoseidonHasher.sol";
 
 /// @notice Fuzz + unit tests for the DarkPool curve. Theorem under test:
 ///           K = (R0+v0)(R1+v1) never decreases across swaps (batch settlement) or rebalances, and rounding
@@ -339,6 +341,88 @@ contract DarkPoolTest is DarkPoolBase {
         _custody(0, 1e18);
         DarkPool.Batch memory b = _batch(1e18 + 1, 0, 0, 0);
         vm.expectRevert(); // checked arithmetic: custody underflow
+        pool.settleBatch(b);
+    }
+
+    // ---- batch circuit interface: [root, tNow, X, Y, in0, in1, out0, out1, nullifiers(N), commitments(N)]
+    function test_batchPublicInputLayoutMatchesTheCircuit() public {
+        _addLiquidity(lp, 1e24, 2e24);
+        _custody(0, 1e21);
+        ExpectingVerifier ev = new ExpectingVerifier();
+        // fresh pool wired to the layout-checking verifier, batch size 4
+        DarkPool p = new DarkPool(
+            pool.token0(), pool.token1(), V0, V1, joinSplitV, ev, IPoseidonHasher(address(hasher)), oracle, treasury, 4
+        );
+        token0.mint(lp, 1e24);
+        token1.mint(lp, 2e24);
+        vm.startPrank(lp);
+        token0.approve(address(p), type(uint256).max);
+        token1.approve(address(p), type(uint256).max);
+        p.addLiquidity(1e24, 2e24, lp);
+        vm.stopPrank();
+        token0.mint(trader, 1e21);
+        NoteTree.JoinSplit memory js = _js();
+        js.root = p.currentRoot();
+        vm.startPrank(trader);
+        token0.approve(address(p), 1e21);
+        p.depositNote(0, 1e21, js);
+        vm.stopPrank();
+
+        DarkPool.Batch memory b = _batch(1e20, 0, 0, 7);
+        b.root = p.currentRoot();
+        b.nullifiers = new bytes32[](2);
+        b.commitments = new bytes32[](2);
+        b.encryptedNotes = new bytes[](2);
+        (b.nullifiers[0], b.nullifiers[1]) = (bytes32(uint256(11)), bytes32(uint256(12)));
+        (b.commitments[0], b.commitments[1]) = (bytes32(uint256(21)), bytes32(uint256(22)));
+        uint256[] memory e = new uint256[](16); // 8 + 2*4
+        e[0] = uint256(b.root); e[1] = b.tNow; e[2] = 1e24 + V0; e[3] = 2e24 + V1;
+        e[4] = 1e20; e[5] = 0; e[6] = 0; e[7] = 7;
+        e[8] = 11; e[9] = 12; /* e[10], e[11] = 0 padding */ e[12] = 21; e[13] = 22; /* e[14], e[15] = 0 */
+        ev.expect(e);
+        p.settleBatch(b); // reverts InvalidProof if ANY public input differs from the circuit's order
+
+        e[2] += 1; // pool state differs by 1 wei => proof built for another state must fail
+        ev.expect(e);
+        DarkPool.Batch memory b2 = _batch(1e20, 0, 0, 7);
+        b2.root = p.currentRoot();
+        vm.expectRevert(NoteTree.InvalidProof.selector);
+        p.settleBatch(b2);
+    }
+
+    function test_batchClockWindowEnforced() public {
+        _addLiquidity(lp, 1e24, 2e24);
+        _custody(0, 1e21);
+        DarkPool.Batch memory b = _batch(1e20, 0, 0, 1);
+        b.tNow = uint64(block.timestamp + 1); // clock in the future
+        vm.expectRevert(DarkPool.StaleBatchClock.selector);
+        pool.settleBatch(b);
+        b.tNow = uint64(block.timestamp - pool.BATCH_CLOCK_WINDOW() - 1); // too old
+        vm.expectRevert(DarkPool.StaleBatchClock.selector);
+        pool.settleBatch(b);
+        b.tNow = uint64(block.timestamp - pool.BATCH_CLOCK_WINDOW()); // exactly at the edge: ok
+        pool.settleBatch(b);
+    }
+
+    function test_batchShapeChecks() public {
+        _addLiquidity(lp, 1e24, 2e24);
+        _custody(0, 1e21);
+        DarkPool.Batch memory b = _batch(1e20, 0, 0, 1);
+        b.commitments = new bytes32[](2); // commitments != nullifiers
+        vm.expectRevert(DarkPool.BadBatch.selector);
+        pool.settleBatch(b);
+        b = _batch(1e20, 0, 0, 1);
+        b.nullifiers = new bytes32[](0);
+        b.commitments = new bytes32[](0);
+        b.encryptedNotes = new bytes[](0);
+        vm.expectRevert(DarkPool.BadBatch.selector); // empty batch
+        pool.settleBatch(b);
+        b = _batch(1e20, 0, 0, 1);
+        uint256 n = pool.batchSize() + 1; // more intents than circuit slots
+        b.nullifiers = new bytes32[](n);
+        b.commitments = new bytes32[](n);
+        b.encryptedNotes = new bytes[](n);
+        vm.expectRevert(DarkPool.BadBatch.selector);
         pool.settleBatch(b);
     }
 

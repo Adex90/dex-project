@@ -47,12 +47,12 @@ strawberryswap/
 │   └── script/                     # (Phase 2) deterministic deploy
 ├── circuits/                       # Circom 2.1.9 (+ test harness, dev setup, fixture generator)
 │   ├── joinsplit/                  #   2-in/2-out note circuit (shield/transfer/unshield, assetId)
-│   ├── batch_swap/                 #   (NOT WRITTEN) aggregated intent settlement
+│   ├── batch_swap/                 #   aggregated shielded intent settlement (N = 2/4/8/16)
 │   └── zkdeco_oracle/              #   TLS-session attestation for price feeds
 ├── frontend/                       # Next.js + TypeScript + Tailwind, `output: "export"` (static → IPFS)
 │   └── src/{app/{,trade},components,hooks,lib,styles}
 ├── bots/
-│   ├── automator-go/               # intent mempool, batching, proving orchestration, relayer (Go)
+│   ├── automator/                  # Go relayer: intents → batch → proof → settleBatch; Tor-only metadata layer
 │   ├── searcher-rust/              # (reserved) production RPC / signer adapters
 │   └── inventory-cpp/              # Searcher core: LOB signals, Avellaneda–Stoikov, curve planner (C++20)
 ├── mpc/tss-vault/                  # (Phase 4) threshold-ECDSA/EdDSA corporate vault coordinator
@@ -131,6 +131,19 @@ cd contracts && forge install foundry-rs/forge-std --no-git && forge test
 # circuits (circom >= 2.1.9 on PATH or $CIRCOM)
 cd circuits && npm ci && npm run compile && node test/joinsplit.test.mjs && node test/zkdeco.test.mjs
 ```
+
+## Phase 6 deliverables
+
+| # | Deliverable | Status |
+|---|---|---|
+| 17 | `circuits/batch_swap` — N shielded intents → one net transition at a uniform curve price | N=4 proven end-to-end; 38 witness tests; 9 circuit mutations |
+| 18 | `DarkPool.settleBatch` rewired to the circuit (public-input layout, clock window, net flows, `batchSize`) + `GenericGroth16Adapter` | 22 pool tests + 11 real-proof E2E tests |
+| 19 | `bots/automator/` — Go relayer: tree mirror, batcher, prover wrapper, chain client, HTTP intake, epoch loop | `go test -race` green; golden-checked against the JS reference |
+| 20 | Metadata-privacy layer: onion-only intake, redacting HTTP/log layers, Tor egress, hardened systemd unit, `torrc` | tested properties G1–G5 (`internal/privacy`) |
+| 21 | `docs/BATCH_SETTLEMENT.md` — design, K proof, threat table, measured costs | — |
+
+**Open:** the frontend still posts a legacy plaintext intent (client-side proving not wired); `settleBatch` costs ≈3.05M
+gas at N=4, dominated by on-chain Merkle insertions (SNARK verification is 297k); keys are single-party DEV keys.
 
 ## Known limitations (read before Phase 2)
 

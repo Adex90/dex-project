@@ -33,6 +33,23 @@ contract MockVerifier is IZKVerifier {
     }
 }
 
+/// @dev Accepts a proof only if the public inputs equal an expected vector set by the test: pins down the EXACT
+///      layout DarkPool passes to the batch verifier (must equal the order declared in circuits/batch_swap).
+contract ExpectingVerifier is IZKVerifier {
+    uint256[] public expected;
+
+    function expect(uint256[] calldata e) external {
+        delete expected;
+        for (uint256 i; i < e.length; ++i) expected.push(e[i]);
+    }
+
+    function verifyProof(bytes calldata, uint256[] calldata pub) external view returns (bool) {
+        if (pub.length != expected.length) return false;
+        for (uint256 i; i < pub.length; ++i) if (pub[i] != expected[i]) return false;
+        return true;
+    }
+}
+
 /// @dev Poseidon stand-in for fast fuzzing: keccak mod BN254 field. NOT the circuit's hash.
 contract MockHasher is IPoseidonHasher {
     uint256 internal constant FIELD =
