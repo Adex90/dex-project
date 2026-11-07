@@ -26,6 +26,8 @@ var (
 	ErrBusy        = errors.New("automator is at capacity")
 	ErrUnknownNote = errors.New("intent note is not in the note tree: create it on-chain first")
 	ErrTreeBehind  = errors.New("local note tree is not in sync with the chain")
+	ErrStaleOracle = errors.New("oracle price went stale while proving; batch held back")
+	ErrValueLeak   = errors.New("oracle moved while proving: the batch would now lower pool value; held back")
 )
 
 type State string
@@ -47,11 +49,25 @@ type Config struct {
 	DeployBlock  uint64        // first block to scan for NoteInserted
 	LogChunk     uint64        // blocks per eth_getLogs
 	RetainEpochs int           // how long finished intents stay queryable (in epochs, not wall time)
+	// MaxOracleAge mirrors DarkPool.MAX_ORACLE_AGE: an older price cannot back a value-moving batch.
+	MaxOracleAge uint64
+	// ValueMarginBps (default 0): plan batches so they still pass DarkPool's value guard if the oracle moves this
+	// far. Every batch is re-checked against the oracle right before submission either way, so the margin only
+	// trades fewer wasted proofs for fewer settled intents.
+	ValueMarginBps int64
+	// TreeDepth of the local note-tree mirror; must equal NoteTree.DEPTH (tests use smaller trees).
+	TreeDepth int
 }
 
 func (c *Config) defaults() {
 	if c.LogChunk == 0 {
 		c.LogChunk = 2000
+	}
+	if c.MaxOracleAge == 0 {
+		c.MaxOracleAge = 60
+	}
+	if c.TreeDepth == 0 {
+		c.TreeDepth = notetree.Depth
 	}
 	if c.MaxPending == 0 {
 		c.MaxPending = 4096
@@ -82,7 +98,8 @@ type Service struct {
 	log *slog.Logger
 
 	mu       sync.Mutex
-	tree     *notetree.Tree
+	tree     *notetree.Tree    // the current on-chain tree
+	trees    []*notetree.Tree  // completed (rolled-over) trees, oldest first; their roots stay valid on-chain forever
 	scanned  uint64            // last block fully scanned
 	entries  map[string]*entry // by intent commitment (decimal)
 	receipts map[string]string // receipt -> commitment
@@ -96,7 +113,7 @@ const minResync = 15 * time.Second
 
 func New(cfg Config, ch chain.Chain, prv prover.Prover, log *slog.Logger) *Service {
 	cfg.defaults()
-	return &Service{cfg: cfg, ch: ch, prv: prv, log: log, tree: notetree.New(notetree.Depth),
+	return &Service{cfg: cfg, ch: ch, prv: prv, log: log, tree: notetree.New(cfg.TreeDepth),
 		scanned: cfg.DeployBlock - boolU(cfg.DeployBlock > 0), entries: map[string]*entry{}, receipts: map[string]string{}}
 }
 
@@ -140,14 +157,14 @@ func (s *Service) Submit(in *intent.Intent) (string, error) {
 	if len(s.entries) >= s.cfg.MaxPending {
 		return "", ErrBusy
 	}
-	if _, ok := s.tree.IndexOf(in.Commitment()); !ok {
+	if _, _, ok := s.locateLocked(in.Commitment()); !ok {
 		// the note may have been created after our last scan (a user submits right after their transferNote)
 		if time.Since(s.lastSync) > minResync {
 			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 			_ = s.syncLocked(ctx)
 			cancel()
 		}
-		if _, ok := s.tree.IndexOf(in.Commitment()); !ok {
+		if _, _, ok := s.locateLocked(in.Commitment()); !ok {
 			return "", ErrUnknownNote
 		}
 	}
@@ -195,6 +212,11 @@ func (s *Service) syncLocked(ctx context.Context) error {
 			return err
 		}
 		for _, l := range leaves {
+			if s.tree.Len() == 1<<s.cfg.TreeDepth && l.Index == 0 {
+				// NoteTree rolled over: the full tree is final (its root stays valid), indices restart at 0
+				s.trees = append(s.trees, s.tree)
+				s.tree = notetree.New(s.cfg.TreeDepth)
+			}
 			switch {
 			case l.Index < uint64(s.tree.Len()):
 				continue // already have it (overlapping scan)
@@ -229,7 +251,7 @@ func (s *Service) Tick(ctx context.Context) error {
 		s.mu.Unlock()
 		return fmt.Errorf("configured batch size %d differs from the pool's %d", s.cfg.N, pool.BatchSize)
 	}
-	if pool.Root.Cmp(s.tree.Root()) != 0 {
+	if pool.TreeID != uint64(len(s.trees)) || pool.Root.Cmp(s.tree.Root()) != 0 {
 		s.mu.Unlock()
 		return ErrTreeBehind // the chain moved between our scan and the pool read; retry next epoch
 	}
@@ -239,22 +261,39 @@ func (s *Service) Tick(ctx context.Context) error {
 		s.mu.Unlock()
 		return err
 	}
-	var cands []batcher.Candidate
+	// One batch proves membership under ONE root: settle the oldest tree that has pending intents first (a
+	// completed tree's final root stays valid on-chain forever).
+	byTree := map[int][]batcher.Candidate{}
+	first := -1
 	for _, e := range s.entries {
 		if e.state != Queued {
 			continue
 		}
-		idx, ok := s.tree.IndexOf(e.in.Commitment())
+		t, idx, ok := s.locateLocked(e.in.Commitment())
 		if !ok {
 			continue
 		}
-		cands = append(cands, batcher.Candidate{Intent: e.in, LeafIndex: idx})
+		byTree[t] = append(byTree[t], batcher.Candidate{Intent: e.in, LeafIndex: idx})
+		if first < 0 || t < first {
+			first = t
+		}
 	}
-	tree := s.tree
+	if first < 0 {
+		s.mu.Unlock()
+		return nil
+	}
+	cands, tree := byTree[first], s.treeAtLocked(first)
 	s.mu.Unlock()
 
-	bp := batcher.Pool{X: pool.X(), Y: pool.Y(), R0: pool.R0, R1: pool.R1}
-	plan, err := batcher.Build(bp, cands, head.Timestamp, batcher.Config{N: s.cfg.N, MinSwaps: s.cfg.MinSwaps})
+	orc, err := s.ch.Oracle(ctx)
+	if err != nil {
+		return err
+	}
+	bp := batcher.Pool{X: pool.X(), Y: pool.Y(), R0: pool.R0, R1: pool.R1, Price: s.freshPrice(orc, head.Timestamp)}
+	if bp.Price == nil {
+		s.log.Warn("oracle stale: refunds only this epoch")
+	}
+	plan, err := batcher.Build(bp, cands, head.Timestamp, batcher.Config{N: s.cfg.N, MinSwaps: s.cfg.MinSwaps, ValueMarginBps: s.cfg.ValueMarginBps})
 	if errors.Is(err, batcher.ErrNoBatch) {
 		return nil
 	}
@@ -271,8 +310,29 @@ func (s *Service) Tick(ctx context.Context) error {
 		return err
 	}
 
+	// Proving took a while: re-check DarkPool's value guard against the oracle as it is NOW. A batch that would
+	// revert is not worth its gas; its intents stay queued for the next epoch.
+	if plan.Swaps > 0 {
+		now, err := s.ch.Head(ctx)
+		if err != nil {
+			return err
+		}
+		o2, err := s.ch.Oracle(ctx)
+		if err != nil {
+			return err
+		}
+		p2 := s.freshPrice(o2, now.Timestamp)
+		if p2 == nil {
+			return ErrStaleOracle
+		}
+		if leak, _ := batcher.LeaksValue(plan.NetIn0, plan.NetIn1, plan.NetOut0, plan.NetOut1, p2); leak {
+			return ErrValueLeak
+		}
+	}
+
 	outs := plan.Outputs()
-	b := &chain.Batch{Proof: proof.Bytes, TNow: head.Timestamp, In0: plan.NetIn0, In1: plan.NetIn1, Out0: plan.NetOut0, Out1: plan.NetOut1}
+	b := &chain.Batch{Proof: proof.Bytes, TNow: head.Timestamp, In0: plan.NetIn0, In1: plan.NetIn1, Out0: plan.NetOut0, Out1: plan.NetOut1,
+		X: bp.X, Y: bp.Y}
 	b.Root = field.Bytes32(tree.Root())
 	for i, o := range outs {
 		sealed, err := plan.Slots[i].Cand.Intent.Seal(o.AssetOut, o.ValueOut)
@@ -305,14 +365,14 @@ func (s *Service) reconcileLocked(ctx context.Context) {
 	for k, e := range s.entries {
 		switch e.state {
 		case Inflight:
-			if _, ok := s.tree.IndexOf(e.outCommit); ok {
+			if _, _, ok := s.locateLocked(e.outCommit); ok {
 				e.state, e.doneEpoch = Settled, s.epoch
 				if e.isRefund {
 					e.state = Refunded
 				}
 			}
 		case Queued:
-			if idx, ok := s.tree.IndexOf(e.in.Commitment()); ok {
+			if _, idx, ok := s.locateLocked(e.in.Commitment()); ok {
 				if spent, err := s.ch.Spent(ctx, e.in.Nullifier(idx)); err == nil && spent {
 					e.state, e.doneEpoch = Dropped, s.epoch
 				}
@@ -328,6 +388,34 @@ func (s *Service) reconcileLocked(ctx context.Context) {
 			}
 		}
 	}
+}
+
+// locateLocked finds a commitment in the completed trees (oldest first) or the current one: (tree ordinal, leaf, ok).
+func (s *Service) locateLocked(c *big.Int) (int, int, bool) {
+	for t, tr := range s.trees {
+		if i, ok := tr.IndexOf(c); ok {
+			return t, i, true
+		}
+	}
+	if i, ok := s.tree.IndexOf(c); ok {
+		return len(s.trees), i, true
+	}
+	return 0, 0, false
+}
+
+func (s *Service) treeAtLocked(t int) *notetree.Tree {
+	if t < len(s.trees) {
+		return s.trees[t]
+	}
+	return s.tree
+}
+
+// freshPrice returns the oracle price if DarkPool would accept it at time now, else nil.
+func (s *Service) freshPrice(o chain.OraclePrice, now uint64) *big.Int {
+	if o.Price == nil || o.Price.Sign() == 0 || o.UpdatedAt > now || now-o.UpdatedAt > s.cfg.MaxOracleAge {
+		return nil
+	}
+	return o.Price
 }
 
 // Run is the epoch loop. Epoch boundaries are jittered with crypto/rand and are independent of request arrival.

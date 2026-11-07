@@ -32,6 +32,7 @@ func TestEncodeSettleBatchMatchesCast(t *testing.T) {
 		Nullifiers: [][32]byte{rep(0x22), rep(0x33)}, Commitments: [][32]byte{rep(0x44), rep(0x55)},
 		EncryptedNotes: [][]byte{{0xde, 0xad, 0xbe, 0xef}, bytes.Repeat([]byte{0xcd}, 61)},
 		In0:            big.NewInt(7), In1: big.NewInt(0), Out0: big.NewInt(0), Out1: big.NewInt(9),
+		X: big.NewInt(0).Mul(big.NewInt(3_000_000), big.NewInt(1e18)), Y: big.NewInt(0).Mul(big.NewInt(6_000_000), big.NewInt(1e18)),
 	}
 	got := EncodeSettleBatch(b)
 	if !bytes.Equal(got, want) {
@@ -40,7 +41,7 @@ func TestEncodeSettleBatchMatchesCast(t *testing.T) {
 }
 
 func TestEmptyNotesAndSelector(t *testing.T) {
-	b := &Batch{Proof: make([]byte, 256), In0: big.NewInt(0), In1: big.NewInt(0), Out0: big.NewInt(0), Out1: big.NewInt(0)}
+	b := &Batch{Proof: make([]byte, 256), In0: big.NewInt(0), In1: big.NewInt(0), Out0: big.NewInt(0), Out1: big.NewInt(0), X: big.NewInt(1), Y: big.NewInt(1)}
 	cd := EncodeSettleBatch(b)
 	if len(cd)%32 != 4 {
 		t.Fatal("calldata must be selector + whole words")

@@ -22,6 +22,14 @@ type PoolState struct {
 	Root           *big.Int // NoteTree.currentRoot()
 	NextLeaf       uint64
 	BatchSize      uint64
+	TreeID         uint64 // NoteTree.treeId(): increments when a full tree rolls over
+}
+
+// OraclePrice is DarkPool's zk-oracle reading (token1 per token0, 1e18-scaled) and its timestamp. settleBatch
+// requires it to be fresh whenever a batch moves value, and never to lose pool value at that price.
+type OraclePrice struct {
+	Price     *big.Int
+	UpdatedAt uint64
 }
 
 // X, Y are the effective reserves (the circuit's public inputs).
@@ -44,6 +52,7 @@ type Head struct {
 type Chain interface {
 	Head(ctx context.Context) (Head, error)
 	Pool(ctx context.Context) (PoolState, error)
+	Oracle(ctx context.Context) (OraclePrice, error)
 	Leaves(ctx context.Context, from, to uint64) ([]Leaf, error)
 	Spent(ctx context.Context, nullifier *big.Int) (bool, error)
 	Submit(ctx context.Context, calldata []byte) (txHash string, err error)
@@ -115,7 +124,11 @@ func hexU64(s string) (uint64, error) {
 }
 
 func (c *RPC) ethCall(ctx context.Context, data []byte) ([]byte, error) {
-	res, err := c.call(ctx, "eth_call", map[string]string{"to": c.Pool_, "data": "0x" + hex.EncodeToString(data)}, "latest")
+	return c.ethCallTo(ctx, c.Pool_, data)
+}
+
+func (c *RPC) ethCallTo(ctx context.Context, to string, data []byte) ([]byte, error) {
+	res, err := c.call(ctx, "eth_call", map[string]string{"to": to, "data": "0x" + hex.EncodeToString(data)}, "latest")
 	if err != nil {
 		return nil, err
 	}
@@ -171,8 +184,30 @@ func (c *RPC) Pool(ctx context.Context) (PoolState, error) {
 	if err != nil {
 		return p, err
 	}
-	p.NextLeaf, p.BatchSize = nl.Uint64(), bs.Uint64()
+	tid, err := c.callUint(ctx, "treeId()")
+	if err != nil {
+		return p, err
+	}
+	p.NextLeaf, p.BatchSize, p.TreeID = nl.Uint64(), bs.Uint64(), tid.Uint64()
 	return p, nil
+}
+
+// Oracle reads DarkPool.oracle().latestVerifiedPrice().
+func (c *RPC) Oracle(ctx context.Context) (OraclePrice, error) {
+	addr, err := c.callUint(ctx, "oracle()")
+	if err != nil {
+		return OraclePrice{}, err
+	}
+	sel := Selector("latestVerifiedPrice()")
+	out, err := c.ethCallTo(ctx, fmt.Sprintf("0x%040x", addr), sel[:])
+	if err != nil || len(out) < 64 {
+		return OraclePrice{}, errors.New("latestVerifiedPrice call failed")
+	}
+	ts := new(big.Int).SetBytes(out[32:64])
+	if !ts.IsUint64() {
+		return OraclePrice{}, errors.New("oracle timestamp out of range")
+	}
+	return OraclePrice{Price: new(big.Int).SetBytes(out[:32]), UpdatedAt: ts.Uint64()}, nil
 }
 
 func (c *RPC) Spent(ctx context.Context, nullifier *big.Int) (bool, error) {

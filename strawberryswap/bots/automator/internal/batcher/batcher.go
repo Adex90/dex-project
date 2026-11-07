@@ -31,8 +31,9 @@ var (
 )
 
 // Pool is the on-chain AMM state the proof is bound to. X, Y are EFFECTIVE reserves (real + virtual) — the public
-// inputs; R0, R1 are the REAL reserves, which bound what the pool can actually pay out.
-type Pool struct{ X, Y, R0, R1 *big.Int }
+// inputs; R0, R1 are the REAL reserves, which bound what the pool can actually pay out. Price is the fresh zk-oracle
+// price (1e18-scaled token1 per token0), or nil when the oracle is stale: settleBatch then accepts refunds only.
+type Pool struct{ X, Y, R0, R1, Price *big.Int }
 
 // Candidate is a pending intent whose note is already in the tree.
 type Candidate struct {
@@ -58,6 +59,34 @@ type Plan struct {
 type Config struct {
 	N        int // circuit slot count
 	MinSwaps int // minimum swaps per batch (anonymity floor); refunds are exempt
+	// ValueMarginBps: DarkPool.settleBatch rejects any batch that lowers the pool's value at the oracle price (I5).
+	// The plan must also pass with the oracle moved this far against it, so a price update while the proof is being
+	// generated does not void the batch.
+	ValueMarginBps int64
+}
+
+// LeaksValue reports whether net flows would lower the pool's value at oracle price p (DarkPool I5:
+// in0·p + in1·WAD < out0·p + out1·WAD), and which asset's sellers cause it (the asset the pool receives net).
+func LeaksValue(in0, in1, out0, out1, p *big.Int) (bool, int) {
+	gain := new(big.Int).Add(new(big.Int).Mul(in0, p), new(big.Int).Mul(in1, field.WAD))
+	loss := new(big.Int).Add(new(big.Int).Mul(out0, p), new(big.Int).Mul(out1, field.WAD))
+	if gain.Cmp(loss) >= 0 {
+		return false, -1
+	}
+	if in0.Sign() > 0 {
+		return true, 0
+	}
+	return true, 1
+}
+
+// adversePrice moves p by marginBps in the direction that hurts a batch whose pool receives token0 net (lower p) or
+// token1 net (higher p): the value change (in0−out0)·p + (in1−out1)·WAD is linear in p.
+func adversePrice(p, in0 *big.Int, marginBps int64) *big.Int {
+	f := 10_000 - marginBps
+	if in0.Sign() == 0 {
+		f = 10_000 + marginBps
+	}
+	return new(big.Int).Div(new(big.Int).Mul(p, big.NewInt(f)), big.NewInt(10_000))
 }
 
 // Cleared is the result of pricing a set of swaps.
@@ -145,6 +174,9 @@ func Build(pool Pool, cands []Candidate, tNow uint64, cfg Config) (*Plan, error)
 		swaps = swaps[:room]
 	}
 
+	if pool.Price == nil || pool.Price.Sign() == 0 {
+		swaps = nil // no fresh oracle: settleBatch accepts value-free (refund-only) batches only
+	}
 	// Shrink until every included swap is satisfiable and the pool can actually settle it.
 	for len(swaps) > 0 {
 		ints := make([]*intent.Intent, len(swaps))
@@ -178,6 +210,17 @@ func Build(pool Pool, cands []Candidate, tNow uint64, cfg Config) (*Plan, error)
 				swaps = append(swaps[:k:k], swaps[k+1:]...)
 				continue
 			}
+		}
+		// I5: the batch may not lower the pool's value at the oracle price (with a margin for oracle updates).
+		// Only sellers of the asset the pool receives net can cause that: they are being paid above the oracle.
+		if leak, dir := LeaksValue(in0, in1, out0, out1, adversePrice(pool.Price, in0, cfg.ValueMarginBps)); leak {
+			k := largest(swaps, dir)
+			if k < 0 {
+				swaps = nil
+				break
+			}
+			swaps = append(swaps[:k:k], swaps[k+1:]...)
+			continue
 		}
 		break
 	}

@@ -18,6 +18,7 @@ type Batch struct {
 	Commitments          [][32]byte
 	EncryptedNotes       [][]byte
 	In0, In1, Out0, Out1 *big.Int
+	X, Y                 *big.Int // effective reserves the proof was generated against (DarkPool accepts recent states)
 }
 
 // Selector returns the first 4 bytes of keccak256(signature).
@@ -28,7 +29,7 @@ func Selector(sig string) [4]byte {
 	return s
 }
 
-const settleBatchSig = "settleBatch((bytes,bytes32,uint64,bytes32[],bytes32[],bytes[],uint256,uint256,uint256,uint256))"
+const settleBatchSig = "settleBatch((bytes,bytes32,uint64,bytes32[],bytes32[],bytes[],uint256,uint256,uint256,uint256,uint256,uint256))"
 
 func word(v *big.Int) []byte { b := make([]byte, 32); v.FillBytes(b); return b }
 func wordU(v uint64) []byte  { b := make([]byte, 32); binary.BigEndian.PutUint64(b[24:], v); return b }
@@ -63,7 +64,7 @@ func encBytesArray(a [][]byte) []byte {
 // four dynamic members (proof, nullifiers, commitments, encryptedNotes) whose offsets are relative to the tuple start.
 func EncodeSettleBatch(b *Batch) []byte {
 	proof, nul, com, enc := encBytes(b.Proof), encB32Array(b.Nullifiers), encB32Array(b.Commitments), encBytesArray(b.EncryptedNotes)
-	const headWords = 10
+	const headWords = 12
 	off := headWords * 32
 	offProof, offNul := off, off+len(proof)
 	offCom, offEnc := offNul+len(nul), offNul+len(nul)+len(com)
@@ -74,7 +75,7 @@ func EncodeSettleBatch(b *Batch) []byte {
 	tuple = append(tuple, wordU(uint64(offNul))...)
 	tuple = append(tuple, wordU(uint64(offCom))...)
 	tuple = append(tuple, wordU(uint64(offEnc))...)
-	for _, v := range []*big.Int{b.In0, b.In1, b.Out0, b.Out1} {
+	for _, v := range []*big.Int{b.In0, b.In1, b.Out0, b.Out1, b.X, b.Y} {
 		tuple = append(tuple, word(v)...)
 	}
 	tuple = append(tuple, proof...)

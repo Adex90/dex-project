@@ -24,6 +24,9 @@ func tok(n int64) *big.Int { return new(big.Int).Mul(big.NewInt(n), e18) }
 // fakeChain is a deterministic stand-in for DarkPool: a note tree fed by "events", pool reserves, a spent set.
 type fakeChain struct {
 	tree      *notetree.Tree
+	depth     int
+	done      []*notetree.Tree // rolled-over trees
+	oracle    chain.OraclePrice
 	leaves    []chain.Leaf
 	block     uint64
 	ts        uint64
@@ -33,12 +36,20 @@ type fakeChain struct {
 	failNext  bool
 }
 
-func newFake() *fakeChain {
-	return &fakeChain{tree: notetree.New(notetree.Depth), block: 1, ts: 1_800_000_000, spent: map[string]bool{},
-		pool: chain.PoolState{R0: tok(1_000_000), R1: tok(2_000_000), V0: tok(2_000_000), V1: tok(4_000_000), BatchSize: 4}}
+func newFake() *fakeChain { return newFakeDepth(notetree.Depth) }
+
+// newFakeDepth: spot = (R1+V1)/(R0+V0) = 2.0 and a fresh oracle at that price.
+func newFakeDepth(depth int) *fakeChain {
+	return &fakeChain{tree: notetree.New(depth), depth: depth, block: 1, ts: 1_800_000_000, spent: map[string]bool{},
+		oracle: chain.OraclePrice{Price: tok(2), UpdatedAt: 1_800_000_000},
+		pool:   chain.PoolState{R0: tok(1_000_000), R1: tok(2_000_000), V0: tok(2_000_000), V1: tok(4_000_000), BatchSize: 4}}
 }
 
 func (f *fakeChain) addLeaf(c *big.Int) {
+	if f.tree.Len() == 1<<f.depth { // mirror NoteTree._rollover
+		f.done = append(f.done, f.tree)
+		f.tree = notetree.New(f.depth)
+	}
 	idx, _ := f.tree.Insert(c)
 	f.block++
 	f.leaves = append(f.leaves, chain.Leaf{Index: uint64(idx), Commitment: c, Block: f.block})
@@ -50,8 +61,10 @@ func (f *fakeChain) Pool(context.Context) (chain.PoolState, error) {
 	p := f.pool
 	p.Root = f.tree.Root()
 	p.NextLeaf = uint64(f.tree.Len())
+	p.TreeID = uint64(len(f.done))
 	return p, nil
 }
+func (f *fakeChain) Oracle(context.Context) (chain.OraclePrice, error) { return f.oracle, nil }
 func (f *fakeChain) Leaves(_ context.Context, from, to uint64) ([]chain.Leaf, error) {
 	var out []chain.Leaf
 	for _, l := range f.leaves {
@@ -120,12 +133,16 @@ func TestEndToEndEpoch(t *testing.T) {
 		t.Fatalf("want 1 batch submitted, got %d", len(fc.submitted))
 	}
 	cd := fc.submitted[0]
-	if sel := chain.Selector("settleBatch((bytes,bytes32,uint64,bytes32[],bytes32[],bytes[],uint256,uint256,uint256,uint256))"); !bytes.Equal(cd[:4], sel[:]) {
+	if sel := chain.Selector("settleBatch((bytes,bytes32,uint64,bytes32[],bytes32[],bytes[],uint256,uint256,uint256,uint256,uint256,uint256))"); !bytes.Equal(cd[:4], sel[:]) {
 		t.Fatal("wrong function selector")
 	}
 	tuple := cd[4+32:]
 	if !bytes.Equal(tuple[32:64], field.Bytes32Slice(fc.tree.Root())) {
 		t.Fatal("batch is not bound to the current tree root")
+	}
+	p, _ := fc.Pool(context.Background())
+	if !bytes.Equal(tuple[320:352], field.Bytes32Slice(p.X())) || !bytes.Equal(tuple[352:384], field.Bytes32Slice(p.Y())) {
+		t.Fatal("batch does not carry the (X, Y) it was proven against")
 	}
 	for _, r := range receipts {
 		if st, _ := svc.Status(r); st.State != Inflight {
@@ -265,4 +282,85 @@ func TestSubmitResyncsForFreshNotesButIsRateLimited(t *testing.T) {
 		t.Fatalf("resync must be rate-limited, got %v", err)
 	}
 	_ = before
+}
+
+// A stale oracle means DarkPool would reject any value-moving batch: nothing is submitted, intents stay queued.
+func TestStaleOracleHoldsSwaps(t *testing.T) {
+	svc, fc, _, ints := setup(t, 1)
+	for _, in := range ints {
+		if _, err := svc.Submit(in); err != nil {
+			t.Fatal(err)
+		}
+	}
+	fc.oracle.UpdatedAt = fc.ts - 61
+	if err := svc.Tick(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(fc.submitted) != 0 {
+		t.Fatal("a swap batch was submitted with a stale oracle")
+	}
+}
+
+// oracleMover moves the oracle while the proof is being generated.
+type oracleMover struct {
+	fc *fakeChain
+	to *big.Int
+}
+
+func (m *oracleMover) Prove(_ context.Context, _ map[string]any, exp []*big.Int) (*prover.Proof, error) {
+	m.fc.oracle.Price = m.to
+	return &prover.Proof{Bytes: make([]byte, 256), Public: exp}, nil
+}
+
+// The batch is re-checked against the oracle right before submission: if it would now trip DarkPool's value guard
+// it is held back instead of burning gas on a revert.
+func TestOracleMoveDuringProvingHoldsTheBatch(t *testing.T) {
+	fc := newFake()
+	in := mkIntent(0, 0, tok(1000), 0) // sells token0: leaks value if the oracle drops below the clearing price
+	fc.addLeaf(in.Commitment())
+	svc := New(Config{N: 4, MinSwaps: 1, Interval: time.Second, MaxPending: 8}, fc, &oracleMover{fc: fc, to: tok(1)}, quiet())
+	if _, err := svc.Submit(in); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.Tick(context.Background()); !errors.Is(err, ErrValueLeak) {
+		t.Fatalf("want ErrValueLeak, got %v", err)
+	}
+	if len(fc.submitted) != 0 {
+		t.Fatal("submitted a batch that would revert")
+	}
+}
+
+// NoteTree rolls over when full (audit H-3). The mirror follows, and an intent that lives in the completed tree is
+// settled against that tree's (permanently valid) final root, before intents in the new tree.
+func TestTreeRolloverSettlesOldTreeFirst(t *testing.T) {
+	fc := newFakeDepth(2) // 4 leaves per tree
+	for i := 0; i < 3; i++ {
+		fc.addLeaf(big.NewInt(int64(77 + i)))
+	}
+	old, fresh := mkIntent(0, 0, tok(100), 0), mkIntent(1, 1, tok(100), 0)
+	fc.addLeaf(old.Commitment()) // last slot of tree 0
+	oldRoot := fc.tree.Root()
+	fc.addLeaf(fresh.Commitment()) // rolls over: leaf 0 of tree 1
+	cp := &captureProver{}
+	svc := New(Config{N: 4, MinSwaps: 1, Interval: time.Second, MaxPending: 8, TreeDepth: 2}, fc, cp, quiet())
+	if err := svc.SyncTree(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	for _, in := range []*intent.Intent{old, fresh} {
+		if _, err := svc.Submit(in); err != nil {
+			t.Fatalf("intent not found after rollover: %v", err)
+		}
+	}
+	if err := svc.Tick(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(fc.submitted) != 1 || !bytes.Equal(fc.submitted[0][4+32+32:4+32+64], field.Bytes32Slice(oldRoot)) {
+		t.Fatal("first batch must settle the completed tree against its final root")
+	}
+	if err := svc.Tick(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(fc.submitted) != 2 || !bytes.Equal(fc.submitted[1][4+32+32:4+32+64], field.Bytes32Slice(fc.tree.Root())) {
+		t.Fatal("second batch must settle the current tree")
+	}
 }

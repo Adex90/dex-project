@@ -19,8 +19,9 @@ func mkIntent(i int, dir int, value, minOut *big.Int, deadline uint64) Candidate
 	}}
 }
 
+// testPool: spot 2.0 with a fresh oracle at the same price.
 func testPool() Pool {
-	return Pool{X: tok(3_000_000), Y: tok(6_000_000), R0: tok(1_000_000), R1: tok(2_000_000)}
+	return Pool{X: tok(3_000_000), Y: tok(6_000_000), R0: tok(1_000_000), R1: tok(2_000_000), Price: tok(2)}
 }
 
 const now = 1_800_000_000
@@ -112,7 +113,7 @@ func TestAnonymityFloor(t *testing.T) {
 }
 
 func TestPoolCannotPayMoreThanItsRealReserve(t *testing.T) {
-	pool := Pool{X: tok(3_000_000), Y: tok(6_000_000), R0: tok(1_000_000), R1: tok(50)} // almost no real token1
+	pool := Pool{X: tok(3_000_000), Y: tok(6_000_000), R0: tok(1_000_000), R1: tok(50), Price: tok(2)} // almost no real token1
 	cands := []Candidate{mkIntent(0, 0, tok(1000), big.NewInt(0), now+100), mkIntent(1, 0, tok(10), big.NewInt(0), now+100)}
 	p, err := Build(pool, cands, now, Config{N: 4, MinSwaps: 1})
 	if err != nil {
@@ -149,5 +150,42 @@ func TestPublicInputsLayout(t *testing.T) {
 	outs := p.Outputs()
 	if pub[8].Cmp(outs[0].Nullifier) != 0 || pub[12].Cmp(outs[0].Commitment) != 0 || pub[10].Sign() != 0 || pub[14].Sign() != 0 {
 		t.Fatal("nullifiers/commitments must be at [8..12) / [12..16) and zero-padded")
+	}
+}
+
+// Without a fresh oracle DarkPool only accepts value-free batches: swaps wait, refunds still go out.
+func TestStaleOracleMeansRefundsOnly(t *testing.T) {
+	pool := testPool()
+	pool.Price = nil
+	cands := []Candidate{mkIntent(0, 0, tok(100), big.NewInt(0), now+100), mkIntent(1, 1, tok(100), big.NewInt(0), now-1)}
+	p, err := Build(pool, cands, now, Config{N: 4, MinSwaps: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.Swaps != 0 || p.Refunds != 1 || p.NetIn0.Sign()+p.NetIn1.Sign()+p.NetOut0.Sign()+p.NetOut1.Sign() != 0 {
+		t.Fatalf("want a value-free refund-only batch, got swaps=%d refunds=%d", p.Swaps, p.Refunds)
+	}
+}
+
+// DarkPool I5 (audit C-1): a batch may not lower pool value at the oracle price. With the pool at 2.0 and the oracle
+// at 1.9, token0 sellers would be paid above the oracle (arbitrage, which must go through flashRebalance); token1
+// sellers buy token0 above the oracle, which only adds value. The planner keeps exactly the latter.
+func TestValueGuardDropsSellersPaidAboveTheOracle(t *testing.T) {
+	pool := testPool()
+	pool.Price = new(big.Int).Div(tok(19), big.NewInt(10))
+	cands := []Candidate{mkIntent(0, 0, tok(1000), big.NewInt(0), now+100), mkIntent(1, 1, tok(500), big.NewInt(0), now+100)}
+	p, err := Build(pool, cands, now, Config{N: 4, MinSwaps: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.Swaps != 1 || p.Slots[0].Cand.Intent.Dir != 1 {
+		t.Fatalf("want only the token1 seller, got %d swaps", p.Swaps)
+	}
+	if leak, _ := LeaksValue(p.NetIn0, p.NetIn1, p.NetOut0, p.NetOut1, pool.Price); leak {
+		t.Fatal("plan would revert on-chain with ValueLeak")
+	}
+	// the same token0 seller is fine when the oracle agrees with the pool
+	if p, err := Build(testPool(), cands[:1], now, Config{N: 4, MinSwaps: 1}); err != nil || p.Swaps != 1 {
+		t.Fatalf("a retail trade at the oracle price must settle: %v", err)
 	}
 }

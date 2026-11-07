@@ -15,11 +15,8 @@ import (
 	"strawberryswap/automator/internal/field"
 )
 
-// Nothing-up-my-sleeve constants shared with the circuit (no known Poseidon preimage for BatchPubKey).
-var (
-	BatchPubKey = field.LabelToField("StrawberrySwap.batch.pubkey")
-	BatchNK     = field.LabelToField("StrawberrySwap.batch.nullifierKey")
-)
+// Nothing-up-my-sleeve constant shared with the circuit (no known Poseidon preimage).
+var BatchPubKey = field.LabelToField("StrawberrySwap.batch.pubkey")
 
 var (
 	two112 = new(big.Int).Lsh(big.NewInt(1), 112)
@@ -76,9 +73,11 @@ func (i *Intent) Commitment() *big.Int {
 	return field.MustHash(big.NewInt(int64(i.Dir)), i.Value, BatchPubKey, i.Blinding())
 }
 
-// Nullifier of the intent note at a given leaf: Poseidon(commitment, leafIndex, BATCH_NK).
+// Nullifier of the intent note at a given leaf: Poseidon(commitment, leafIndex, destBlinding). The key is the
+// intent's own secret (known to the user and to whoever holds the opening), so an observer cannot link a spent intent
+// to the transaction that created it. A public key made every batch slot linkable (Phase-8 audit H-7).
 func (i *Intent) Nullifier(leafIndex int) *big.Int {
-	return field.MustHash(i.Commitment(), big.NewInt(int64(leafIndex)), BatchNK)
+	return field.MustHash(i.Commitment(), big.NewInt(int64(leafIndex)), i.DestBlinding)
 }
 
 // SwapOutputCommitment is the note the user receives on a swap: (assetOut, payout, destPubKey, destBlinding).

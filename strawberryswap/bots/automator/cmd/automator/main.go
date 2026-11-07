@@ -81,6 +81,9 @@ type fileConfig struct {
 	Wasm        string `json:"wasm"`
 	Zkey        string `json:"zkey"`
 	ProverTmp   string `json:"proverTmpDir"`
+	// valueMarginBps: plan batches to survive this much oracle movement while proving (default 0; every batch is
+	// re-checked against the live oracle before submission anyway).
+	ValueMarginBps int64 `json:"valueMarginBps"`
 	// Development escape hatches: each one is a deliberate privacy downgrade and is named accordingly.
 	DevAllowClearnetListen bool `json:"devAllowClearnetListen"`
 	DevAllowDirectEgress   bool `json:"devAllowDirectEgress"`
@@ -145,7 +148,7 @@ func serve(args []string) error {
 	prv := &prover.SnarkJS{Bin: c.Snarkjs, Wasm: c.Wasm, Zkey: c.Zkey, TmpDir: orDefault(c.ProverTmp, "/dev/shm"), Timeout: 10 * time.Minute}
 	svc := service.New(service.Config{
 		N: c.N, MinSwaps: c.MinSwaps, Interval: time.Duration(c.IntervalSec) * time.Second, Jitter: time.Duration(c.JitterSec) * time.Second,
-		DeployBlock: c.DeployBlock,
+		DeployBlock: c.DeployBlock, ValueMarginBps: c.ValueMarginBps,
 	}, rpc, prv, log)
 
 	srv := privacy.NewServer(server.New(svc, 64), log)

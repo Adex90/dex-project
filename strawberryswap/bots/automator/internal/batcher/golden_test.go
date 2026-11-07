@@ -13,7 +13,7 @@ import (
 )
 
 type golden struct {
-	Constants struct{ BatchPubKey, BatchNK, Zero string }
+	Constants struct{ BatchPubKey, Zero string }
 	Poseidon  []struct {
 		In  []string
 		Out string
@@ -70,7 +70,6 @@ func TestCrossLanguageGolden(t *testing.T) {
 	g := load(t)
 
 	if field.LabelToField("StrawberrySwap.batch.pubkey").String() != g.Constants.BatchPubKey ||
-		field.LabelToField("StrawberrySwap.batch.nullifierKey").String() != g.Constants.BatchNK ||
 		field.LabelToField("StrawberrySwap.NoteTree.zero").String() != g.Constants.Zero {
 		t.Fatal("nothing-up-my-sleeve constants differ from the circuit's")
 	}
@@ -125,6 +124,7 @@ func TestCrossLanguageGolden(t *testing.T) {
 	}
 
 	pool := Pool{X: dec(t, g.Pool.X), Y: dec(t, g.Pool.Y), R0: dec(t, g.Pool.R0), R1: dec(t, g.Pool.R1)}
+	pool.Price = new(big.Int).Div(new(big.Int).Mul(pool.Y, field.WAD), pool.X) // oracle at spot
 	plan, err := Build(pool, all, g.TNow, Config{N: g.N, MinSwaps: 1})
 	if err != nil {
 		t.Fatal(err)
