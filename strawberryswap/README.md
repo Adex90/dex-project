@@ -13,6 +13,13 @@ touched).
 | 3 | `contracts/src/dex/DarkPool.sol` — AMM + `flashRebalance()` | written, compiles |
 | – | Shared: `privacy/NoteTree.sol`, `utils/*`, `interfaces/*` | written, compiles |
 
+## Phase 2 deliverables
+
+| # | Deliverable | Status |
+|---|---|---|
+| 4 | `contracts/src/derivatives/OptionsMarket.sol` — ZK-ERC1155 European calls/puts, 100 % collateral | written, compiles |
+| 5 | `contracts/src/derivatives/SyntheticRWA.sol` — fully-funded long/short index pairs + `IZKDecoOracle` | written, compiles |
+
 **Not done in Phase 1 (deliberately):** circuits and verifier keys, Poseidon contract deployment, tests,
 frontend, bots, Terraform. **Nothing here is audited. Do not deploy.**
 
@@ -30,7 +37,10 @@ strawberryswap/
 │   │   ├── privacy/NoteTree.sol    # incremental Poseidon Merkle tree + nullifiers + join-split gate
 │   │   ├── utils/                  # ReentrancyGuard, SafeTransfer, Math
 │   │   ├── tokens/Berrycoin.sol    # MODULE 1  ZK-ERC20, fixed genesis supply, no mint
-│   │   └── dex/DarkPool.sol        # MODULE 2  adjusted x·y=k, batch settle, flashRebalance
+│   │   ├── dex/DarkPool.sol        # MODULE 2  adjusted x·y=k, batch settle, flashRebalance
+│   │   └── derivatives/
+│   │       ├── OptionsMarket.sol   # MODULE 3  ZK-ERC1155 options, total coverage, European exercise
+│   │       └── SyntheticRWA.sol    # MODULE 4  capped-index long/short pairs + IZKDecoOracle
 │   ├── test/                       # (Phase 2) invariant + fuzz suites, mock verifiers
 │   └── script/                     # (Phase 2) deterministic deploy
 ├── circuits/                       # (Phase 2) Circom/Noir
@@ -60,7 +70,8 @@ strawberryswap/
 | 100% backing | `DarkPool._checkBalances` | token balance ≥ reserve + note custody after every entrypoint |
 | 0% retail fee | `DarkPool.RETAIL_FEE_BPS = 0` | curve rounds in the pool's favour so K never decreases |
 | Gas subsidy via MEV | `DarkPool.flashRebalance` | searcher must pay ≥ 80% of harvested value to the Treasury in-tx |
-| No naked options | *(Phase 3)* | option vault will only mint against fully escrowed collateral |
+| No naked options | `OptionsMarket.mintOptionToken` | only mint path; pulls 100 % collateral, verified by balance delta; solvency check `balance >= liabilities` |
+| Synthetics stay 100 % backed | `SyntheticRWA` | capped payoff: long + short payouts sum to exactly the locked collateral |
 | Hidden amounts/parties | `NoteTree`, `settleBatch` | join-split + batch proofs, stealth-addressed ciphertexts |
 
 ## Known limitations (read before Phase 2)
