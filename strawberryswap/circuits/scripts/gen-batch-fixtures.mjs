@@ -178,3 +178,5 @@ ${slots.map((s, i) => `        if (i == ${i}) return ${s.mode === "refund"};`).j
 `;
 writeFileSync(`${OUT}/BatchFixtures.sol`, sol);
 console.log("fixtures written:", slots.map((s) => `${s.user.label}:${s.mode}->asset${s.assetOut}:${Number(BigInt(s.valueOut) / 10n ** 15n) / 1000}`).join("  "));
+// snarkjs keeps its worker threads alive after proving; exit explicitly so scripted pipelines do not hang.
+process.exit(0);

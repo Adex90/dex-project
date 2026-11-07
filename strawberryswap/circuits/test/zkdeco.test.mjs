@@ -44,7 +44,6 @@ const GOOD = '{"symbol":"XAUUSD","price":2345.678912,"ts":1767225600}';
 console.log("positive");
 await accepts("canonical body", make(GOOD));
 await accepts("price 0.5 (1 int digit, 1 frac digit)", make('{"symbol":"XAUUSD","price":0.5,"ts":1767225600}'));
-await accepts("price last field (terminator '}')", make('{"symbol":"XAUUSD","ts":1767225600,"price":88.25}'));
 await accepts("max precision 12.10 digits", make('{"symbol":"XAUUSD","price":123456789012.1234567890,"ts":1767225600}'));
 
 // public price/time are exactly what was parsed
@@ -69,6 +68,28 @@ await rejects("price key misspelt", make('{"symbol":"XAUUSD","prise":2345.6789,"
 await rejects("price zero", make('{"symbol":"XAUUSD","price":0.0,"ts":1767225600}'));
 await rejects("timestamp with 9 digits", make('{"symbol":"XAUUSD","price":2.5,"ts":176722560}'));
 await rejects("price with no decimal point", make('{"symbol":"XAUUSD","price":2345,"ts":1767225600}', { intLen: 4, fracLen: 1 }));
+
+// ---- B6 structure: price and timestamp must belong to THE object that carries the symbol (Phase-8 audit C-3).
+// Each body below is a plausible notarised response; before B6 every claim here produced a valid proof.
+const nth = (str, needle, n) => { let at = -1; for (let k = 0; k <= n; k++) at = str.indexOf(needle, at + 1); return at; };
+function pick(bodyStr, nPrice, nTs) {
+  const offPriceKey = nth(bodyStr, '"price":', nPrice), offTsKey = nth(bodyStr, '"ts":', nTs);
+  const [ip, fp] = bodyStr.slice(offPriceKey + 8).match(/^([0-9]+)\.([0-9]+)/).slice(1);
+  return make(bodyStr, { offPriceKey, offTsKey, intLen: ip.length, fracLen: fp.length,
+    price: BigInt(ip + fp) * 10n ** BigInt(18 - fp.length), observedAt: BigInt(bodyStr.slice(offTsKey + 5, offTsKey + 15)) });
+}
+const MULTI = '{"symbol":"XAUUSD","price":2345.60,"ts":1767225600,"x":{"symbol":"XAGUSD","price":29.10}}';
+const BOOK = '{"symbol":"XAUUSD","bid":{"price":2340.10},"ask":{"price":2351.30},"ts":1767225600}';
+const HIST = '{"symbol":"XAUUSD","price":2345.60,"ts":1767225600,"prev":{"price":2290.00,"ts":1767225000}}';
+await rejects("C-3: price taken from ANOTHER instrument's object", pick(MULTI, 1, 0));
+await rejects("C-3: honest first price, but the body is not one object", pick(MULTI, 0, 0));
+await rejects("C-3: bid chosen from a bid/ask body", pick(BOOK, 0, 0));
+await rejects("C-3: ask chosen from a bid/ask body", pick(BOOK, 1, 0));
+await rejects("C-3: older nested price + timestamp (earliest-ts override)", pick(HIST, 1, 1));
+await rejects("key order differs (ts before price)", make('{"symbol":"XAUUSD","ts":1767225600,"price":88.25}'));
+await rejects("symbol not the first key", make('{"price":2345.6,"symbol":"XAUUSD","ts":1767225600}'));
+await rejects("whitespace inside the object", make('{"symbol":"XAUUSD", "price":2345.6,"ts":1767225600}'));
+await rejects("price terminated by '}' (object must continue with ts)", make('{"symbol":"XAUUSD","price":2345.6}'));
 
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

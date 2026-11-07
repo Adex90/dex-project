@@ -1,6 +1,7 @@
 // Adversarial tests for the BatchSwap circuit (N = 4). A violated constraint => no witness => no proof.
 import * as snarkjs from "snarkjs";
 import { init, Tree, stringify, FIELD, rand } from "./lib.mjs";
+import { keccak256, toBytes } from "viem";
 import { intentNote, buildBatchInput, clear, WAD, BATCH_PUBKEY } from "./batch.lib.mjs";
 
 const N = Number(process.env.BATCH_N ?? 4);
@@ -60,6 +61,11 @@ await rejects("clearing price understated by 10^6 (a larger, profitable skew)", 
 { const g = B([item(sell0a, "refund")]);                                        await rejects("refund requested before the deadline", g); }
 { const g = B([item(sell0a)]); g.commitment[0] = (BigInt(g.commitment[0]) + 1n).toString(); await rejects("output commitment redirected", g); }
 { const g = B([item(sell0a)]); g.nullifier[0] = (BigInt(g.nullifier[0]) + 1n).toString();   await rejects("forged nullifier", g); }
+{ // Phase-8 audit H-7: the nullifier key used to be a PUBLIC constant, so anyone could recompute every intent's
+  // nullifier from NoteInserted events and link each batch slot to the transaction that created it.
+  const publicKey = BigInt(keccak256(toBytes("StrawberrySwap.batch.nullifierKey"))) % FIELD;
+  const g = B([item(sell0a)]); g.nullifier[0] = h(sell0a.commitment, BigInt(sell0a.index), publicKey).toString();
+  await rejects("H-7: nullifier derivable from public data (old public key)", g); }
 { const g = B([item(sell0a)]); g.netIn0 = BigInt(g.netIn0) + 1n;                await rejects("net flow overstated (public)", g); }
 { const g = B([item(sell0a), item(sell1a)]); g.netIn1 = 1n; g.netOut1 = 1n;     await rejects("both netIn and netOut non-zero for one asset", g); }
 { const g = B([item(sell0a, "refund"), item(expired, "refund")]); g.isSwap[0] = 1n; await rejects("slot flagged swap AND refund", g); }

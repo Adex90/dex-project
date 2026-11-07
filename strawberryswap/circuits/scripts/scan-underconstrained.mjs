@@ -1,11 +1,11 @@
-// PHASE 8 AUDIT — exact single-wire under-constraint scan over the COMPILED R1CS (what the verifier key encodes).
+// Exact single-wire under-constraint scan over the COMPILED R1CS (what the verifier key encodes).
 // For every prover-controlled wire i and every constraint k it appears in, with a valid witness w:
 //     g_k(δ) = (A_k·w + a_i δ)(B_k·w + b_i δ) − (C_k·w + c_i δ) = δ·(L_k + δ·Q_k),
 //     L_k = A_k·w·b_i + B_k·w·a_i − c_i,   Q_k = a_i·b_i         (A_k·w·B_k·w = C_k·w holds at w)
 // so the set of δ ≠ 0 that keep constraint k satisfied is: everything (L=Q=0), nothing (Q=0, L≠0) or {−L/Q}.
 // Wire i admits a SECOND valid value (holding every other wire and every public input fixed) iff the
 // intersection over its constraints is non-empty. Unlike random fuzzing this is exhaustive for one-wire changes.
-// Run from circuits/:  node audit/freewire.mjs
+// Run from circuits/:  node scripts/scan-underconstrained.mjs   (after compile; batch_swap_n4 needs its wasm)
 import * as snarkjs from "snarkjs";
 import { readFileSync } from "node:fs";
 import { init, Tree, makeNote, dummyNote, buildInput, stringify, rand, FIELD as P } from "../test/lib.mjs";

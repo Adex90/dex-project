@@ -134,3 +134,5 @@ ${caseSol("unshield", fx.unshield)}
 }
 `);
 console.log("fixtures written to", OUT);
+// snarkjs keeps its worker threads alive after proving; exit explicitly so scripted pipelines do not hang.
+process.exit(0);

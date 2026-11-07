@@ -7,7 +7,8 @@
   "scripts": {
     "compile": "node scripts/compile.mjs",
     "setup:dev": "node scripts/setup-dev.mjs",
-    "test": "node test/joinsplit.test.mjs && node test/zkdeco.test.mjs",
+    "test": "node test/joinsplit.test.mjs && node test/zkdeco.test.mjs && node test/batch.test.mjs",
+    "scan": "node scripts/scan-underconstrained.mjs",
     "fixtures": "node scripts/gen-fixtures.mjs"
   },
   "dependencies": {
