@@ -16,4 +16,10 @@ library SafeTransfer {
         (bool ok, bytes memory r) = address(t).call(abi.encodeCall(IERC20Min.transferFrom, (from, to, amt)));
         if (!ok || (r.length != 0 && !abi.decode(r, (bool)))) revert TransferFailed();
     }
+
+    /// @dev Sets an allowance; callers use it as approve(x) ... approve(0) around a single call.
+    function safeApprove(IERC20Min t, address spender, uint256 amt) internal {
+        (bool ok, bytes memory r) = address(t).call(abi.encodeCall(IERC20Min.approve, (spender, amt)));
+        if (!ok || (r.length != 0 && !abi.decode(r, (bool)))) revert TransferFailed();
+    }
 }
