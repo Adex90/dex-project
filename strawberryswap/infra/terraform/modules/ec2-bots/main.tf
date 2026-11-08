@@ -46,6 +46,17 @@ data "aws_iam_policy_document" "bot" {
     actions   = ["s3:GetObject", "s3:PutObject"]
     resources = ["${var.metadata_bucket_arn}/automator/*"]
   }
+  # The bucket is SSE-KMS with a customer managed key: S3 needs these on the caller's behalf, and only S3 may use them.
+  statement {
+    sid       = "UseMetadataKeyThroughS3Only"
+    actions   = ["kms:GenerateDataKey", "kms:Decrypt"]
+    resources = [var.metadata_kms_key_arn]
+    condition {
+      test     = "StringEquals"
+      variable = "kms:ViaService"
+      values   = ["s3.${data.aws_region.current.name}.amazonaws.com"]
+    }
+  }
 }
 
 resource "aws_iam_role_policy" "bot" {

@@ -28,3 +28,4 @@ variable "db_user" { type = string }
 variable "db_password_parameter_name" { type = string }
 variable "metadata_bucket_name" { type = string }
 variable "metadata_bucket_arn" { type = string }
+variable "metadata_kms_key_arn" { type = string }

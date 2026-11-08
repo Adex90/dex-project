@@ -73,7 +73,7 @@ resource "aws_default_security_group" "default" {
 
 # Security group for the Automator / Searcher instances.
 #  * NO inbound rules at all: no SSH, no HTTP. Administration is through SSM Session Manager (outbound 443).
-#  * Egress is allow-listed: HTTPS (RPC nodes, data providers, AWS APIs), Postgres inside the VPC, DNS, NTP.
+#  * Egress is allow-listed by port: HTTPS out, Postgres inside the VPC, the VPC DNS resolver, Amazon Time Sync.
 resource "aws_security_group" "bots" {
   name_prefix = "${var.name}-bots-"
   description = "Automator instances: no ingress, restricted egress"
@@ -81,6 +81,16 @@ resource "aws_security_group" "bots" {
   lifecycle { create_before_destroy = true }
 }
 
+# HTTPS to any address is a requirement, not an oversight (an accepted risk, Trivy AWS-0104):
+#  * all Automator egress goes through Tor (bots/automator/deploy, guarantee G4), and Tor relays are arbitrary
+#    internet hosts;
+#  * the SSM agent (the only admin path), the package mirrors and the RPC / market-data providers sit behind CDNs
+#    whose addresses change;
+#  * the Free Tier design has no NAT gateway or egress proxy to pin those destinations behind.
+# Compensating controls: no ingress at all, TCP 443 only, no signing key on the host (remote MPC/TSS signer),
+# IMDSv2 only, a least-privilege instance role, and systemd confines the Automator process itself to loopback
+# (the Tor SocksPort; bots/automator/deploy/systemd/automator.service).
+#trivy:ignore:AWS-0104 Tor relays, the SSM agent and CDN-fronted providers need 443 to arbitrary addresses (see above).
 resource "aws_vpc_security_group_egress_rule" "https" {
   security_group_id = aws_security_group.bots.id
   ip_protocol       = "tcp"

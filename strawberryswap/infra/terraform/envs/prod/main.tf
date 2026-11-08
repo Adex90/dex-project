@@ -33,6 +33,7 @@ module "automators" {
   db_password_parameter_name = module.database.password_parameter_name
   metadata_bucket_name       = module.metadata.bucket_name
   metadata_bucket_arn        = module.metadata.bucket_arn
+  metadata_kms_key_arn       = module.metadata.kms_key_arn
 }
 
 # Free Tier guard rail: email when actual spend passes 80 % or forecast passes 100 % of the budget.
