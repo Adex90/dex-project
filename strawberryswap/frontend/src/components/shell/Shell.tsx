@@ -143,8 +143,3 @@ export function BottomNav() {
     </nav>
   );
 }
-
-export function AppFooter() {
-  const { t } = useSettings();
-  return <footer className="mx-auto max-w-6xl px-4 pb-32 text-center text-xs text-haze sm:px-6 lg:pb-10">{t("footer.disclaimer")}</footer>;
-}
