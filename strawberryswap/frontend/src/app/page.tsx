@@ -1,6 +1,7 @@
 import Link from "next/link";
 import { IconBank, IconShield, IconVault, IconZap } from "@/components/ui/icons";
 import { Logo, Mascot } from "@/components/ui/Mascot";
+import { SiteFooter } from "@/components/shell/Footer";
 
 const PRINCIPLES = [
   { name: "Full reserve", scope: "Demand deposits", Icon: IconBank, text: "Held in a contract whose code contains no function to lend, stake or rehypothecate them. This is a property of the bytecode, not a setting." },
@@ -89,10 +90,9 @@ export default function Home() {
           </div>
         </section>
 
-        <footer className="mt-16 text-center text-xs text-haze">
-          Unaudited software. Testnet use only. This page describes intended behaviour of the contracts, not a guarantee.
-        </footer>
+        <p className="mt-16 text-center text-xs text-haze">This page describes intended behaviour of the contracts, not a guarantee.</p>
       </main>
+      <SiteFooter />
     </>
   );
 }

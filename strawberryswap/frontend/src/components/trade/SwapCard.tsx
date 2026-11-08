@@ -7,11 +7,35 @@ import { config } from "@/lib/config";
 import { bpsToPct, fmt, parseAmount } from "@/lib/format";
 import { proofsAvailable, zkeyBytes } from "@/zk/availability";
 import { useApp, useShieldedBalances, useSymbols } from "@/components/AppState";
-import { IconFlip, IconSettings, IconShield, IconZap } from "@/components/ui/icons";
-import { Card, Notice, Row, Skeleton, TokenSelect } from "@/components/ui/primitives";
+import { IconClock, IconFlip, IconSettings, IconShield, IconStocks, IconZap } from "@/components/ui/icons";
+import { Card, Notice, Row, Segmented, Skeleton, TabPanel, TokenSelect } from "@/components/ui/primitives";
 import { useWalletModal } from "@/components/wallet/WalletModal";
 
 const SLIPPAGE_PRESETS = [10, 50, 100] as const; // bps
+
+type OrderType = "swap" | "twap" | "limit";
+const ORDER_TYPES: readonly { value: OrderType; label: string; soon: boolean; subtitle: string }[] = [
+  { value: "swap", label: "Swap", soon: false, subtitle: "Private · settled in batches at one uniform price" },
+  { value: "twap", label: "TWAP", soon: true, subtitle: "Large orders, sliced across batches · coming soon" },
+  { value: "limit", label: "Limit", soon: true, subtitle: "Fill at your price or better · coming soon" },
+];
+
+/** TWAP / Limit: what the order type will do, stated plainly; no form that looks live but cannot submit. */
+function ComingSoon({ icon, title, body, onBack }: { icon: React.ReactNode; title: string; body: string; onBack: () => void }) {
+  return (
+    <div className="card-inset flex flex-col items-center gap-3 py-8 text-center">
+      <span className="grid h-12 w-12 place-items-center rounded-2xl bg-gradient-to-br from-plum-600 to-plum-700 text-fuchsia shadow-glow-fuchsia">{icon}</span>
+      <div>
+        <h3 className="text-lg font-bold">{title}</h3>
+        <span className="pill-plum mt-1">Not available in this build</span>
+      </div>
+      <p className="max-w-sm text-sm text-lavender">{body}</p>
+      <button type="button" className="btn-secondary mt-1" onClick={onBack}>
+        Back to Swap
+      </button>
+    </div>
+  );
+}
 
 /**
  * § 1 Dark-pool swap. Same state, same hook calls and the same request/validation rules as the old private-swap form:
@@ -29,6 +53,7 @@ export function SwapCard({ className = "" }: { className?: string }) {
   const [slippage, setSlippage] = useState("50");
   const [minutes, setMinutes] = useState("30");
   const [showSettings, setShowSettings] = useState(false);
+  const [orderType, setOrderType] = useState<OrderType>("swap");
   const [answered, setAnswered] = useState<string>();
 
   const swapAmt = parseAmount(amount);
@@ -74,26 +99,44 @@ export function SwapCard({ className = "" }: { className?: string }) {
 
   return (
     <Card className={className} aria-labelledby="swap-title">
-      <header className="mb-4 flex items-center justify-between gap-3">
-        <div>
-          <h2 id="swap-title" className="text-2xl font-extrabold tracking-tight">Swap</h2>
-          <p className="text-sm text-lavender">Private · settled in batches at one uniform price</p>
-        </div>
+      <h2 id="swap-title" className="sr-only">Order entry</h2>
+      <header className="mb-2 flex items-center justify-between gap-3">
+        <Segmented
+          idPrefix="order"
+          label="Order type"
+          value={orderType}
+          onChange={setOrderType}
+          options={ORDER_TYPES.map((o) => ({
+            value: o.value,
+            label: o.soon ? (
+              <span className="flex items-center gap-1.5">
+                {o.label}
+                <span className="rounded-full bg-plum-600/90 px-1.5 py-px text-[10px] font-bold uppercase tracking-wide text-lavender">Soon</span>
+              </span>
+            ) : (
+              o.label
+            ),
+          }))}
+        />
         <div className="flex items-center gap-2">
-          <span className="pill-mint">{ps ? bpsToPct(ps.feeBps) : "0.00%"} fee</span>
-          <button
-            type="button"
-            className={`grid h-10 w-10 place-items-center rounded-full transition hover:bg-plum-700 hover:text-ink focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-fuchsia ${showSettings ? "bg-plum-700 text-fuchsia" : "text-lavender"}`}
-            aria-expanded={showSettings}
-            aria-controls="swap-settings"
-            aria-label="Swap settings"
-            onClick={() => setShowSettings((s) => !s)}
-          >
-            <IconSettings />
-          </button>
+          <span className="pill-mint hidden sm:inline-flex">{ps ? bpsToPct(ps.feeBps) : "0.00%"} fee</span>
+          {orderType === "swap" ? (
+            <button
+              type="button"
+              className={`grid h-10 w-10 place-items-center rounded-full transition hover:bg-plum-700 hover:text-ink focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-fuchsia ${showSettings ? "bg-plum-700 text-fuchsia" : "text-lavender"}`}
+              aria-expanded={showSettings}
+              aria-controls="swap-settings"
+              aria-label="Swap settings"
+              onClick={() => setShowSettings((s) => !s)}
+            >
+              <IconSettings />
+            </button>
+          ) : null}
         </div>
       </header>
+      <p className="mb-4 px-1 text-sm text-lavender">{ORDER_TYPES.find((o) => o.value === orderType)?.subtitle}</p>
 
+      <TabPanel idPrefix="order" value="swap" active={orderType === "swap"}>
       {showSettings ? (
         <div id="swap-settings" className="card-inset mb-4 animate-fade-in space-y-3">
           <div className="flex flex-wrap items-center justify-between gap-2">
@@ -200,22 +243,44 @@ export function SwapCard({ className = "" }: { className?: string }) {
           <span className={slipBps > 100n ? "text-blush" : ""}>{bpsToPct(slipBps)} · {Math.round(validity / 60)} min</span>
         </Row>
       </div>
+      </TabPanel>
+
+      <TabPanel idPrefix="order" value="twap" active={orderType === "twap"}>
+        <ComingSoon
+          icon={<IconClock />}
+          title="Time-weighted average price"
+          body="Split a large order into equal private intents that settle across consecutive batches over a period you choose, so size never shows up in a single batch."
+          onBack={() => setOrderType("swap")}
+        />
+      </TabPanel>
+      <TabPanel idPrefix="order" value="limit" active={orderType === "limit"}>
+        <ComingSoon
+          icon={<IconStocks />}
+          title="Limit order"
+          body="A private intent that fills only at your price or better before its deadline, and refunds you otherwise. Today's swap already protects you with a minimum output and a deadline."
+          onBack={() => setOrderType("swap")}
+        />
+      </TabPanel>
 
       <ZkStatus />
 
-      <button
-        type="button"
-        className={`btn-primary mt-4 w-full py-4 text-xl ${live ? "animate-cta-glow" : ""}`}
-        onClick={cta.onClick}
-        disabled={cta.disabled || !cta.onClick}
-      >
-        {cta.label === "Shield & Swap (ZK)" ? <IconZap className="h-5 w-5" /> : null}
-        {cta.label}
-      </button>
-      <p className="mt-3 text-center text-xs leading-relaxed text-haze">
-        Funds move into an intent note only the batch circuit can spend: it pays at least your minimum before the deadline, or refunds you after
-        it. The relay receives the terms, never a key.
-      </p>
+      {orderType === "swap" ? (
+        <>
+          <button
+            type="button"
+            className={`btn-primary mt-4 w-full py-4 text-xl ${live ? "animate-cta-glow" : ""}`}
+            onClick={cta.onClick}
+            disabled={cta.disabled || !cta.onClick}
+          >
+            {cta.label === "Shield & Swap (ZK)" ? <IconZap className="h-5 w-5" /> : null}
+            {cta.label}
+          </button>
+          <p className="mt-3 text-center text-xs leading-relaxed text-haze">
+            Funds move into an intent note only the batch circuit can spend: it pays at least your minimum before the deadline, or refunds you
+            after it. The relay receives the terms, never a key.
+          </p>
+        </>
+      ) : null}
     </Card>
   );
 }

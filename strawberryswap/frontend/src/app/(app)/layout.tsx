@@ -1,5 +1,6 @@
 import { AppStateProvider } from "@/components/AppState";
-import { AppFooter, AppHeader, BottomNav } from "@/components/shell/Shell";
+import { SiteFooter } from "@/components/shell/Footer";
+import { AppHeader, BottomNav } from "@/components/shell/Shell";
 import { WalletModalProvider } from "@/components/wallet/WalletModal";
 
 /**
@@ -12,7 +13,7 @@ export default function AppLayout({ children }: { children: React.ReactNode }) {
       <WalletModalProvider>
         <AppHeader />
         <main className="mx-auto max-w-6xl px-4 pb-10 pt-6 sm:px-6 sm:pt-8">{children}</main>
-        <AppFooter />
+        <SiteFooter withBottomNav />
         <BottomNav />
       </WalletModalProvider>
     </AppStateProvider>
