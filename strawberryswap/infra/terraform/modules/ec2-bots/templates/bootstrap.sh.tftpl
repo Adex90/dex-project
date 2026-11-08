@@ -1,0 +1,37 @@
+#!/bin/bash
+# First-boot provisioning. Idempotent; contains NO secrets (the DB password is fetched from SSM at runtime
+# by the service wrapper and passed in memory, never written to disk).
+set -euo pipefail
+
+dnf -y update
+dnf -y install docker postgresql16 jq
+systemctl enable --now docker
+
+install -d -m 0750 /etc/strawberry
+cat >/etc/strawberry/automator.env <<ENV
+AWS_REGION=${region}
+DB_HOST=${db_host}
+DB_PORT=${db_port}
+DB_NAME=${db_name}
+DB_USER=${db_user}
+DB_PASSWORD_PARAM=${db_password}
+DB_SSLMODE=require
+METADATA_BUCKET=${bucket}
+ENV
+chmod 0640 /etc/strawberry/automator.env
+
+# Wrapper: pull the secret into the process environment only.
+cat >/usr/local/bin/with-automator-secrets <<'WRAP'
+#!/bin/bash
+set -euo pipefail
+set -a; . /etc/strawberry/automator.env; set +a
+PGPASSWORD="$(aws ssm get-parameter --with-decryption --name "$DB_PASSWORD_PARAM" \
+  --region "$AWS_REGION" --query Parameter.Value --output text)"
+export PGPASSWORD
+exec "$@"
+WRAP
+chmod 0750 /usr/local/bin/with-automator-secrets
+
+# The Automator workload itself (relayer, oracle watcher, limit-order matcher) is deployed by CI
+# as a container or binary and run under systemd via `with-automator-secrets`. Nothing starts here.
+echo "bootstrap complete" >/var/log/strawberry-bootstrap.done

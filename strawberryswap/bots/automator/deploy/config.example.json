@@ -1,0 +1,18 @@
+{
+  "listen": "unix:/run/automator/intents.sock",
+  "torSocks": "127.0.0.1:9050",
+  "rpcUrl": "https://YOUR-RPC-ENDPOINT.example",
+  "signerUrl": "https://YOUR-MPC-SIGNER-GATEWAY.example/sign",
+  "chainId": 1,
+  "pool": "0xDarkPoolAddress",
+  "deployBlock": 0,
+  "batchSize": 4,
+  "minSwaps": 2,
+  "intervalSeconds": 120,
+  "jitterSeconds": 30,
+  "gasLimit": 5000000,
+  "snarkjs": "/opt/automator/node_modules/.bin/snarkjs",
+  "wasm": "/opt/automator/keys/main_n4.wasm",
+  "zkey": "/opt/automator/keys/batch_swap_n4.zkey",
+  "proverTmpDir": "/run/automator/prove"
+}

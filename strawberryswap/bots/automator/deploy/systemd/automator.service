@@ -1,0 +1,45 @@
+[Unit]
+Description=StrawberrySwap Automator (shielded batch relayer)
+After=network-online.target tor.service
+Requires=tor.service
+
+[Service]
+User=automator
+Group=automator
+# /run/automator holds the intent socket AND the prover scratch space (tmpfs, never written to disk)
+RuntimeDirectory=automator
+RuntimeDirectoryMode=0750
+ExecStart=/usr/local/bin/automator serve --config /etc/automator/config.json
+EnvironmentFile=-/etc/automator/secrets.env
+Restart=on-failure
+RestartSec=5
+
+# ---- NETWORK: the process can only reach loopback (the Tor SocksPort). Even a bug or a compromised dependency
+# ---- cannot connect to the clearnet and thereby reveal this host's address.
+IPAddressDeny=any
+IPAddressAllow=127.0.0.0/8 ::1/128
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+# ---- HARDENING
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+RestrictNamespaces=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+LimitCORE=0
+UMask=0077
+# (MemoryDenyWriteExecute is intentionally NOT set: the snarkjs prover runs on Node's JIT.)
+# Logs go to the journal; the application scrubs addresses and identifiers before writing them.
+
+[Install]
+WantedBy=multi-user.target

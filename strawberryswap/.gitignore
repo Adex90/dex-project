@@ -1,0 +1,12 @@
+node_modules/
+contracts/out/
+contracts/cache/
+frontend/.next/
+frontend/out/
+**/target/
+infra/terraform/**/.terraform/
+*.tfstate*
+*.tfvars
+!*.tfvars.example
+.env*
+__pycache__/
