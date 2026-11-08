@@ -4,7 +4,9 @@
 #include <cmath>
 #include <cstdint>
 #include <stdexcept>
-#include <string>
+#include <array>
+#include <cstring>
+#include <string_view>
 
 namespace sb {
 
@@ -19,17 +21,48 @@ inline U128 toWei(double tokens, Round r) {
 
 inline double fromWei(U128 w) { return static_cast<double>(static_cast<long double>(w) / 1e18L); }
 
-inline std::string word(U128 v) {  // 32-byte big-endian word, lowercase hex, no prefix
-  static const char* H = "0123456789abcdef";
-  std::string s(64, '0');
-  for (int i = 63; i >= 0 && v != 0; --i) { s[static_cast<std::size_t>(i)] = H[static_cast<unsigned>(v & 0xF)]; v >>= 4; }
-  return s;
+/// Calldata for SearcherExecutor.rebalance: "0x" + selector + 5 words, as lowercase hex (330 chars). A fixed array:
+/// building it allocates nothing (the previous std::string concatenation made five heap allocations per order).
+struct Calldata {
+  static constexpr std::size_t kLen = 2 + 8 + 5 * 64;
+  std::array<char, kLen> bytes{};
+  std::string_view view() const { return {bytes.data(), bytes.size()}; }
+};
+
+namespace detail {
+struct HexLut {
+  char t[512];
+  constexpr HexLut() : t() {
+    const char* h = "0123456789abcdef";
+    for (int i = 0; i < 256; ++i) {
+      t[2 * i] = h[i >> 4];
+      t[2 * i + 1] = h[i & 15];
+    }
+  }
+};
+inline constexpr HexLut kHex{};
+inline void hex64(char* p, std::uint64_t x) {  // 16 chars, big-endian, one table lookup per byte
+  for (int i = 7; i >= 0; --i) {
+    std::memcpy(p + 2 * i, kHex.t + 2 * (x & 0xFF), 2);
+    x >>= 8;
+  }
 }
+}  // namespace detail
 
 /// selector 0xc0661737 = keccak256("rebalance(uint256,uint256,uint256,uint256,uint256)")[0:4]
 /// (taken from the solc methodIdentifiers of contracts/src/periphery/SearcherExecutor.sol; checked in CI)
-inline std::string encodeRebalance(U128 amount0Out, U128 amount1Out, U128 pay0, U128 pay1, U128 treasuryPay) {
-  return "0xc0661737" + word(amount0Out) + word(amount1Out) + word(pay0) + word(pay1) + word(treasuryPay);
+inline Calldata encodeRebalance(U128 amount0Out, U128 amount1Out, U128 pay0, U128 pay1, U128 treasuryPay) {
+  Calldata c;
+  char* o = c.bytes.data();
+  std::memcpy(o, "0xc0661737", 10);
+  const U128 v[5] = {amount0Out, amount1Out, pay0, pay1, treasuryPay};
+  for (int w = 0; w < 5; ++w) {
+    char* p = o + 10 + 64 * w;
+    std::memset(p, '0', 32);  // amounts are < 2^128: the high half of every word is zero
+    detail::hex64(p + 32, static_cast<std::uint64_t>(v[w] >> 64));
+    detail::hex64(p + 48, static_cast<std::uint64_t>(v[w]));
+  }
+  return c;
 }
 
 }  // namespace sb

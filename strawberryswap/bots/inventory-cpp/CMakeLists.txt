@@ -19,3 +19,11 @@ enable_testing()
 add_executable(selftest tests/selftest.cpp)
 target_link_libraries(selftest PRIVATE strawberry)
 add_test(NAME selftest COMMAND selftest)
+
+# Hot-path benchmarks against the pre-Phase-8 implementations (bench/bench.cpp). Opt-in: not built by default.
+option(STRAWBERRY_BENCH "Build the hot-path benchmark" OFF)
+if(STRAWBERRY_BENCH)
+  add_executable(bench bench/bench.cpp)
+  target_link_libraries(bench PRIVATE strawberry)
+  target_compile_options(bench PRIVATE -march=native)
+endif()

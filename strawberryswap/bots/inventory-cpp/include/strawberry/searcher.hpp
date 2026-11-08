@@ -12,6 +12,7 @@
 namespace sb {
 
 struct SearcherConfig {
+  double tickSize = 0.01;             // reference venue's price tick (the order book is keyed by integer ticks)
   ASParams as;
   AlphaParams alpha;
   PlannerParams planner;
@@ -26,14 +27,15 @@ enum class Skip { None, NoBook, StaleOracle, OracleDivergence, NoEdge, Preflight
 struct Decision {
   Skip skip = Skip::None;
   Plan plan;
-  std::string calldata, txHash;
+  Calldata calldata;
+  std::string txHash;
   Quotes quotes{0, 0};
   double fair = 0, q = 0;
 };
 
 class Searcher {
  public:
-  explicit Searcher(SearcherConfig c) : cfg_(c), var_(c.varHalfLifeSec), ofi_(c.ofiHalfLifeSec) {}
+  explicit Searcher(SearcherConfig c) : cfg_(c), book_(c.tickSize), var_(c.varHalfLifeSec), ofi_(c.ofiHalfLifeSec) {}
 
   // ---- feed side (single thread) -------------------------------------------------------------------
   OrderBook& book() { return book_; }
@@ -67,14 +69,14 @@ class Searcher {
     d.plan = plan(chain.readPool(), oq.price, d.quotes.bid(), d.quotes.ask(), pp);
     if (!d.plan.ok) { d.skip = Skip::NoEdge; return d; }
 
-    // Round in the pool's favour: take slightly less, return slightly more, tip the Treasury slightly more.
+    // Round in the pool's favour: take slightly less, return slightly more; the Treasury allowance is a cap (rounded up).
     const U128 o0 = toWei(d.plan.amount0Out, Round::Down), o1 = toWei(d.plan.amount1Out, Round::Down);
     const U128 p0 = toWei(d.plan.pay0 * (1 + 1e-9), Round::Up), p1 = toWei(d.plan.pay1 * (1 + 1e-9), Round::Up);
     const U128 tr = toWei(d.plan.treasuryPay, Round::Up);
     d.calldata = encodeRebalance(o0, o1, p0, p1, tr);
 
-    if (!chain.preflight(d.calldata)) { d.skip = Skip::PreflightFailed; return d; }
-    if (auto h = chain.send(d.calldata)) d.txHash = *h; else d.skip = Skip::SendFailed;
+    if (!chain.preflight(d.calldata.view())) { d.skip = Skip::PreflightFailed; return d; }
+    if (auto h = chain.send(d.calldata.view())) d.txHash = *h; else d.skip = Skip::SendFailed;
     return d;
   }
 

@@ -22,8 +22,8 @@ int main() {
     px += step(rng);  // the off-chain market moves; the pool only moves when somebody trades it
     const double half = 0.15 + std::fabs(noise(rng));
     bot.book().clear();  // synthetic feed publishes full snapshots; a real feed applies deltas
-    bot.book().set(Side::Bid, px - half, 30 + 20 * std::fabs(noise(rng)) * 10);
-    bot.book().set(Side::Ask, px + half, 30 + 20 * std::fabs(noise(rng)) * 10);
+    bot.book().setPrice(Side::Bid, px - half, 30 + 20 * std::fabs(noise(rng)) * 10);
+    bot.book().setPrice(Side::Ask, px + half, 30 + 20 * std::fabs(noise(rng)) * 10);
     bot.onBookUpdate(sec);
     bot.onPublicTrade(px + noise(rng));
     chain.oracle = {px + noise(rng) * 0.2, static_cast<std::uint64_t>(sec)};  // zk-DECO price ≈ market
@@ -34,5 +34,6 @@ int main() {
                   d.plan.sellsToken0 ? "sell" : "buy ", d.plan.harvest, d.plan.treasuryPay, d.plan.net, d.quotes.reservation, d.q);
     }
   }
-  std::printf("done: %d rebalances, inventory token0=%.3f token1=%.1f, pool spot=%.3f\n", chain.sent, chain.inv.token0, chain.inv.token1, chain.pool.spot());
+  std::printf("done: %d rebalances, inventory token0=%.3f token1=%.1f, pool spot=%.3f, Treasury pulled %.4f\n", chain.sent, chain.inv.token0,
+              chain.inv.token1, chain.pool.spot(), chain.treasury);
 }

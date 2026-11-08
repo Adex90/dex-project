@@ -5,7 +5,6 @@
 #pragma once
 #include <algorithm>
 #include <cmath>
-#include <limits>
 
 namespace sb {
 
@@ -19,28 +18,29 @@ struct PoolState {
 };
 
 struct PlannerParams {
-  double extractionBps = 8000;      // DarkPool.EXTRACTION_BPS
-  double treasuryMarginBps = 5;     // overpay a hair: the oracle price may tick before inclusion
+  double extractionBps = 8000;      // DarkPool.EXTRACTION_BPS: the pool PULLS exactly this share of the harvest
+  double treasuryMarginBps = 5;     // headroom on the allowance (the cap) in case the oracle ticks before inclusion
   double gasCostQuote = 0;          // expected gas in token1 units
   double minNet = 0;                // minimum expected profit worth the risk
   double maxInv0 = 0, maxInv1 = 0;  // executor inventory available to deliver
 };
 
-/// A concrete rebalance: what the pool sends out, what the executor must return, what the Treasury gets.
+/// A concrete rebalance: what the pool sends out, what the executor must return, and the Treasury allowance.
 struct Plan {
   bool ok = false;
   bool sellsToken0 = false;  // true: pool price > oracle, we SELL token0 into the pool
   double amount0Out = 0, amount1Out = 0;
-  double pay0 = 0, pay1 = 0, treasuryPay = 0;
+  double pay0 = 0, pay1 = 0;
+  double treasuryPay = 0;    // allowance for the pool's pull (a cap); the pool takes exactly harvest · extraction
   double harvest = 0;        // value the pool loses at oracle price = our gross gain (token1)
   double edge = 0;           // gain measured against the AS bid/ask
-  double net = 0;           // edge − treasury − gas
+  double net = 0;            // edge − Treasury cut − gas
   double targetPrice = 0;
 };
 
 namespace detail {
 
-struct Eval { double in0, out0, in1, out1, harvest, pay, edge, net; bool feasible; };
+struct Eval { double in0, out0, in1, out1, harvest, cut, cap, edge, net; bool feasible; };
 
 inline Eval evalAt(const PoolState& s, double pt, bool sell, double oracleP, double bid, double ask, const PlannerParams& pp) {
   const double k = s.k();
@@ -59,57 +59,63 @@ inline Eval evalAt(const PoolState& s, double pt, bool sell, double oracleP, dou
     e.edge = e.out0 * bid - e.in1;
     e.feasible = e.in1 > 0 && e.out0 > 0 && e.out0 < s.r0;
   }
-  e.pay = std::max(0.0, e.harvest) * (pp.extractionBps / 1e4) * (1.0 + pp.treasuryMarginBps / 1e4);
-  if (!sell) e.feasible = e.feasible && (e.in1 + e.pay <= pp.maxInv1);
-  e.net = e.edge - e.pay - pp.gasCostQuote;
+  e.cut = std::max(0.0, e.harvest) * (pp.extractionBps / 1e4);
+  e.cap = e.cut * (1.0 + pp.treasuryMarginBps / 1e4);
+  if (!sell) e.feasible = e.feasible && (e.in1 + e.cap <= pp.maxInv1);
+  e.net = e.edge - e.cut - pp.gasCostQuote;
   return e;
 }
 
 }  // namespace detail
 
-/// Chooses the target price pt (how far to push the pool) that maximises expected net profit.
-///   sell case: pt ∈ [oracle, spot)   buy case: pt ∈ (spot, oracle]    — always TOWARD the oracle, never past
-/// (the contract requires |spot'−P| < |spot−P|). Net profit is smooth and single-peaked in pt, so a ternary
-/// search finds the optimum; with no Treasury cut and no costs the peak is exactly pt = our ask/bid.
+/// Chooses the target price pt (how far to push the pool) that maximises net profit — IN CLOSED FORM.
+///   sell (spot > P):  net(x_t) = (1−φ)(y − K/x_t) − (x_t − x)(ask − φP) − gas   ⇒   p* = (ask − φP)/(1 − φ)
+///   buy  (spot < P):  net(y_t) = (x − K/y_t)(bid − φP) − (y_t − y)(1 − φ) − gas  ⇒   p* = (bid − φP)/(1 − φ)
+/// with φ = extraction share. Both objectives are concave in x_t (resp. y_t), so the optimum over the feasible interval
+/// is p* clamped to it, and that interval is closed-form too:
+///   sell: pt ≥ K/(x + inv0)² (inventory), pt > (y − r1)²/K (real reserve), pt ∈ (P, spot)
+///   buy : pt < K/(x − r0)² (real reserve), √pt ≤ u⁺ where u⁺ is the positive root of
+///         (1−φc)√K·u² − ((1−φc)y − φc·P·x + inv1)·u − φc·P·√K = 0   (repayment + capped cut ≤ inventory), pt ∈ (spot, P)
+/// Always TOWARD the oracle, never past it (the contract requires |spot'−P| < |spot−P|). ~25 ns, exact: the previous
+/// 80-step "bisection" + 200-step ternary search took ~5–10 µs and could stop up to half an interval short of the
+/// feasibility boundary, leaving up to 23 % of the profit (Phase-8 audit Q-3).
 inline Plan plan(const PoolState& s, double oracleP, double bid, double ask, const PlannerParams& pp) {
   Plan out;
   const double spot = s.spot();
   if (!(oracleP > 0) || !(spot > 0) || std::fabs(spot - oracleP) / oracleP < 1e-9) return out;
   const bool sell = spot > oracleP;
-
-  double lo = sell ? oracleP : spot, hi = sell ? spot : oracleP;
-  // shrink the interval so every probe is feasible (inventory / reserve limits are monotone in pt)
-  const double eps = 1e-9 * oracleP;
-  if (sell) { lo += eps; hi -= eps; } else { lo += eps; hi -= eps; }
+  const double phi = pp.extractionBps / 1e4, phiCap = phi * (1.0 + pp.treasuryMarginBps / 1e4);
+  const double K = s.k(), eps = 1e-9 * oracleP;
+  double lo = sell ? oracleP + eps : spot + eps, hi = sell ? spot - eps : oracleP - eps;
+  if (sell) {
+    const double xmax = s.x() + pp.maxInv0;
+    lo = std::max(lo, K / (xmax * xmax));
+    const double ymin = s.y() - s.r1;
+    if (ymin > 0) lo = std::max(lo, (ymin * ymin / K) * (1 + 1e-12));
+  } else {
+    const double xmin = s.x() - s.r0;
+    if (xmin > 0) hi = std::min(hi, (K / (xmin * xmin)) * (1 - 1e-12));
+    const double sK = std::sqrt(K), a = (1 - phiCap) * sK, b = -((1 - phiCap) * s.y() - phiCap * oracleP * s.x() + pp.maxInv1),
+                 c = -phiCap * oracleP * sK;
+    const double u = (-b + std::sqrt(b * b - 4 * a * c)) / (2 * a);
+    hi = std::min(hi, u * u * (1 - 1e-12));
+  }
   if (!(lo < hi)) return out;
-  for (int i = 0; i < 80; ++i) {  // bisection for the extreme feasible end
-    const double probe = sell ? lo : hi;
-    if (detail::evalAt(s, probe, sell, oracleP, bid, ask, pp).feasible) break;
-    if (sell) lo = lo + (hi - lo) * 0.5; else hi = hi - (hi - lo) * 0.5;
-    if (hi - lo < eps) return out;
-  }
-  for (int i = 0; i < 200; ++i) {
-    const double a = lo + (hi - lo) / 3.0, b = hi - (hi - lo) / 3.0;
-    const auto ea = detail::evalAt(s, a, sell, oracleP, bid, ask, pp);
-    const auto eb = detail::evalAt(s, b, sell, oracleP, bid, ask, pp);
-    const double na = ea.feasible ? ea.net : -std::numeric_limits<double>::infinity();
-    const double nb = eb.feasible ? eb.net : -std::numeric_limits<double>::infinity();
-    if (na < nb) lo = a; else hi = b;
-  }
-  const double pt = 0.5 * (lo + hi);
+  const double pt = std::clamp(((sell ? ask : bid) - phi * oracleP) / (1 - phi), lo, hi);
   const auto e = detail::evalAt(s, pt, sell, oracleP, bid, ask, pp);
   if (!e.feasible || e.net <= pp.minNet) return out;
 
   out.ok = true; out.sellsToken0 = sell; out.targetPrice = pt;
   out.amount0Out = e.out0; out.amount1Out = e.out1;
-  out.pay0 = e.in0; out.pay1 = e.in1; out.treasuryPay = e.pay;
+  out.pay0 = e.in0; out.pay1 = e.in1; out.treasuryPay = e.cap;
   out.harvest = e.harvest; out.edge = e.edge; out.net = e.net;
   return out;
 }
 
 /// Independent re-implementation of the three DarkPool.flashRebalance acceptance rules (I1, I3a, I3b),
 /// used by tests and by the dry-run mock chain. Inputs are the amounts that will actually be sent.
-struct RuleCheck { bool kOk, deviationOk, treasuryOk; bool all() const { return kOk && deviationOk && treasuryOk; } };
+/// `cut` is what DarkPool pulls (80 % of the harvest at P); treasuryOk = the allowance (`treasuryPaid`) covers it.
+struct RuleCheck { bool kOk, deviationOk, treasuryOk; double cut; bool all() const { return kOk && deviationOk && treasuryOk; } };
 
 inline RuleCheck chainRules(const PoolState& s, double oracleP, double out0, double out1, double in0, double in1, double treasuryPaid) {
   const double n0 = s.r0 - out0 + in0, n1 = s.r1 - out1 + in1;
@@ -119,7 +125,8 @@ inline RuleCheck chainRules(const PoolState& s, double oracleP, double out0, dou
   const double devBefore = std::fabs(s.spot() - oracleP) / oracleP, devAfter = std::fabs(y / x - oracleP) / oracleP;
   r.deviationOk = devAfter < devBefore;
   const double valueBefore = s.x() * oracleP + s.y(), valueAfter = x * oracleP + y;
-  r.treasuryOk = treasuryPaid >= std::max(0.0, valueBefore - valueAfter) * 0.8 * (1.0 - 1e-12);
+  r.cut = std::max(0.0, valueBefore - valueAfter) * 0.8;
+  r.treasuryOk = treasuryPaid >= r.cut * (1.0 - 1e-12);
   return r;
 }
 

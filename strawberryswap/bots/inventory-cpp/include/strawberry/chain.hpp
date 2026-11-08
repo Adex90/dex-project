@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <string_view>
 #include "strawberry/curve.hpp"
 
 namespace sb {
@@ -18,9 +19,9 @@ class IChain {
   virtual OracleQuote readOracle() = 0;
   virtual Inventory readInventory() = 0;
   /// eth_call of the exact calldata against the pending block. MUST be true before any send.
-  virtual bool preflight(const std::string& calldataHex) = 0;
+  virtual bool preflight(std::string_view calldataHex) = 0;
   /// Hands calldata to the remote signer / relay (private mempool). Returns tx hash. The bot NEVER holds a key.
-  virtual std::optional<std::string> send(const std::string& calldataHex) = 0;
+  virtual std::optional<std::string> send(std::string_view calldataHex) = 0;
 };
 
 }  // namespace sb

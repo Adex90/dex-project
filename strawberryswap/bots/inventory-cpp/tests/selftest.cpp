@@ -1,5 +1,7 @@
 #include <cassert>
 #include <cstdio>
+#include <map>
+#include <memory>
 #include <random>
 #include "strawberry/abi.hpp"
 #include "strawberry/avellaneda_stoikov.hpp"
@@ -36,7 +38,7 @@ static void testAvellanedaStoikov() {
 }
 
 static void testLob() {
-  OrderBook b;
+  OrderBook b(1.0);  // tick 1.0: prices are the tick numbers
   b.set(Side::Bid, 99, 10); b.set(Side::Bid, 98, 5); b.set(Side::Ask, 101, 10); b.set(Side::Ask, 102, 5);
   CHECK(b.valid() && b.mid() == 100 && b.micro() == 100 && b.imbalance(2) == 0);
   b.set(Side::Bid, 99, 30);
@@ -57,7 +59,8 @@ static void testLob() {
 }
 
 static void testAbi() {
-  const std::string cd = encodeRebalance(toWei(1.0, Round::Down), 0, 0, 0, toWei(2.0, Round::Down));
+  const Calldata c = encodeRebalance(toWei(1.0, Round::Down), 0, 0, 0, toWei(2.0, Round::Down));
+  const std::string_view cd = c.view();
   CHECK(cd.size() == 2 + 8 + 5 * 64);
   CHECK(cd.substr(0, 10) == "0xc0661737");
   CHECK(cd.substr(10, 64) == "0000000000000000000000000000000000000000000000000de0b6b3a7640000");
@@ -117,7 +120,7 @@ static void testEndToEnd() {
   Searcher bot(c);
   SimChain chain;
   chain.oracle = {1985, 100};                    // pool 2000 vs zk-oracle 1985: pool too expensive
-  bot.book().set(Side::Bid, 1984.9, 40); bot.book().set(Side::Ask, 1985.1, 40);
+  bot.book().setPrice(Side::Bid, 1984.9, 40); bot.book().setPrice(Side::Ask, 1985.1, 40);
   double t = 0;
   for (int i = 0; i < 20; ++i) { t += 1; bot.onBookUpdate(t); bot.onPublicTrade(1985.0 + 0.2 * (i % 3)); }
   chain.oracle.updatedAtSec = 105;
@@ -125,6 +128,10 @@ static void testEndToEnd() {
   CHECK(d.skip == Skip::None && !d.txHash.empty() && d.plan.sellsToken0);
   CHECK(chain.pool.spot() < 2000 && chain.pool.spot() >= 1985 * (1 - 1e-6));   // moved TOWARD oracle, not past
   CHECK(chain.inv.token1 > 100'000 - 1);                                       // inventory moved as planned
+  // the pool pulled 80 % of the harvest it actually realised (the bot rounds repayments up, so slightly less than
+  // planned) — the allowance (treasuryPay) is only a cap
+  CHECK(chain.treasury <= 0.8 * d.plan.harvest * (1 + 1e-9) && chain.treasury >= 0.8 * d.plan.harvest * (1 - 1e-4));
+  CHECK(d.plan.treasuryPay >= chain.treasury);
 
   // safety gates
   SimChain stale; stale.oracle = {1985, 0};
@@ -137,7 +144,80 @@ static void testEndToEnd() {
   CHECK(bot.tick(110, flat).skip == Skip::NoEdge);                              // nothing to do ⇒ do nothing
 }
 
+// Differential test: the flat integer-tick book against a straightforward std::map reference, over random L2
+// streams that include deletions, crossed-level cleanup and jumps large enough to re-centre the window.
+static void testFlatBookMatchesReference() {
+  std::mt19937_64 g(9);
+  std::uniform_real_distribution<double> u(0, 1);
+  auto book = std::make_unique<OrderBook>(0.01);
+  std::map<std::int64_t, double, std::greater<>> bids;
+  std::map<std::int64_t, double> asks;
+  std::int64_t mid = 200'000;
+  for (int step = 0; step < 300'000; ++step) {
+    if (u(g) < 0.02) mid += static_cast<std::int64_t>((u(g) - 0.5) * 6);
+    if (u(g) < 0.0002) {  // a gap far beyond the window: venues follow it with a snapshot resync
+      mid += (u(g) < 0.5 ? -1 : 1) * 20'000;
+      book->clear(); bids.clear(); asks.clear();
+    }
+    while (!bids.empty() && bids.begin()->first >= mid) { book->set(Side::Bid, bids.begin()->first, 0); bids.erase(bids.begin()); }
+    while (!asks.empty() && asks.begin()->first <= mid) { book->set(Side::Ask, asks.begin()->first, 0); asks.erase(asks.begin()); }
+    const bool bid = u(g) < 0.5;
+    const std::int64_t t = bid ? mid - 1 - static_cast<std::int64_t>(u(g) * 40) : mid + 1 + static_cast<std::int64_t>(u(g) * 40);
+    const double q = u(g) < 0.3 ? 0.0 : 1 + 100 * u(g);
+    book->set(bid ? Side::Bid : Side::Ask, t, q);
+    if (bid) { if (q > 0) bids[t] = q; else bids.erase(t); } else { if (q > 0) asks[t] = q; else asks.erase(t); }
+    // the reference keeps only levels the window can hold (deep levels are out of scope by design)
+    if (bids.empty() || asks.empty()) { CHECK(!book->valid() || bids.empty() || asks.empty()); continue; }
+    CHECK(book->valid());
+    CHECK(book->bestBid() == static_cast<double>(bids.begin()->first) * 0.01);
+    CHECK(book->bestAsk() == static_cast<double>(asks.begin()->first) * 0.01);
+    CHECK(book->bidQty() == bids.begin()->second && book->askQty() == asks.begin()->second);
+    double b5 = 0, a5 = 0; int k = 0;
+    for (auto it = bids.begin(); it != bids.end() && k < 5; ++it, ++k) b5 += it->second;
+    k = 0;
+    for (auto it = asks.begin(); it != asks.end() && k < 5; ++it, ++k) a5 += it->second;
+    CHECK(std::fabs(book->imbalance(5) - (b5 - a5) / (b5 + a5)) < 1e-12);
+  }
+  book->clear();
+  CHECK(!book->valid());
+
+  // re-centring keeps every level that is still inside the new window; far-side levels beyond it are ignored
+  OrderBook r(1.0);
+  r.set(Side::Bid, 1000, 1); r.set(Side::Bid, 990, 2); r.set(Side::Ask, 1010, 1);  // window [-7192, 9192)
+  r.set(Side::Ask, 1010, 0); r.set(Side::Ask, 9100, 3); r.set(Side::Bid, 9050, 3);  // the market rallies
+  CHECK(r.valid() && r.bestBid() == 9050 && r.bestAsk() == 9100);
+  r.set(Side::Ask, 9600, 5);  // beyond the window, worse than the touch: ignored
+  CHECK(r.bestAsk() == 9100);
+  r.set(Side::Ask, 9100, 0);
+  r.set(Side::Ask, 9700, 4);  // no ask left in the window: this is the new touch -> re-centre around 9700
+  r.set(Side::Bid, 9600, 4);
+  CHECK(r.valid() && r.bestBid() == 9600 && r.bestAsk() == 9700);
+  r.set(Side::Bid, 9600, 0);
+  CHECK(r.bestBid() == 9050);  // survived the shift; 1000 and 990 fell out of the new window
+  r.set(Side::Bid, 9050, 0);
+  CHECK(!r.valid());
+}
+
+// Regression for audit Q-3: when the pool's REAL reserve binds near the oracle, the old search stopped up to half an
+// interval short of the boundary. The closed form must match a fine brute-force grid over the feasible range.
+static void testPlannerHitsTheReserveBoundary() {
+  PoolState s{15.52, 17'642, 1000, 2'000'000};  // tiny real token1: out1 < r1 binds
+  const double P = 1951.8427, bid = 1951.4363, ask = 1952.2491;
+  PlannerParams pp; pp.gasCostQuote = 0.4; pp.maxInv0 = 50; pp.maxInv1 = 100'000;
+  const Plan p = plan(s, P, bid, ask, pp);
+  CHECK(p.ok && p.sellsToken0);
+  double best = -1e300;
+  for (int i = 1; i < 200'000; ++i) {
+    const double pt = P + (s.spot() - P) * i / 200'000.0;
+    const auto e = detail::evalAt(s, pt, true, P, bid, ask, pp);
+    if (e.feasible) best = std::max(best, e.net);
+  }
+  CHECK(p.net >= best - 1e-6);
+  CHECK(p.net > 27.0);  // the old planner stopped at 21.28 here
+}
+
 int main() {
   testAvellanedaStoikov(); testLob(); testAbi(); testPlannerAgainstContractRules(); testEndToEnd();
+  testFlatBookMatchesReference(); testPlannerHitsTheReserveBoundary();
   std::printf("selftest OK (%d checks)\n", checks);
 }
