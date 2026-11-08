@@ -62,7 +62,7 @@ export function VaultCard() {
       >
         <span className="flex min-w-0 flex-1 items-center gap-3">
           <span className="relative">
-            <span className="grid h-12 w-12 place-items-center rounded-2xl bg-gradient-to-br from-fuchsia-deep to-plum-500 text-white shadow-glow-fuchsia">
+            <span className="grid h-12 w-12 place-items-center rounded-2xl bg-plum-700 text-lavender shadow-inset">
               <IconVault />
             </span>
             {s ? (

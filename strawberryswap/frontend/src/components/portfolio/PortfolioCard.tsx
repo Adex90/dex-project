@@ -56,7 +56,7 @@ function ShieldedBalances() {
   if (w.phase === "locked" || w.phase === "error") {
     return (
       <div className="card-inset flex flex-col items-center gap-3 py-6 text-center">
-        <IconLock className="h-6 w-6 text-fuchsia" />
+        <IconLock className="h-6 w-6 text-lavender" />
         <p className="max-w-sm text-sm text-lavender">Shielded balances are encrypted to a key derived on this device. Unlock to scan the chain for your notes.</p>
         <button type="button" className="btn-primary" disabled={unavailable || !ready} onClick={() => void w.unlock()}>
           Unlock shielded wallet

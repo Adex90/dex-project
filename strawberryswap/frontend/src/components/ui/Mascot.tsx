@@ -106,9 +106,9 @@ export function Mascot({ className = "h-10 w-10", float = false, title }: { clas
 export function Logo({ compact = false }: { compact?: boolean }) {
   return (
     <span className="flex items-center gap-2">
-      <Mascot className="h-10 w-10 shrink-0 drop-shadow-[0_0_12px_rgba(255,42,133,0.45)]" />
+      <Mascot className="h-10 w-10 shrink-0" />
       <span className={`text-xl font-extrabold tracking-tight ${compact ? "hidden sm:inline" : ""}`}>
-        <span className="text-gradient">Strawberry</span>
+        <span className="text-berry">Strawberry</span>
         <span className="text-ink">Swap</span>
       </span>
     </span>

@@ -38,7 +38,7 @@ function WalletButton() {
           type="button"
           onClick={openWallet}
           title={wallet.account}
-          className="flex h-10 items-center gap-2 whitespace-nowrap rounded-full border border-fuchsia/30 bg-plum-700/70 pl-2 pr-3.5 text-sm transition hover:border-fuchsia hover:shadow-glow-fuchsia focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-fuchsia"
+          className="flex h-10 items-center gap-2 whitespace-nowrap rounded-full border border-lavender/15 bg-plum-700/70 pl-2 pr-3.5 text-sm transition hover:border-fuchsia hover:shadow-glow-fuchsia focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-fuchsia"
         >
           <span className={`h-2.5 w-2.5 rounded-full ${wallet.chainOk ? "bg-mint shadow-glow-mint" : "bg-blush"}`} aria-hidden />
           <span className="num font-semibold text-ink">{shortAddr(wallet.account)}</span>
@@ -59,7 +59,7 @@ export function AppHeader() {
   const { t } = useSettings();
   const active = useActive();
   return (
-    <header className="sticky top-0 z-40 border-b border-lavender/10 bg-plum-950/70 backdrop-blur-xl">
+    <header className="sticky top-0 z-40 border-b border-lavender/10 bg-plum-950">
       <div className="mx-auto flex max-w-6xl items-center gap-2 px-4 py-2.5 sm:gap-3 sm:px-6">
         <Link href="/" aria-label="StrawberrySwap home" className="rounded-2xl focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-fuchsia">
           <Logo compact />
@@ -87,7 +87,7 @@ export function AppHeader() {
 
         <div className="ml-auto flex items-center gap-2">
           <span className="pill-plum hidden 2xl:inline-flex" title="Network this build talks to">
-            <span className="h-1.5 w-1.5 rounded-full bg-fuchsia" aria-hidden />
+            <span className="h-1.5 w-1.5 rounded-full bg-haze" aria-hidden />
             <span className="num">{chain.name} · {chain.id}</span>
           </span>
           <SettingsMenu />
@@ -119,7 +119,7 @@ export function BottomNav() {
   return (
     <nav aria-label="Main" className="fixed inset-x-0 bottom-0 z-40 lg:hidden">
       <div className="pb-safe mx-auto max-w-md px-3">
-        <div className="mb-1 grid grid-cols-4 gap-1 rounded-3xl border border-lavender/10 bg-plum-900/85 p-1.5 shadow-card backdrop-blur-xl">
+        <div className="mb-1 grid grid-cols-4 gap-1 rounded-3xl border border-lavender/10 bg-plum-900 p-1.5 shadow-card">
           {TABS.map(({ href, short, label, Icon }) => {
             const on = active(href);
             return (

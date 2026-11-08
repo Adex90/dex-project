@@ -45,7 +45,7 @@ export function WalletCard({ className = "" }: { className?: string }) {
 
       {!unlocked ? (
         <div className="card-inset flex gap-3">
-          <IconLock className="mt-0.5 h-5 w-5 shrink-0 text-fuchsia" />
+          <IconLock className="mt-0.5 h-5 w-5 shrink-0 text-lavender" />
           <p className="text-sm text-lavender">
             Unlocking asks your wallet to sign one message. The signature stays on this device and derives the key that controls your shielded notes
             inside a Web Worker. Your private key and trade parameters are never sent anywhere. Reloading the page forgets it; signing again restores
