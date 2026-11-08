@@ -20,10 +20,16 @@ known Poseidon pre-image: **no JoinSplit can spend it** (that circuit needs `Pos
 circuit that can is `batch_swap`, which (a) pays `destPubKey` at least `minOut` before `deadline`, or (b) after the
 deadline returns the full amount to `refundPubKey`. The terms are fixed because they are hashed into the note's
 blinding. Consequence: **the Automator learns an intent but cannot spend, redirect, delay-and-keep, or alter it.**
-Its only power is censorship, and the refund path bounds even that.
+It *can* choose when to settle it and with which other intents, including its own: within the user's `minOut` it can
+sandwich the user (Phase-8 audit H-4). The on-chain value guard (§4, I5) rejects any batch that moves the pool toward
+the oracle, so the unwind leg must go through `flashRebalance` and pay the Treasury's 80 %; that removes ~96 % of the
+incentive, not all of it. Keep `minOut` tight and computed against the oracle; an oracle-relative bound in-circuit is the
+complete fix (open, see §6).
 
-Nullifier of an intent note is `Poseidon(commitment, leafIndex, BATCH_NK)`: derivable by anyone *because* nobody else
-can spend that note, so no second nullifier for the same note can ever exist (no double-spend path).
+Nullifier of an intent note is `Poseidon(commitment, leafIndex, destBlinding)`. `destBlinding` is bound inside the
+commitment, so each note has exactly one nullifier (no double-spend path), and it is known only to the user and the
+holder of the opening, so an observer cannot link a spent intent to the transaction that created it. (A public key
+here made every slot linkable: audit H-7.)
 
 ## 2. The clearing price (closed form)
 With effective reserves `X, Y`, gross token0 sold `A0` and token1 sold `A1`:
@@ -61,27 +67,36 @@ the price: it is a function of public data (`X, Y` and the net flow).
 | " | skim 1 wei from a user (even with consistent remainders) | `rem < den` bound — circuit tests + mutation M7 |
 | " | understate the price | `pRem < D` bound — circuit tests + mutation M8 |
 | " | drop an intent but keep the net flow | net equation — circuit + `test_aggregatorCannotDropAnIntentAndKeepTheRest` |
-| " | settle a stale proof after the pool moved | `X, Y` are public inputs read from storage — `test_proofIsBoundToPoolState` |
+| " | settle against an old pool state | `(X, Y)` travel with the batch and are accepted only if they were the pool's state within `STATE_WINDOW_BLOCKS` (64); K and I5 are checked against the CURRENT state — `test_proofIsBoundToPoolState`, `test_H5_*` |
+| " / arbitrageur | arbitrage the pool through batches without paying the Treasury | I5: `(in0 − out0)·P + (in1 − out1) ≥ 0` at the fresh oracle price; refund-only batches are exempt — `test_C1_*` |
+| " | settle while the oracle is stale | value-moving batches need a fresh oracle (`StaleOracle`); refunds never do |
+| chain observer | link a batch slot to the wallet that created the intent | secret nullifier key — `circuits/test/batch.test.mjs` (H-7) |
 | " | replay | nullifier set — `test_batchCannotBeReplayed` |
 | " | execute after a deadline / refund early | in-circuit clock + contract window — circuit tests, `test_clockWindow` |
 | broken verifier / bad circuit | create value | contract re-checks `K' ≥ K` and `balance ≥ reserve + custody` (I1, I2) |
 | anyone | spend an intent note with JoinSplit | needs a pre-image of `BATCH_PUBKEY` (infeasible) |
 
 ## 5. Costs (measured)
-Circuit constraints: N=2 **14,982** · N=4 **28,736** · N=8 **56,244** · N=16 **111,260** (≈6.9k per slot, of which
+Circuit constraints: N=2 **14,988** · N=4 **28,748** · N=8 **56,268** · N=16 **111,308** (≈6.9k per slot, of which
 ≈5k is the 20-level Poseidon Merkle path). Design choices that kept it down: closed-form price (computed once, shared by
 all slots), one muxed division gadget per slot, no hashing of the public arrays (they are public inputs instead:
 ≈2N extra verifier inputs ≈ 7k gas each, versus ≈300k constraints for SHA-256 over `abi.encode(arrays)`).
 
-Gas, N=4 real batch: SNARK verification **297k** · `settleBatch` total **3.05M**. **The proof is not the bottleneck:**
-≈2.75M is four on-chain Poseidon Merkle insertions (≈680k each; `NoteTree` hashes 20 levels per leaf with the
-circomlib contract). Obvious next optimisation (not done): insert the batch's commitments as one aligned subtree
+Gas, N=4 real batch: SNARK verification **297k** · `settleBatch` total **2.96M** (3.05M before one root per
+transaction). **The proof is not the bottleneck:** ≈2.66M is four on-chain Poseidon Merkle insertions (≈650k each;
+`NoteTree` hashes 20 levels per leaf with the circomlib contract). Obvious next optimisation (not done): insert the batch's commitments as one aligned subtree
 (compute the subtree root in the circuit, one insertion of `log2(N)`-shorter path), cutting this by roughly `N×`.
 
 ## 6. Not done / open
 * No ceremony: keys in `test/fixtures` are single-party DEV keys.
 * In-batch duplicate use of one intent note is rejected by the contract's nullifier set, not in-circuit.
 * A batch carries at most one output per intent (no partial fills / change notes).
-* The frontend still builds the legacy plaintext EIP-712 intent; wiring client-side proving (JoinSplit + intent note)
-  into the browser is a separate piece of work.
-* `minSwaps` can be gamed by an Automator padding batches with its own swaps; cover traffic is not implemented.
+* `minSwaps` is an Automator policy, not an on-chain rule (audit M-6), and it can be gamed by an Automator padding
+  batches with its own swaps; cover traffic is not implemented.
+* Deadlines stretch by `BATCH_CLOCK_WINDOW` (300 s) and the prover's choice of `tNow` decides swap vs refund near the
+  deadline (audit M-5).
+* Price protection is the user's absolute `minOut`; an oracle-relative bound in-circuit (audit P-9) is not implemented.
+* The transaction that creates an intent note is public; the wallet sends it from the user's own address. Relaying it
+  is required for unlinkability of the deposit edge.
+* An adverse state change while a proof is generated (a large withdrawal, a rebalance against the batch) still fails
+  the current-state K check by design: an LP can still delay batches at the cost of leaving the pool (audit H-5).

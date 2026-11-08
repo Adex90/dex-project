@@ -1,6 +1,10 @@
 # Phase 8 — Institutional Security Audit, Cryptographic Red Team and HFT Review
 
-**Audited commit:** `a0a7eea` (Phase 7) · **Date:** 2026-11-07 · **Product code changed by this audit:** none
+**Audited commit:** `a0a7eea` (Phase 7) · **Date:** 2026-11-07 · **Remediation:** merged on 2026-11-08, see §7
+
+> The exploit tests, circuit scripts and the reference patch described below lived in commit `5d035e2`. After the fixes
+> were merged, every exploit became a regression test that passes only while its attack stays blocked (§7). To replay
+> an original attack, check out `5d035e2` and follow §1.
 
 This is an adversarial review. Every Critical and High finding is backed by something that runs. A suspected break of
 that severity counts only if I could reproduce it. Findings marked *analysis* are argued from the code instead:
@@ -12,14 +16,14 @@ that severity counts only if I could reproduce it. Findings marked *analysis* ar
 * **Exact-integer economic models** (`contracts/audit/models/`).
 * **C++ micro-benchmarks** (`bots/inventory-cpp/audit/bench.cpp`).
 
-Every patch proposed here is in `docs/AUDIT_PHASE8.patch` (812 lines). It applies cleanly to this commit. On a fresh copy,
+Every patch proposed here was first delivered as `docs/AUDIT_PHASE8.patch` (812 lines, in `5d035e2`). On a fresh copy,
 after applying it:
 
-* **all 92 existing tests still pass**;
-* **all 12 exploits fail**, each on the guard the patch adds;
-* the patched circuits still satisfy their own test suites.
+* **all 92 existing tests still passed**;
+* **all 12 exploits failed**, each on the guard the patch adds;
+* the patched circuits still satisfied their own test suites.
 
-The patch is a reference fix. It is **not** applied here.
+The patch has since been merged; §7 records what changed during the merge and what remains open.
 
 ---
 
@@ -85,6 +89,10 @@ existing suite still passes.
 ---
 
 ## 1. Reproduce everything
+
+The commands below are for the audited state (`git checkout 5d035e2`). On the current branch the same attacks run as
+regression tests (`forge test`, `npm test` in `circuits/`), the models live in `docs/audit-phase8-models/`, the scan is
+`npm run scan`, and the benchmark is `bots/inventory-cpp/bench/` (§7).
 
 ```bash
 # Exploits on the audited code: 13/13 PASS (12 attacks work + 1 gas measurement)
@@ -659,7 +667,7 @@ Impact: one junk leaf, and burning nullifier 0 forever. The Go Automator only li
 
 ## 3. Mission 2 — Cryptographic audit (joinsplit, batch_swap, zkdeco_oracle)
 
-### 3.1 Exact under-constraint scan (`circuits/audit/freewire.mjs`)
+### 3.1 Exact under-constraint scan (now `circuits/scripts/scan-underconstrained.mjs`, `npm run scan`)
 
 For each circuit, I computed a valid witness `w` and then examined every prover-controlled wire `i` exactly. Write
 `a, b, c` for the coefficients of wire `i` in constraint `k`. Changing wire `i` by `δ` gives:
@@ -836,7 +844,7 @@ multi-party phase-2.
 
 ## 4. Mission 3 — HFT engine and `SearcherExecutor`
 
-### Measurements (`bots/inventory-cpp/audit/bench.cpp`, Xeon 2.1 GHz, g++ 13)
+### Measurements (now `bots/inventory-cpp/bench/bench.cpp`, Xeon 2.1 GHz, g++ 13)
 
 | hot path | current | patched | speed-up | correctness |
 |---|---|---|---|---|
@@ -979,7 +987,7 @@ threads. Make the hand-off an SPSC queue of immutable top-of-book structs.
 
 ---
 
-## 5. The patch set (`docs/AUDIT_PHASE8.patch`)
+## 5. The patch set (delivered as `docs/AUDIT_PHASE8.patch`; merged, see §7)
 
 | patch | files | fixes | interface change | consumers to update |
 |---|---|---|---|---|
@@ -1037,3 +1045,48 @@ from 1,625,492 to **1,581,175 (−2.7 %)**.
   variation is shown as ranges.
 * **Gas costs.** Gas prices used for attack costs are illustrative. The gas *amounts* were measured with real Poseidon
   and a real verifier.
+
+---
+
+## 7. Remediation status (merged 2026-11-08)
+
+The patch was applied to the product code and every off-chain component was brought in line with it. Each exploit is
+now a regression test that **passes only while the attack stays blocked**.
+
+| ID | Status | Fix | Regression test |
+|---|---|---|---|
+| C-1 | **Fixed** | value guard I5 + oracle freshness in `settleBatch` | `test_C1_*` (mock and real proofs) |
+| C-2 | **Fixed** | virtual reserves ∝ `totalShares` | `test_C2_*` |
+| C-3 | **Fixed** (new keys) | canonical single-object layout in zk-DECO | `circuits/test/zkdeco.test.mjs` (`C-3: …`) |
+| H-1 | **Fixed** | pool pulls the exact cut from the initiator | `test_H1_nestedRebalancesEachPayTheirFullCut`, `SearcherExecutor.t.sol` |
+| H-2 | **Fixed** | one root per transaction, `ROOT_HISTORY = 1024` | `test_H2_rootWindowIsExactly1024Transactions` |
+| H-3 | **Fixed** | rollover; completed roots stay valid; Go and wallet mirrors follow | `test_H3_*`, Go `TestTreeRolloverSettlesOldTreeFirst`, wallet rollover test |
+| H-4 | **Partially fixed** | unwind toward the oracle now pays the Treasury (−96 % incentive) | `test_H4_sandwichBackRunIsRejected`; P-9 (oracle-relative `minOut` in-circuit) is **open** |
+| H-5 | **Partially fixed** | proofs survive state changes for 64 blocks | `test_H5_*`; an ADVERSE change (large withdrawal, rebalance against the batch) still fails the current-state K check by design, so an LP can still delay batches at the cost of leaving the pool |
+| H-6 | **Fixed** (+ adapter spec) | pull-measured settle | `test_H6_*`; per-deposit escrow remains the complete fix for non-compliant adapters |
+| H-7 | **Fixed** (new keys) | intent nullifier keyed by `destBlinding` | `circuits/test/batch.test.mjs` (`H-7: …`), golden vectors (JS, Go, wallet) |
+| M-1 | **Fixed** | pro-rata exits (demand and, found during the merge, TimeDeposits HOLD) | `testFuzz_demand_shortfallIsSharedProRataInAnyOrder`, `test_time_holdShortfallIsSharedProRata` |
+| M-2 | **Fixed** | pro-rata pay-outs; solvency required on inflows | `test_M2_*` |
+| L-1 | **Fixed** | zero entries rejected | `test_L1_zeroEntriesAreRejected` |
+| Q-3, Q-4, Q-5 | **Fixed** | closed-form planner, flat tick book, fixed-buffer calldata | `selftest` (incl. differential book test, Q-3 regression), `bench/` |
+| M-3 … M-7, L-2 … L-6, Q-2, Q-6 … Q-9, I-1 | **Open** | see the findings above | — |
+| C-0 | **Open — mainnet blocker** | multi-party ceremony | — |
+
+**Found or decided during the merge**
+
+* **TimeDeposits HOLD mode had the M-1 freeze too** (global `balance ≥ heldInContract` checks). Same pro-rata fix; local
+  outflow checks in `open`/`settle`.
+* **The wallet sorted `NoteInserted` events by leaf index.** After a rollover, indices restart at 0, which would have
+  interleaved two trees. Events now carry their chain position and are applied in chain order; re-delivered events are
+  dropped by position.
+* **The Automator must respect I5 and the oracle.** It reads `oracle().latestVerifiedPrice()`, plans refund-only batches
+  while the oracle is stale, drops sellers who would be paid above the oracle, and re-checks the plan against the live
+  oracle before submitting (a batch that would revert is held back instead of burning gas).
+* **No production `IZKOracle` exists** (only test mocks). The local deployment and e2e use `DevLiveOracle`, a test mock
+  that is always fresh. A zk-DECO-backed price feed is a **mainnet blocker**.
+* **New suites for previously untested modules** (I-2): SovereignBank (12), OptionsMarket (9), SearcherExecutor (4).
+
+**Verification of the merged state:** Foundry 134 tests (92 original + 42 new); circuits 20 + 30 + 39 witness tests and a
+clean under-constraint scan; Go `go test ./...` and `go vet`; wallet 16 logic tests, 1 real-proof test, strict
+typecheck and the static-export check; C++ self-test (1,675,045 checks, `-Werror`); full e2e (anvil, real contracts,
+Chromium, Go Automator with a real batch proof).

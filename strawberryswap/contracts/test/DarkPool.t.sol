@@ -211,7 +211,7 @@ contract DarkPoolTest is DarkPoolBase {
         assertLt(pool.spotPrice(), 2e18, "price moved toward the oracle");
     }
 
-    function test_flashRebalance_underpayingTreasuryReverts() public {
+    function test_flashRebalance_poolPullsExactlyTheCut() public {
         MockSearcher s = _rebalanceSetup();
         (uint256 in0, uint256 out1, uint256 req,,) = _plan();
         token0.mint(address(s), in0);

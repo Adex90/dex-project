@@ -1,4 +1,4 @@
-# StrawberrySwap — Phase 1
+# StrawberrySwap
 
 DeFi SuperApp / institutional dark-pool broker. This directory is a self-contained monorepo that lives
 beside the unrelated `Synthetic Capital` code at the repo root (nothing outside `strawberryswap/` was
@@ -160,6 +160,30 @@ gas at N=4, dominated by on-chain Merkle insertions (SNARK verification is 297k)
 cd frontend && npm ci && npm run test:zk && npm run test:zk:proofs   # needs circuits/build (see circuits/README)
 cd e2e && AUTOMATOR_BIN=… SOLC=… node run.mjs                         # full stack, real browser
 ```
+
+## Phase 8 — adversarial audit and remediation
+
+`docs/AUDIT_PHASE8.md` is an internal red-team review of the contracts, circuits and searcher (3 Critical, 7 High,
+7 Medium findings, each reproduced by a working exploit). The fixes are merged:
+
+| Area | What changed | Proven by |
+|---|---|---|
+| DarkPool | batches can never lower pool value at the oracle price (arbitrage must pay the Treasury); virtual reserves scale with shares; the Treasury cut is pulled per pool; batch proofs survive state changes for 64 blocks; zero entries rejected | `test/security/DarkPoolRegression.t.sol`, `RealProofRegression.t.sol` |
+| NoteTree | one root per transaction, 1024 kept; a full tree rolls over (old roots stay valid) | same |
+| SovereignBank / OptionsMarket | pro-rata exits instead of global freezes; pull-measured `TimeDeposits.settle` | `SovereignBank.t.sol`, `OptionsMarket.t.sol` (first suites for these modules) |
+| Circuits | zk-DECO pinned to the canonical single-object layout (7,164 constraints); batch intent nullifier keyed by `destBlinding` | `circuits/test/*`, `npm run scan` (exact under-constraint scan: clean) |
+| Go Automator, wallet | new nullifier, `Batch.(X, Y)`, oracle-aware batch selection, tree-rollover mirrors | `go test ./...`, `npm run test:zk`, `e2e/run.mjs` |
+| C++ searcher | flat integer-tick book (3.6×), closed-form planner (~350×, and it fixes a profit-losing search bug), allocation-free calldata | `selftest` (1.67 M checks), `bench/` |
+
+Test totals: Foundry 134, circuits 89 witness tests, Go all packages, wallet 17, C++ 1.67 M checks, full e2e.
+
+### Mainnet blockers (not solved by this phase)
+1. **Trusted setup.** Every verifier is built from single-party DEV keys; a public multi-party ceremony is required.
+2. **No production price oracle.** `DarkPool` needs an `IZKOracle` implementation (a feed of zk-DECO-attested prices);
+   only test mocks exist. Batches and rebalances depend on it being fresh (≤ 60 s).
+3. **No external audit.** The Phase-8 review is internal; open items are listed in `docs/AUDIT_PHASE8.md` §7
+   (operator sandwich residual, oracle-relative slippage, anonymity floor on-chain, deadline window, intent relaying,
+   searcher RPC architecture, among others).
 
 ## Known limitations (read before Phase 2)
 

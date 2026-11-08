@@ -44,18 +44,40 @@ cannot be farmed by repetition. Tested by `testFuzz_roundTripNeverProfits` and
 
 **Scope.** `K` *does* legitimately change when liquidity is added or removed. For those operations the
 invariant is *reserves-per-share never decreases* (`r'·ts >= r·ts'`, proved by the floor argument above and
-checked as `invariant_noLiquidityDilution`).
+checked as `invariant_noLiquidityDilution`), and since the virtual reserves scale with `totalShares`
+(`v = v_ref·S/S_ref`), a proportional deposit or withdrawal scales `x` and `y` by the same factor and leaves the price
+unchanged (`test_C2_proportionalLiquidityNeverMovesThePrice`). With immutable virtual reserves it did not, which made
+liquidity a price-manipulation tool (Phase-8 audit C-2).
+
+## I5 — no value leaves the pool through a batch  (DarkPool.settleBatch)
+
+> For every accepted batch with non-zero flows, at the fresh oracle price `P`:
+> `in0·P + in1·WAD >= out0·P + out1·WAD`.
+
+Moving the pool toward the oracle lowers `V_P = x·P + y` (on the curve `xy = K`, `V_P` is convex with its minimum at
+spot = `P`), so every arbitrage batch is rejected and arbitrage must use `flashRebalance`, which pays the Treasury.
+Conversely, when spot = `P` every curve trade has `ΔV_P >= 0` (the tangent of slope `−P` lies below the convex curve),
+so retail is not blocked. Refund-only batches move no value and never read the oracle. Tested:
+`test_C1_batchArbitrageTowardTheOracleReverts`, `test_C1_retailTradeAtTheOraclePriceSettles`, the K-monotonicity
+fuzzer (accepted ⇔ `K' >= K ∧ I5`) and, with real proofs, `test_C1_real_*`. Residual (documented): a move the oracle has
+not seen yet can still be traded with, inside `MAX_ORACLE_AGE`.
 
 ## Other properties and where they are checked
 
 | Property | Mechanism | Test |
 |---|---|---|
-| Treasury receives ≥ 80 % of harvest | `flashRebalance` rule I3b | `invariant_treasuryAlwaysPaid`, `test_flashRebalance_underpayingTreasuryReverts` |
+| Treasury receives exactly 80 % of the harvest, PULLED by each pool from the initiator | `flashRebalance` I3b | `invariant_treasuryAlwaysPaid`, `test_flashRebalance_poolPullsExactlyTheCut`, `test_H1_nestedRebalancesEachPayTheirFullCut` |
 | Rebalance must move toward the oracle | I3a | `test_flashRebalance_movingAwayFromOracleReverts` |
 | Pool fully backed (balance ≥ reserve + custody) | `_checkBalances` | `invariant_poolIsFullyBacked` |
 | A greedy batch (1 wei beyond the curve) is never accepted | I-K | `invariant_greedyBatchNeverAccepted` |
 | Proofs bound to caller / recipient / amount / ciphertext | `extDataHash` | `JoinSplitIntegrationTest.test_*Bound*`, `test_ciphertextSwapRejected` |
 | A forged proof cannot be replayed | nullifier set | `test_replayedProofReverts` |
+| A proof in flight survives 1023 later transactions | one root per transaction, `ROOT_HISTORY = 1024` | `test_H2_rootWindowIsExactly1024Transactions` |
+| No note is ever frozen by tree capacity | rollover; completed roots stay valid | `test_H3_fullTreeRollsOverAndOldNotesStaySpendable` |
+| A batch proof stays valid while the state changes within 64 blocks | recent-state window (K and I5 on the current state) | `test_H5_*` |
+| Demand and HOLD exits never freeze on a token-side loss | pro-rata pay-out `amount·balance/total` | `testFuzz_demand_shortfallIsSharedProRataInAnyOrder`, `test_time_holdShortfallIsSharedProRata` |
+| A ROUTED settlement is credited only with its own adapter's money | pull-measured settle | `test_H6_*` |
+| A token-side shortfall never freezes an options series | pro-rata pay-out; solvency required on inflows | `test_M2_*` |
 | Malformed proof cannot burn unbounded gas | verifier gas cap | `testFuzz_malformedProofCannotBurnMoreThanGasCap` |
 
 ## Mutation testing (do the tests actually fail when the code is wrong?)
@@ -92,4 +114,7 @@ those attacks are now in `circuits/test/batch.test.mjs`, and all 9 mutations are
    `wasm`/`zkey` paths no longer resolved. Found by the end-to-end fixture run, not by a unit test — hence the E2E.
 6. **IPv6 scrubbing gap (fixed).** A regex cannot recognise compressed IPv6 (`2001:db8::1`); the log scrubber now
    validates candidate tokens with `net.ParseIP`, without redacting times (`12:30:45`) or MAC addresses.
-7. **Settlement gas is dominated by Merkle insertions, not the proof** (≈2.75M of 3.05M at N=4; verification 297k).
+7. **Settlement gas is dominated by Merkle insertions, not the proof** (≈2.66M of 2.96M at N=4; verification 297k).
+8. **Phase-8 adversarial audit** (`docs/AUDIT_PHASE8.md`): every confirmed exploit is now a regression test
+   (`test/security/`, `SovereignBank.t.sol`, `OptionsMarket.t.sol`, circuit suites) that passes only while the attack
+   stays blocked.

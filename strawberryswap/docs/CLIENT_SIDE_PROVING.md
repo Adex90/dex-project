@@ -96,7 +96,12 @@ Go batch proof + settlement ≈ one epoch + ≈ 40 s. Browser, wallet, chain and
   from the Automator's sealed output (61 B), so an observer can tell the two kinds of output apart.
 * Deposit and withdrawal edges reveal amount and caller by construction.
 * The wallet scans `NoteInserted` from the pool's deployment block on every unlock; for a busy pool this needs either a
-  checkpoint or an indexer (an indexer would learn which tree the user is interested in, not which notes).
+  checkpoint or an indexer (an indexer would learn which tree the user is interested in, not which notes). Events are
+  applied in CHAIN order (block, log index): when the on-chain tree rolls over, leaf indices restart at 0 and the wallet
+  starts a new tree, proving older notes against their completed tree's final root.
+* The `transferNote` that creates an intent is sent from the user's own address, which links the intent's creation to
+  that address; relaying it is required for unlinkability (the batch itself no longer links a slot to its intent: the
+  intent nullifier is keyed by the secret `destBlinding`).
 * Browser storage is intentionally not used for secrets. The cost is a rescan per session.
 * Memory-safety of the browser (extensions with page access, a compromised dependency in the bundle) is outside this
   design; the pinned content hash and the absence of third-party origins reduce, but do not remove, that surface.
