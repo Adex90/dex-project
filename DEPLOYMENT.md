@@ -97,10 +97,12 @@ internet -> host 80/443 (UFW, fail2ban) -> nginx (edge network)
 | No inbound administrative port (SSH, 5432) | DBA access only through Session Manager port forwarding: bastion without ingress rule, public address, key pair or sshd; `dba-tunnel` policy refuses shell sessions | SSH hardened by `hardening.sh` (keys only) | `terraform/bastion.tf`; Appendix C |
 | Services reach only what they need | Security groups per service; backend egress limited to `backend_egress_cidrs` (default none) | Separate internal networks per path (`web`, `api`, `data`); backend egress internal by default, then restricted on the host (§5.11) | Appendix C |
 | Staff authenticate with two factors; TOTP secrets never in clear | Same code on both: two-step verification (TOTP) is mandatory for `OPERADOR`, `AUDITOR` and `CUMPLIMIENTO` and re-checked on every request; secrets encrypted with `MFA_CLAVE_CIFRADO` (Secrets Manager) | Same; key in `secrets/mfa_encryption_key` | `tests/mfa.rs`, `tests/db/0010_auth_mfa.sql`, AML e2e (Appendix C) |
+| A client's reads return only that client's rows, even if the query is wrong | Same code on both: role `sc_cliente` (SELECT only) and RESTRICTIVE RLS policies keyed to `sc.cliente_actual` on users, accounts, movements, SPEI and SOFOM tables (migration `0011`) | Same | `tests/rls.rs`, `tests/db/0011_rls_por_cliente.sql` |
+| No request field outside the API contract is accepted | Same code on both: `deny_unknown_fields` on every body and query type (400 `VALIDACION`) | Same | `tests/entrada.rs` (source scan and HTTP) |
 | Least-privilege database identities | Service holds only `sc_app` (NOINHERIT, no owner rights); owner credentials only in the migrate task and with DBAs holding the `dba-tunnel` policy | Same, plus the schema owner is **not** a superuser (`deploy/postgres/10-schema-owner.sh`); the `postgres` superuser is break-glass only | `pg_authid` query in Appendix C |
 | Containers non-root, read-only, least capability, resource-limited | uid 65532, read-only rootfs, `drop ALL`, task CPU/memory | uid 65532 / 70 / 101, `read_only`, `cap_drop: ALL`, `no-new-privileges`, CPU/memory/PID limits | `docker inspect` in Appendix C |
 | No secret in code, images, environment or state the operator does not control | Secrets Manager (CMK); RDS manages and rotates the owner password; Terraform state is CMK-encrypted | Docker secrets files (0400, owned by the reading uid); services read them through `NAME_FILE` | No secret value in `docker inspect` or image history (Appendix C) |
-| TLS 1.3 at the edge, HSTS, strict CSP, rate limits, body-size limits | ALB policy `ELBSecurityPolicy-TLS13-1-3-2021-06`; WAF | nginx (`nginx/`) | Edge tests in Appendix C |
+| TLS 1.3 at the edge, HSTS, strict CSP, rate limits, body-size limits | ALB policy `ELBSecurityPolicy-TLS13-1-3-2021-06`; WAF; per-IP limits again in the backend (`HTTP_LIMITE_*`) | nginx (`nginx/`); per-IP limits again in the backend | Edge tests in Appendix C; `tests/limites.rs` |
 
 ---
 
@@ -197,17 +199,21 @@ guarantee the same bytes.
 - **CI result** (`ci.yml`) covers:
   - **Code checks:** lint, typecheck and unit tests (frontend); rustfmt, clippy
     `-D warnings` and every test (backend).
-  - **Database and browser tests:** the six SQL invariant suites, and the Playwright
+  - **Database and browser tests:** the seven SQL invariant suites, and the Playwright
     e2e runs (smoke and AML).
-  - **Images:** hadolint, then the build. The Trivy scan fails on any fixable CRITICAL
-    finding and reports HIGH.
+  - **Images:** hadolint, then the build. Each build includes a dependency audit
+    stage that fails it on a known vulnerability: `cargo audit` (RustSec), and
+    `npm audit` (moderate or worse in runtime dependencies, high or worse anywhere).
+    The Trivy scan fails on any fixable CRITICAL finding and reports HIGH.
   - **Infrastructure and scripts:** Terraform fmt, validate and tflint; Trivy
     misconfiguration and secret scans; ShellCheck; actionlint.
 - **Security result** (`security.yml`, also weekly): Trivy on the lockfiles and on the
   third-party images pinned in `docker-compose*.yml`.
 
-Exceptions live only in `.github/trivyignore.yaml`. Each has a statement, an approver
-and an expiry date.
+Exceptions live only in `.github/trivyignore.yaml` (Trivy) and
+`backend/.cargo/audit.toml` (cargo audit). Each has a statement, an approver and an
+expiry date. npm has no exception file: a finding is fixed or the package is pinned
+through `overrides`.
 
 ---
 
@@ -972,12 +978,12 @@ aid for the compliance team and the auditors, not a certification.
 | Control area | CNBV (fintech and AML/CFT provisions) | ISO/IEC 27001:2022 Annex A | SOC 2 (TSC 2017) | Implementation | Evidence |
 |---|---|---|---|---|---|
 | Network segregation | information-security requirements | 8.20, 8.21, 8.22 | CC6.6 | private data tier; internal Docker networks; security groups; WAF | Terraform; `docker-compose.yml`; §5.7 |
-| Least privilege, privileged access | access control | 5.15, 5.18, 8.2 | CC6.1, CC6.3 | `sc_app` NOINHERIT; non-superuser owner; superuser break-glass only; no task role; DBA access only by Session Manager port forwarding (`dba-tunnel` policy) | `pg_authid`; Terraform IAM; CloudTrail `StartSession` |
+| Least privilege, privileged access | access control | 5.15, 5.18, 8.2 | CC6.1, CC6.3 | `sc_app` NOINHERIT; non-superuser owner; superuser break-glass only; no task role; DBA access only by Session Manager port forwarding (`dba-tunnel` policy); a client's reads confined to its rows by RLS (`sc_cliente`) | `pg_authid`; Terraform IAM; CloudTrail `StartSession`; `tests/db/0011_rls_por_cliente.sql` |
 | Segregation of duties | internal control | 5.3 | CC5.1 | role matrix (§2.1); four-eyes in the AML console (database-enforced) | AML suite; tickets |
 | Authentication secrets | information security | 5.17 | CC6.1 | Secrets Manager / Docker secrets; SCRAM-SHA-256 everywhere; rotation (§8) | §8; rotation records |
 | Cryptography | information security | 8.24 | CC6.1, CC6.7 | TLS 1.3 at the edge; TLS to RDS (`verify-full` to the proxy); KMS CMKs | ALB/nginx config; KMS key policies |
 | Logging and monitoring | operation records; AML audit trail | 8.15, 8.16 | CC7.2, CC7.3 | ALB/WAF/flow logs; container logs; fail2ban; tamper-evident AML audit log (`aml.verificar_bitacora`) | log groups; SIEM |
-| Vulnerability management | information security | 8.8 | CC7.1 | Trivy gates (images, lockfiles, IaC, third-party images); Dependabot; digest pins | CI history; `.github/trivyignore.yaml` |
+| Vulnerability management | information security | 8.8 | CC7.1 | Trivy gates (images, lockfiles, IaC, third-party images); `cargo audit` and `npm audit` in every image build; Dependabot; digest pins | CI history; `.github/trivyignore.yaml`; `backend/.cargo/audit.toml` |
 | Secure development and change | change management | 8.25, 8.28, 8.29, 8.32 | CC8.1 | protected `main`; required checks; migration procedure (§6) | PRs; CI; release tickets |
 | Backup and recovery | business continuity | 8.13, 8.14 | A1.2, A1.3 | RDS 35-day point-in-time recovery, Multi-AZ; tested dump and restore (§5.9) | restore drill records |
 | Configuration hardening | information security | 8.9 | CC6.8, CC7.1 | `hardening.sh`; read-only, non-root containers; distroless images | §5.2 output; `docker inspect` |
@@ -1012,6 +1018,9 @@ to the specific provisions.
 | 17 | The CSP allows `'unsafe-inline'` scripts (Next.js inlines its bootstrap scripts), and the session JWT is in `sessionStorage` | an XSS bug would expose the session | React escapes all output; the frontend has no raw-HTML sinks (`dangerouslySetInnerHTML`, `innerHTML`, `eval`); `frame-ancestors 'none'`, `object-src 'none'`, `base-uri 'none'`; the JWT is short-lived and cleared when the tab closes | nonce-based CSP through Next.js middleware; HttpOnly, SameSite session cookies (frontend, backend) |
 | 18 | Images are not signed and carry no SBOM attestation | registry tampering is not detected at deploy time | digest pinning end to end; ECR tags are immutable | cosign signatures and an SBOM (Trivy or Syft) in the release pipeline, verified before deploy (infrastructure) |
 | 19 | The `dba-tunnel` policy restricts DBAs, not account administrators: a principal allowed `ssm:StartSession` on every instance could open a shell on the bastion | a shell inside the VPC with a path to the database port, still without the owner password | the instance role holds only `AmazonSSMManagedInstanceCore`, and the bastion holds no secret | an SCP that denies shell sessions on instances tagged `Component = dba-access` (account baseline) |
+| 20 | The backend's per-IP limits count in each process | with N tasks behind the ALB, an address can make up to N times the quota | the WAF's rate-based rules are global per IP; nginx counts once on a single host | a shared store (for example ElastiCache) if exact global limits are needed in the backend |
+| 21 | RLS keys on a transaction-local setting that the backend writes | SQL injection inside a client transaction could rewrite `sc.cliente_actual` | every query is parameterized (sqlx binds); `sc_cliente` only reads; the policies stop wrong-id and missing-`WHERE` bugs | none planned: per-client database roles do not scale |
+| 22 | Dependency audit exception: RUSTSEC-2023-0071 (`rsa`, no fixed version); six moderate npm findings in lint tooling (minimatch, GHSA-g3hv-75wg-m249) | none: `rsa` is in Cargo.lock only through sqlx's unused MySQL driver, and the npm findings are in dev-only tooling, below the gate's threshold | the backend build fails if `rsa` enters the build graph; dev tooling never reaches an image | review the `rsa` exception when sqlx moves to 0.9; take the eslint update Dependabot proposes |
 
 ---
 
@@ -1161,6 +1170,72 @@ available, so Session Manager itself was not exercised. Everything around it was
   superuser, like the RDS master user. The §4.1 promotion through the tunnel printed one
   row and `UPDATE 1`; repeated, it printed `UPDATE 0`. The check query listed the officer
   with `mfa_enabled = f`.
+
+**Request hardening, rate limits, row-level security and dependency audits**
+(migration `0011`):
+
+- **Mass assignment.** `tests/entrada.rs` scans the source for every `Json`/`Query`
+  request type and every struct nested in one, and finds `deny_unknown_fields` on all
+  of them. With the attribute removed from a query struct and from a nested struct,
+  the scan names both. Over HTTP, injected fields are rejected with 400 `VALIDACION`
+  and nothing is created:
+  - a sign-up with `"rol": "CUMPLIMIENTO"`;
+  - a transfer with `cuenta_origen_id`, `comision` or `estado`;
+  - a movements query with `cliente_id`;
+  - a proof check with extra fields in the leaf or a step.
+- **Rate limits** (`tests/limites.rs`, 8 tests, limits switched on):
+  - **Sign-in:** limited per IP, with `429 REINTENTAR` and `Retry-After`; another IP
+    is unaffected.
+  - **Behind the proxy:** the last `X-Forwarded-For` hop counts, so rotating the
+    client-written entries does not help, and two clients behind one proxy keep
+    separate counts.
+  - **Without a trusted proxy:** the header is ignored.
+  - **IPv6:** counted per /64.
+  - **KYC verification:** limited before authentication.
+  - **Webhooks:** keep their own quota after the general one is used up.
+  - **Health probes** are never limited, and with the limits off nothing is.
+- **Row-level security:**
+  - **`tests/rls.rs`** (5 tests), on data built through the app's own flows
+    (verified clients, deposits, an internal transfer): a client-scoped transaction
+    sees one user, one account and only its own movements. A transfer is visible to
+    both sides. Asking for another client's rows returns nothing. Without a client
+    the role sees nothing; with a value that is not a UUID the query fails.
+    `sc_cliente` cannot update, delete or insert, nor read credentials.
+  - **SQL suite** `tests/db/0011_rls_por_cliente.sql`: 17 checks, run with a role
+    that is not a superuser, like the RDS master user.
+  - **Earlier suites:** all six pass unchanged with RLS enabled on the six
+    additional tables.
+- **Dependency audits:**
+  - **cargo audit:** on the lockfile as merged, it found 7 vulnerabilities and 1
+    unsound warning: rustls (4 advisories), rustls-webpki and webpki-roots (both
+    accepted distrusted intermediates), rsa, and tokio `AsyncFd`. The `cargo update`
+    of rustls, rustls-webpki, webpki-roots and tokio fixed all but `rsa`, which has
+    no fix and is never compiled; it is now an exception with a build-time guard.
+    1,422 advisories, 309 crates, clean.
+  - **npm audit:** runtime dependencies clean; 6 moderate findings in dev-only lint
+    tooling, below the gate's threshold.
+  - **In Docker, the backend `audit` stage:** passes on the current lockfile. On the
+    pre-update lockfile it fails the build (6 vulnerabilities and the denied tokio
+    warning).
+  - **In Docker, the frontend `audit` stage:** passes on the current lockfile. It
+    fails the build with `lodash@4.17.20` added as a runtime dependency.
+  - **Full images:** both build through the gate (`COPY --from=audit`), and the
+    marker is in neither runtime image.
+  - **`rsa` guard:** passes when `rsa` is absent, as in the full backend build; fails
+    when the crate is in the graph and when `cargo tree` errors.
+- **Real server, limits on** (the binary with the default quotas):
+  - **Sign-in:** ten bad sign-ins from one IP get 401, and the eleventh gets
+    `429 REINTENTAR` with `Retry-After: 11`.
+  - **Spoofed header:** a request with a forged `X-Forwarded-For` still gets 429.
+  - **Health probes:** `/salud` and `/vivo` still answer 200.
+- **Browser suites** (local stack with migration `0011`, limits off because every
+  browser comes from 127.0.0.1):
+  - **Results:** smoke passes all 47 checks, AML all 121.
+  - **Fixed check:** the AML wrong-code check now skips Next.js's empty route
+    announcer, which also has `role="alert"`. When the refusal arrived after the check
+    ran, it had read the announcer and failed: 3 of 4 times on one run.
+- **Backend:** rustfmt and clippy `-D warnings` clean; 314 tests passed, 0 failed.
+  hadolint, actionlint and ShellCheck (with the CI settings) are clean.
 
 **Images and scans:**
 

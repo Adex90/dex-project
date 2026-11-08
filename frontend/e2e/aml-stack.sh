@@ -42,6 +42,9 @@ SPEI_DESPACHO_INTERVALO_MS=0
 RUST_LOG=info
 JWT_SECRET=$(openssl rand -hex 32)
 MFA_CLAVE_CIFRADO=$(openssl rand -hex 32)
+# Every browser session comes from 127.0.0.1 and signs in far more than 5 times a minute;
+# backend/tests/limites.rs covers the per-IP limits.
+HTTP_LIMITE_IP=false
 SPEI_WEBHOOK_SECRETO=$(openssl rand -hex 32)
 BOOTSTRAP_CUMPLIMIENTO_EMAILS=oficial1@cumplimiento.mx,oficial2@cumplimiento.mx
 BOOTSTRAP_CUMPLIMIENTO_PASSWORD=cumplimiento-e2e-2026

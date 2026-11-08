@@ -82,6 +82,7 @@ mod auth;
 mod extraccion;
 mod ifpe;
 mod kyc;
+pub mod limites;
 mod operaciones;
 mod reserva;
 mod sofom;
@@ -100,6 +101,7 @@ use axum::{
 use serde_json::json;
 use tower_http::{cors::CorsLayer, timeout::RequestBodyTimeoutLayer, trace::TraceLayer};
 
+use self::limites::Limitadores;
 use crate::{error::AppError, state::AppState};
 
 /// Ninguna petición legítima se acerca a esto (una prueba de inclusión con
@@ -115,15 +117,20 @@ pub fn router(estado: AppState) -> Router {
         Err(_) => CorsLayer::new(),
     };
 
+    // Límites por IP (limites.rs): estricto para auth y kyc, general para el
+    // resto de la API y aparte para los webhooks de los proveedores.
+    let por_ip = Limitadores::nuevos(&estado.config.http);
     let api = Router::new()
-        .merge(auth::rutas())
+        .merge(auth::rutas(&por_ip))
         .merge(ifpe::rutas())
-        .merge(kyc::rutas())
+        .merge(kyc::rutas(&por_ip))
         .merge(sofom::rutas())
         .merge(reserva::rutas())
         .merge(operaciones::rutas())
         .merge(spei::rutas())
         .merge(aml::rutas(estado.clone()));
+    let api = limites::aplicar(api, &por_ip.api)
+        .merge(limites::aplicar(spei::webhooks().merge(kyc::webhooks()), &por_ip.webhook));
 
     let limites = &estado.config.http;
     let peticion = Duration::from_secs(limites.peticion_seg);

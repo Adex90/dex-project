@@ -153,9 +153,15 @@ function wrongCode(email) {
 async function wrongCodeIsRefused(page, email, where) {
   await page.fill("#totp-code", wrongCode(email));
   await page.click("button[type=submit]");
-  const alert = page.getByRole("alert");
-  await alert.waitFor({ timeout: 10_000 }).catch(() => undefined);
-  const text = (await alert.count()) > 0 ? ((await alert.first().textContent()) ?? "") : "";
+  // Next.js keeps its own role="alert" (the empty route announcer) on every page: read the page's messages only,
+  // once the refusal has had time to arrive, or the check races the response.
+  const alerts = page.locator('[role="alert"]:not(#__next-route-announcer__)');
+  await alerts
+    .filter({ hasText: /not valid/i })
+    .first()
+    .waitFor({ timeout: 10_000 })
+    .catch(() => undefined);
+  const text = (await alerts.allTextContents()).join(" | ");
   check(/not valid/i.test(text), `${where}: a wrong code is refused (${JSON.stringify(text)})`);
   check((await page.locator("#totp-code").count()) > 0, `${where}: the same screen asks for the code again`);
 }

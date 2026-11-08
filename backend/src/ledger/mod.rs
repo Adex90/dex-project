@@ -602,7 +602,7 @@ async fn retener_tx(pool: &PgPool, r: &Retencion, monto: Decimal) -> AppResult<M
 // -----------------------------------------------------------------------------
 
 pub async fn cuenta_de_cliente(pool: &PgPool, cliente_id: Uuid) -> AppResult<Option<CuentaIfpe>> {
-    let mut tx = db::begin_lectura(pool, Rol::Ifpe).await?;
+    let mut tx = db::begin_lectura_cliente(pool, cliente_id).await?;
     let cuenta = sqlx::query_as("SELECT * FROM ifpe.cuentas WHERE cliente_id = $1 AND moneda = 'MXN'")
         .bind(cliente_id)
         .fetch_optional(&mut *tx)
@@ -617,7 +617,7 @@ pub async fn movimientos_de_cliente(
     limite: i64,
     antes_de_secuencia: Option<i64>,
 ) -> AppResult<Vec<TransaccionIfpe>> {
-    let mut tx = db::begin_lectura(pool, Rol::Ifpe).await?;
+    let mut tx = db::begin_lectura_cliente(pool, cliente_id).await?;
     let cuenta_id = id_cuenta_ifpe_de_cliente(&mut tx, cliente_id).await?;
     let movimientos = sqlx::query_as(
         "SELECT * FROM ifpe.transacciones \

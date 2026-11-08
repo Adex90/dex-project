@@ -217,6 +217,8 @@ jobs:
             expect: "tests/db/0009_aml.sql: todas las pruebas pasaron (ROLLBACK)"
           - suite: 0010_auth_mfa
             expect: "tests/db/0010_auth_mfa.sql: todas las pruebas pasaron (ROLLBACK)"
+          - suite: 0011_rls_por_cliente
+            expect: "tests/db/0011_rls_por_cliente.sql: todas las pruebas pasaron (ROLLBACK)"
     services:
       postgres:
         image: postgres:16
@@ -456,14 +458,18 @@ jobs:
             # Migrations are embedded from ../migrations: the context is the repo root.
             context: .
             dockerfile: backend/Dockerfile
+            # AUDIT_EPOCH re-runs the dependency audit stage on every run (cargo audit /
+            # npm audit fail the build on a known vulnerability), even from the gha cache.
             build-args: |
               REVISION=${{ github.sha }}
+              AUDIT_EPOCH=${{ github.run_id }}
           - image: frontend
             context: frontend
             dockerfile: frontend/Dockerfile
             # NEXT_PUBLIC_* are inlined at build time; CI uses a reserved .example origin.
             build-args: |
               REVISION=${{ github.sha }}
+              AUDIT_EPOCH=${{ github.run_id }}
               NEXT_PUBLIC_API_URL=https://synthetic-capital.example
               NEXT_PUBLIC_COMPLIANCE_EMAIL=compliance@synthetic-capital.example
     env:

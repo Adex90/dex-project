@@ -12,7 +12,7 @@ use std::{
 
 use axum::{
     extract::{ConnectInfo, FromRequest, FromRequestParts},
-    http::request::Parts,
+    http::{request::Parts, Extensions, HeaderMap},
     response::{IntoResponse, Response},
 };
 use serde::Serialize;
@@ -57,21 +57,26 @@ impl FromRequestParts<AppState> for IpCliente {
     type Rejection = Infallible;
 
     async fn from_request_parts(parts: &mut Parts, estado: &AppState) -> Result<Self, Self::Rejection> {
-        if estado.config.http.proxy_confiable {
-            // Solo el último segmento (el del proxy), leído como bytes: un
-            // valor no ASCII escrito por el cliente antes no lo invalida.
-            let reenviada = parts
-                .headers
-                .get_all("x-forwarded-for")
-                .iter()
-                .next_back()
-                .and_then(|v| v.as_bytes().rsplit(|b| *b == b',').next())
-                .and_then(|segmento| std::str::from_utf8(segmento).ok())
-                .and_then(|v| v.trim().parse::<IpAddr>().ok());
-            if reenviada.is_some() {
-                return Ok(Self(reenviada));
-            }
-        }
-        Ok(Self(parts.extensions.get::<ConnectInfo<SocketAddr>>().map(|c| c.0.ip())))
+        Ok(Self(ip_cliente(&parts.headers, &parts.extensions, estado.config.http.proxy_confiable)))
     }
+}
+
+/// La regla de [`IpCliente`], también para el límite por IP
+/// ([`super::limites`]): las dos ven siempre la misma IP.
+pub fn ip_cliente(cabeceras: &HeaderMap, extensiones: &Extensions, proxy_confiable: bool) -> Option<IpAddr> {
+    if proxy_confiable {
+        // Solo el último segmento (el del proxy), leído como bytes: un
+        // valor no ASCII escrito por el cliente antes no lo invalida.
+        let reenviada = cabeceras
+            .get_all("x-forwarded-for")
+            .iter()
+            .next_back()
+            .and_then(|v| v.as_bytes().rsplit(|b| *b == b',').next())
+            .and_then(|segmento| std::str::from_utf8(segmento).ok())
+            .and_then(|v| v.trim().parse::<IpAddr>().ok());
+        if reenviada.is_some() {
+            return reenviada;
+        }
+    }
+    extensiones.get::<ConnectInfo<SocketAddr>>().map(|c| c.0.ip())
 }

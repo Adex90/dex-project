@@ -1364,7 +1364,7 @@ pub async fn anular(pool: &PgPool, s: &SolicitudAnulacion) -> AppResult<Resultad
 
 /// SPEI recibidos de un cliente (más recientes primero).
 pub async fn de_cliente(pool: &PgPool, cliente_id: Uuid, limite: i64) -> AppResult<Vec<SpeiInbound>> {
-    let mut tx = db::begin_lectura(pool, Rol::Ifpe).await?;
+    let mut tx = db::begin_lectura_cliente(pool, cliente_id).await?;
     let filas = sqlx::query_as(
         "SELECT s.* FROM ifpe.spei_inbound s JOIN ifpe.cuentas c ON c.id = s.cuenta_id \
          WHERE c.cliente_id = $1 ORDER BY s.recibido_en DESC LIMIT $2",

@@ -15,7 +15,7 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::{
-    db::{self, Rol, Tx},
+    db::{self, Tx},
     error::{AppError, AppResult},
     ledger::hash,
     models::sofom::{Caja, ContratoMutuo, CuentaSofom, TipoTxSofom, TransaccionSofom},
@@ -90,7 +90,7 @@ pub struct Posicion {
 }
 
 pub async fn posicion_de_cliente(pool: &PgPool, cliente_id: Uuid) -> AppResult<Posicion> {
-    let mut tx = db::begin_lectura(pool, Rol::Sofom).await?;
+    let mut tx = db::begin_lectura_cliente(pool, cliente_id).await?;
     let cuenta: Option<CuentaSofom> =
         sqlx::query_as("SELECT * FROM sofom.cuentas WHERE cliente_id = $1 AND moneda = 'MXN'")
             .bind(cliente_id)

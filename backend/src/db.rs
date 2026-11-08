@@ -13,6 +13,7 @@
 use std::{future::Future, time::Duration};
 
 use sqlx::{postgres::PgPoolOptions, Executor, PgPool, Postgres, Transaction};
+use uuid::Uuid;
 
 use crate::{config::Config, error::AppError};
 
@@ -45,13 +46,18 @@ pub enum Rol {
     /// Autenticación fuerte: segundo factor (secretos TOTP cifrados) y
     /// restablecimiento de contraseña. El único rol que lee esos secretos.
     Auth,
+    /// Lecturas a nombre de un cliente (su perfil, cuenta, movimientos,
+    /// posición, SPEI). Solo SELECT, y RLS (migración 0011) le deja ver solo
+    /// las filas del cliente de la transacción. Se abre con
+    /// [`begin_lectura_cliente`]; sin cliente no ve nada.
+    Cliente,
 }
 
 impl Rol {
     /// Todos los roles transaccionales: el login de la aplicación es miembro
     /// de cada uno (sin heredar sus privilegios) y actúa con `SET LOCAL ROLE`.
     /// `sc_auditor_pld` no está: es para un verificador externo de la bitácora PLD.
-    pub const TODOS: [Rol; 9] = [
+    pub const TODOS: [Rol; 10] = [
         Rol::Ifpe,
         Rol::Sofom,
         Rol::Puente,
@@ -61,6 +67,7 @@ impl Rol {
         Rol::Spei,
         Rol::Aml,
         Rol::Auth,
+        Rol::Cliente,
     ];
 
     pub const fn nombre(self) -> &'static str {
@@ -74,6 +81,7 @@ impl Rol {
             Rol::Spei => "sc_spei",
             Rol::Aml => "sc_aml",
             Rol::Auth => "sc_auth",
+            Rol::Cliente => "sc_cliente",
         }
     }
 
@@ -90,6 +98,7 @@ impl Rol {
             Rol::Spei => "SET LOCAL ROLE sc_spei",
             Rol::Aml => "SET LOCAL ROLE sc_aml",
             Rol::Auth => "SET LOCAL ROLE sc_auth",
+            Rol::Cliente => "SET LOCAL ROLE sc_cliente",
         }
     }
 }
@@ -112,6 +121,19 @@ pub async fn begin(pool: &PgPool, rol: Rol) -> Result<Tx, sqlx::Error> {
 /// Transacción de solo lectura con el rol indicado.
 pub async fn begin_lectura(pool: &PgPool, rol: Rol) -> Result<Tx, sqlx::Error> {
     begin_con(pool, rol, Modo::Lectura).await
+}
+
+/// Lectura a nombre de un cliente: rol `sc_cliente` y su id en
+/// `sc.cliente_actual` (solo para esta transacción). RLS (migración 0011) le
+/// deja ver solo las filas de ese cliente, aunque la consulta pida otras: un
+/// id equivocado o un `WHERE` olvidado no muestran datos ajenos.
+pub async fn begin_lectura_cliente(pool: &PgPool, cliente_id: Uuid) -> Result<Tx, sqlx::Error> {
+    let mut tx = begin_con(pool, Rol::Cliente, Modo::Lectura).await?;
+    sqlx::query("SELECT set_config('sc.cliente_actual', $1, true)")
+        .bind(cliente_id.to_string())
+        .execute(&mut *tx)
+        .await?;
+    Ok(tx)
 }
 
 /// Foto consistente (REPEATABLE READ) de solo lectura.
@@ -174,12 +196,13 @@ pub async fn verificar_usuario_de_aplicacion(pool: &PgPool) -> Result<(), sqlx::
                 AND pg_has_role(current_user, 'sc_puente', 'MEMBER') AND pg_has_role(current_user, 'sc_auditor', 'MEMBER') \
                 AND pg_has_role(current_user, 'sc_kyc', 'MEMBER') AND pg_has_role(current_user, 'sc_spei', 'MEMBER') \
                 AND pg_has_role(current_user, 'sc_kyc_verificador', 'MEMBER') \
-                AND pg_has_role(current_user, 'sc_aml', 'MEMBER') AND pg_has_role(current_user, 'sc_auth', 'MEMBER')",
+                AND pg_has_role(current_user, 'sc_aml', 'MEMBER') AND pg_has_role(current_user, 'sc_auth', 'MEMBER') \
+                AND pg_has_role(current_user, 'sc_cliente', 'MEMBER')",
     )
     .fetch_one(pool)
     .await?;
     if !miembro {
-        tracing::error!(%usuario, "el usuario de la aplicación no es miembro de sc_ifpe, sc_sofom, sc_puente, sc_auditor, sc_kyc, sc_kyc_verificador, sc_spei, sc_aml y sc_auth");
+        tracing::error!(%usuario, "el usuario de la aplicación no es miembro de sc_ifpe, sc_sofom, sc_puente, sc_auditor, sc_kyc, sc_kyc_verificador, sc_spei, sc_aml, sc_auth y sc_cliente");
     }
     if superusuario || dueno {
         tracing::warn!(

@@ -229,6 +229,7 @@ async fn kyc_pendientes(
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Limite {
     limite: Option<i64>,
 }

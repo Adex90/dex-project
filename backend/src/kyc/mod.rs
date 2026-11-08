@@ -223,7 +223,7 @@ pub async fn registrar(pool: &PgPool, clabe_prefijo: &str, d: DatosRegistro) -> 
 }
 
 pub async fn perfil(pool: &PgPool, cliente_id: Uuid) -> AppResult<Cliente> {
-    let mut tx = db::begin_lectura(pool, Rol::Kyc).await?;
+    let mut tx = db::begin_lectura_cliente(pool, cliente_id).await?;
     let cliente = sqlx::query_as("SELECT * FROM kyc.clientes WHERE id = $1")
         .bind(cliente_id)
         .fetch_optional(&mut *tx)

@@ -36,13 +36,19 @@ use crate::{
 
 pub fn rutas() -> Router<AppState> {
     Router::new()
-        .route("/spei/webhook/inbound", post(webhook_inbound))
-        .route("/spei/webhook/estado", post(webhook_estado))
         .route("/spei/transfer", post(transferir))
         .route("/spei/transferencias", get(transferencias))
         .route("/spei/recibidos", get(recibidos))
         .route("/spei/conciliacion", get(conciliacion))
         .route("/spei/en-revision", get(en_revision))
+}
+
+/// Notificaciones del proveedor: su propio límite por IP, fuera del general
+/// (el proveedor manda ráfagas desde pocas direcciones; ver [`super::limites`]).
+pub fn webhooks() -> Router<AppState> {
+    Router::new()
+        .route("/spei/webhook/inbound", post(webhook_inbound))
+        .route("/spei/webhook/estado", post(webhook_estado))
 }
 
 /// Autentica la notificación del proveedor antes de leerla.
@@ -139,6 +145,10 @@ async fn webhook_inbound(
 /// Cambio de estado de una orden enviada (`LIQUIDADA`/`Exito`, `CANCELADA`,
 /// `DEVUELTA`). Se identifica por el id del proveedor o por la clave de
 /// rastreo (y fecha de operación).
+///
+/// Acepta campos desconocidos a propósito, como `NotificacionAbono`: llega
+/// firmada por el proveedor (HMAC verificado antes de leerla), que puede
+/// agregar campos sin aviso, y ningún campo de más llega a la base de datos.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct NotificacionEstado {

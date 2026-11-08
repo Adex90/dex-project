@@ -15,6 +15,12 @@
 #
 #   --secret id=extra_ca,src=/path/to/corporate-ca.pem
 #
+# Dependency audit: the `audit` stage checks Cargo.lock against the RustSec
+# advisory database (cargo audit, policy in backend/.cargo/audit.toml) and the
+# build fails on a known vulnerability. It runs alongside the compilation. CI
+# passes --build-arg AUDIT_EPOCH=<run id> so a cached layer never hides a new
+# advisory; a local build re-checks whenever Cargo.lock changes.
+#
 # Runtime contract (README "Production database users", .env.example):
 #   (no args) | servir    HTTP server on BIND_ADDR (default 0.0.0.0:8080)
 #   migrar                one-shot job: migrations + bootstrap as the schema
@@ -22,6 +28,37 @@
 #   salud [vivo|listo]    probe of the local server; exit 0 only on HTTP 200
 # Every configuration variable NAME also accepts NAME_FILE (secrets files).
 # The process writes nothing to disk: run it with a read-only root filesystem.
+
+# --------------------------------------------------------------------------
+FROM docker.io/library/rust:1.97.1-slim-trixie@sha256:8e8cf8f7fd54a2d23d5a743b3a03f56e26b6c774276c33fa0595111704ebb15c AS audit
+
+# cargo-audit itself, pinned and built from its own lockfile (cached layer).
+RUN --mount=type=secret,id=extra_ca,required=false \
+    --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
+    set -eu; \
+    if [ -s /run/secrets/extra_ca ]; then \
+        cat /etc/ssl/certs/ca-certificates.crt /run/secrets/extra_ca > /tmp/ca-bundle.crt; \
+        export CARGO_HTTP_CAINFO=/tmp/ca-bundle.crt; \
+    fi; \
+    cargo install cargo-audit --locked --version 0.22.2 --root /opt/cargo-audit; \
+    rm -f /tmp/ca-bundle.crt
+
+WORKDIR /audit
+COPY backend/Cargo.lock ./
+COPY backend/.cargo/audit.toml ./.cargo/audit.toml
+# Fetches the current advisory database on every run: any known vulnerability
+# (or unsound or yanked crate) not listed in audit.toml fails the image build.
+ARG AUDIT_EPOCH=local
+RUN --mount=type=secret,id=extra_ca,required=false \
+    set -eu; \
+    if [ -s /run/secrets/extra_ca ]; then \
+        cat /etc/ssl/certs/ca-certificates.crt /run/secrets/extra_ca > /tmp/ca-bundle.crt; \
+        export SSL_CERT_FILE=/tmp/ca-bundle.crt; \
+    fi; \
+    echo "RustSec audit (${AUDIT_EPOCH})"; \
+    /opt/cargo-audit/bin/cargo-audit audit --file Cargo.lock; \
+    rm -f /tmp/ca-bundle.crt; \
+    touch /audit.ok
 
 # --------------------------------------------------------------------------
 FROM docker.io/library/rust:1.97.1-slim-trixie@sha256:8e8cf8f7fd54a2d23d5a743b3a03f56e26b6c774276c33fa0595111704ebb15c AS builder
@@ -54,6 +91,16 @@ RUN --mount=type=secret,id=extra_ca,required=false \
     cargo fetch --locked --target "$(rustc --print host-tuple)"; \
     rm -f /tmp/ca-bundle.crt
 
+# backend/.cargo/audit.toml ignores RUSTSEC-2023-0071 (rsa) only because rsa is never
+# built: it is in Cargo.lock through sqlx's optional MySQL driver. Fail if that changes.
+# (cargo tree prints nothing for a crate outside the graph; any error fails the step.)
+RUN set -eu; \
+    construido="$(cargo tree --frozen -i rsa -e normal,build)"; \
+    if [ -n "$construido" ]; then \
+        echo "rsa is now built: RUSTSEC-2023-0071 applies, drop its exception in backend/.cargo/audit.toml" >&2; \
+        exit 1; \
+    fi
+
 RUN cargo build --release --frozen --bin synthetic-capital
 
 # 2. The application. COPY keeps the build context's mtimes, which can be
@@ -63,6 +110,10 @@ COPY backend/src ./src
 RUN touch src/main.rs src/lib.rs \
  && cargo build --release --frozen --bin synthetic-capital \
  && install -D -m 0755 target/release/synthetic-capital /out/synthetic-capital
+
+# 3. Gate: no image without a passing dependency audit (the marker stays here,
+#    out of the runtime image).
+COPY --from=audit /audit.ok /tmp/audit.ok
 
 # --------------------------------------------------------------------------
 FROM gcr.io/distroless/cc-debian13:nonroot@sha256:3ee00291cf386ec52a552e6a858d555debd74776eb4bfa53fa3df2cd6677515e

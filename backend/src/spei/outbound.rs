@@ -1350,7 +1350,7 @@ pub async fn buscar_por_id_proveedor(pool: &PgPool, id_proveedor: &str) -> AppRe
 }
 
 pub async fn de_cliente(pool: &PgPool, cliente_id: Uuid, limite: i64) -> AppResult<Vec<SpeiOutbound>> {
-    let mut tx = db::begin_lectura(pool, Rol::Ifpe).await?;
+    let mut tx = db::begin_lectura_cliente(pool, cliente_id).await?;
     let ordenes =
         sqlx::query_as("SELECT * FROM ifpe.spei_outbound WHERE cliente_id = $1 ORDER BY creado_en DESC LIMIT $2")
             .bind(cliente_id)

@@ -14,22 +14,25 @@ use crate::{
     ledger,
     models::{ifpe::CuentaIfpe, kyc::ClienteVista},
     reserva::{self, EstadoReservaVista},
-    routes::extraccion::{IpCliente, Json},
+    routes::{
+        extraccion::{IpCliente, Json},
+        limites::{self, Limitadores},
+    },
     sofom::{self, Posicion},
     state::AppState,
 };
 
-pub fn rutas() -> Router<AppState> {
-    Router::new()
+pub fn rutas(limites: &Limitadores) -> Router<AppState> {
+    // Las que prueban credenciales o crean cuentas: el límite por IP estricto.
+    let acceso = Router::new()
         .route("/auth/registro", post(registro))
         .route("/auth/login", post(login))
         .route("/auth/verify-mfa", post(verificar_mfa))
         .route("/auth/mfa/setup", post(configurar_mfa))
         .route("/auth/mfa/enable", post(activar_mfa))
         .route("/auth/password/forgot", post(olvido_password))
-        .route("/auth/password/reset", post(restablecer_password))
-        .route("/yo", get(yo))
-        .route("/tablero", get(tablero))
+        .route("/auth/password/reset", post(restablecer_password));
+    Router::new().merge(limites::aplicar(acceso, &limites.auth)).route("/yo", get(yo)).route("/tablero", get(tablero))
 }
 
 /// Las proyecciones del propio cliente usan [`ClienteVista`]: sin nivel de

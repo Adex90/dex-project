@@ -26,7 +26,10 @@ use crate::{
         verificacion::{self, ResultadoVerificacion},
         EnvioVerificacion,
     },
-    routes::extraccion::{Cuerpo, IpCliente, Json},
+    routes::{
+        extraccion::{Cuerpo, IpCliente, Json},
+        limites::{self, Limitadores},
+    },
     spei,
     state::AppState,
 };
@@ -39,17 +42,23 @@ const MAX_CUERPO_VERIFICACION: usize = 12 * 1024 * 1024;
 /// sus imágenes decodificadas). Las demás esperan sin leer su cuerpo.
 const VERIFICACIONES_SIMULTANEAS: usize = 8;
 
-pub fn rutas() -> Router<AppState> {
+pub fn rutas(limites: &Limitadores) -> Router<AppState> {
+    let verificar = Router::new().route(
+        "/kyc/verificar",
+        post(verificar)
+            .layer::<_, Infallible>(DefaultBodyLimit::max(MAX_CUERPO_VERIFICACION))
+            .layer::<_, Infallible>(ConcurrencyLimitLayer::new(VERIFICACIONES_SIMULTANEAS)),
+    );
     Router::new()
         .route("/kyc/expediente", get(ver_expediente))
         .route("/kyc/perfil", post(guardar_perfil))
-        .route(
-            "/kyc/verificar",
-            post(verificar)
-                .layer::<_, Infallible>(DefaultBodyLimit::max(MAX_CUERPO_VERIFICACION))
-                .layer::<_, Infallible>(ConcurrencyLimitLayer::new(VERIFICACIONES_SIMULTANEAS)),
-        )
-        .route("/kyc/webhook", post(webhook))
+        .merge(limites::aplicar(verificar, &limites.kyc))
+}
+
+/// Resultados del proveedor biométrico: su propio límite por IP, fuera del
+/// general (ver [`super::limites`]).
+pub fn webhooks() -> Router<AppState> {
+    Router::new().route("/kyc/webhook", post(webhook))
 }
 
 async fn ver_expediente(State(e): State<AppState>, u: Usuario) -> AppResult<Json<VistaExpediente>> {
