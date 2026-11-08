@@ -10,7 +10,6 @@ export const labelToField = (label: string): bigint => BigInt(keccak256(toBytes(
 
 /** Owner key of intent notes: no known Poseidon pre-image, so no JoinSplit can ever spend one. */
 export const BATCH_PUBKEY = labelToField("StrawberrySwap.batch.pubkey");
-export const BATCH_NK = labelToField("StrawberrySwap.batch.nullifierKey");
 export const TREE_ZERO = labelToField("StrawberrySwap.NoteTree.zero");
 
 export function randomBytes(n: number): Uint8Array<ArrayBuffer> {

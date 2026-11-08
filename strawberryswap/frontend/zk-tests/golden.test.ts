@@ -3,13 +3,13 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { test } from "node:test";
-import { BATCH_NK, BATCH_PUBKEY, TREE_ZERO } from "../src/zk/field";
+import { BATCH_PUBKEY, TREE_ZERO } from "../src/zk/field";
 import { makeIntentNote, openSealedOutput, type IntentTerms } from "../src/zk/notes";
 import { H } from "../src/zk/poseidon";
 import { NoteTree } from "../src/zk/tree";
 
 interface Golden {
-  constants: { batchPubKey: string; batchNK: string; zero: string };
+  constants: { batchPubKey: string; zero: string };
   poseidon: { in: string[]; out: string }[];
   tree: { leaves: string[]; root: string; path3: string[]; bits3: number[] };
   intents: { label: string; index: number; json: { dir: 0 | 1; value: string; destPubKey: string; refundPubKey: string; destBlinding: string; minOut: string; deadline: number }; commitment: string; nullifier: string }[];
@@ -18,7 +18,6 @@ const g: Golden = JSON.parse(readFileSync(new URL("../../bots/automator/testdata
 
 test("nothing-up-my-sleeve constants match the circuit", () => {
   assert.equal(BATCH_PUBKEY.toString(), g.constants.batchPubKey);
-  assert.equal(BATCH_NK.toString(), g.constants.batchNK);
   assert.equal(TREE_ZERO.toString(), g.constants.zero);
 });
 
@@ -43,7 +42,8 @@ test("intent notes: commitment and batch nullifier match the Go Automator", () =
     };
     const note = makeIntentNote(terms);
     assert.equal(note.commitment.toString(), it.commitment, `${it.label}: commitment`);
-    assert.equal(H(note.commitment, BigInt(it.index), BATCH_NK).toString(), it.nullifier, `${it.label}: nullifier`);
+    // the key is the intent's own destBlinding, never a public constant (Phase-8 audit H-7)
+    assert.equal(H(note.commitment, BigInt(it.index), terms.destBlinding).toString(), it.nullifier, `${it.label}: nullifier`);
   }
 });
 

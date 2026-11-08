@@ -12,11 +12,11 @@ import {PoseidonHasherAdapter, IPoseidonT3, JoinSplitVerifierAdapter, IGroth16Ve
 import {GenericGroth16Adapter} from "../src/verifiers/GenericGroth16Adapter.sol";
 import {JoinSplitGroth16Verifier} from "../test/fixtures/JoinSplitGroth16Verifier.dev.sol";
 import {BatchSwapGroth16Verifier} from "../test/fixtures/BatchSwapGroth16Verifier.dev.sol";
-import {MockERC20, MockOracle, MockTreasury} from "../test/mocks/Mocks.sol";
+import {MockERC20, DevLiveOracle, MockTreasury} from "../test/mocks/Mocks.sol";
 
 /// @notice LOCAL DEVELOPMENT / E2E ONLY. Deploys a complete DarkPool (real Poseidon, real Groth16 verifiers built
-///         from DEV keys, batch size 4) plus open-mint dev tokens, a mock oracle and treasury, seeds liquidity, and
-///         funds a user. Never run against a live network: the tokens are freely mintable and the keys are insecure.
+///         from DEV keys, batch size 4) plus open-mint dev tokens, an always-fresh dev oracle at the seeded spot price
+///         (2.0), a mock treasury, seeds liquidity, and funds a user. Never run against a live network: the tokens are freely mintable and the keys are insecure.
 ///         The Poseidon contract's bytecode cannot be deployed with `new`, so e2e/run.mjs deploys it first and passes
 ///         its address in $POSEIDON.
 /// Usage: POSEIDON=0x… USER=0x… forge script script/DeployLocal.s.sol --rpc-url … --private-key … --broadcast
@@ -36,7 +36,7 @@ contract DeployLocal is Script {
 
         DarkPool pool = new DarkPool(
             IERC20Min(address(t0)), IERC20Min(address(t1)), 2_000_000e18, 4_000_000e18, joinSplit, batch, hasher,
-            IZKOracle(address(new MockOracle())), ITreasury(address(new MockTreasury())), 4
+            IZKOracle(address(new DevLiveOracle(2e18))), ITreasury(address(new MockTreasury())), 4
         );
 
         t0.mint(msg.sender, 1_000_000e18);

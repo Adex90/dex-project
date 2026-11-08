@@ -140,3 +140,26 @@ test("lock() forgets everything", async () => {
   assert.deepEqual([st.unlocked, st.notes.length, st.intents.length, st.treeSize], [false, 0, 0, 0]);
   await assert.rejects(eng.proveDeposit({ assetId: 0n, amount: 1n, caller: ALICE }), /locked/);
 });
+
+test("tree rollover: notes in a completed tree stay spendable against its final root", async () => {
+  const prover = new RecordingProver();
+  const eng = new ZkEngine(prover, 2); // 4 leaves per tree
+  eng.unlock(SIG_A);
+  const chain = new FakeChain(2);
+  const dep = await eng.proveDeposit({ assetId: 0n, amount: 5n * U, caller: ALICE });
+  chain.pushPair(dep.js.commitments, dep.js.encryptedNotes); // leaves 0, 1 of tree 0
+  chain.push(77n, "0x00");
+  chain.push(78n, "0x00"); // tree 0 is full
+  let st = await eng.addLeaves(chain.leaves);
+  const oldRoot = st.root;
+  chain.push(79n, "0x00"); // rolls over: leaf 0 of tree 1
+  st = await eng.addLeaves(chain.leaves);
+  assert.equal(st.treeId, 1);
+  assert.equal(st.treeSize, 1);
+  assert.notEqual(st.root, oldRoot);
+  const note = st.notes[0];
+  assert.ok(note && note.value === 5n * U);
+  await eng.proveWithdraw({ commitment: note.commitment, recipient: ALICE });
+  const pub = (prover.calls.at(-1) as { pub: bigint[] }).pub;
+  assert.equal(pub[0], oldRoot, "a note of the completed tree is proven against that tree's final root");
+});

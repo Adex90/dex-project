@@ -1,5 +1,5 @@
 import type { Address, Hex } from "viem";
-import { bigintToHex32, randomField } from "./field";
+import { DEPTH, bigintToHex32, randomField } from "./field";
 import { buildJoinSplitWitness, type SpendInput } from "./joinsplit";
 import {
   deriveKeys, extHashNoAddress, extHashWithAddress, makeIntentNote, makeNote, nullifierOf, openSealedOutput, openSelf, paddingCiphertext,
@@ -16,6 +16,9 @@ export interface LeafEvent {
   index: number;
   commitment: bigint;
   encryptedNote: Hex;
+  /** Monotonic chain position (block·2^32 + logIndex): lets the engine drop re-delivered events, which leaf indices
+   *  alone cannot do once the on-chain tree has rolled over. */
+  seq?: bigint;
 }
 
 export interface OwnedNoteView {
@@ -47,6 +50,7 @@ export interface WalletState {
   root: bigint;
   notes: OwnedNoteView[];
   intents: IntentView[];
+  treeId: number; // ordinal of the current on-chain tree (NoteTree.treeId)
 }
 
 /** The exact tuple `DarkPool.depositNote / transferNote / withdrawNote` take as `JoinSplit`. */
@@ -64,8 +68,9 @@ export interface WithdrawBundle { assetId: bigint; amount: bigint; recipient: Ad
 
 const TWO_112 = 1n << 112n;
 
-interface Owned { note: Note; index: number; spent: boolean }
-interface IntentRec { terms: IntentTerms; index: number; state: IntentState }
+// `tree` is the ordinal of the (rolled-over) on-chain tree that holds the leaf; `index` is the position inside it.
+interface Owned { note: Note; index: number; tree: number; spent: boolean }
+interface IntentRec { terms: IntentTerms; index: number; tree: number; state: IntentState }
 
 /**
  * The shielded wallet. Everything secret — the derived key, note openings, intent terms — lives in this object, and
@@ -74,12 +79,18 @@ interface IntentRec { terms: IntentTerms; index: number; state: IntentState }
  */
 export class ZkEngine {
   private keys: ShieldedKeys | undefined;
-  private tree = new NoteTree();
+  private tree: NoteTree;
+  /** Completed trees (NoteTree rolls over when full); their final roots stay valid on-chain forever. */
+  private trees: NoteTree[] = [];
+  private lastSeq = -1n;
   private owned = new Map<bigint, Owned>();
   private intents = new Map<bigint, IntentRec>();
   private reserved = new Set<bigint>();
 
-  constructor(private readonly prover: Groth16Prover) {}
+  /** `depth` must equal NoteTree.DEPTH on-chain; tests use smaller trees to exercise rollover. */
+  constructor(private readonly prover: Groth16Prover, private readonly depth: number = DEPTH) {
+    this.tree = new NoteTree(depth);
+  }
 
   // ------------------------------------------------------------------------------------------ lifecycle
   unlock(signature: Hex): bigint {
@@ -91,7 +102,9 @@ export class ZkEngine {
   /** Forget the key, every note and every intent. */
   lock(): void {
     this.keys = undefined;
-    this.tree = new NoteTree();
+    this.tree = new NoteTree(this.depth);
+    this.trees = [];
+    this.lastSeq = -1n;
     this.owned.clear();
     this.intents.clear();
     this.reserved.clear();
@@ -106,22 +119,32 @@ export class ZkEngine {
   /**
    * Appends NoteInserted events IN ORDER and recovers whatever belongs to this wallet: notes and intents it sealed
    * to itself, and the sealed outputs the Automator produced for its intents. Throws on an index gap — the caller
-   * must then resync from the pool's first block.
+   * must then resync from the pool's first block. Events must arrive in CHAIN order: after the on-chain tree rolls
+   * over (it was full), indices restart at 0 in a fresh tree.
    */
   async addLeaves(leaves: LeafEvent[]): Promise<WalletState> {
     const { pubKey, privKey } = this.k();
     for (const leaf of leaves) {
+      if (leaf.seq !== undefined) {
+        if (leaf.seq <= this.lastSeq) continue; // re-delivered (overlapping scan)
+        this.lastSeq = leaf.seq;
+      }
+      if (this.tree.size === 2 ** this.tree.depth && leaf.index === 0) {
+        this.trees.push(this.tree);
+        this.tree = new NoteTree(this.depth);
+      }
       if (leaf.index < this.tree.size) continue; // overlap with a previous scan
       if (leaf.index !== this.tree.size) throw new Error(`leaf gap: expected ${this.tree.size}, got ${leaf.index}`);
       const idx = this.tree.insert(leaf.commitment);
+      const tree = this.trees.length;
 
       const own = await openSelf(privKey, leaf.encryptedNote);
       if (own?.kind === "note") {
         const n = makeNote(own.assetId, own.value, pubKey, own.blinding);
-        if (n.commitment === leaf.commitment && n.value > 0n) this.owned.set(n.commitment, { note: n, index: idx, spent: false });
+        if (n.commitment === leaf.commitment && n.value > 0n) this.owned.set(n.commitment, { note: n, index: idx, tree, spent: false });
       } else if (own?.kind === "intent") {
         const terms: IntentTerms = { dir: own.dir, value: own.value, destPubKey: pubKey, refundPubKey: pubKey, destBlinding: own.destBlinding, minOut: own.minOut, deadline: own.deadline };
-        if (makeIntentNote(terms).commitment === leaf.commitment) this.intents.set(leaf.commitment, { terms, index: idx, state: "created" });
+        if (makeIntentNote(terms).commitment === leaf.commitment) this.intents.set(leaf.commitment, { terms, index: idx, tree, state: "created" });
       } else {
         for (const rec of this.intents.values()) {
           if (rec.state !== "created") continue;
@@ -129,7 +152,7 @@ export class ZkEngine {
           if (!out) continue;
           const n = makeNote(BigInt(out.assetOut), out.value, pubKey, rec.terms.destBlinding);
           if (n.commitment !== leaf.commitment) continue; // a blob that opens but does not match the leaf: ignore, never trust it
-          this.owned.set(n.commitment, { note: n, index: idx, spent: false });
+          this.owned.set(n.commitment, { note: n, index: idx, tree, spent: false });
           rec.state = out.assetOut === rec.terms.dir ? "refunded" : "settled";
           break;
         }
@@ -194,7 +217,7 @@ export class ZkEngine {
     this.reserved.add(input.note.commitment);
     try {
       const spend: SpendInput = { note: input.note, index: input.index, privKey };
-      const js = await this.proveJoinSplit({ assetId: BigInt(args.dir), ins: [spend, undefined], outs: [intentNote, change], publicIn: 0n, publicOut: 0n, ext }, [enc0, enc1]);
+      const js = await this.proveJoinSplit({ assetId: BigInt(args.dir), ins: [spend, undefined], outs: [intentNote, change], publicIn: 0n, publicOut: 0n, ext }, [enc0, enc1], input.tree);
       return { assetId: BigInt(args.dir), js, opening: toOpening(terms), intentCommitment: intentNote.commitment, spentCommitment: input.note.commitment };
     } catch (e) {
       this.reserved.delete(input.note.commitment);
@@ -214,7 +237,7 @@ export class ZkEngine {
     const ext = extHashWithAddress(args.recipient, enc0, enc1);
     this.reserved.add(args.commitment);
     try {
-      const js = await this.proveJoinSplit({ assetId: o.note.assetId, ins: [{ note: o.note, index: o.index, privKey }, undefined], outs: [z0, z1], publicIn: 0n, publicOut: o.note.value, ext }, [enc0, enc1]);
+      const js = await this.proveJoinSplit({ assetId: o.note.assetId, ins: [{ note: o.note, index: o.index, privKey }, undefined], outs: [z0, z1], publicIn: 0n, publicOut: o.note.value, ext }, [enc0, enc1], o.tree);
       return { assetId: o.note.assetId, amount: o.note.value, recipient: args.recipient, js, spentCommitment: args.commitment };
     } catch (e) {
       this.reserved.delete(args.commitment);
@@ -228,15 +251,16 @@ export class ZkEngine {
   }
 
   // ------------------------------------------------------------------------------------------ internals
-  private pickInput(assetId: bigint, amount: bigint, wanted?: bigint): { note: Note; index: number } {
+  private pickInput(assetId: bigint, amount: bigint, wanted?: bigint): Owned {
     const usable = [...this.owned.values()].filter((o) => !o.spent && !this.reserved.has(o.note.commitment) && o.note.assetId === assetId && o.note.value >= amount);
     const chosen = wanted !== undefined ? usable.find((o) => o.note.commitment === wanted) : usable.sort((a, b) => (a.note.value < b.note.value ? -1 : 1))[0];
     if (!chosen) throw new Error("no single shielded note covers this amount — deposit more, or merge notes");
     return chosen;
   }
 
-  private async proveJoinSplit(spec: Parameters<typeof buildJoinSplitWitness>[1], enc: [Hex, Hex]): Promise<JoinSplitCall> {
-    const w = buildJoinSplitWitness(this.tree, spec);
+  /** Proves against the tree that holds the spent note (a completed tree's final root is still accepted on-chain). */
+  private async proveJoinSplit(spec: Parameters<typeof buildJoinSplitWitness>[1], enc: [Hex, Hex], tree = this.trees.length): Promise<JoinSplitCall> {
+    const w = buildJoinSplitWitness(tree < this.trees.length ? (this.trees[tree] as NoteTree) : this.tree, spec);
     const proof = await this.prover.prove(w.input, w.publicSignals);
     return {
       proof, root: bigintToHex32(w.root), nullifiers: [bigintToHex32(w.nullifiers[0]), bigintToHex32(w.nullifiers[1])],
@@ -247,7 +271,7 @@ export class ZkEngine {
   state(): WalletState {
     const keys = this.keys;
     return {
-      unlocked: !!keys, pubKey: keys?.pubKey, treeSize: this.tree.size, root: this.tree.root,
+      unlocked: !!keys, pubKey: keys?.pubKey, treeSize: this.tree.size, root: this.tree.root, treeId: this.trees.length,
       notes: keys
         ? [...this.owned.values()].map((o) => ({
             commitment: o.note.commitment, assetId: o.note.assetId, value: o.note.value, index: o.index, spent: o.spent,

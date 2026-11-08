@@ -1,4 +1,4 @@
-import { DEPTH, randomField } from "./field";
+import { randomField } from "./field";
 import { makeNote, nullifierOf, type Note } from "./notes";
 import { H } from "./poseidon";
 import type { NoteTree } from "./tree";
@@ -36,7 +36,7 @@ const s = (x: bigint): string => x.toString();
  * conservation Σin + publicIn = Σout + publicOut, well-formed outputs of the same asset.
  */
 export function buildJoinSplitWitness(tree: NoteTree, spec: JoinSplitSpec): JoinSplitWitness {
-  const zeroPath = { elements: new Array<bigint>(DEPTH).fill(0n), bits: new Array<number>(DEPTH).fill(0) };
+  const zeroPath = { elements: new Array<bigint>(tree.depth).fill(0n), bits: new Array<number>(tree.depth).fill(0) };
   const rows = spec.ins.map((i) => {
     if (i) {
       const p = tree.path(i.index);

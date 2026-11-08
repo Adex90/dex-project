@@ -19,8 +19,10 @@ export class RecordingProver implements Groth16Prover {
 /** A chain's NoteInserted stream: commitments are inserted in order, exactly as the contract does. */
 export class FakeChain {
   leaves: LeafEvent[] = [];
+  constructor(private readonly depth = 20) {}
   push(commitment: bigint, encryptedNote: Hex): LeafEvent {
-    const ev = { index: this.leaves.length, commitment, encryptedNote };
+    // indices restart on rollover; seq is the chain position (as fetchLeaves derives it from block + log index)
+    const ev = { index: this.leaves.length % 2 ** this.depth, commitment, encryptedNote, seq: BigInt(this.leaves.length) };
     this.leaves.push(ev);
     return ev;
   }

@@ -150,3 +150,22 @@ contract MockSearcher is IFlashRebalancer {
         }
     }
 }
+
+/// @dev LOCAL DEVELOPMENT / E2E ONLY — NEVER DEPLOY. Reports its price as observed in the current block, so a local
+///      chain always has a fresh oracle (DarkPool requires one for every value-moving batch). Production needs a real
+///      zk-attested price feed implementing IZKOracle.
+contract DevLiveOracle is IZKOracle {
+    uint256 public price;
+
+    constructor(uint256 p) {
+        price = p;
+    }
+
+    function set(uint256 p) external {
+        price = p;
+    }
+
+    function latestVerifiedPrice() external view returns (uint256, uint64) {
+        return (price, uint64(block.timestamp));
+    }
+}

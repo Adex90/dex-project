@@ -26,11 +26,13 @@ export async function fetchLeaves(pool: Address, from: bigint, to: bigint, onChu
     for (const l of logs) {
       const { leafIndex, commitment, encryptedNote } = l.args;
       if (leafIndex === undefined || commitment === undefined || encryptedNote === undefined) throw new Error("malformed NoteInserted log");
-      out.push({ index: Number(leafIndex), commitment: BigInt(commitment), encryptedNote });
+      if (l.blockNumber === null || l.logIndex === null) throw new Error("pending NoteInserted log");
+      out.push({ index: Number(leafIndex), commitment: BigInt(commitment), encryptedNote, seq: (l.blockNumber << 32n) | BigInt(l.logIndex) });
     }
     onChunk?.(end);
   }
-  return out.sort((a, b) => a.index - b.index);
+  // CHAIN order, never leaf-index order: indices restart at 0 when the on-chain tree rolls over.
+  return out.sort((a, b) => ((a.seq as bigint) < (b.seq as bigint) ? -1 : (a.seq as bigint) > (b.seq as bigint) ? 1 : 0));
 }
 
 export async function poolRoot(pool: Address): Promise<bigint> {
