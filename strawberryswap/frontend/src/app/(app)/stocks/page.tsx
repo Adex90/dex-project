@@ -22,7 +22,7 @@ export default function StocksPage() {
         <ol className="grid gap-3 md:grid-cols-3">
           {STEPS.map(([title, text], i) => (
             <li key={title} className="card-inset">
-              <span className="grid h-8 w-8 place-items-center rounded-full bg-gradient-to-br from-berry-deep to-fuchsia-deep text-sm font-bold text-white shadow-glow-fuchsia">{i + 1}</span>
+              <span className="grid h-8 w-8 place-items-center rounded-full bg-plum-700 text-sm font-bold text-ink ring-1 ring-lavender/15">{i + 1}</span>
               <h3 className="mt-3 font-bold">{title}</h3>
               <p className="mt-1 text-sm text-lavender">{text}</p>
             </li>

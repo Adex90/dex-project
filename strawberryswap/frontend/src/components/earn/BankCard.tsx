@@ -53,7 +53,7 @@ function ProductCard({ p }: { p: Product }) {
   return (
     <article className="card-inset flex flex-col gap-3 sm:flex-row sm:items-center">
       <span className="flex min-w-0 flex-1 items-center gap-3">
-        <span className="grid h-11 w-11 shrink-0 place-items-center rounded-2xl bg-plum-700 text-fuchsia">{p.icon}</span>
+        <span className="grid h-11 w-11 shrink-0 place-items-center rounded-2xl bg-plum-700 text-lavender">{p.icon}</span>
         <span className="min-w-0">
           <span className="block font-bold">{p.name}</span>
           <span className="mt-1 flex flex-wrap gap-1.5">

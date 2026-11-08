@@ -32,7 +32,7 @@ export default function Home() {
           <div>
             <span className="pill-mint">0% retail fee · 100% reserve</span>
             <h1 className="mt-5 text-balance text-4xl font-extrabold leading-[1.05] tracking-tight sm:text-6xl">
-              A broker that <span className="text-gradient">cannot</span> lend your deposit, print money, or be switched off.
+              A broker that cannot lend your deposit, print money, or be switched off.
             </h1>
             <p className="mt-5 max-w-xl text-lg text-lavender">
               StrawberrySwap is a trading venue built from immutable smart contracts: a zero-fee private dark pool, fully collateralised derivatives,
@@ -48,10 +48,9 @@ export default function Home() {
             </div>
           </div>
           <div className="relative mx-auto grid h-72 w-72 place-items-center sm:h-80 sm:w-80">
-            <div className="absolute inset-6 rounded-full bg-gradient-to-br from-fuchsia/40 via-berry/20 to-plum-500/30 blur-3xl" aria-hidden />
-            <div className="absolute inset-0 rounded-full border border-fuchsia/20" aria-hidden />
+            <div className="absolute inset-0 rounded-full border border-lavender/10" aria-hidden />
             <div className="absolute inset-10 rounded-full border border-lavender/10" aria-hidden />
-            <Mascot className="relative h-56 w-56 drop-shadow-[0_20px_40px_rgba(255,42,133,0.45)] sm:h-64 sm:w-64" float title="Berri, the StrawberrySwap mascot" />
+            <Mascot className="relative h-56 w-56 sm:h-64 sm:w-64" float title="Berri, the StrawberrySwap mascot" />
           </div>
         </section>
 
@@ -61,7 +60,7 @@ export default function Home() {
           <ol className="mt-5 grid gap-4 md:grid-cols-3">
             {FLOW.map(([title, text], i) => (
               <li key={title} className="card-inset">
-                <span className="grid h-9 w-9 place-items-center rounded-full bg-gradient-to-br from-berry-deep to-fuchsia-deep font-bold text-white shadow-glow-fuchsia">{i + 1}</span>
+                <span className="grid h-9 w-9 place-items-center rounded-full bg-plum-700 font-bold text-ink ring-1 ring-lavender/15">{i + 1}</span>
                 <h3 className="mt-3 text-lg font-bold">{title}</h3>
                 <p className="mt-1 text-sm text-lavender">{text}</p>
               </li>
@@ -74,9 +73,9 @@ export default function Home() {
           <h2 id="principles-title" className="text-2xl font-bold">Design principles</h2>
           <div className="mt-5 grid gap-4 sm:grid-cols-2">
             {PRINCIPLES.map(({ name, scope, text, Icon }) => (
-              <article key={name} className="card transition duration-300 hover:-translate-y-1 hover:shadow-glow-fuchsia">
+              <article key={name} className="card group transition duration-300 hover:-translate-y-1 hover:border-fuchsia/40 hover:shadow-glow-fuchsia">
                 <div className="flex items-center gap-3">
-                  <span className="grid h-11 w-11 place-items-center rounded-2xl bg-plum-700 text-fuchsia shadow-inset">
+                  <span className="grid h-11 w-11 place-items-center rounded-2xl bg-plum-700 text-lavender shadow-inset transition group-hover:text-fuchsia">
                     <Icon />
                   </span>
                   <div>

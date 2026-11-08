@@ -80,7 +80,7 @@ export function OrdersCard({ className = "" }: { className?: string }) {
 
       {!unlocked ? (
         <div className="card-inset flex items-center gap-3 text-sm text-lavender">
-          <IconLock className="h-5 w-5 shrink-0 text-fuchsia" />
+          <IconLock className="h-5 w-5 shrink-0 text-lavender" />
           Unlock your shielded wallet to see your intents and notes.
         </div>
       ) : !w.wallet ? (

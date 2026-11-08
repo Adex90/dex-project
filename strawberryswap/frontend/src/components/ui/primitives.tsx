@@ -5,7 +5,7 @@ import { IconChevron } from "./icons";
 
 /* ------------------------------------------------------------------------------------------------ surfaces */
 
-/** Floating glass card (rounded-3xl, backdrop blur, soft glow). */
+/** Card: rounded-3xl, solid matte surface, lavender hairline (globals.css `.card`). */
 export function Card({ children, className = "", as: Tag = "section", ...rest }: { children: ReactNode; className?: string; as?: "section" | "div" | "article" | "aside" } & Record<string, unknown>) {
   return (
     <Tag className={`card ${className}`} {...rest}>
@@ -18,7 +18,7 @@ export function CardHeader({ icon, title, subtitle, right }: { icon?: ReactNode;
   return (
     <header className="mb-4 flex items-start justify-between gap-3">
       <div className="flex min-w-0 items-center gap-3">
-        {icon ? <span className="grid h-10 w-10 shrink-0 place-items-center rounded-2xl bg-plum-700/80 text-fuchsia shadow-inset">{icon}</span> : null}
+        {icon ? <span className="grid h-10 w-10 shrink-0 place-items-center rounded-2xl bg-plum-700/80 text-lavender shadow-inset">{icon}</span> : null}
         <div className="min-w-0">
           <h2 className="card-title truncate">{title}</h2>
           {subtitle ? <p className="text-sm text-lavender">{subtitle}</p> : null}
@@ -208,7 +208,7 @@ export function TokenIcon({ symbol, size = 28 }: { symbol: string | undefined; s
   const isUsd = s.startsWith("USD");
   const [a, b] = PALETTE.at(hash(s) % PALETTE.length) ?? ["#ff2a85", "#6b33ad"];
   return (
-    <svg width={size} height={size} viewBox="0 0 32 32" aria-hidden focusable={false} className="shrink-0 rounded-full shadow-[0_0_10px_-2px_rgba(255,42,133,0.6)]">
+    <svg width={size} height={size} viewBox="0 0 32 32" aria-hidden focusable={false} className="shrink-0 rounded-full">
       <defs>
         <linearGradient id={gid} x1="0" y1="0" x2="1" y2="1">
           <stop offset="0%" stopColor={isBerry ? "#ff2a62" : isUsd ? "#00c46a" : a} />

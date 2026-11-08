@@ -4,40 +4,15 @@
 
 :root { color-scheme: dark; }
 
-/* Only <html> carries a background: a body background would paint over the fixed backdrop layers below (z-index −1). */
-html { background: #080214; }
+/* The canvas is one solid, matte colour: no gradients, glows, grids or textures. Neon is reserved for the primary
+   action, the selected tab or nav item, hover and focus states, and the sparklines and chart. */
+html { background-color: #080214; }
 
 body {
-  @apply min-h-screen font-sans text-ink antialiased;
+  @apply min-h-screen bg-plum-950 font-sans text-ink antialiased;
   font-size: 16px;
   line-height: 1.5;
   -webkit-tap-highlight-color: transparent;
-}
-
-/* Backdrop: deep plum fading into midnight, three soft brand glows, and a faint cyber grid that fades out downwards.
-   Fixed pseudo-elements rather than `background-attachment: fixed`, which stutters on mobile. */
-body::before,
-body::after {
-  content: "";
-  position: fixed;
-  inset: 0;
-  z-index: -1;
-  pointer-events: none;
-}
-body::before {
-  background:
-    radial-gradient(56rem 38rem at 8% -12%, rgba(255, 42, 133, 0.2), transparent 62%),
-    radial-gradient(46rem 34rem at 108% 28%, rgba(255, 26, 83, 0.13), transparent 60%),
-    radial-gradient(44rem 30rem at 50% 118%, rgba(107, 51, 173, 0.32), transparent 62%),
-    linear-gradient(180deg, #080214 0%, #0d0526 52%, #0b0a2c 100%);
-}
-body::after {
-  background-image:
-    linear-gradient(rgba(185, 163, 217, 0.05) 1px, transparent 1px),
-    linear-gradient(90deg, rgba(185, 163, 217, 0.05) 1px, transparent 1px);
-  background-size: 44px 44px;
-  -webkit-mask-image: radial-gradient(ellipse 80% 60% at 50% 0%, #000 25%, transparent 75%);
-  mask-image: radial-gradient(ellipse 80% 60% at 50% 0%, #000 25%, transparent 75%);
 }
 
 ::selection { background: #ff2a85; color: #080214; }
@@ -46,8 +21,8 @@ body::after {
 
 @layer components {
   /* ---- surfaces ---------------------------------------------------------------------------------------------- */
-  /* Floating glass card: heavy rounding, plum glass, a hairline of lavender and a soft fuchsia glow. */
-  .card { @apply relative rounded-3xl border border-lavender/10 bg-plum-800/60 p-5 shadow-card backdrop-blur-xl sm:p-6; }
+  /* Card: heavy rounding, a solid matte plum surface and a lavender hairline. No glow at rest. */
+  .card { @apply relative rounded-3xl border border-lavender/10 bg-plum-850 p-5 shadow-card sm:p-6; }
   /* Nested mini-card inside a card (input rows, status panels). */
   .card-inset { @apply rounded-2xl bg-plum-950/60 p-4 shadow-inset; }
   .card-title { @apply text-lg font-bold tracking-tight text-ink; }
@@ -66,7 +41,7 @@ body::after {
            disabled:scale-100 disabled:from-plum-700 disabled:to-plum-700 disabled:text-lavender disabled:shadow-none disabled:brightness-100;
   }
   .btn-secondary {
-    @apply btn border border-fuchsia/40 bg-plum-700/70 px-4 py-2 text-sm text-ink
+    @apply btn border border-lavender/20 bg-plum-700/70 px-4 py-2 text-sm text-ink
            hover:scale-[1.03] hover:border-fuchsia hover:shadow-glow-fuchsia active:scale-[0.98]
            disabled:scale-100 disabled:border-lavender/10 disabled:text-haze disabled:shadow-none;
   }
@@ -96,8 +71,8 @@ body::after {
   .num { @apply font-mono tabular-nums; }
 
   /* ---- async states --------------------------------------------------------------------------------------------- */
-  /* Skeleton: plum/magenta heavy-rounded block with a glowing pulse (never a grey box). */
-  .skeleton { @apply block animate-glow-pulse rounded-2xl bg-gradient-to-r from-plum-700 via-fuchsia-deep/30 to-plum-700; }
+  /* Skeleton: a solid plum block that pulses (no gradient, no glow; never a grey box). */
+  .skeleton { @apply block animate-pulse rounded-2xl bg-plum-700/70; }
   /* Strawberry-red striped bar for proof generation / artifact download. */
   .stripes {
     background-image: repeating-linear-gradient(-45deg, #ff1a53 0 10px, #ff2a85 10px 20px);
@@ -109,7 +84,6 @@ body::after {
 @layer utilities {
   .no-scrollbar { scrollbar-width: none; }
   .no-scrollbar::-webkit-scrollbar { display: none; }
-  .text-gradient { @apply bg-gradient-to-r from-berry via-fuchsia to-fuchsia-soft bg-clip-text text-transparent; }
   .pb-safe { padding-bottom: max(env(safe-area-inset-bottom), 0.5rem); }
 }
 

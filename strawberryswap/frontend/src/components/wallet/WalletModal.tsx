@@ -87,7 +87,7 @@ function Option({
       disabled={disabled}
       className="group flex w-full items-center gap-3 rounded-2xl border border-lavender/10 bg-plum-800/70 p-3 text-left transition duration-200 hover:-translate-y-0.5 hover:border-fuchsia hover:bg-plum-700/80 hover:shadow-glow-fuchsia focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-fuchsia disabled:cursor-not-allowed disabled:opacity-60 disabled:hover:translate-y-0 disabled:hover:border-lavender/10 disabled:hover:bg-plum-800/70 disabled:hover:shadow-none"
     >
-      <span className="grid h-12 w-12 shrink-0 place-items-center overflow-hidden rounded-2xl bg-gradient-to-br from-plum-600 to-plum-700 text-fuchsia shadow-inset transition group-hover:from-fuchsia-deep group-hover:to-berry-deep group-hover:text-white group-disabled:from-plum-600 group-disabled:to-plum-700 group-disabled:text-fuchsia">
+      <span className="grid h-12 w-12 shrink-0 place-items-center overflow-hidden rounded-2xl bg-plum-700 text-lavender shadow-inset transition group-hover:bg-fuchsia-deep group-hover:text-white group-disabled:bg-plum-700 group-disabled:text-lavender">
         {icon}
       </span>
       <span className="min-w-0 flex-1">
@@ -246,7 +246,7 @@ function WalletModal({ view, setView, onClose }: { view: View; setView: (v: View
             <ol className="space-y-2.5">
               {(["modal.hardware.step1", "modal.hardware.step2", "modal.hardware.step3"] as const).map((k, i) => (
                 <li key={k} className="card-inset flex gap-3 text-sm text-lavender">
-                  <span className="grid h-7 w-7 shrink-0 place-items-center rounded-full bg-gradient-to-br from-berry-deep to-fuchsia-deep text-xs font-bold text-white">{i + 1}</span>
+                  <span className="grid h-7 w-7 shrink-0 place-items-center rounded-full bg-plum-700 text-xs font-bold text-ink ring-1 ring-lavender/15">{i + 1}</span>
                   {t(k)}
                 </li>
               ))}
@@ -281,7 +281,7 @@ function WalletModal({ view, setView, onClose }: { view: View; setView: (v: View
             </div>
             <div className="card-inset flex items-center justify-between gap-3">
               <span className="flex items-center gap-2 text-sm">
-                <IconShield className="h-4 w-4 text-fuchsia" />
+                <IconShield className="h-4 w-4 text-lavender" />
                 {t("modal.account.shielded")} {phasePill}
               </span>
               {shielded.phase === "ready" || shielded.phase === "syncing" ? (

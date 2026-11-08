@@ -24,7 +24,7 @@ const ORDER_TYPES: readonly { value: OrderType; label: string; soon: boolean; su
 function ComingSoon({ icon, title, body, onBack }: { icon: React.ReactNode; title: string; body: string; onBack: () => void }) {
   return (
     <div className="card-inset flex flex-col items-center gap-3 py-8 text-center">
-      <span className="grid h-12 w-12 place-items-center rounded-2xl bg-gradient-to-br from-plum-600 to-plum-700 text-fuchsia shadow-glow-fuchsia">{icon}</span>
+      <span className="grid h-12 w-12 place-items-center rounded-2xl bg-plum-700 text-lavender shadow-inset">{icon}</span>
       <div>
         <h3 className="text-lg font-bold">{title}</h3>
         <span className="pill-plum mt-1">Not available in this build</span>
@@ -180,7 +180,7 @@ export function SwapCard({ className = "" }: { className?: string }) {
             <span className="text-haze">
               Shielded <span className="num text-lavender">{unlocked ? fmt(balances[dir]) : "—"}</span>
               {unlocked && balances[dir] > 0n ? (
-                <button type="button" className="ml-2 rounded-full bg-fuchsia/15 px-2 py-0.5 text-xs font-bold text-fuchsia hover:bg-fuchsia/25" onClick={() => setAmount(formatUnits(balances[dir], 18))}>
+                <button type="button" className="ml-2 rounded-full bg-plum-700 px-2 py-0.5 text-xs font-bold text-lavender transition hover:bg-fuchsia/15 hover:text-fuchsia" onClick={() => setAmount(formatUnits(balances[dir], 18))}>
                   MAX
                 </button>
               ) : null}
@@ -198,7 +198,7 @@ export function SwapCard({ className = "" }: { className?: string }) {
             type="button"
             onClick={() => setDir((d) => (d === 0 ? 1 : 0))}
             aria-label="Flip assets"
-            className="grid h-11 w-11 place-items-center rounded-2xl border-4 border-plum-800 bg-gradient-to-br from-plum-600 to-plum-700 text-fuchsia shadow-glow-fuchsia transition duration-300 hover:rotate-180 hover:scale-110 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-fuchsia"
+            className="grid h-11 w-11 place-items-center rounded-2xl border-4 border-plum-850 bg-plum-700 text-lavender transition duration-300 hover:rotate-180 hover:scale-110 hover:text-fuchsia hover:shadow-glow-fuchsia focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-fuchsia"
           >
             <IconFlip />
           </button>
@@ -305,7 +305,7 @@ function ZkStatus() {
       </p>
       <div className="flex items-center justify-between gap-3">
         <span className="flex items-center gap-2 text-sm font-semibold">
-          <IconShield className="h-4 w-4 text-fuchsia" />
+          <IconShield className="h-4 w-4 text-lavender" />
           ZK prover
         </span>
         <span className="text-xs">

@@ -26,7 +26,7 @@ export function PoolCard({ className = "" }: { className?: string }) {
           <div className="grid grid-cols-2 gap-3">
             <StatTile label={`Reserve ${s?.symbol0 ?? ""}`} value={fmt(s?.reserve0)} loading={loading} />
             <StatTile label={`Reserve ${s?.symbol1 ?? ""}`} value={fmt(s?.reserve1)} loading={loading} />
-            <StatTile label="Spot" value={fmt(s?.spot, 18, 6)} sub={s ? `${s.symbol1} per ${s.symbol0}` : undefined} tone="fuchsia" loading={loading} />
+            <StatTile label="Spot" value={fmt(s?.spot, 18, 6)} sub={s ? `${s.symbol1} per ${s.symbol0}` : undefined} loading={loading} />
             <StatTile
               label="MEV bounty"
               value={!s ? "—" : s.extractable === undefined ? "oracle stale" : fmt(s.extractable)}
