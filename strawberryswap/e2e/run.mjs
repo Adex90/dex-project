@@ -130,7 +130,7 @@ async function main() {
   await page.locator('select[aria-label="Asset to sell"]').selectOption("0");
   await page.locator('input[aria-label="Amount to sell"]').fill("100");
   const t1 = Date.now();
-  await page.getByRole("button", { name: "Create private intent" }).click();
+  await page.getByRole("button", { name: "Shield & Swap (ZK)" }).click(); // the swap card's primary action
   await page.getByText("✓ Sending the intent to the Automator").waitFor({ timeout: 300_000 });
   log(`intent created + sent in ${((Date.now() - t1) / 1000).toFixed(1)} s`);
 
@@ -153,14 +153,20 @@ async function main() {
   assert.deepEqual([...hosts].sort(), ["127.0.0.1:4173", "127.0.0.1:8545", "127.0.0.1:8787"], `the page talked to unexpected hosts: ${[...hosts]}`);
   const relay = requests.filter((r) => r.url.startsWith(RELAY));
   const posts = relay.filter((r) => r.method === "POST");
-  assert.equal(posts.length, 1, "exactly one intent was transmitted");
-  assert.deepEqual(Object.keys(JSON.parse(posts[0].body)).sort(), ["deadline", "destBlinding", "destPubKey", "dir", "minOut", "refundPubKey", "value"], "the relay received only the intent opening");
+  // A note created seconds ago can still be unknown to the relay (its on-demand resync runs at most every 15 s); the
+  // wallet then re-sends the SAME opening every 5 s until it is accepted (usePrivateSwap.postOpening). The property is
+  // therefore "one distinct opening, byte-identical on every attempt", not "one HTTP request".
+  assert.ok(posts.length >= 1, "the intent was transmitted");
+  assert.equal(new Set(posts.map((p) => p.body)).size, 1, "exactly one intent opening was transmitted (retries re-send the same bytes)");
+  for (const p of posts) {
+    assert.deepEqual(Object.keys(JSON.parse(p.body)).sort(), ["deadline", "destBlinding", "destPubKey", "dir", "minOut", "refundPubKey", "value"], "the relay received only the intent opening");
+  }
   assert.ok(sigs.length >= 1, "the wallet signed the key-derivation message");
   for (const r of requests) {
     for (const s of sigs) assert.ok(!r.url.includes(s) && !r.body.includes(s), "the key-derivation signature leaked in a request");
     if (!r.url.startsWith(RPC)) assert.ok(!/inPrivKey|privKey|witness/i.test(r.body), `a witness/private field left the device in ${r.url}`);
   }
-  log(`privacy: ${requests.length} requests to 3 local hosts only; the relay got 1 POST with the 7 opening fields; the signature never left the page`);
+  log(`privacy: ${requests.length} requests to 3 local hosts only; the relay got 1 intent opening (${posts.length} POST${posts.length > 1 ? "s, identical retries" : ""}) with the 7 opening fields; the signature never left the page`);
 
   await browser.close();
   log("E2E PASSED");

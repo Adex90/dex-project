@@ -185,6 +185,28 @@ Test totals: Foundry 134, circuits 89 witness tests, Go all packages, wallet 17,
    (operator sandwich residual, oracle-relative slippage, anonymity floor on-chain, deadline window, intent relaying,
    searcher RPC architecture, among others).
 
+## Frontend — "Cyber-Strawberry" app shell
+
+A mobile-first rebuild of the UI (presentation only: every hook, ABI, `lib/` and `zk/` file is byte-for-byte unchanged).
+
+| Route | Screen |
+|---|---|
+| `/trade/` | Swap card (from/to token rows, flip, one primary action that names the next step, ending in **Shield & Swap (ZK)**) with the prover as a nested mini-card (real download progress, striped bar while proving, every step); shielded wallet + shield form; private orders (intents, notes, withdraw); live pool stats; market trackers |
+| `/stocks/` | Market trackers and the synthetic-RWA explainer |
+| `/earn/` | Strategy vault list card (NAV, high-water mark, share price, deposit / redeem / settle); Sovereign Bank products behind a Demand / Time segmented control |
+| `/portfolio/` | Overview, Liquidity and History tabs over the shielded wallet and the vault position |
+
+* **Shared state.** The `(app)` layout calls the existing hooks once (`components/AppState.tsx`), so an unlocked wallet and an
+  in-flight proof survive switching tabs; the sticky bottom navigation (desktop: header pills) is client-side.
+* **No invented numbers.** Prices come only from the chain (the pool's spot; its sparkline is the points this session has
+  polled). The vault's green/red pill is its share price against the 1.00 start. SPY and NVDA show *feed pending* until a
+  zk-DECO price feed exists; the bank shows its contract terms but no actions, because this build has no bank address.
+* **Static and private.** Outfit and JetBrains Mono are bundled from npm (`@fontsource-variable/*`, OFL-1.1), the mascot and
+  token icons are inline SVG: the export still talks only to the configured RPC and relay (`verify:static`, e2e).
+* **Accessible.** Text meets WCAG AA on every surface (button fills use deeper brand shades for white labels), token pickers
+  are native `<select>`s, tabs are ARIA tablists, and motion stops under `prefers-reduced-motion`. Skeletons are sized like
+  the data they stand in for, so content fades in without layout shift.
+
 ## Known limitations (read before Phase 2)
 
 1. **Privacy edges leak.** `shield`/`unshield`/`depositNote`/`withdrawNote` reveal their amount. Berrycoin ↔

@@ -4,45 +4,121 @@
 
 :root { color-scheme: dark; }
 
-html, body { background: #0b0e14; }
+/* Only <html> carries a background: a body background would paint over the fixed backdrop layers below (z-index −1). */
+html { background: #080214; }
 
 body {
-  @apply font-serif text-text antialiased;
-  font-size: 17px;
-  line-height: 1.55;
-  font-feature-settings: "kern", "liga", "onum" 0;
-  text-rendering: optimizeLegibility;
+  @apply min-h-screen font-sans text-ink antialiased;
+  font-size: 16px;
+  line-height: 1.5;
+  -webkit-tap-highlight-color: transparent;
 }
 
-::selection { background: #8fb4ff; color: #0b0e14; }
+/* Backdrop: deep plum fading into midnight, three soft brand glows, and a faint cyber grid that fades out downwards.
+   Fixed pseudo-elements rather than `background-attachment: fixed`, which stutters on mobile. */
+body::before,
+body::after {
+  content: "";
+  position: fixed;
+  inset: 0;
+  z-index: -1;
+  pointer-events: none;
+}
+body::before {
+  background:
+    radial-gradient(56rem 38rem at 8% -12%, rgba(255, 42, 133, 0.2), transparent 62%),
+    radial-gradient(46rem 34rem at 108% 28%, rgba(255, 26, 83, 0.13), transparent 60%),
+    radial-gradient(44rem 30rem at 50% 118%, rgba(107, 51, 173, 0.32), transparent 62%),
+    linear-gradient(180deg, #080214 0%, #0d0526 52%, #0b0a2c 100%);
+}
+body::after {
+  background-image:
+    linear-gradient(rgba(185, 163, 217, 0.05) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(185, 163, 217, 0.05) 1px, transparent 1px);
+  background-size: 44px 44px;
+  -webkit-mask-image: radial-gradient(ellipse 80% 60% at 50% 0%, #000 25%, transparent 75%);
+  mask-image: radial-gradient(ellipse 80% 60% at 50% 0%, #000 25%, transparent 75%);
+}
+
+::selection { background: #ff2a85; color: #080214; }
+
+* { scrollbar-width: thin; scrollbar-color: #35165f transparent; }
 
 @layer components {
-  /* Section: a ruled block with a numbered serif heading, like a paper's numbered sections. */
-  .section-title { @apply flex items-baseline gap-3 border-b border-rule pb-2 font-serif text-xl text-text; }
-  .section-no { @apply font-serif italic text-muted; }
+  /* ---- surfaces ---------------------------------------------------------------------------------------------- */
+  /* Floating glass card: heavy rounding, plum glass, a hairline of lavender and a soft fuchsia glow. */
+  .card { @apply relative rounded-3xl border border-lavender/10 bg-plum-800/60 p-5 shadow-card backdrop-blur-xl sm:p-6; }
+  /* Nested mini-card inside a card (input rows, status panels). */
+  .card-inset { @apply rounded-2xl bg-plum-950/60 p-4 shadow-inset; }
+  .card-title { @apply text-lg font-bold tracking-tight text-ink; }
+  .eyebrow { @apply text-[11px] font-semibold uppercase tracking-[0.16em] text-haze; }
 
-  /* Small-caps caption used for every label */
-  .label { @apply font-serif text-[13px] text-muted; font-variant-caps: all-small-caps; letter-spacing: 0.08em; }
-
-  /* Figures: tabular, monospaced, for column alignment */
-  .num { @apply font-mono tabular-nums; }
-
-  .field {
-    @apply w-full border border-rule bg-surface px-3 py-2 font-mono text-base tabular-nums text-text
-           placeholder:text-muted/50 focus:border-accent focus:outline-none;
-  }
-
+  /* ---- buttons ----------------------------------------------------------------------------------------------- */
   .btn {
-    @apply border border-accent bg-accent px-4 py-2 font-serif text-[15px] text-bg transition-colors
-           hover:bg-transparent hover:text-accent
-           disabled:cursor-not-allowed disabled:border-rule disabled:bg-transparent disabled:text-muted
-           focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent;
-    font-variant-caps: all-small-caps; letter-spacing: 0.08em;
+    @apply inline-flex select-none items-center justify-center gap-2 rounded-full font-semibold transition duration-200 ease-out
+           focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-fuchsia focus-visible:ring-offset-2 focus-visible:ring-offset-plum-950
+           disabled:cursor-not-allowed;
+  }
+  /* Primary action: deep strawberry → fuchsia gradient (white label ≥ 4.96:1), brand-red glow, gentle scale. */
+  .btn-primary {
+    @apply btn bg-gradient-to-r from-berry-deep to-fuchsia-deep px-6 py-3 text-white shadow-glow-berry
+           hover:scale-[1.03] hover:brightness-110 active:scale-[0.98]
+           disabled:scale-100 disabled:from-plum-700 disabled:to-plum-700 disabled:text-lavender disabled:shadow-none disabled:brightness-100;
+  }
+  .btn-secondary {
+    @apply btn border border-fuchsia/40 bg-plum-700/70 px-4 py-2 text-sm text-ink
+           hover:scale-[1.03] hover:border-fuchsia hover:shadow-glow-fuchsia active:scale-[0.98]
+           disabled:scale-100 disabled:border-lavender/10 disabled:text-haze disabled:shadow-none;
   }
   .btn-ghost {
-    @apply btn border-rule bg-transparent text-text hover:border-accent hover:text-accent;
+    @apply btn px-3 py-1.5 text-sm text-lavender hover:bg-plum-700/70 hover:text-ink disabled:text-haze disabled:hover:bg-transparent;
   }
 
-  /* Definition rows: label left, figure right, hairline between — the terminal "statement" look */
-  .kv { @apply flex items-baseline justify-between gap-4 border-b border-rule/60 py-1.5; }
+  /* ---- inputs: tabular monospace only where figures are typed ----------------------------------------------- */
+  .field { @apply w-full min-w-0 bg-transparent font-mono text-2xl tabular-nums text-ink outline-none placeholder:text-haze; }
+  .field-sm {
+    @apply w-full rounded-xl border border-lavender/15 bg-plum-950/70 px-3 py-2 font-mono text-sm tabular-nums text-ink outline-none
+           transition-colors placeholder:text-haze focus:border-fuchsia/70;
+  }
+  /* Native <select> dressed as a token pill; the icon and the caret are drawn by the wrapper (TokenSelect). */
+  .token-select {
+    @apply cursor-pointer appearance-none rounded-full border border-lavender/15 bg-plum-700/80 py-2 pl-11 pr-9 text-base font-bold text-ink
+           outline-none transition hover:border-fuchsia/60 focus-visible:ring-2 focus-visible:ring-fuchsia disabled:cursor-not-allowed disabled:opacity-60;
+  }
+
+  /* ---- pills / tags ------------------------------------------------------------------------------------------- */
+  .pill { @apply inline-flex items-center gap-1 whitespace-nowrap rounded-full px-2.5 py-0.5 text-xs font-semibold; }
+  .pill-mint { @apply pill bg-mint/10 text-mint ring-1 ring-mint/30; }
+  .pill-berry { @apply pill bg-berry/10 text-berry-soft ring-1 ring-berry/35; }
+  .pill-blush { @apply pill bg-blush/10 text-blush ring-1 ring-blush/30; }
+  .pill-plum { @apply pill bg-plum-600/70 text-lavender ring-1 ring-lavender/15; }
+
+  .num { @apply font-mono tabular-nums; }
+
+  /* ---- async states --------------------------------------------------------------------------------------------- */
+  /* Skeleton: plum/magenta heavy-rounded block with a glowing pulse (never a grey box). */
+  .skeleton { @apply block animate-glow-pulse rounded-2xl bg-gradient-to-r from-plum-700 via-fuchsia-deep/30 to-plum-700; }
+  /* Strawberry-red striped bar for proof generation / artifact download. */
+  .stripes {
+    background-image: repeating-linear-gradient(-45deg, #ff1a53 0 10px, #ff2a85 10px 20px);
+    background-size: 28px 28px;
+    @apply animate-stripes;
+  }
+}
+
+@layer utilities {
+  .no-scrollbar { scrollbar-width: none; }
+  .no-scrollbar::-webkit-scrollbar { display: none; }
+  .text-gradient { @apply bg-gradient-to-r from-berry via-fuchsia to-fuchsia-soft bg-clip-text text-transparent; }
+  .pb-safe { padding-bottom: max(env(safe-area-inset-bottom), 0.5rem); }
+}
+
+/* Motion is decoration here: honour the OS setting. */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 1ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 1ms !important;
+    scroll-behavior: auto !important;
+  }
 }
