@@ -2,12 +2,14 @@
 
 import { BankCard } from "@/components/earn/BankCard";
 import { VaultCard } from "@/components/earn/VaultCard";
+import { useSettings } from "@/components/settings/Settings";
 import { PageHeader } from "@/components/ui/primitives";
 
 export default function EarnPage() {
+  const { t } = useSettings();
   return (
     <>
-      <PageHeader title="Earn & Vaults" subtitle="Non-custodial strategy vaults and segregated bank deposits. Nobody can withdraw your assets but you." />
+      <PageHeader title={t("page.earn.title")} subtitle={t("page.earn.subtitle")} />
       <section aria-labelledby="vaults-heading" className="space-y-3">
         <h2 id="vaults-heading" className="text-lg font-bold">Strategy vaults</h2>
         <VaultCard />

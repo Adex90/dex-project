@@ -3,6 +3,7 @@ import type { Metadata, Viewport } from "next";
 import "@fontsource-variable/outfit";
 import "@fontsource-variable/jetbrains-mono";
 import "@/styles/globals.css";
+import { SettingsProvider } from "@/components/settings/Settings";
 
 export const metadata: Metadata = {
   title: "StrawberrySwap — zero-fee private dark pool",
@@ -21,7 +22,9 @@ export const viewport: Viewport = {
 export default function RootLayout({ children }: { children: React.ReactNode }) {
   return (
     <html lang="en" className="dark">
-      <body>{children}</body>
+      <body>
+        <SettingsProvider>{children}</SettingsProvider>
+      </body>
     </html>
   );
 }

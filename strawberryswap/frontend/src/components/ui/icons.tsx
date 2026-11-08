@@ -68,3 +68,27 @@ export const IconClock = (p: P) => (
 export const IconInfo = (p: P) => (
   <svg {...base(p)}><circle cx="12" cy="12" r="9" /><path d="M12 11v5M12 8h.01" /></svg>
 );
+export const IconGlobe = (p: P) => (
+  <svg {...base(p)}><circle cx="12" cy="12" r="9" /><path d="M3 12h18M12 3c2.5 2.6 3.7 5.6 3.7 9s-1.2 6.4-3.7 9c-2.5-2.6-3.7-5.6-3.7-9S9.5 5.6 12 3Z" /></svg>
+);
+export const IconClose = (p: P) => (
+  <svg {...base(p)}><path d="M6 6l12 12M18 6 6 18" /></svg>
+);
+export const IconBrowser = (p: P) => (
+  <svg {...base(p)}><rect x="3" y="4.5" width="18" height="15" rx="3" /><path d="M3 9h18M6.5 6.8h.01M9 6.8h.01" /></svg>
+);
+export const IconChip = (p: P) => (
+  <svg {...base(p)}><rect x="6.5" y="6.5" width="11" height="11" rx="2" /><path d="M10 10h4v4h-4zM9 3.5v3M15 3.5v3M9 17.5v3M15 17.5v3M3.5 9h3M3.5 15h3M17.5 9h3M17.5 15h3" /></svg>
+);
+export const IconLink = (p: P) => (
+  <svg {...base(p)}><path d="M10 14a4 4 0 0 0 5.7 0l3-3a4 4 0 0 0-5.7-5.7l-1 1" /><path d="M14 10a4 4 0 0 0-5.7 0l-3 3a4 4 0 0 0 5.7 5.7l1-1" /></svg>
+);
+export const IconCopy = (p: P) => (
+  <svg {...base(p)}><rect x="8.5" y="8.5" width="11" height="11" rx="2.5" /><path d="M15.5 8.5V6.5a2 2 0 0 0-2-2h-7a2 2 0 0 0-2 2v7a2 2 0 0 0 2 2h2" /></svg>
+);
+export const IconCandles = (p: P) => (
+  <svg {...base(p)}><path d="M7 3v3M7 15v6M17 3v6M17 18v3" /><rect x="5" y="6" width="4" height="9" rx="1" /><rect x="15" y="9" width="4" height="9" rx="1" /></svg>
+);
+export const IconLine = (p: P) => (
+  <svg {...base(p)}><path d="M3 17l5-6 4 3 5-7 4 4" /></svg>
+);

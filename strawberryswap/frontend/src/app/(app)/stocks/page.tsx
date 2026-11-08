@@ -1,7 +1,8 @@
 "use client";
 
-import { MarketStrip } from "@/components/markets/MarketStrip";
+import { MarketsSection } from "@/components/markets/MarketStrip";
 import { IconStocks } from "@/components/ui/icons";
+import { useSettings } from "@/components/settings/Settings";
 import { Card, CardHeader, Notice, PageHeader } from "@/components/ui/primitives";
 
 const STEPS: [string, string][] = [
@@ -11,10 +12,11 @@ const STEPS: [string, string][] = [
 ];
 
 export default function StocksPage() {
+  const { t } = useSettings();
   return (
     <>
-      <PageHeader title="Stocks & RWAs" subtitle="Synthetic exposure to real-world prices, fully collateralised and settled against zero-knowledge-attested quotes." />
-      <MarketStrip title="Market trackers" />
+      <PageHeader title={t("page.stocks.title")} subtitle={t("page.stocks.subtitle")} />
+      <MarketsSection title="Market trackers" />
       <Card className="mt-6" aria-labelledby="rwa-title">
         <CardHeader icon={<IconStocks />} title={<span id="rwa-title">Synthetic RWAs</span>} subtitle="Long/short index pairs with 100% collateral" right={<span className="pill-plum">Not in this build</span>} />
         <ol className="grid gap-3 md:grid-cols-3">

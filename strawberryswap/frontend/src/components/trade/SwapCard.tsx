@@ -9,6 +9,7 @@ import { proofsAvailable, zkeyBytes } from "@/zk/availability";
 import { useApp, useShieldedBalances, useSymbols } from "@/components/AppState";
 import { IconFlip, IconSettings, IconShield, IconZap } from "@/components/ui/icons";
 import { Card, Notice, Row, Skeleton, TokenSelect } from "@/components/ui/primitives";
+import { useWalletModal } from "@/components/wallet/WalletModal";
 
 const SLIPPAGE_PRESETS = [10, 50, 100] as const; // bps
 
@@ -21,6 +22,7 @@ export function SwapCard({ className = "" }: { className?: string }) {
   const sym = useSymbols();
   const balances = useShieldedBalances();
   const ps = pool.state;
+  const { openWallet } = useWalletModal();
 
   const [dir, setDir] = useState<0 | 1>(0);
   const [amount, setAmount] = useState("");
@@ -56,7 +58,7 @@ export function SwapCard({ className = "" }: { className?: string }) {
   // One primary action that always names the next required step.
   type Cta = { label: string; onClick?: () => void; disabled?: boolean };
   let cta: Cta;
-  if (!wallet.account) cta = { label: wallet.hasProvider ? "Connect Wallet" : "No wallet detected", onClick: () => void wallet.connect(), disabled: !wallet.hasProvider };
+  if (!wallet.account) cta = { label: "Connect Wallet", onClick: openWallet };
   else if (!wallet.chainOk) cta = { label: "Switch network", onClick: () => void wallet.switchChain() };
   else if (unavailable) cta = { label: "Private swaps unavailable in this build", disabled: true };
   else if (w.phase === "locked" || w.phase === "error") cta = { label: "Unlock shielded wallet", onClick: () => void w.unlock() };

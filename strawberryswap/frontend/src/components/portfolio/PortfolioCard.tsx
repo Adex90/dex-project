@@ -9,12 +9,43 @@ import { IntentRow, NoteRow } from "@/components/trade/OrdersCard";
 import { IconLock, IconPortfolio, IconWallet } from "@/components/ui/icons";
 import { Mascot } from "@/components/ui/Mascot";
 import { Card, CardHeader, Loading, Reveal, Segmented, Skeleton, TabPanel, TokenIcon } from "@/components/ui/primitives";
+import { useFiat } from "@/components/settings/Settings";
+import { useWalletModal } from "@/components/wallet/WalletModal";
 
 const WAD = 10n ** 18n;
 type Tab = "overview" | "liquidity" | "history";
 
 function Empty({ children }: { children: React.ReactNode }) {
   return <p className="card-inset text-center text-sm text-haze">{children}</p>;
+}
+
+/**
+ * Total shielded value in the reference currency, from on-chain data only: the pool price converts the non-stable leg into
+ * the pool's USD stablecoin, and only USD has a rate (the peg, stated). EUR/MXN say so instead of guessing.
+ */
+function FiatTotal({ balances }: { balances: [bigint, bigint] }) {
+  const { pool } = useApp();
+  const fiat = useFiat();
+  const s = pool.state;
+  let usd: number | undefined;
+  let stable: string | undefined;
+  if (s && s.spot > 0n) {
+    const b0 = Number(balances[0]) / 1e18;
+    const b1 = Number(balances[1]) / 1e18;
+    const spot = Number(s.spot) / 1e18; // token1 per token0
+    if (s.symbol0.toUpperCase().startsWith("USD")) [usd, stable] = [b0 + b1 / spot, s.symbol0];
+    else if (s.symbol1.toUpperCase().startsWith("USD")) [usd, stable] = [b0 * spot + b1, s.symbol1];
+  }
+  const v = fiat(usd, stable);
+  return (
+    <div className="mb-3 flex flex-wrap items-baseline justify-between gap-2 px-1">
+      <span className="text-sm text-lavender">Estimated total</span>
+      <span className="text-right">
+        {v.text ? <span className="num text-xl font-semibold text-ink">≈ {v.text}</span> : null}
+        <span className="ml-2 text-xs text-haze">{v.note}</span>
+      </span>
+    </div>
+  );
 }
 
 function ShieldedBalances() {
@@ -42,7 +73,9 @@ function ShieldedBalances() {
     );
   }
   return (
-    <Reveal className="grid grid-cols-2 gap-3">
+    <Reveal>
+      <FiatTotal balances={balances} />
+      <div className="grid grid-cols-2 gap-3">
       {([0, 1] as const).map((a) => (
         <div key={a} className="card-inset min-w-0">
           <div className="flex items-center gap-2">
@@ -53,6 +86,7 @@ function ShieldedBalances() {
           <div className="text-xs text-haze">shielded · spendable</div>
         </div>
       ))}
+      </div>
     </Reveal>
   );
 }
@@ -91,6 +125,7 @@ function VaultPosition() {
 /** Wallet overview: Overview (balances), Liquidity (vault share + private notes), History (intents + this session). */
 export function PortfolioCard() {
   const { wallet, shielded: w, swapper } = useApp();
+  const { openWallet } = useWalletModal();
   const [tab, setTab] = useState<Tab>("overview");
   const notes = (w.wallet?.notes ?? []).filter((n) => !n.spent);
   const intents = w.wallet?.intents ?? [];
@@ -103,9 +138,9 @@ export function PortfolioCard() {
           <h2 className="text-xl font-bold">Connect a wallet to see your portfolio</h2>
           <p className="mt-1 text-sm text-lavender">Shielded balances are decrypted on this device only.</p>
         </div>
-        <button type="button" className="btn-primary" disabled={!wallet.hasProvider} onClick={() => void wallet.connect()}>
+        <button type="button" className="btn-primary" onClick={openWallet}>
           <IconWallet className="h-5 w-5" />
-          {wallet.hasProvider ? "Connect Wallet" : "No wallet detected"}
+          Connect Wallet
         </button>
       </Card>
     );

@@ -198,9 +198,20 @@ A mobile-first rebuild of the UI (presentation only: every hook, ABI, `lib/` and
 
 * **Shared state.** The `(app)` layout calls the existing hooks once (`components/AppState.tsx`), so an unlocked wallet and an
   in-flight proof survive switching tabs; the sticky bottom navigation (desktop: header pills) is client-side.
-* **No invented numbers.** Prices come only from the chain (the pool's spot; its sparkline is the points this session has
-  polled). The vault's green/red pill is its share price against the 1.00 start. SPY and NVDA show *feed pending* until a
-  zk-DECO price feed exists; the bank shows its contract terms but no actions, because this build has no bank address.
+* **No invented numbers.** Prices come only from the chain. The vault's green/red pill is its share price against the 1.00
+  start. SPY and NVDA show *feed pending* until a zk-DECO price feed exists; the bank shows its contract terms but no
+  actions, because this build has no bank address.
+* **Market chart** (`components/markets/`). TradingView-style candles or line, 1m to 1D, OHLC under the crosshair, built on
+  [lightweight-charts](https://github.com/tradingview/lightweight-charts) (Apache-2.0; loaded on demand, attribution shown).
+  History is the pool's own `spotPrice()` read at every block that emitted `Sync` in the last ~50,000 blocks (exact on
+  anvil and archive RPCs; a node without historical state falls back to live points), then a live point per 12 s poll.
+  The price only moves when reserves move, so a bucket without a change is a muted flat bar.
+* **Wallet sheet** (`components/wallet/`). Browser wallet (named via EIP-6963, inline icons only), the native Shielded Wallet
+  (connect, then unlock with one signature), hardware signers through the browser wallet, and WalletConnect shown as not in
+  this build: it would route through a third-party relay. Focus is trapped, Esc closes, phones get a bottom sheet.
+* **Language and currency** (`components/settings/`). English or Español and USD / EUR / MXN, remembered in
+  `localStorage`. Navigation, dialogs and page headings are translated; trading screens follow later. Fiat totals use real
+  rates only: USD through the pool's USD stablecoin (stated as such); EUR and MXN show no number until a rate feed exists.
 * **Static and private.** Outfit and JetBrains Mono are bundled from npm (`@fontsource-variable/*`, OFL-1.1), the mascot and
   token icons are inline SVG: the export still talks only to the configured RPC and relay (`verify:static`, e2e).
 * **Accessible.** Text meets WCAG AA on every surface (button fills use deeper brand shades for white labels), token pickers
