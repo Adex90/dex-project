@@ -53,6 +53,7 @@ const config: Config = {
         "fade-in": { from: { opacity: "0" }, to: { opacity: "1" } },
         float: { "0%, 100%": { transform: "translateY(0)" }, "50%": { transform: "translateY(-6px)" } },
         indeterminate: { from: { transform: "translateX(-100%)" }, to: { transform: "translateX(250%)" } },
+        marquee: { from: { transform: "translateX(0)" }, to: { transform: "translateX(-50%)" } },
       },
       animation: {
         "cta-glow": "cta-glow 2.6s ease-in-out infinite",
@@ -61,6 +62,7 @@ const config: Config = {
         "sheet-up": "sheet-up 280ms cubic-bezier(0.2, 0.8, 0.2, 1) both",
         float: "float 4.5s ease-in-out infinite",
         indeterminate: "indeterminate 1.6s ease-in-out infinite",
+        marquee: "marquee 80s linear infinite", // ticker: two of its four copies per loop
       },
     },
   },

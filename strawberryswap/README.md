@@ -104,6 +104,8 @@ cd contracts && forge build
 # frontend: static export for IPFS (addresses are inlined at build time)
 cd frontend && npm ci && NEXT_PUBLIC_DARKPOOL_ADDRESS=0x… NEXT_PUBLIC_VAULT_ADDRESS=0x… npm run build && npm run verify:static
 #   ./out is the directory to `ipfs add -r`; serve from an origin root (ipfs://, <cid>.ipfs.<gw>, ENS/DNSLink)
+#   optional, official accounts only: NEXT_PUBLIC_SOCIAL_X / _TELEGRAM / _DISCORD=https://… add those footer icons
+#   (unset, they stay hidden; GitHub always links to this repository)
 
 # searcher: unit/property tests + dry run (no network, no keys)
 cd bots/inventory-cpp && cmake -S . -B build && cmake --build build && ./build/selftest && ./build/searcher_dryrun
