@@ -34,6 +34,7 @@ use synthetic_capital::{
         kyc::{RolUsuario, TipoPersona},
         sofom::ContratoMutuo,
     },
+    reserva,
     sofom::puente,
     spei::{
         inbound::{self, Origen, SiNoAcreditable},
@@ -393,6 +394,11 @@ pub async fn verificar_invariantes(pool: &PgPool) {
     .await
     .unwrap();
     assert_eq!(descuadres, 0, "hay cuentas IFPE cuyo saldo no se reconstruye desde el ledger");
+    // Y por la reproducción del corte de Proof of Reserve, que nombra cada tipo
+    // de movimiento: uno que no conozca haría fallar el siguiente corte.
+    let mut conexion = pool.acquire().await.unwrap();
+    let sin_ledger = reserva::saldos_sin_ledger(&mut conexion).await.unwrap();
+    assert_eq!(sin_ledger, 0, "el corte de reserva no reproduce desde el ledger {sin_ledger} saldos");
 
     // Regla 2: el saldo bloqueado SOFOM es exactamente el principal de los mutuos vigentes,
     // y ningún mutuo está sobreasignado.

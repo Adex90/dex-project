@@ -19,7 +19,7 @@ use synthetic_capital::{
     ledger::hash,
     mercado::{self, Lado, SolicitudOrden},
     models::kyc::RolUsuario,
-    routes, AppState,
+    reserva, routes, AppState,
 };
 use uuid::Uuid;
 
@@ -246,6 +246,13 @@ async fn compra_y_venta_por_la_api(pool: PgPool) {
         (&json!("sell"), &json!("0.31000000"), &json!("499.84000000"))
     );
     assert_eq!(posicion(&pool, ana.cliente.id, "AUG1").await, Some((d("0.4652"), d("750.08699174"))));
+
+    // Un corte de Proof of Reserve con la posición abierta: su reproducción del
+    // ledger conoce las patas del mercado (0013 las había dejado fuera, y cada
+    // corte después de una orden fallaba con FALLA DE INTEGRIDAD).
+    let corte = reserva::generar_corte(&pool).await.expect("corte de reserva después de comprar y vender");
+    assert_eq!(corte.total_pasivo, corte.total_reserva);
+    assert_eq!(saldo_ifpe(&pool, cuenta).await, (d("19249.91"), d("0")), "20 000 − 1 249.93 + 499.84");
 
     // Lo que vale el resto (750.08, el «Max» del frontend) vende toda la
     // posición, sin residuos: 0.4652 g por 750.09.
