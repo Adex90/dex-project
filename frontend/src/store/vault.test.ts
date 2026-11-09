@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { beforeEach, test } from "node:test";
 
 import type { Holding, SpeiTransfer, VaultBalance, VaultSnapshot } from "../types/vault.ts";
-import { MAX_RECENT_TRANSFERS, useVaultStore } from "./useVaultStore.ts";
+import { MAX_RECENT_TRANSFERS, useVaultStore } from "./vault.ts";
 
 const vault = () => useVaultStore.getState();
 
