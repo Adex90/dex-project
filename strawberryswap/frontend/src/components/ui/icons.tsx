@@ -92,3 +92,19 @@ export const IconCandles = (p: P) => (
 export const IconLine = (p: P) => (
   <svg {...base(p)}><path d="M3 17l5-6 4 3 5-7 4 4" /></svg>
 );
+/** Filled flame (the ticker's HOT marker): the outer flame plus a lighter inner core. */
+export const IconFlame = (p: P) => (
+  <svg {...base({ ...p, fill: "currentColor", stroke: "none" })}>
+    <path d="M12 2.5c.6 3 4.8 5.6 4.8 10.6a4.8 4.8 0 0 1-9.6 0c0-2.4 1-4 2.4-5.4.3 1.8 1 2.8 2 3.3.1-3.3-.4-5.6.4-8.5z" />
+    <path d="M12 19.2a2.2 2.2 0 0 1-2.2-2.2c0-1.3 1-2.1 2.2-3.4 1.2 1.3 2.2 2.1 2.2 3.4a2.2 2.2 0 0 1-2.2 2.2z" fill="#ffd1e3" />
+  </svg>
+);
+export const IconPause = (p: P) => (
+  <svg {...base(p)}><path d="M9 6v12M15 6v12" /></svg>
+);
+export const IconPlay = (p: P) => (
+  <svg {...base({ ...p, fill: "currentColor" })}><path d="M8 5.5v13l10.5-6.5z" /></svg>
+);
+export const IconArrowRight = (p: P) => (
+  <svg {...base(p)}><path d="M5 12h14M13 6l6 6-6 6" /></svg>
+);

@@ -1,6 +1,7 @@
 "use client";
 
-import { createContext, useContext, useMemo, type ReactNode } from "react";
+import { useContext, useMemo, type ReactNode } from "react";
+import { AppStateContext } from "@/components/appStateContext";
 import { useDarkPool } from "@/hooks/useDarkPool";
 import { usePrivateSwap } from "@/hooks/usePrivateSwap";
 import { useShieldedWallet } from "@/hooks/useShieldedWallet";
@@ -23,8 +24,6 @@ function useAppStateValue() {
 }
 
 export type AppState = ReturnType<typeof useAppStateValue>;
-
-const AppStateContext = createContext<AppState | null>(null);
 
 export function AppStateProvider({ children }: { children: ReactNode }) {
   const value = useAppStateValue();
