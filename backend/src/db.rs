@@ -128,7 +128,19 @@ pub async fn begin_lectura(pool: &PgPool, rol: Rol) -> Result<Tx, sqlx::Error> {
 /// deja ver solo las filas de ese cliente, aunque la consulta pida otras: un
 /// id equivocado o un `WHERE` olvidado no muestran datos ajenos.
 pub async fn begin_lectura_cliente(pool: &PgPool, cliente_id: Uuid) -> Result<Tx, sqlx::Error> {
-    let mut tx = begin_con(pool, Rol::Cliente, Modo::Lectura).await?;
+    begin_cliente(pool, cliente_id, Modo::Lectura).await
+}
+
+/// Como [`begin_lectura_cliente`] (mismo rol, misma RLS), pero REPEATABLE
+/// READ: varias consultas ven una sola foto. La bóveda la usa para que la
+/// versión de la cuenta, sus saldos y su principal invertido vengan de la
+/// misma confirmación.
+pub async fn begin_lectura_instantanea_cliente(pool: &PgPool, cliente_id: Uuid) -> Result<Tx, sqlx::Error> {
+    begin_cliente(pool, cliente_id, Modo::LecturaInstantanea).await
+}
+
+async fn begin_cliente(pool: &PgPool, cliente_id: Uuid, modo: Modo) -> Result<Tx, sqlx::Error> {
+    let mut tx = begin_con(pool, Rol::Cliente, modo).await?;
     sqlx::query("SELECT set_config('sc.cliente_actual', $1, true)")
         .bind(cliente_id.to_string())
         .execute(&mut *tx)

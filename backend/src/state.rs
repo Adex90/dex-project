@@ -4,6 +4,7 @@ use sqlx::PgPool;
 
 use crate::{
     auth::{correo::BuzonSimulado, jwt::ClavesJwt},
+    boveda::CentralBoveda,
     config::Config,
     crypto::cifrado::Cifrador,
     kyc::biometria::{ProveedorBiometrico, ProveedorNoConfigurado, ProveedorSimulado},
@@ -30,6 +31,9 @@ pub struct AppState {
     /// proveedor certificado integrado, el onboarding responde 503 (falla
     /// cerrado) y la base de datos rechaza resultados del simulado.
     pub biometria: Arc<dyn ProveedorBiometrico>,
+    /// Los WebSocket de la bóveda abiertos en esta tarea y los avisos de
+    /// PostgreSQL que los alimentan (`boveda::central::escuchar`).
+    pub boveda: Arc<CentralBoveda>,
 }
 
 impl AppState {
@@ -47,16 +51,9 @@ impl AppState {
         } else {
             Arc::new(ProveedorNoConfigurado)
         };
-        Self {
-            pool,
-            config: Arc::new(config),
-            jwt: Arc::new(jwt),
-            mfa,
-            correo,
-            cortes: Arc::default(),
-            pasarela,
-            biometria,
-        }
+        let config = Arc::new(config);
+        let boveda = CentralBoveda::nueva(pool.clone(), Arc::clone(&config));
+        Self { pool, config, jwt: Arc::new(jwt), mfa, correo, cortes: Arc::default(), pasarela, biometria, boveda }
     }
 
     /// Sustituye el proveedor biométrico (pruebas).

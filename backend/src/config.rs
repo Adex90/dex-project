@@ -123,6 +123,10 @@ pub struct ConfigSpei {
     /// datos y del proveedor) más la duración máxima de una llamada al
     /// proveedor.
     pub margen_corte_seg: u64,
+    /// Institución que lleva las CLABE de los clientes, como la ve el banco
+    /// del ordenante (`SPEI_BANCO_NOMBRE`). La bóveda la muestra junto a la
+    /// CLABE para depositar.
+    pub banco_nombre: String,
 }
 
 impl Default for ConfigSpei {
@@ -141,6 +145,8 @@ impl Default for ConfigSpei {
             // Por confirmar contra el contrato con el participante liquidador.
             hora_corte: chrono::NaiveTime::from_hms_opt(17, 30, 0).expect("hora válida"),
             margen_corte_seg: 600,
+            // El participante liquidador (state.rs): sus CLABE empiezan con 646.
+            banco_nombre: "STP".into(),
         }
     }
 }
@@ -539,6 +545,16 @@ impl Config {
                             .map_err(|e| anyhow::anyhow!("SPEI_HORA_CORTE debe ser HH:MM ({v}): {e}"))?,
                     },
                     margen_corte_seg: var_o("SPEI_MARGEN_CORTE_SEG", d.margen_corte_seg)?.max(60),
+                    banco_nombre: match var("SPEI_BANCO_NOMBRE")? {
+                        None => d.banco_nombre,
+                        Some(v) => {
+                            let nombre = v.trim().to_string();
+                            if nombre.is_empty() || nombre.chars().count() > 60 {
+                                bail!("SPEI_BANCO_NOMBRE debe tener de 1 a 60 caracteres");
+                            }
+                            nombre
+                        }
+                    },
                 }
             },
             http: {

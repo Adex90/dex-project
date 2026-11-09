@@ -71,7 +71,8 @@ pub async fn servir(listener: TcpListener, app: Router, limites: &LimitesHttp, a
         tokio::spawn(async move {
             // El permiso vive lo mismo que la conexión.
             let _permiso = permiso;
-            let conexion = constructor.serve_connection(TokioIo::new(socket), servicio);
+            // with_upgrades: sin él, hyper no entrega la conexión a un WebSocket (426).
+            let conexion = constructor.serve_connection(TokioIo::new(socket), servicio).with_upgrades();
             tokio::pin!(conexion);
             let resultado = tokio::select! {
                 r = conexion.as_mut() => r,

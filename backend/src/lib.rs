@@ -17,6 +17,7 @@
 pub mod aml;
 pub mod auth;
 pub mod bootstrap;
+pub mod boveda;
 pub mod cli;
 pub mod config;
 pub mod crypto;

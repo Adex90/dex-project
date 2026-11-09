@@ -236,6 +236,8 @@ jobs:
             expect: "tests/db/0010_auth_mfa.sql: todas las pruebas pasaron (ROLLBACK)"
           - suite: 0011_rls_por_cliente
             expect: "tests/db/0011_rls_por_cliente.sql: todas las pruebas pasaron (ROLLBACK)"
+          - suite: 0012_boveda_tiempo_real
+            expect: "tests/db/0012_boveda_tiempo_real.sql: todas las pruebas pasaron (ROLLBACK)"
     services:
       postgres:
         image: postgres:16

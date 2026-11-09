@@ -98,6 +98,7 @@ internet -> host 80/443 (UFW, fail2ban) -> nginx (edge network)
 | Services reach only what they need | Security groups per service; backend egress limited to `backend_egress_cidrs` (default none) | Separate internal networks per path (`web`, `api`, `data`); backend egress internal by default, then restricted on the host (§5.11) | Appendix C |
 | Staff authenticate with two factors; TOTP secrets never in clear | Same code on both: two-step verification (TOTP) is mandatory for `OPERADOR`, `AUDITOR` and `CUMPLIMIENTO` and re-checked on every request; secrets encrypted with `MFA_CLAVE_CIFRADO` (Secrets Manager) | Same; key in `secrets/mfa_encryption_key` | `tests/mfa.rs`, `tests/db/0010_auth_mfa.sql`, AML e2e (Appendix C) |
 | A client's reads return only that client's rows, even if the query is wrong | Same code on both: role `sc_cliente` (SELECT only) and RESTRICTIVE RLS policies keyed to `sc.cliente_actual` on users, accounts, movements, SPEI and SOFOM tables (migration `0011`) | Same | `tests/rls.rs`, `tests/db/0011_rls_por_cliente.sql` |
+| A client's live vault channel carries only that client's data, and only while the session is valid | Same code on both: the WebSocket handshake runs the same JWT and database checks as every route (token as a subprotocol entry, never echoed), requires `Origin` = `FRONTEND_ORIGIN`, sits in the `API` rate-limit group and is capped per client and per task; the session is re-checked every 60 s and at JWT expiry (close 4001); reads run as `sc_cliente` under RLS | Same, plus nginx's dedicated location (`limit_conn` 20 per IP) | `tests/boveda.rs`, `tests/db/0012_boveda_tiempo_real.sql` |
 | No request field outside the API contract is accepted | Same code on both: `deny_unknown_fields` on every body and query type (400 `VALIDACION`) | Same | `tests/entrada.rs` (source scan and HTTP) |
 | Least-privilege database identities | Service holds only `sc_app` (NOINHERIT, no owner rights); owner credentials only in the migrate task and with DBAs holding the `dba-tunnel` policy | Same, plus the schema owner is **not** a superuser (`deploy/postgres/10-schema-owner.sh`); the `postgres` superuser is break-glass only | `pg_authid` query in Appendix C |
 | Containers non-root, read-only, least capability, resource-limited | uid 65532, read-only rootfs, `drop ALL`, task CPU/memory | uid 65532 / 70 / 101, `read_only`, `cap_drop: ALL`, `no-new-privileges`, CPU/memory/PID limits | `docker inspect` in Appendix C |
@@ -199,7 +200,7 @@ guarantee the same bytes.
 - **CI result** (`ci.yml`) covers:
   - **Code checks:** lint, typecheck and unit tests (frontend); rustfmt, clippy
     `-D warnings` and every test (backend).
-  - **Database and browser tests:** the seven SQL invariant suites, and the Playwright
+  - **Database and browser tests:** the eight SQL invariant suites, and the Playwright
     e2e runs (smoke and AML).
   - **Images:** hadolint, then the build. Each build includes a dependency audit
     stage that fails it on a known vulnerability: `cargo audit` (RustSec), and
@@ -967,6 +968,52 @@ production.
 | Webhook deliveries refused (401/403) | HMAC key mismatch (rotation in progress? `*_previous` / `*_ANTERIOR`); source allowlist |
 | migrate exits non-zero | its log: lock timeout (retry later), statement timeout (§6), checksum mismatch (an applied migration was edited: never deploy it) |
 | Certificate near expiry | `certbot renew --dry-run`; the deploy-hook output; ACM validation records |
+| Vault balances stop updating live (a refresh shows them) | backend log: `LISTEN sc_boveda` warnings (lost, not responding, cannot listen); the `/api/v1/vault/ws` upgrades (101) in the nginx or ALB access log; idle timeouts below 30 s (§10.6) |
+
+### 10.6 Sovereign Vault real-time channel
+
+The vault's WebSocket (`GET /api/v1/vault/ws`, README "Sovereign Vault") adds the
+following to operations.
+
+- **One more database connection per task.**
+  - Each backend task keeps one connection from its pool (`DB_MAX_CONEXIONES`,
+    `backend_db_max_connections`) open for `LISTEN sc_boveda`.
+  - Through RDS Proxy the connection is pinned, like every pooled connection.
+  - It runs a `SELECT 1` probe every 30 s. That keeps it under the proxy's
+    `idle_client_timeout` (minimum 60 s) and detects a connection that died
+    silently.
+  - When the connection fails, the task reconnects and every open socket gets
+    a fresh snapshot. Each reconnect costs one vault read per socket.
+  - Vault reads (snapshots and notified changes) take at most half of the pool
+    at a time; the rest wait their turn. A browser's `resync` requests are
+    served at most once per second.
+- **Idle timeouts.**
+  - The server pings each socket every 25 s and closes it after 75 s of
+    silence.
+  - Every hop must allow more than 25 s of idle time:
+    - the ALB (`alb_idle_timeout_seconds`, default 90);
+    - nginx (`proxy_read_timeout 90s` in `nginx/snippets/websocket.conf`);
+    - any proxy in between.
+- **Capacity.**
+  - Each task holds up to `HTTP_MAX_CONEXIONES` sockets, and 5 per client.
+  - These count separately from HTTP connections: an upgraded socket no longer
+    holds an HTTP slot.
+  - nginx allows 20 sockets per address.
+  - Scale tasks for the expected open dashboards as well as for requests.
+- **Deploys.** On SIGTERM every socket closes with 1001 and the browser
+  reconnects to a new task. The task waits up to 2 s for those close frames
+  before closing its database pool.
+- **Migration `0012`** is additive, so the running binary keeps working: deploy
+  migrate, then the backend, as in §6. What it does:
+  - adds `seq` and `seq_xact` to `ifpe.cuentas`. These are constant defaults, so
+    there is no table rewrite. Checking `seq >= 0` scans the accounts once while
+    holding the table's lock;
+  - adds the triggers;
+  - builds two partial indexes. They are empty for existing rows, but each
+    build scans `ifpe.spei_inbound` or `ifpe.spei_outbound` and blocks writes
+    to it meanwhile.
+
+  On large tables, run it at a quiet moment.
 
 ---
 
@@ -1236,6 +1283,65 @@ available, so Session Manager itself was not exercised. Everything around it was
     ran, it had read the announcer and failed: 3 of 4 times on one run.
 - **Backend:** rustfmt and clippy `-D warnings` clean; 314 tests passed, 0 failed.
   hadolint, actionlint and ShellCheck (with the CI settings) are clean.
+
+**Sovereign Vault backend** (migration `0012`, `GET /api/v1/vault` and its WebSocket):
+
+- **SQL suite** `tests/db/0012_boveda_tiempo_real.sql`: 24 checks, on a freshly
+  migrated database, as a role that is not a superuser. The other seven suites pass
+  unchanged (39, 47, 17, 40, 409, 32 and 17 checks).
+- **`backend/tests/boveda.rs`** (13 tests, against the real HTTP server):
+  - **Versions:**
+    - `seq` goes up once per transaction: deposits, an internal transfer (both
+      accounts) and an investment. A reserve cut does not move it.
+    - `NOTIFY sc_boveda` arrives on commit, carrying the transaction id stamped on
+      the SPEI credit. A rolled-back change notifies nothing. A cut notifies its id.
+  - **REST:** the exact JSON contract: invested principal counted in the total, the
+    proof `pending` (64 zeros) before the first cut and `verified` with the cut's
+    root after it. 401 without a session, 403 for staff.
+  - **WebSocket, end to end:**
+    - a snapshot on open, and again when `LISTEN` starts;
+    - an inbound SPEI arrives as `spei.transfer` (`inbound`/`settled`, bank `012`);
+    - an internal transfer and an outgoing order's hold arrive as snapshots;
+    - the order is rejected by the bank: its refund arrives as `spei.transfer`
+      (`outbound`/`returned`);
+    - a requested resync and a published cut arrive as snapshots with the same `seq`;
+    - another client's deposit never arrives;
+    - on shutdown the socket closes with 1001, `LISTEN` releases its connection and
+      no socket is left.
+  - **Fan-out and recovery:**
+    - Two tabs receive the same change.
+    - The `LISTEN` backend is killed with `pg_terminate_backend`: the task
+      reconnects, the socket gets a snapshot that includes the deposit made in
+      between, and notifications resume.
+  - **Handshake:**
+    - 401: no token, a tampered token, a revoked session;
+    - 403: a foreign `Origin`, a staff token;
+    - 400: no `sc.vault.v1` subprotocol, a plain GET;
+    - a non-browser client with `Authorization` is accepted;
+    - the token is never echoed in the response.
+  - **Caps and limits:**
+    - A client's sixth socket gets 429 `DEMASIADAS_CONEXIONES`; another client is
+      unaffected. Closing a socket frees its slot, and the server answers the
+      close.
+    - The task cap gives 503 while plain HTTP is still served.
+    - The per-IP `API` limit refuses the third handshake with 429 and
+      `Retry-After`.
+    - Ten resync requests in a row produce one immediate snapshot and one more
+      after the 1 s floor.
+  - **Session and heartbeat (shortened timers):**
+    - A revoked session closes the open socket with 4001.
+    - A client that answers pings stays connected. One that never reads gets pings
+      and then 1001 `sin respuesta`, checked on the raw frames.
+  - **Stability:** 10 consecutive runs of the file passed.
+  - **Not covered end to end:** the close at JWT expiry (4001 `sesión vencida`),
+    because token lifetimes are in minutes.
+- **Backend:** rustfmt and clippy `-D warnings` clean; 327 tests passed, 0 failed.
+- **`cargo audit`:** clean on 312 crates, including the new `tokio-tungstenite`,
+  `tungstenite` and `data-encoding`. The advisory database was from 2026-11-08.
+- **Frontend:** lint and typecheck clean. 126 unit tests passed, among them the
+  store's handling of same-`seq` snapshots.
+- **nginx:** `nginx -t` passes in the pinned image with the WebSocket location
+  (`/api/v1/vault/ws`).
 
 **Images and scans:**
 

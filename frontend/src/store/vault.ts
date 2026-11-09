@@ -21,8 +21,11 @@
  * server rendering, and call `reset()` on sign-out. Nothing is persisted to
  * browser storage.
  *
- * Wiring a socket (sketch):
+ * Wiring a socket (sketch). The backend (`GET /api/v1/vault/ws`) takes the
+ * session token as a subprotocol entry, since a browser cannot set headers
+ * on a WebSocket, and confirms only `sc.vault.v1`:
  *
+ *   const socket = new WebSocket(url, ["sc.vault.v1", `bearer.${token}`]);
  *   const vault = useVaultStore.getState();
  *   vault.setRealtimeStatus("connecting");
  *   socket.onopen = () => vault.setRealtimeStatus("live");
@@ -57,7 +60,9 @@ export type RealtimeStatus = "offline" | "connecting" | "live" | "reconnecting";
  * - `applied`: next in sequence; the state is updated.
  * - `gap`: applied, but at least one earlier message never arrived. `stale`
  *   is now true: ask the server for a new snapshot.
- * - `duplicate`: at or below the last applied `seq` (a replay); ignored.
+ * - `duplicate`: a delta at or below the last applied `seq`, or a snapshot
+ *   below it (a replay); ignored. A snapshot at the current `seq` is applied:
+ *   it is how a resync answers, and how a new reserve proof arrives.
  * - `no-baseline`: a delta before the stream's first snapshot; ignored.
  * - `invalid`: failed validation; ignored.
  */
@@ -195,9 +200,12 @@ export const useVaultStore = create<VaultState>()((set, get) => ({
 
   applyMessage: (message) => {
     const { lastSeq } = get();
-    if (lastSeq !== null && message.seq <= lastSeq) return "duplicate";
 
     if (message.type === "vault.snapshot") {
+      // Same version, same balances: a snapshot at the current seq is sent on
+      // purpose (a resync after a gap, a new reserve proof) and must apply,
+      // or `stale` would never clear. Only an older one is a replay.
+      if (lastSeq !== null && message.seq < lastSeq) return "duplicate";
       set({
         ...fromSnapshot(message.vault),
         lastSeq: message.seq,
@@ -210,6 +218,7 @@ export const useVaultStore = create<VaultState>()((set, get) => ({
     }
 
     if (lastSeq === null) return "no-baseline";
+    if (message.seq <= lastSeq) return "duplicate";
     const gap = message.seq !== lastSeq + 1;
     set((state) => ({
       ...applyDelta(state, message),

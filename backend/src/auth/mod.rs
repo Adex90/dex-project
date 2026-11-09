@@ -125,6 +125,24 @@ where
     }
 }
 
+/// Las mismas comprobaciones del extractor [`Usuario`] (firma, audiencia y
+/// vigencia del JWT; después, en la base de datos, rol actual, revocación,
+/// bloqueo y segundo factor) para un token que no llega en `Authorization`:
+/// un navegador no puede poner cabeceras en un WebSocket. Devuelve también
+/// los claims, cuyo `exp` acota la vida de la conexión.
+pub async fn autenticar_token(estado: &AppState, token: &str) -> AppResult<(Usuario, jwt::Claims)> {
+    let claims = estado.jwt.validar(token)?;
+    let usuario = validar_contra_bd(&estado.pool, &claims).await?;
+    Ok((usuario, claims))
+}
+
+/// Vuelve a confirmar contra la base de datos una sesión ya abierta: una
+/// conexión larga no debe sobrevivir a una revocación, un cambio de rol o un
+/// bloqueo.
+pub async fn revalidar(pool: &PgPool, claims: &jwt::Claims) -> AppResult<Usuario> {
+    validar_contra_bd(pool, claims).await
+}
+
 fn bearer(parts: &Parts) -> AppResult<&str> {
     parts
         .headers

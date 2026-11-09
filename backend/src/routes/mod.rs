@@ -79,6 +79,7 @@
 
 mod aml;
 mod auth;
+mod boveda;
 mod extraccion;
 mod ifpe;
 mod kyc;
@@ -128,7 +129,8 @@ pub fn router(estado: AppState) -> Router {
         .merge(reserva::rutas())
         .merge(operaciones::rutas())
         .merge(spei::rutas())
-        .merge(aml::rutas(estado.clone()));
+        .merge(aml::rutas(estado.clone()))
+        .merge(boveda::rutas());
     let api = limites::aplicar(api, &por_ip.api)
         .merge(limites::aplicar(spei::webhooks().merge(kyc::webhooks()), &por_ip.webhook));
 

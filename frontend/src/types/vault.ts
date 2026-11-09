@@ -22,7 +22,10 @@ export type DecimalString = string;
 
 /** The vault's totals, in MXN. */
 export interface VaultBalance {
-  /** Net worth: `available_cash` + `invested_assets`. */
+  /**
+   * Net worth: cash (available and on hold) plus `invested_assets`. With funds
+   * on hold, `available_cash` + `invested_assets` is less than the total.
+   */
   total_mxn: DecimalString;
   /** Settled cash, free to withdraw or invest right now. */
   available_cash: DecimalString;
@@ -104,20 +107,28 @@ export interface SpeiTransfer {
   amount: DecimalString;
   /** The sender of an inbound transfer, the beneficiary of an outbound one. */
   counterparty_name: string;
+  /**
+   * The counterparty's bank as its 3-digit code, the CLABE prefix ("012" is
+   * BBVA México, "646" STP). No name catalog yet.
+   */
   counterparty_bank: string;
   /** When the backend applied it, ISO 8601. */
   occurred_at: string;
 }
 
 /**
- * Server-to-client messages. Each carries `seq`, its position in this
- * client's event stream (one stream per user, strictly increasing).
+ * Server-to-client messages. Each carries `seq`, the version of the account
+ * whose values it brings (the backend's `ifpe.cuentas.seq`: +1 per
+ * transaction that changes a balance).
  *
  * The protocol is snapshot-first: on every (re)connection the server sends a
  * `vault.snapshot`, then deltas. A delta carries the authoritative values
  * after the change (the new balance, the whole holding), never increments,
  * so the client does no money arithmetic and replaying a message is harmless.
  *
+ * - A snapshot may repeat the current `seq`: that is the answer to a
+ *   `{"type": "resync"}`, or a new reserve proof (a cut changes no balance).
+ *   The backend sends new proofs that way rather than as `reserve.updated`.
  * - `holding.updated` with `shares` "0" means the position was closed.
  */
 export type VaultRealtimeMessage =

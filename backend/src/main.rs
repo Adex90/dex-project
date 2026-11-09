@@ -5,7 +5,7 @@ use std::{future::Future, io::IsTerminal, process::ExitCode, time::Duration};
 use anyhow::Context;
 use sqlx::PgPool;
 use synthetic_capital::{
-    bootstrap,
+    bootstrap, boveda,
     cli::{self, Comando},
     config::{Config, LoginAplicacion},
     db, routes, servidor, tareas, AppState,
@@ -89,11 +89,24 @@ async fn servir() -> anyhow::Result<()> {
     let limites = cfg.http.clone();
     let estado = AppState::nuevo(pool.clone(), cfg);
     tareas::lanzar(estado.clone());
+    // Los avisos de PostgreSQL que alimentan los WebSocket de la bóveda.
+    tokio::spawn(boveda::central::escuchar(estado.boveda.clone()));
+    let boveda = estado.boveda.clone();
+    let sockets = estado.boveda.clone();
     let app = routes::router(estado);
 
     let listener = tokio::net::TcpListener::bind(bind).await?;
     tracing::info!(%bind, max_conexiones = limites.max_conexiones, "Synthetic Capital escuchando");
-    servidor::servir(listener, app, &limites, senal_de_apagado()).await;
+    let apagado = async move {
+        senal_de_apagado().await;
+        // Un socket abierto ya no es una conexión HTTP que el servidor drene:
+        // se cierra con 1001 para que el navegador se reconecte a otra tarea.
+        boveda.cerrar();
+    };
+    servidor::servir(listener, app, &limites, apagado).await;
+    if !sockets.esperar_cierre(Duration::from_secs(2)).await {
+        tracing::warn!(abiertos = sockets.sockets(), "sockets de la bóveda sin cerrar al apagar");
+    }
     // Las tareas de fondo terminan con el runtime; se cierra el pool con plazo.
     if tokio::time::timeout(Duration::from_secs(5), pool.close()).await.is_err() {
         tracing::warn!("el pool de PostgreSQL no cerró a tiempo");

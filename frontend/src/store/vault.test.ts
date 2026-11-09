@@ -178,6 +178,33 @@ test("a gap is applied but marks the state stale until the next snapshot", () =>
   assert.equal(vault().stale, false);
 });
 
+test("the resync after a gap answers at the same version, and clears stale", () => {
+  goLive(10);
+  vault().receive(frame({ type: "spei.transfer", seq: 13, transfer: transfer("K3"), balance: balance("131000.00") }));
+  assert.equal(vault().stale, true);
+  // The server reads the account at seq 13 again: same version, now complete.
+  assert.equal(vault().receive(frame({ type: "vault.snapshot", seq: 13, vault: snapshot("131000.00") })), "applied");
+  assert.equal(vault().stale, false);
+  assert.equal(vault().lastSeq, 13);
+});
+
+test("an older snapshot is a replay; a delta at the same version too", () => {
+  goLive(10);
+  assert.equal(vault().receive(frame({ type: "vault.snapshot", seq: 9, vault: snapshot("1.00") })), "duplicate");
+  assert.equal(
+    vault().receive(frame({ type: "spei.transfer", seq: 10, transfer: transfer("K1"), balance: balance("2.00") })),
+    "duplicate",
+  );
+  assert.equal(vault().balance?.total_mxn, "128450.75");
+});
+
+test("a new reserve proof can arrive as a snapshot at the same version", () => {
+  goLive(10);
+  const pending = { ...snapshot(), reserve_proof: { status: "pending", zk_root_hash: "0xabc123" } };
+  assert.equal(vault().receive(frame({ type: "vault.snapshot", seq: 10, vault: pending })), "applied");
+  assert.equal(vault().reserveProof?.status, "pending");
+});
+
 test("holdings update in place, new ones append, closed ones leave", () => {
   goLive(10);
   const repriced = { ...NVDA, current_price: "3300.00", total_value: "41250.00", daily_change_pct: "1.65" };

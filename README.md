@@ -588,6 +588,111 @@ into `aml.alertas` and `GET /api/v1/operaciones/alertas` was removed.
 - **Dependency audits.** Both image builds fail on a known vulnerability (see
   "Dependency audits" under "Running locally").
 
+## Sovereign Vault: snapshot and real-time channel (migration `0012`)
+
+The dashboard's vault (Bóveda Soberana) comes from two client-only routes in
+the `API` rate-limit group. Their JSON contract is
+`frontend/src/types/vault.ts`.
+
+- **`GET /api/v1/vault`** returns the whole vault in one call, read as the
+  client with row-level security (`sc_cliente`, one REPEATABLE READ snapshot):
+  - `user_id`, `clabe`, and `bank_name` (`SPEI_BANCO_NOMBRE`, default `STP`);
+  - `balance`:
+    - `available_cash`: the IFPE account's available balance;
+    - `invested_assets`: the principal of the client's SOFOM mutuums that are
+      in force or matured and not yet settled;
+    - `total_mxn`: available plus held plus invested;
+    - `unrealized_pnl_percentage`: `"0.00"`. Mutuums are carried at cost and
+      their interest is realized at settlement.
+  - `reserve_proof`: the Merkle root of the last published reserve cut
+    (`zk_root_hash`) and its status:
+    - `verified` when that cut covers the deposits and the live reserve is at 100 %;
+    - `failed` otherwise;
+    - `pending`, with a root of 64 zeros, until the first cut.
+  - `holdings`: `[]` until the RWA pricing oracle.
+  - Amounts are decimal strings with 8 decimals, like the rest of the API.
+- **`GET /api/v1/vault/ws`** is a WebSocket (`backend/src/boveda/`) that
+  pushes every change to the vault.
+  - **Authentication.** A browser cannot set headers on a WebSocket, so the
+    JWT travels as a subprotocol entry:
+    `new WebSocket(url, ["sc.vault.v1", "bearer." + token])`.
+    - The server confirms only `sc.vault.v1`; the token is never echoed back.
+    - Non-browser clients may send `Authorization: Bearer` instead, but must
+      still offer `sc.vault.v1`.
+    - The checks are those of every authenticated route: signature, audience,
+      expiry, and then current role, revocation, block and second factor in
+      the database.
+    - `Origin`, when present, must equal `FRONTEND_ORIGIN`, because CORS does
+      not cover WebSockets.
+    - The edge's CSP (`connect-src 'self'`) already allows `wss:` to the
+      same host.
+  - **Handshake errors** use the usual JSON envelope:
+
+    | Status | Code | Cause |
+    |---|---|---|
+    | 400 | `WEBSOCKET_REQUERIDO` | not a WebSocket upgrade |
+    | 400 | `PROTOCOLO_REQUERIDO` | `sc.vault.v1` not offered |
+    | 401 | `NO_AUTENTICADO` | missing, invalid, expired or revoked token |
+    | 403 | `PROHIBIDO` | wrong `Origin`, or not a client |
+    | 429 | `DEMASIADAS_CONEXIONES` | the client already has 5 sockets open on this task |
+    | 429 | `REINTENTAR` | per-IP rate limit (`API` group) |
+    | 503 | `REINTENTAR` | the task already holds `HTTP_MAX_CONEXIONES` sockets |
+
+  - **Messages.** Every message carries `seq`, the account's version.
+    - **`vault.snapshot`**, the whole vault, is sent:
+      - first, when the socket opens;
+      - after `{"type":"resync"}` from the browser. At most one per second:
+        requests within that second are merged into one;
+      - when a reserve cut is published (same `seq`, new proof);
+      - when the socket fell behind;
+      - when the server's `LISTEN` reconnects.
+    - **`spei.transfer`**: an inbound SPEI credited (`inbound`/`settled`) or an
+      outgoing order refunded (`outbound`/`returned`), with the balance it left.
+      `counterparty_bank` is the 3-digit bank code of the CLABE (`012` is BBVA
+      México); there is no name catalog yet.
+    - **Any other balance change** (internal transfer, outgoing order,
+      investment, hold) arrives as a `vault.snapshot`.
+    - **Ordering.**
+      - A delta is only sent with a `seq` above the last one sent.
+      - A gap means messages were skipped. The browser marks the vault stale
+        and asks for `resync`.
+      - Balances are always those of the `seq` they carry. Two changes that
+        commit within milliseconds can merge into one message, so the transfer
+        feed is best-effort; the balance is not.
+  - **Liveness and session.**
+    - The server pings every 25 s. A socket silent for 75 s is closed with
+      1001.
+    - The session is re-checked against the database every 60 s.
+    - The socket closes with **4001** when the JWT expires or the session is
+      revoked or blocked; the browser signs in again.
+    - A deploy closes sockets with **1001**, and the browser reconnects.
+  - **Limits.**
+    - Each backend task holds up to `HTTP_MAX_CONEXIONES` sockets, and 5 per
+      client.
+    - An open socket no longer counts against the HTTP connection limit.
+    - Vault reads (snapshots and notified changes) use at most half of the
+      database pool at a time, so a burst waits instead of starving HTTP
+      requests.
+    - The browser may send 4 KB per message.
+- **Where versions come from (migration `0012`).**
+  - `ifpe.cuentas.seq` goes up by exactly one in every transaction that
+    changes an account's balances. A trigger does it, so every code path is
+    covered and nobody can set or rewrite it.
+  - On commit, PostgreSQL sends `NOTIFY sc_boveda`. Notifications are
+    delivered only for committed transactions, in commit order.
+  - The SPEI credit or refund that moved the money carries the same
+    transaction id (`xact`), which is how a change is matched to its transfer.
+  - Each backend task holds one connection from its pool for
+    `LISTEN sc_boveda`. It probes that connection every 30 s, reconnects when
+    it fails, and fans changes out to its own sockets, so any number of tasks
+    work behind the load balancer without coordination.
+  - Tests:
+    - `tests/db/0012_boveda_tiempo_real.sql`: the triggers, in one
+      transaction.
+    - `backend/tests/boveda.rs`: delivery, the REST contract, and the
+      WebSocket end to end against the real server (handshake rules, caps,
+      rate limit, heartbeat, revocation, LISTEN reconnection, shutdown).
+
 ## Layout
 
 ```
@@ -600,6 +705,7 @@ backend/      Rust: axum + sqlx + tokio
   src/sofom/             IFPE -> mutuum bridge, maturity liquidation, loans
   src/kyc/               onboarding: CURP/RFC/INE/MRZ validation, biometric provider, verdicts
   src/spei/              CLABE, signed SPEI webhooks, outbound dispatcher, gateway
+  src/boveda/            Sovereign Vault: snapshot, LISTEN/NOTIFY fan-out, WebSocket
   src/routes/            HTTP API (/api/v1)
 frontend/     Next.js dashboard (Task 3)
 tests/db/     SQL invariant tests for the schema
@@ -638,6 +744,7 @@ psql "$EMPTY_DATABASE_URL" -f tests/db/0008_spei.sql
 psql "$EMPTY_DATABASE_URL" -f tests/db/0009_aml.sql
 psql "$EMPTY_DATABASE_URL" -f tests/db/0010_auth_mfa.sql
 psql "$EMPTY_DATABASE_URL" -f tests/db/0011_rls_por_cliente.sql
+psql "$EMPTY_DATABASE_URL" -f tests/db/0012_boveda_tiempo_real.sql
 cd frontend && npm test && npm run build
 FRONTEND_URL=http://localhost:3000 node e2e/smoke.mjs   # needs backend (MODO_DEMO=true) + next start
 # AML/PLD console against the real stack (structuring -> freeze -> four-eyes unfreeze, roles, no tipping off):
@@ -775,7 +882,7 @@ in front for production.
 | `HTTP_CABECERAS_SEG` | 10 | Close connections that do not send a full request head in time, including idle keep-alive and silent sockets |
 | `HTTP_CUERPO_SEG` | 15 | Request body deadline (408 `TIEMPO_AGOTADO`) |
 | `HTTP_PETICION_SEG` | 30 | Whole-request deadline (503 `TIEMPO_AGOTADO`; the transaction rolls back) |
-| `HTTP_MAX_CONEXIONES` | 512 | Concurrent connections; beyond this the server stops accepting instead of running out of file descriptors |
+| `HTTP_MAX_CONEXIONES` | 512 | Concurrent connections; beyond this the server stops accepting instead of running out of file descriptors. Also the cap on open vault WebSockets per task, counted separately |
 | `HTTP_APAGADO_SEG` | 20 | Graceful shutdown deadline |
 
 Request bodies are limited to 64 KB. Per-IP rate limits (`HTTP_LIMITE_*`) are
@@ -811,6 +918,8 @@ the password is hashed, so a parallel burst cannot test more than 5 passwords.
 | GET | `/api/v1/operaciones/kyc/pendientes` | operator: files awaiting human review |
 | POST | `/api/v1/operaciones/kyc/{cliente_id}` | operator: verify / reject (with reason) / reopen, risk level (not lowered while the client is under AML review); answers the client projection, without risk fields; an empty dictamen is 400 |
 | GET | `/api/v1/tablero` | client: vault + investment + live reserve |
+| GET | `/api/v1/vault` | client: Sovereign Vault snapshot (balance, reserve proof, holdings) |
+| GET | `/api/v1/vault/ws` | client: Sovereign Vault real-time channel (WebSocket, subprotocol `sc.vault.v1`) |
 | GET | `/api/v1/ifpe/cuenta`, `/api/v1/ifpe/movimientos` | client |
 | POST | `/api/v1/ifpe/transferencias` | client: internal transfer |
 | POST | `/api/v1/ifpe/retiros` | client: withdrawal to own external CLABE (an outgoing SPEI) |
