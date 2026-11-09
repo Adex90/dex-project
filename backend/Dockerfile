@@ -30,7 +30,7 @@
 # The process writes nothing to disk: run it with a read-only root filesystem.
 
 # --------------------------------------------------------------------------
-FROM docker.io/library/rust:1.97.1-slim-trixie@sha256:8e8cf8f7fd54a2d23d5a743b3a03f56e26b6c774276c33fa0595111704ebb15c AS audit
+FROM docker.io/library/rust:1.99.0-slim-trixie@sha256:2752b332db73fdbb7dc576f06c82ed1f312005784ef913d7e04a28f5f55dc581 AS audit
 
 # cargo-audit itself, pinned and built from its own lockfile (cached layer).
 RUN --mount=type=secret,id=extra_ca,required=false \
@@ -61,7 +61,7 @@ RUN --mount=type=secret,id=extra_ca,required=false \
     touch /audit.ok
 
 # --------------------------------------------------------------------------
-FROM docker.io/library/rust:1.97.1-slim-trixie@sha256:8e8cf8f7fd54a2d23d5a743b3a03f56e26b6c774276c33fa0595111704ebb15c AS builder
+FROM docker.io/library/rust:1.99.0-slim-trixie@sha256:2752b332db73fdbb7dc576f06c82ed1f312005784ef913d7e04a28f5f55dc581 AS builder
 
 # Release profile for the image: fat LTO, one codegen unit, debuginfo stripped
 # (symbols stay, so panic messages and backtraces remain readable). panic stays
@@ -116,7 +116,7 @@ RUN touch src/main.rs src/lib.rs \
 COPY --from=audit /audit.ok /tmp/audit.ok
 
 # --------------------------------------------------------------------------
-FROM gcr.io/distroless/cc-debian13:nonroot@sha256:3ee00291cf386ec52a552e6a858d555debd74776eb4bfa53fa3df2cd6677515e
+FROM gcr.io/distroless/cc-debian13:nonroot@sha256:cc66d222f0a7ec996b78a99fe76a969bc80b539a5016ad866c14d1949bc6d0ab
 
 ARG VERSION=0.1.0
 ARG REVISION=unknown
