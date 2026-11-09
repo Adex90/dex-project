@@ -93,7 +93,7 @@ type Fields = Record<string, unknown>;
 const HEX_RE = /^(0x)?[0-9a-fA-F]+$/;
 const MAX_HOLDINGS = 1_000;
 
-function isRecord(value: unknown): value is Fields {
+export function isRecord(value: unknown): value is Fields {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
@@ -103,11 +103,11 @@ function isString(value: unknown, max = 200): value is string {
 }
 
 /** A non-blank string of at most `max` characters. */
-function isText(value: unknown, max = 200): value is string {
+export function isText(value: unknown, max = 200): value is string {
   return isString(value, max) && value.trim().length > 0;
 }
 
-function isOneOf<T extends string>(options: readonly T[], value: unknown): value is T {
+export function isOneOf<T extends string>(options: readonly T[], value: unknown): value is T {
   return typeof value === "string" && (options as readonly string[]).includes(value);
 }
 
@@ -130,11 +130,11 @@ export function isDecimalString(value: unknown): value is DecimalString {
   }
 }
 
-function isNonNegative(value: unknown): value is DecimalString {
+export function isNonNegative(value: unknown): value is DecimalString {
   return isDecimalString(value) && toUnits(value) >= 0n;
 }
 
-function isPositive(value: unknown): value is DecimalString {
+export function isPositive(value: unknown): value is DecimalString {
   return isDecimalString(value) && toUnits(value) > 0n;
 }
 

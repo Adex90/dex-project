@@ -163,7 +163,10 @@ export type TipoTxIfpe =
   | "TRASPASO_A_SOFOM"
   | "RETORNO_DE_SOFOM"
   | "RETENCION"
-  | "LIBERACION_RETENCION";
+  | "LIBERACION_RETENCION"
+  // The cash legs of market orders (migration 0013): a buy pays from the vault, a sale pays into it.
+  | "COMPRA_MERCADO"
+  | "VENTA_MERCADO";
 
 export interface TransaccionIfpe {
   id: Uuid;

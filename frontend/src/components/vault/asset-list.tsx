@@ -1,8 +1,13 @@
-import { useId } from "react";
+"use client";
+
+import { useId, type MouseEvent } from "react";
+import Link from "next/link";
+import { useRouter } from "next/navigation";
 import { ArrowDownRight, ArrowUpRight, Coins, Minus, type LucideIcon } from "lucide-react";
 
 import { cx } from "@/components/ui/primitives";
 import { addUnits, formatMoney } from "@/lib/decimal";
+import { assetPath } from "@/lib/market-data";
 import { formatShares, signedPercent, type Trend } from "@/lib/vault";
 import type { Holding } from "@/types/vault";
 
@@ -10,13 +15,16 @@ import type { Holding } from "@/types/vault";
  * Asset List: the vault's holdings as a terminal-style table on a charcoal
  * card ("Sovereign Gold", globals.css).
  *
- * - Rows raise to the lighter charcoal on hover, with a yellow edge and the
- *   ticker in yellow: a reading aid across the columns (rows are not links).
+ * - Each row opens its asset's page (/dashboard/asset/{ticker}), where the
+ *   client buys and sells. The name is the row's link (keyboard, assistive
+ *   technology, a new tab); a click anywhere else on the row follows it too.
+ * - Rows raise to the lighter charcoal on hover or keyboard focus, with a
+ *   yellow edge and the ticker in yellow.
  * - Phones get two columns (asset with its shares, value with its daily
  *   change); wider screens get shares and price as their own columns.
  * - The daily change carries its sign and an arrow as well as green or red.
  *
- * Presentational and hook-free apart from `useId`. Feed it `holdings` from
+ * Presentational apart from `useId` and the router. Feed it `holdings` from
  * `useVaultStore`; amounts are decimal strings, formatted exactly.
  */
 
@@ -103,18 +111,33 @@ const TREND: Record<Trend, { Icon: LucideIcon; className: string }> = {
 };
 
 function AssetRow({ holding }: { holding: Holding }) {
+  const router = useRouter();
+  const href = assetPath(holding.ticker);
   const change = signedPercent(holding.daily_change_pct);
   const trend = TREND[change.trend];
 
+  const openAsset = (event: MouseEvent<HTMLTableRowElement>) => {
+    // A click on the link itself is the link's (with its modifier keys: new tab, new window).
+    if (event.target instanceof Element && event.target.closest("a")) return;
+    // Selecting text across the row is not a click on it.
+    if (window.getSelection()?.isCollapsed === false) return;
+    router.push(href);
+  };
+
   return (
-    <tr className="group transition-colors hover:bg-surface-2" data-testid="asset-row">
+    <tr
+      className="group cursor-pointer transition-colors focus-within:bg-surface-2 hover:bg-surface-2"
+      data-testid="asset-row"
+      data-ticker={holding.ticker}
+      onClick={openAsset}
+    >
       <th
         scope="row"
         className={cx(
           "relative px-5 py-3.5 text-left font-normal sm:px-6",
-          // The yellow edge: invisible at rest, drawn on hover.
+          // The yellow edge: invisible at rest, drawn on hover or keyboard focus.
           "before:absolute before:inset-y-2 before:left-0 before:w-[3px] before:bg-synthetic-yellow",
-          "before:opacity-0 before:transition-opacity group-hover:before:opacity-100",
+          "before:opacity-0 before:transition-opacity group-focus-within:before:opacity-100 group-hover:before:opacity-100",
         )}
       >
         <div className="flex min-w-0 items-center gap-3">
@@ -122,13 +145,24 @@ function AssetRow({ holding }: { holding: Holding }) {
             className={cx(
               "inline-flex h-7 min-w-14 shrink-0 items-center justify-center rounded-md border border-border bg-bg px-2",
               "font-mono text-xs font-semibold tracking-wide text-ink transition-colors",
+              "group-focus-within:border-synthetic-yellow/50 group-focus-within:text-synthetic-yellow",
               "group-hover:border-synthetic-yellow/50 group-hover:text-synthetic-yellow",
             )}
           >
             {holding.ticker}
           </span>
           <span className="min-w-0">
-            <span className="block truncate font-medium text-ink">{holding.name}</span>
+            <Link
+              href={href}
+              className={cx(
+                "block truncate font-medium text-ink",
+                "focus-visible:ring-2 focus-visible:ring-synthetic-yellow focus-visible:ring-offset-2",
+                "focus-visible:ring-offset-surface-2 focus-visible:outline-none",
+              )}
+              data-testid="asset-row-link"
+            >
+              {holding.name}
+            </Link>
             {/* Shares have their own column from md up. */}
             <span className="block text-xs text-muted tabular-nums md:hidden">
               {formatShares(holding.shares)} shares

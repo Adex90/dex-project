@@ -437,7 +437,7 @@ jobs:
           SKIP_FRONTEND_BUILD: "1"
         run: e2e/aml-stack.sh start
 
-      - name: Smoke test (sign-up, KYC onboarding, deposit, investment, Proof of Reserve)
+      - name: Smoke test (sign-up, KYC onboarding, deposit, investment, Proof of Reserve, trading)
         working-directory: frontend
         timeout-minutes: 10
         run: node e2e/smoke.mjs "${E2E_OUT}/smoke"

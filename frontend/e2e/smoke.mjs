@@ -13,11 +13,17 @@
  * (personal data, INE photos and details, biometric consent + liveness) ->
  * VERIFICADO -> deposit, fixed-term investment, Proof of Reserve, ledger,
  * moving between the dashboard's tabs (Vault, Account, Invest, Reserve).
+ * It ends on asset pages opened by their address: AUG1, an unknown ticker, an
+ * address that is not a ticker, and a market without live prices.
  * Second pass: signing in again lands directly on the Vault, which is live
  * over its WebSocket: a deposit made outside the browser reaches the screen
  * with REST blocked, a server restart (1001) reconnects, and a session the
- * server ends (4001) returns to sign-in. In between, the same dashboard on a
- * phone-sized screen (bottom tab bar instead of the sidebar).
+ * server ends (4001) returns to sign-in. In between, trading with REST for
+ * the vault blocked: a gold buy on another device appears in the asset list,
+ * its row opens the asset's page, a buy whose answer is lost is retried with
+ * the same idempotency key and fills once, refusals show their reason; then,
+ * on a phone-sized screen (bottom tab bar instead of the sidebar), "Max"
+ * sells the whole position.
  * The theme is dark only ("Sovereign Gold"); the passes still differ in the
  * browser's preferred color scheme, which must not change it.
  */
@@ -65,6 +71,22 @@ async function apiLogin(emailAddress, secret) {
   return body.token;
 }
 
+/** Registers a client through the API: a new account, still without KYC, holding nothing. */
+async function apiRegister(emailAddress, secret) {
+  const response = await fetch(`${API}/api/v1/auth/registro`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      tipo_persona: "FISICA",
+      nombre: "Corte",
+      apellido_paterno: "Nuevo",
+      email: emailAddress,
+      password: secret,
+    }),
+  });
+  return response.status;
+}
+
 /** A demo SPEI deposit through the API (MODO_DEMO), not through this browser. */
 async function apiDeposit(token, monto) {
   const response = await fetch(`${API}/api/v1/ifpe/depositos/simulados`, {
@@ -74,6 +96,36 @@ async function apiDeposit(token, monto) {
   });
   return response.status;
 }
+
+/** A market order through the API, as another device would place it. */
+async function apiOrder(token, order) {
+  const response = await fetch(`${API}/api/v1/market/order`, {
+    method: "POST",
+    headers: { "content-type": "application/json", authorization: `Bearer ${token}` },
+    body: JSON.stringify({ ...order, idempotency_key: crypto.randomUUID() }),
+  });
+  return { status: response.status, receipt: await response.json() };
+}
+
+/**
+ * An API refusal answered in the browser instead of by the backend, for
+ * states a run cannot reach for real (the market closed, a conflicting key).
+ * It carries the API's CORS header, or the browser would hide the answer.
+ */
+function apiRefusal(status, codigo) {
+  return {
+    status,
+    headers: { "access-control-allow-origin": new URL(BASE).origin },
+    json: { error: { codigo, mensaje: "respuesta simulada por la prueba" } },
+  };
+}
+
+// The browser logs its own "Failed to load resource" line for every API call
+// that fails. The calls this test fails on purpose (a refused order, a lost
+// answer, a ticker that does not exist) are announced first: each entry
+// excuses one such line for that API path, and nothing else.
+const deliberateFailures = [];
+const expectFailure = (path) => deliberateFailures.push(path);
 
 /** Waits for the header's stream indicator to read `status` ("live" only once a snapshot applied). */
 async function streamStatus(page, status, timeout = 15_000) {
@@ -222,6 +274,119 @@ try {
       check(true, "the Account tab shows the cash balance, deposit included");
       check(vaultSockets.length === 2, "switching tabs keeps the same socket");
 
+      // -------------------------------------------------------------------
+      // Trading. REST for the vault stays blocked: the asset list, the
+      // position and the cash on screen can only follow the WebSocket (an
+      // order's commit raises the vault's seq), never a write by the page.
+      // -------------------------------------------------------------------
+      await openTab(page, "Vault");
+      await page.getByTestId("asset-list-empty").waitFor();
+      await page.route("**/api/v1/vault", (route) => route.abort());
+      const elsewhere = await apiOrder(otherDevice, { ticker: "AUG1", side: "buy", amount: "1250.00" });
+      check(
+        elsewhere.status === 201 &&
+          elsewhere.receipt.status === "filled" &&
+          elsewhere.receipt.quantity === "0.77520000" &&
+          elsewhere.receipt.amount === "1249.93000000",
+        "a buy of 1,250.00 of gold on another device fills 0.7752 g for 1,249.93",
+      );
+      const goldRow = page.getByTestId("asset-row").and(page.locator("[data-ticker=AUG1]"));
+      await goldRow.waitFor({ timeout: 5_000 });
+      check((await goldRow.innerText()).includes("Tokenized gold"), "the holding appears in the asset list live");
+
+      // A click anywhere on the row (here, its value) opens the asset's page inside the dashboard.
+      await goldRow.locator("td").last().click();
+      await page.waitForURL("**/dashboard/asset/AUG1");
+      const detail = page.getByTestId("asset-detail");
+      await detail.getByText("0.7752 AUG1").waitFor();
+      check(vaultSockets.length === 2, "the row opens AUG1's page on the same socket, with the position (0.7752)");
+
+      // Buy 1,250.00 more on the numpad. The first answer is lost on its way
+      // back although the order filled; the retry carries the same
+      // idempotency key and gets that order back, so it fills only once.
+      await page.getByTestId("asset-buy").click();
+      const checkout = page.getByTestId("order-checkout");
+      for (const key of ["1", "2", "5", "0"]) await checkout.getByRole("button", { name: key, exact: true }).click();
+      check(
+        (await checkout.getByTestId("order-summary").innerText()).includes("0.7752 AUG1"),
+        "the drawer estimates 0.7752 AUG1 for 1,250.00",
+      );
+      const sent = [];
+      let retryStatus = 0;
+      await page.route("**/api/v1/market/order", async (route) => {
+        if (route.request().method() !== "POST") return route.continue();
+        sent.push(JSON.parse(route.request().postData() ?? "{}"));
+        const response = await route.fetch();
+        if (sent.length === 1) return route.abort("connectionreset");
+        retryStatus = response.status();
+        return route.fulfill({ response });
+      });
+      expectFailure("/api/v1/market/order");
+      await checkout.getByTestId("order-confirm").click();
+      await checkout.getByRole("alert").filter({ hasText: "Cannot reach the bank's servers" }).waitFor();
+      await checkout.getByTestId("order-confirm").click();
+      const receipt = checkout.getByTestId("order-receipt");
+      await receipt.waitFor();
+      await page.unroute("**/api/v1/market/order");
+      check(
+        sent.length === 2 &&
+          sent.every((o) => o.ticker === "AUG1" && o.side === "buy" && o.amount === "1250.00") &&
+          /^[0-9a-f-]{36}$/.test(sent[0].idempotency_key) &&
+          sent[1].idempotency_key === sent[0].idempotency_key,
+        "after a lost answer, the retry sends the same order with the same idempotency key",
+      );
+      check(retryStatus === 200, `the server answers the retry with the order it already filled (${retryStatus})`);
+      const receiptText = await receipt.innerText();
+      check(
+        receiptText.includes("Order filled") && receiptText.includes("Bought 0.7752 AUG1 at $1,612.40."),
+        "the receipt reads: bought 0.7752 AUG1 at $1,612.40",
+      );
+      await shot(page, "asset-receipt");
+      await checkout.getByRole("button", { name: "Done" }).click();
+      await checkout.waitFor({ state: "detached" });
+      await detail.getByText("1.5504 AUG1").waitFor({ timeout: 5_000 });
+      const latest = frames.findLast((m) => m.type === "vault.snapshot");
+      check(
+        latest?.vault.holdings.some((h) => h.ticker === "AUG1" && h.shares === "1.55040000") === true &&
+          latest.vault.balance.available_cash === "13734.70000000",
+        "the WebSocket brings the position (1.5504: filled once) and the cash (13,734.70)",
+      );
+      await page.mouse.move(0, 0);
+      await shot(page, "asset-desktop-position");
+
+      // Refusals, as the API would answer them, show their reason in the drawer.
+      await page.getByTestId("asset-buy").click();
+      await checkout.getByText("Available: $13,734.70").waitFor();
+      check(true, "the drawer offers the cash left after both buys ($13,734.70)");
+      for (const key of ["5", "0", "0"]) await checkout.getByRole("button", { name: key, exact: true }).click();
+      for (const [status, codigo, reason] of [
+        [400, "VALIDACION", "Enter an amount in pesos, with at most two decimals."],
+        [409, "CLAVE_IDEMPOTENCIA_REUTILIZADA", "This request conflicts with a previous operation."],
+        [422, "SALDO_INSUFICIENTE", "Insufficient available balance in your vault."],
+        [503, "MERCADO_NO_DISPONIBLE", "The market opens once live prices are connected. No order was placed."],
+      ]) {
+        await page.route("**/api/v1/market/order", (route) =>
+          route.request().method() === "POST" ? route.fulfill(apiRefusal(status, codigo)) : route.continue(),
+        );
+        expectFailure("/api/v1/market/order");
+        await checkout.getByTestId("order-confirm").click();
+        await checkout.getByRole("alert").filter({ hasText: reason }).waitFor();
+        await page.unroute("**/api/v1/market/order");
+      }
+      check(true, "refused orders (400, 409, 422, 503) show their reason in the drawer");
+      await checkout.getByRole("button", { name: "Close" }).click();
+      await checkout.waitFor({ state: "detached" });
+      check((await detail.getByText("1.5504 AUG1").count()) === 1, "a refused order leaves the position as it was");
+
+      await page.getByTestId("asset-back").click();
+      await page.waitForURL("**/dashboard");
+      await goldRow.filter({ hasText: "1.5504" }).waitFor();
+      await page.getByTestId("vault-total").filter({ hasText: "26,234" }).waitFor();
+      check(vaultSockets.length === 2, "back on the Vault, the row reads 1.5504 and the total is unchanged");
+      await page.mouse.move(0, 0);
+      await shot(page, "vault-desktop-holding");
+      await page.unroute("**/api/v1/vault");
+
       // A phone: the sidebar gives way to the bottom tab bar.
       await page.setViewportSize({ width: 390, height: 844 });
       const tabBar = mainNav(page);
@@ -237,6 +402,57 @@ try {
       await page.waitForTimeout(1500);
       await shot(page, "reserve-mobile");
       check(true, "the dashboard works on a phone-sized screen");
+
+      // On the phone: the holding's name opens its page, and "Max" in the
+      // bottom sheet sells the whole position (REST for the vault blocked again).
+      await page.route("**/api/v1/vault", (route) => route.abort());
+      await openTab(page, "Vault");
+      await page.getByTestId("asset-row-link").filter({ hasText: "Tokenized gold" }).click();
+      await page.waitForURL("**/dashboard/asset/AUG1");
+      await detail.getByText("1.5504 AUG1").waitFor();
+      await shot(page, "asset-mobile");
+      await page.getByRole("button", { name: "Sell", exact: true }).click();
+      await checkout.getByRole("button", { name: "Max" }).click();
+      check(
+        (await checkout.getByTestId("order-amount").inputValue()) === "2,499.86" &&
+          (await checkout.getByTestId("order-summary").innerText()).includes("1.5504 AUG1"),
+        "Max offers the position's whole value (2,499.86) and estimates all of it (1.5504 AUG1)",
+      );
+      await shot(page, "checkout-mobile");
+      await checkout.getByTestId("order-confirm").click();
+      await receipt.waitFor();
+      check((await receipt.innerText()).includes("Sold 1.5504 AUG1 at $1,612.40."), "the sale fills the whole position");
+      await checkout.getByRole("button", { name: "Done" }).click();
+      await checkout.waitFor({ state: "detached" });
+      await detail.getByText("Your position").waitFor({ state: "detached", timeout: 5_000 });
+      check(await page.getByRole("button", { name: "Sell", exact: true }).isDisabled(), "with the position sold, Sell is disabled");
+      await page.getByTestId("asset-back").click();
+      await page.waitForURL("**/dashboard");
+      await page.getByTestId("asset-list-empty").waitFor();
+      await page.getByTestId("vault-total").filter({ hasText: "26,234" }).waitFor();
+      await page.unroute("**/api/v1/vault");
+      check(vaultSockets.length === 2, "the sale empties the asset list live; the whole loop ran on one socket");
+
+      // The ledger lists each order's cash leg: two buys and the sale.
+      await openTab(page, "Account");
+      await page.getByText("Market sale", { exact: true }).waitFor();
+      check(
+        (await page.getByText("Market buy", { exact: true }).count()) === 2 &&
+          (await page.getByText("Market sale", { exact: true }).count()) === 1,
+        "the ledger lists two market buys and a market sale",
+      );
+      // A new Proof of Reserve cut still rebuilds every balance from the
+      // ledger, the orders' legs included: a new account's first proof makes
+      // the server cut again, over every account.
+      const newcomer = `e2e-${runId}-cut@example.mx`;
+      check((await apiRegister(newcomer, password)) === 201, "a new client registers through the API");
+      const cutAfterTrading = await fetch(`${API}/api/v1/reserva/prueba`, {
+        headers: { authorization: `Bearer ${await apiLogin(newcomer, password)}` },
+      });
+      check(
+        cutAfterTrading.status === 200,
+        `after trading, a new reserve cut covers every account (proof answered ${cutAfterTrading.status})`,
+      );
 
       // The server ends the session (4001: expired or revoked): back to sign-in, no reconnection.
       await vaultSockets.at(-1).close({ code: 4001, reason: "sesión revocada" });
@@ -626,6 +842,56 @@ try {
     await page.fill("#bridge-amount", "15000.01");
     check(await page.getByText("More than your available vault balance.").isVisible(), "bridge blocks amounts above the balance");
 
+    // ---------------------------------------------------------------------
+    // Asset pages, by their address (/dashboard/asset/{ticker}).
+    // ---------------------------------------------------------------------
+    const quoteCalls = [];
+    page.on("request", (r) => {
+      if (r.method() === "GET" && r.url().includes("/api/v1/market/quote/")) quoteCalls.push(r);
+    });
+    await page.goto(`${BASE}/dashboard/asset/AUG1`);
+    const assetDetail = page.getByTestId("asset-detail");
+    await assetDetail.waitFor();
+    check(
+      quoteCalls.length === 1 &&
+        quoteCalls[0].url().endsWith("/api/v1/market/quote/AUG1") &&
+        /^Bearer \S+$/.test((await quoteCalls[0].allHeaders()).authorization ?? ""),
+      "the asset's page loads its quote with the session's token",
+    );
+    check(
+      (await assetDetail.innerText()).includes("$1,612.40 MXN, +0.84% in 24 hours") &&
+        (await page.getByTestId("asset-simulated").isVisible()),
+      "AUG1 shows its quote ($1,612.40, +0.84%) and says the prices are simulated",
+    );
+    check(
+      (await mainNav(page).getByRole("link", { name: "Vault", exact: true }).getAttribute("aria-current")) === "page" &&
+        (await page.getByRole("heading", { level: 1 }).innerText()) === "Vault",
+      "an asset's page belongs to the Vault (current tab and title)",
+    );
+    check(await page.getByRole("button", { name: "Sell", exact: true }).isDisabled(), "Sell is disabled without a position");
+    await shot(page, "asset-desktop");
+    await page.getByTestId("asset-back").click();
+    await page.waitForURL("**/dashboard");
+    check(true, "Back to vault returns to the Vault");
+
+    expectFailure("/api/v1/market/quote/ZZZ9");
+    await page.goto(`${BASE}/dashboard/asset/ZZZ9`);
+    await page.getByTestId("asset-notice").filter({ hasText: "There is no asset with the ticker ZZZ9." }).waitFor();
+    check(quoteCalls.length === 2, "an unknown ticker shows No such asset (the API answers 404)");
+    await page.goto(`${BASE}/dashboard/asset/gold`);
+    await page.getByTestId("asset-notice").filter({ hasText: "This address does not name an asset." }).waitFor();
+    check(quoteCalls.length === 2, "an address that is not a ticker shows No such asset without calling the API");
+    await page.route("**/api/v1/market/quote/AUG1", (route) =>
+      route.request().method() === "GET" ? route.fulfill(apiRefusal(503, "MERCADO_NO_DISPONIBLE")) : route.continue(),
+    );
+    expectFailure("/api/v1/market/quote/AUG1");
+    await page.goto(`${BASE}/dashboard/asset/AUG1`);
+    await page.getByTestId("asset-notice").filter({ hasText: "The market is not open yet" }).waitFor();
+    await page.unroute("**/api/v1/market/quote/AUG1");
+    check(true, "without live prices (503) the asset's page says the market is not open yet");
+    await page.getByRole("link", { name: "Go to your vault" }).click();
+    await page.waitForURL("**/dashboard");
+
     // Sign out.
     await page.getByRole("button", { name: /Sign out/ }).click();
     await page.waitForURL("**/auth/login");
@@ -637,10 +903,21 @@ try {
 }
 
 // No console error is tolerated except the browser's own request for a
-// favicon the app does not ship (a 404 on /favicon.ico, not app code).
+// favicon the app does not ship (a 404 on /favicon.ico, not app code) and one
+// "Failed to load resource" line per API call the test failed on purpose.
 const benign = (e) => /Failed to load resource: .*404/.test(e) && /\/favicon\.ico\)$/.test(e);
-const relevant = errors.filter((e) => !benign(e));
-if (errors.length > relevant.length) console.log(`(ignored ${errors.length - relevant.length} favicon 404 message(s))`);
+const excused = [...deliberateFailures];
+const deliberate = (e) => {
+  const i = excused.findIndex((path) => /Failed to load resource/.test(e) && e.endsWith(`${path})`));
+  if (i !== -1) excused.splice(i, 1);
+  return i !== -1;
+};
+const favicons = errors.filter(benign).length;
+const relevant = errors.filter((e) => !benign(e) && !deliberate(e));
+const excusedCount = deliberateFailures.length - excused.length;
+if (favicons + excusedCount > 0) {
+  console.log(`(ignored ${favicons} favicon 404 and ${excusedCount} deliberate API failure message(s))`);
+}
 if (relevant.length) {
   console.error("Console errors:\n" + relevant.join("\n"));
   process.exit(1);

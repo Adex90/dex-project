@@ -5,7 +5,9 @@ import {
   ArrowDownLeft,
   ArrowLeftRight,
   ArrowUpRight,
+  Banknote,
   ChevronRight,
+  Coins,
   Link2,
   Hourglass,
   Lock,
@@ -41,8 +43,19 @@ function describe(tx: TransaccionIfpe, accountId: string | null): Kind {
     // Neutral labels: a hold must never disclose why it exists (no tipping off).
     RETENCION: { label: CLIENT_HOLD_LABELS.RETENCION, icon: Hourglass, tone: "warning", direction: "internal" },
     LIBERACION_RETENCION: { label: CLIENT_HOLD_LABELS.LIBERACION_RETENCION, icon: Unlock, tone: "info", direction: "internal" },
+    // The cash side of a market order; the asset itself is in the vault's holdings.
+    COMPRA_MERCADO: { label: "Market buy", icon: Coins, tone: "accent", direction: "out" },
+    VENTA_MERCADO: { label: "Market sale", icon: Banknote, tone: "verified", direction: "in" },
   };
-  return map[tx.tipo];
+  // A kind this build does not know yet: a plain movement, never a broken feed.
+  return (
+    map[tx.tipo] ?? {
+      label: "Movement",
+      icon: ArrowLeftRight,
+      tone: "neutral",
+      direction: tx.cuenta_destino_id !== null && tx.cuenta_destino_id === accountId ? "in" : "out",
+    }
+  );
 }
 
 /** Your entries in the bank's append-only, SHA-256-chained IFPE ledger. */

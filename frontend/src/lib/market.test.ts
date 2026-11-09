@@ -6,6 +6,7 @@ import {
   amountForApi,
   amountUnits,
   estimateQuantity,
+  estimateSale,
   formatAmountInput,
   maxAmount,
   orderProblem,
@@ -89,6 +90,20 @@ test("estimateQuantity: rounded down, never more than the money buys", () => {
   assert.equal(estimateQuantity(amountUnits("1612.40"), "1612.40", 4), "1.0000", "exactly one");
   assert.equal(estimateQuantity(0n, "1612.40", 4), "0.0000");
   assert.equal(estimateQuantity(amountUnits("5"), "0", 4), null);
+});
+
+test("estimateSale: Max sells the whole holding, as the backend fills it", () => {
+  const max = amountUnits(maxAmount(positionValue("1.55040000", "1612.40000000")));
+  assert.equal(max, amountUnits("2499.86"), "1.5504 at 1,612.40 is worth 2,499.86496");
+  assert.equal(estimateSale(max, "1.55040000", "1612.40000000", 4), "1.5504", "all of it, no residue");
+  assert.equal(estimateQuantity(max, "1612.40000000", 4), "1.5503", "what the amount alone covers");
+  assert.equal(estimateSale(amountUnits("1000"), "1.55040000", "1612.40000000", 4), "0.6201", "part: rounded down");
+  assert.equal(estimateSale(amountUnits("99.20"), "10.00000000", "9.92000000", 0), "10", "worth exactly 99.20");
+  assert.equal(estimateSale(amountUnits("99.19"), "10.00000000", "9.92000000", 0), "9");
+  assert.equal(estimateSale(amountUnits("0.01"), "0.00000100", "1.00000000", 8), "0.00000100", "worth less than a cent");
+  assert.equal(estimateSale(0n, "1.55040000", "1612.40000000", 4), "0.0000", "nothing entered yet");
+  assert.equal(estimateSale(amountUnits("5"), "0", "1612.40000000", 4), "0.0031", "no holding: the amount alone");
+  assert.equal(estimateSale(amountUnits("5"), "1.00000000", "0", 4), null);
 });
 
 test("positionValue: quantity times price, exact", () => {

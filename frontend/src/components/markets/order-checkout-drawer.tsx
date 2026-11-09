@@ -12,6 +12,7 @@ import {
   amountForApi,
   amountUnits,
   estimateQuantity,
+  estimateSale,
   formatAmountInput,
   maxAmount,
   orderProblem,
@@ -47,6 +48,8 @@ export interface OrderCheckoutDrawerProps {
   side: OrderSide;
   /** What the order can draw on, MXN: available cash to buy, the position's value to sell. */
   available: DecimalString;
+  /** Units held, for a sale: an amount that reaches their whole value sells them all (the estimate says so). */
+  held?: DecimalString;
   /** Places the order: resolves with the receipt, or rejects with the error to show. */
   onConfirm: (order: OrderRequest) => Promise<OrderReceipt>;
 }
@@ -63,7 +66,7 @@ const KEY_LABELS: Partial<Record<NumpadKey, string>> = { ".": "Decimal point", b
 /** The amount's type: the input and the invisible copy that sizes it must match to the pixel. */
 const AMOUNT_TYPE = "font-mono text-5xl font-semibold tracking-tight tabular-nums";
 
-function CheckoutDialog({ onClose, asset, side, available, onConfirm }: Omit<OrderCheckoutDrawerProps, "open">) {
+function CheckoutDialog({ onClose, asset, side, available, held, onConfirm }: Omit<OrderCheckoutDrawerProps, "open">) {
   const dialogRef = useRef<HTMLDialogElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
   const doneRef = useRef<HTMLButtonElement>(null);
@@ -81,7 +84,10 @@ function CheckoutDialog({ onClose, asset, side, available, onConfirm }: Omit<Ord
   const busy = phase === "submitting";
   const problem = orderProblem(amount, available);
   const units = amountUnits(amount);
-  const quantity = estimateQuantity(units, asset.price, asset.quantity_decimals);
+  const quantity =
+    !buying && held !== undefined
+      ? estimateSale(units, held, asset.price, asset.quantity_decimals)
+      : estimateQuantity(units, asset.price, asset.quantity_decimals);
   const max = maxAmount(available);
 
   // A modal from the first frame; the page behind does not scroll meanwhile.

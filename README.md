@@ -749,7 +749,10 @@ two routes in the `API` rate-limit group, both behind the JWT extractor:
   - The cash leg is an IFPE ledger movement: `COMPRA_MERCADO` takes cash out
     of the vault and the custody reserve (like an investment in a mutuum);
     `VENTA_MERCADO` brings it back. The 100 % reserve, the shadow balances
-    and the hash chain hold as for every other movement.
+    and the hash chain hold as for every other movement, and the replay a
+    Proof of Reserve cut runs before publishing (`reserva::saldos_sin_ledger`)
+    counts both. The integration tests run that same replay after every money
+    path, so a new movement type it does not know fails there first.
   - The order itself is a row in `mercado.ordenes`, the market's own
     append-only ledger, hash-chained like the IFPE and SOFOM ledgers
     (`SC-MERCADO-v1`). Each movement has its order in the same transaction,
@@ -783,6 +786,20 @@ two routes in the `API` rate-limit group, both behind the JWT extractor:
   neither quoted nor traded (503 `MERCADO_NO_DISPONIBLE`), so production
   never fills at a demo price. The oracle will update `mercado.activos`
   (price, previous close, source `ORACULO`).
+- **Frontend:** `/dashboard/asset/[ticker]`, inside the dashboard shell.
+  - On load it reads the quote with the session's token and validates it
+    whole (`frontend/src/lib/market-data.ts`) before `AssetDetail` renders it.
+    An unknown ticker shows "No such asset"; a 503 says the market is not
+    open yet.
+  - The cash and the position come from the vault store. An order carries the
+    checkout's idempotency key, kept on a retry, so a lost answer never fills
+    twice. The page validates the receipt and never writes the store: the
+    commit raises `seq`, and the WebSocket brings the new cash and position.
+  - Each row of the vault's asset list opens its asset's page, and the page
+    links back to the vault. The ledger shows the cash legs as "Market buy"
+    and "Market sale", and the cash chart counts them.
+  - There is no catalog to browse yet: a first buy starts from the address
+    (`/dashboard/asset/AUG1`).
 - **Audit:** `GET /api/v1/auditoria/ledger/mercado` (operator / auditor)
   re-verifies the chain, replays every position and every sale's average
   cost, and checks each order against its IFPE movement.
@@ -792,6 +809,10 @@ two routes in the `API` rate-limit group, both behind the JWT extractor:
   - `backend/tests/mercado.rs`: the API (quote, buy and sell, idempotency,
     rules, KYC, roles, AML freeze, concurrent orders, tamper detection).
   - `backend/tests/boveda.rs`: an order pushed over the WebSocket.
+  - `frontend/e2e/smoke.mjs`: the trading loop in the browser. A buy on
+    another device appears live; its row opens the page; a buy whose answer
+    is lost fills once; refusals show their reason; "Max" sells everything on
+    a phone; the ledger lists the legs; a new reserve cut still succeeds.
 
 ## Layout
 

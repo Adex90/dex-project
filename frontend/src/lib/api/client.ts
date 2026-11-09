@@ -133,6 +133,11 @@ const MESSAGES: Record<string, string> = {
   SPEI_DUPLICADO: "That SPEI transfer was already credited.",
   LIQUIDEZ_MUTUOS: "The credit division cannot complete this right now without additional capital.",
   FECHA_VALOR: "This operation must be dated today.",
+  // Markets (POST /api/v1/market/order, GET /api/v1/market/quote).
+  MERCADO_NO_DISPONIBLE: "The market opens once live prices are connected. No order was placed.",
+  MERCADO_CERRADO: "This asset is not trading right now. No order was placed.",
+  MONTO_INSUFICIENTE: "That amount is too small to buy the smallest unit of this asset.",
+  POSICION_INSUFICIENTE: "That is more than your position is worth.",
   // A client whose account is restricted gets this one neutral message whatever
   // the cause (no tipping off): it must not mention compliance, alerts or freezes.
   OPERACION_NO_DISPONIBLE: GENERIC_UNAVAILABLE_MESSAGE,

@@ -26,19 +26,28 @@ export interface NavItem {
   icon: LucideIcon;
   /** Active only on this exact path (a section root whose sub-pages are other items). */
   exact?: boolean;
+  /** Other paths that belong to this item, sub-pages included (the Vault's asset pages). */
+  also?: readonly string[];
 }
 
 export const DASHBOARD_NAV: readonly NavItem[] = [
-  { href: "/dashboard", label: "Vault", icon: Vault, exact: true },
+  // An asset's page opens from the vault's holdings and leads back to it.
+  { href: "/dashboard", label: "Vault", icon: Vault, exact: true, also: ["/dashboard/asset"] },
   { href: "/dashboard/account", label: "Account", icon: Landmark },
   { href: "/dashboard/invest", label: "Invest", icon: TrendingUp },
   { href: "/dashboard/reserve", label: "Reserve", icon: ShieldCheck },
 ];
 
-/** Whether `item` is the page at `pathname` (or, unless exact, one of its sub-pages). */
-export function isActive(item: Pick<NavItem, "href" | "exact">, pathname: string): boolean {
+/** Under `path`: the page itself or one of its sub-pages. */
+function isUnder(pathname: string, path: string): boolean {
+  return pathname === path || pathname.startsWith(`${path}/`);
+}
+
+/** Whether `item` is the page at `pathname` (or, unless exact, one of its sub-pages; or under one of its `also` paths). */
+export function isActive(item: Pick<NavItem, "href" | "exact" | "also">, pathname: string): boolean {
   if (pathname === item.href) return true;
-  return !item.exact && pathname.startsWith(`${item.href}/`);
+  if (item.also?.some((path) => isUnder(pathname, path))) return true;
+  return !item.exact && isUnder(pathname, item.href);
 }
 
 /** The item for `pathname`, for page titles; null outside the list. */

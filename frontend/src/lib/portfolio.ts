@@ -35,9 +35,11 @@ export function cashDelta(tx: Pick<LedgerEntry, "tipo" | "monto" | "cuenta_orige
   switch (tx.tipo) {
     case "DEPOSITO":
     case "RETORNO_DE_SOFOM":
+    case "VENTA_MERCADO":
       return amount;
     case "RETIRO":
     case "TRASPASO_A_SOFOM":
+    case "COMPRA_MERCADO":
       return -amount;
     case "TRANSFERENCIA":
       return tx.cuenta_origen_id === accountId ? -amount : amount;

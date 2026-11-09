@@ -236,6 +236,7 @@ export function AssetDetail({
         onClose={() => setCheckout(null)}
         asset={asset}
         available={checkout === "sell" ? worth : availableCash}
+        held={position}
         onConfirm={onPlaceOrder}
       />
     </article>
@@ -286,4 +287,34 @@ function usePriceTick(price: DecimalString): "up" | "down" | null {
   }, [price]);
 
   return tick?.direction ?? null;
+}
+
+/** Placeholder with the same footprint, while the quote or the vault loads. */
+export function AssetDetailSkeleton({ className }: { className?: string }) {
+  return (
+    <div className={className} role="status" data-testid="asset-detail-skeleton">
+      <span className="sr-only">Loading the asset…</span>
+      <div aria-hidden className="motion-safe:animate-pulse">
+        <div className="border border-border bg-surface p-5 sm:p-7">
+          <div className="flex items-center gap-3">
+            <div className="h-8 w-16 bg-surface-2" />
+            <div className="h-3 w-32 bg-surface-2" />
+          </div>
+          <div className="mt-4 h-7 w-56 bg-surface-2" />
+          <div className="mt-6 h-14 w-64 bg-surface-2 sm:h-16" />
+          <div className="mt-3 h-4 w-24 bg-surface-2" />
+          <div className="mt-6 ml-auto h-9 w-60 bg-surface-2" />
+          <div className="mt-4 h-60 bg-surface-2 sm:h-80" />
+        </div>
+        <div className="mt-4 grid grid-cols-1 gap-px border border-border bg-border sm:mt-6 sm:grid-cols-3">
+          {[0, 1, 2].map((i) => (
+            <div key={i} className="bg-surface px-5 py-4">
+              <div className="h-3 w-20 bg-surface-2" />
+              <div className="mt-3 h-6 w-28 bg-surface-2" />
+            </div>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
 }

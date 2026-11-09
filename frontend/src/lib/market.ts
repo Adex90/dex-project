@@ -99,10 +99,38 @@ export function maxAmount(available: DecimalString): string {
 export function estimateQuantity(units: bigint, price: DecimalString, decimals: number): DecimalString | null {
   const priceUnits = toUnits(price);
   if (priceUnits <= 0n || units < 0n) return null;
-  const scaled = (units * 10n ** BigInt(decimals)) / priceUnits;
-  if (decimals === 0) return scaled.toString();
+  return increments((units * 10n ** BigInt(decimals)) / priceUnits, decimals);
+}
+
+/**
+ * Units a sale takes from a holding of `held` at `price`, as the backend
+ * fills it (backend/src/mercado/calculo.rs). An amount that reaches the
+ * holding's value rounded down to the cent (what "Max" enters) sells all of
+ * it, leaving no residue: 2,499.86 of 1.5504 at 1,612.40 sells "1.5504",
+ * where the amount alone would cover 1.5503. Any other amount sells what it
+ * covers, rounded down like a purchase. Null for a price that is not positive.
+ */
+export function estimateSale(
+  units: bigint,
+  held: DecimalString,
+  price: DecimalString,
+  decimals: number,
+): DecimalString | null {
+  if (toUnits(price) <= 0n) return null;
+  const heldUnits = toUnits(held);
+  const worth = toUnits(positionValue(held, price));
+  const cent = 10n ** BigInt(SCALE - AMOUNT_DECIMALS);
+  if (heldUnits > 0n && units > 0n && units >= worth - (worth % cent)) {
+    return increments(heldUnits / 10n ** BigInt(SCALE - decimals), decimals);
+  }
+  return estimateQuantity(units, price, decimals);
+}
+
+/** `count` increments of 10^-decimals, written with `decimals` places. */
+function increments(count: bigint, decimals: number): DecimalString {
+  if (decimals === 0) return count.toString();
   const base = 10n ** BigInt(decimals);
-  return `${scaled / base}.${(scaled % base).toString().padStart(decimals, "0")}`;
+  return `${count / base}.${(count % base).toString().padStart(decimals, "0")}`;
 }
 
 /** What a position is worth at `price`, exact to 10^-8 (rounded down). */

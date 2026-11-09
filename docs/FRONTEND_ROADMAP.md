@@ -73,24 +73,34 @@ what the module waits on. They do not change its scope.
 
 ## Phase 1: Core Trading & Execution
 
-- [ ] **1. Asset Detail View** (Chart, Key Stats, Sticky Buy/Sell)
-  - Component built against the draft contract `types/market.ts`:
-    `components/markets/asset-detail.tsx`, with the price chart on the shared
+- [x] **1. Asset Detail View** (Chart, Key Stats, Sticky Buy/Sell)
+  - `components/markets/asset-detail.tsx`, with the price chart on the shared
     `components/charts/trend-chart.tsx` (the vault's balance chart uses it too).
-  - The quotes API exists: `GET /api/v1/market/quote/{ticker}`
-    (`MarketQuote`, migration `0013`), with simulated prices and history
-    until the pricing oracle, served only with `MODO_DEMO`. Left: a runtime
-    validator for quotes, a route that mounts the view, smoke e2e coverage,
-    and later a market-data stream on the vault socket's pattern.
-- [ ] **2. Order Execution Checkout** (Numpad, swipe-to-trade, zero-commission summary)
-  - Component built against the same contract:
-    `components/markets/order-checkout-drawer.tsx` (numpad, $0.00 commission
-    summary, Confirm Order, one idempotency key per order kept on retry).
-    Order math in `lib/market.ts`, unit tested.
-  - Order placement exists: `POST /api/v1/market/order` fills at once and
-    pushes the new vault over the WebSocket. Left: wire `onConfirm` to it,
-    a runtime validator for the receipt, and smoke e2e coverage. Swipe-to-
-    trade is not built: Confirm Order is the keyboard-accessible path a
+  - Mounted at `/dashboard/asset/[ticker]`, inside the dashboard shell (the
+    Vault tab stays current; a "Back to vault" link returns). The quote comes
+    from `GET /api/v1/market/quote/{ticker}` (`MarketQuote`, migration `0013`)
+    with the session's token, validated whole (`lib/market-data.ts`); the cash
+    and the position come from the vault store. An unknown ticker shows "No
+    such asset"; without live prices (503) the page says the market is not
+    open yet. Each holding in the vault's asset list opens its page.
+  - Prices are simulated until the pricing oracle, and served only with
+    `MODO_DEMO`. Smoke e2e covers the page on both layouts.
+  - Left: a way to reach an asset before holding one (a catalog endpoint and
+    module 8; today a first buy needs the address, e.g.
+    `/dashboard/asset/AUG1`), and a market-data stream on the vault socket's
+    pattern (the quote is read once per visit).
+- [x] **2. Order Execution Checkout** (Numpad, swipe-to-trade, zero-commission summary)
+  - `components/markets/order-checkout-drawer.tsx`: numpad, $0.00 commission
+    summary, Confirm Order, one idempotency key per order kept on retry.
+    Order math in `lib/market.ts`, unit tested; the estimate for a sale
+    follows the backend's rule ("Max" sells the whole position).
+  - Wired to `POST /api/v1/market/order`. The receipt is validated before it
+    is shown, and the page never writes the vault store: the order's commit
+    raises the vault's `seq` and the WebSocket brings the new cash and
+    position. Refusals (400, 409, 422, 503) show their reason in English.
+  - Smoke e2e: a buy whose answer is lost is retried with the same key and
+    fills once; "Max" sells the whole position on a phone.
+  - Left: swipe-to-trade. Confirm Order is the keyboard-accessible path a
     swipe would need anyway.
 - [ ] **3. Advanced Order Engine** (Limit, Stop-Loss, Trailing, Day/GTC)
   - Builds on module 2.

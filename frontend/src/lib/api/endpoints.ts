@@ -1,3 +1,5 @@
+import type { OrderRequest } from "@/types/market";
+
 import { request } from "./client";
 import type {
   AmlAlertsQuery,
@@ -81,6 +83,21 @@ export const api = {
    * `useVaultStore.load` validates the body before anything renders it.
    */
   vault: (token: string, signal?: AbortSignal) => request<unknown>("/api/v1/vault", { token, signal }),
+
+  /**
+   * A market quote: the asset and its price history (src/types/market.ts).
+   * Untyped on purpose: `parseMarketQuote` validates the body before it renders.
+   */
+  marketQuote: (token: string, ticker: string, signal?: AbortSignal) =>
+    request<unknown>(`/api/v1/market/quote/${encodeURIComponent(ticker)}`, { token, signal }),
+
+  /**
+   * A market order, filled at the current price. 201 for a new order, 200 with
+   * the same receipt when the idempotency key repeats one already filled.
+   * Untyped on purpose: `parseOrderReceipt` validates the receipt.
+   */
+  placeOrder: (token: string, order: OrderRequest) =>
+    request<unknown>("/api/v1/market/order", { method: "POST", token, body: order }),
 
   movements: (token: string, params: { limit?: number; before?: number } = {}, signal?: AbortSignal) =>
     request<TransaccionIfpe[]>("/api/v1/ifpe/movimientos", {
