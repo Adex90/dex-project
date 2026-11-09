@@ -532,6 +532,62 @@ into `aml.alertas` and `GET /api/v1/operaciones/alertas` was removed.
   one as `MFA_CLAVE_CIFRADO`, then run `synthetic-capital migrar`: it
   re-encrypts every secret with the new key. Then remove the old one.
 
+## Request hardening, rate limits and row-level security (migration `0011`)
+
+- **No mass assignment.** Every type a handler reads with `Json<T>` or
+  `Query<T>`, and every struct nested in one, has
+  `#[serde(deny_unknown_fields)]`. A field the API does not define (`"rol"` in
+  a sign-up, `"comision"` in a transfer, `?cliente_id=` on a list) is rejected
+  with `400 VALIDACION` (`unknown field ...`) instead of being ignored.
+  - `tests/entrada.rs` scans the source: a new request type without the
+    attribute, or an open `serde_json::Value` field not on its reviewed list,
+    fails the build. One field is open on purpose, `SolicitudPropuesta.cambios`:
+    the database validates each key.
+  - The provider webhooks are the exception: they read the raw body, check the
+    HMAC first and tolerate fields a provider adds.
+- **Rate limits per client IP** (`routes/limites.rs`, `tower_governor`): the
+  same limits as the nginx edge, enforced again in the service. Over the limit
+  the answer is `429 REINTENTAR` with `Retry-After`, exactly as the edge sends.
+
+  | Group | Routes | Default (`HTTP_LIMITE_<GROUP>_POR_MINUTO`, `_RAFAGA`) |
+  |---|---|---|
+  | `AUTH` | `/api/v1/auth/*` (sign-up, sign-in, two-step verification, password reset) | 5 per minute, burst 10 |
+  | `KYC` | `POST /api/v1/kyc/verificar` | 4 per minute, burst 4 |
+  | `API` | the rest of `/api/v1`; auth and KYC requests count here too | 600 per minute, burst 50 |
+  | `WEBHOOK` | `/api/v1/spei/webhook/*`, `/api/v1/kyc/webhook` (outside the API bucket) | 3000 per minute, burst 200 |
+
+  - The key is the client IP that `IpCliente` reads. Behind the trusted proxy
+    (`HTTP_PROXY_CONFIABLE`) that is the last `X-Forwarded-For` hop, never the
+    first, which a client could write to dodge the limit or use up someone
+    else's.
+  - IPv6 counts per /64. `/salud` and `/vivo` are never limited.
+  - Each process counts in memory. With N tasks behind the load balancer an
+    address can reach N times the quota; the global per-IP limit is the WAF's.
+  - `HTTP_LIMITE_IP=false` turns them off, for tests and load runs from one
+    address only.
+- **Row-level security per client.** The reads made on a client's behalf (profile,
+  IFPE account and movements, SOFOM position, SPEI orders and transfers
+  received) run as the role `sc_cliente`, with the client's id in the
+  transaction-local setting `sc.cliente_actual` (`db::begin_lectura_cliente`).
+  - RESTRICTIVE policies on `kyc.clientes`, `ifpe.cuentas`,
+    `ifpe.transacciones`, `ifpe.spei_outbound`, `ifpe.spei_inbound`,
+    `sofom.cuentas`, `sofom.contratos_mutuo` and `sofom.transacciones` let it
+    see only that client's rows, whatever the query asks for.
+  - A transfer between clients is visible to both. Without the setting the
+    role sees nothing, and a value that is not a UUID makes the query fail.
+  - `sc_cliente` only has `SELECT`. Clients never write rows directly: money
+    moves through the ledger roles, which check balances, reserve and AML.
+    Nobody deletes movements, accounts or KYC files (immutable ledger, legal
+    retention). The policies are `FOR ALL` anyway, so any write ever granted
+    stays within the client's own rows.
+  - Every other role works as before.
+  - This guards against application bugs (a wrong id, a missing `WHERE`), not
+    against SQL injection inside that transaction, which could rewrite the
+    setting. Against injection, every query is parameterized.
+  - Tests: `tests/rls.rs` and `tests/db/0011_rls_por_cliente.sql`.
+- **Dependency audits.** Both image builds fail on a known vulnerability (see
+  "Dependency audits" under "Running locally").
+
 ## Layout
 
 ```
@@ -566,7 +622,9 @@ docker compose -f docker-compose.dev.yml up -d   # PostgreSQL 16 on 127.0.0.1:54
 cd backend && cargo run                       # applies migrations and starts on :8080
 ```
 
-Tests (need a user with `CREATEDB` and `CREATEROLE`):
+Tests (need a user with `CREATEDB` and `CREATEROLE`). On a brand-new PostgreSQL cluster, run
+the migrations once first (`cargo run`, above, does it): the tests migrate their databases
+in parallel and would otherwise race to create the cluster-wide `sc_*` roles. CI does the same.
 
 ```bash
 cd backend && DATABASE_URL=postgres://synthetic:synthetic@localhost:5432/synthetic_capital cargo test
@@ -579,6 +637,7 @@ psql "$EMPTY_DATABASE_URL" -f tests/db/0007_kyc.sql
 psql "$EMPTY_DATABASE_URL" -f tests/db/0008_spei.sql
 psql "$EMPTY_DATABASE_URL" -f tests/db/0009_aml.sql
 psql "$EMPTY_DATABASE_URL" -f tests/db/0010_auth_mfa.sql
+psql "$EMPTY_DATABASE_URL" -f tests/db/0011_rls_por_cliente.sql
 cd frontend && npm test && npm run build
 FRONTEND_URL=http://localhost:3000 node e2e/smoke.mjs   # needs backend (MODO_DEMO=true) + next start
 # AML/PLD console against the real stack (structuring -> freeze -> four-eyes unfreeze, roles, no tipping off):
@@ -592,6 +651,32 @@ through the `PGHOST`/`PGUSER`/`PGPASSWORD` variables), starts the backend with
 `MODO_DEMO` and two compliance officers, an operator and an auditor, and serves
 the frontend with `next start`; `stop` kills both by PID and drops the database.
 
+### Dependency audits
+
+Both image builds fail when a locked dependency has a known vulnerability. The
+checks run in an `audit` stage of each Dockerfile, alongside the compilation.
+CI passes `--build-arg AUDIT_EPOCH=<run id>`, so a cached layer never hides an
+advisory published after the lockfile last changed. Locally:
+
+```bash
+# Rust: Cargo.lock against the RustSec database (cargo install cargo-audit --locked).
+# Policy in backend/.cargo/audit.toml: vulnerabilities, unsound and yanked crates fail.
+cd backend && cargo audit
+# Node: runtime dependencies fail from "moderate", the whole tree (build tools
+# included) from "high".
+cd frontend && npm audit --omit=dev --audit-level=moderate && npm audit --audit-level=high
+```
+
+- **Fix first.** Update the dependency (`cargo update -p <crate>`, `npm update
+  <package>` or an `overrides` entry). Never relax the gate itself.
+- **Rust exceptions** go in `ignore` in `backend/.cargo/audit.toml`, each with
+  its ticket: why it does not apply, who approved it, when it expires. Today
+  there is one, RUSTSEC-2023-0071 (`rsa`): it is in Cargo.lock only through
+  sqlx's optional MySQL driver and is never compiled. The backend build fails if
+  `rsa` ever enters the build graph.
+- **npm** has no exception file. A finding with no fixed version is pinned
+  through `overrides` or removed.
+
 ### Production database users
 
 The backend uses two database identities:
@@ -599,7 +684,7 @@ The backend uses two database identities:
 | Identity | Variable | Used by |
 |---|---|---|
 | Schema owner (needs `CREATEROLE` the first time; on RDS, the master user) | `DATABASE_URL_PROPIETARIO` | only the one-shot `synthetic-capital migrar` |
-| App login `sc_app`: `NOINHERIT`, member of `sc_ifpe`, `sc_sofom`, `sc_puente`, `sc_auditor`, `sc_kyc`, `sc_kyc_verificador`, `sc_spei`, `sc_aml` and `sc_auth` | `DATABASE_URL` | the long-running service |
+| App login `sc_app`: `NOINHERIT`, member of `sc_ifpe`, `sc_sofom`, `sc_puente`, `sc_auditor`, `sc_kyc`, `sc_kyc_verificador`, `sc_spei`, `sc_aml`, `sc_auth` and `sc_cliente` | `DATABASE_URL` | the long-running service |
 
 The owner can disable triggers; the app login has no privileges of its own and
 acts only through `SET LOCAL ROLE` to one `sc_*` role per transaction. By
@@ -630,7 +715,7 @@ it then does the following in one transaction:
   `LOGIN NOINHERIT`, setting the password as a SCRAM-SHA-256 verifier
   (PBKDF2-HMAC-SHA-256, 4096 iterations, random 16-byte salt) computed by the
   backend, so the plaintext never reaches the server or its logs;
-- grants the nine `sc_*` roles above (`WITH INHERIT FALSE, SET TRUE` on
+- grants the ten `sc_*` roles above (`WITH INHERIT FALSE, SET TRUE` on
   PostgreSQL 16+, where inheritance is set per grant), never `sc_auditor_pld`;
 - checks the result, and rolls everything back if the login is the owner, a
   member of the owner, a superuser, has `CREATEROLE`, `CREATEDB`,
@@ -653,6 +738,8 @@ GRANT sc_ifpe, sc_sofom, sc_puente, sc_auditor, sc_kyc, sc_kyc_verificador, sc_s
 -- Compliance console (/api/v1/aml) and the AML batch worker. Money paths do
 -- not need it: they reach the engine through SECURITY DEFINER wrappers.
 GRANT sc_aml TO sc_app WITH INHERIT FALSE, SET TRUE;
+-- Two-step verification and password reset (0010); a client's own reads under RLS (0011).
+GRANT sc_auth, sc_cliente TO sc_app WITH INHERIT FALSE, SET TRUE;
 -- Optional: an external job that re-verifies the whole AML audit log
 -- (SELECT * FROM aml.verificar_bitacora(1)) and can do nothing else.
 CREATE ROLE audit_job LOGIN PASSWORD '...';
@@ -691,7 +778,8 @@ in front for production.
 | `HTTP_MAX_CONEXIONES` | 512 | Concurrent connections; beyond this the server stops accepting instead of running out of file descriptors |
 | `HTTP_APAGADO_SEG` | 20 | Graceful shutdown deadline |
 
-Request bodies are limited to 64 KB.
+Request bodies are limited to 64 KB. Per-IP rate limits (`HTTP_LIMITE_*`) are
+described under "Request hardening, rate limits and row-level security".
 
 ## API (summary)
 

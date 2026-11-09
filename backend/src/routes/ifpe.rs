@@ -41,6 +41,7 @@ async fn cuenta(State(e): State<AppState>, u: Usuario) -> AppResult<Json<CuentaI
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Paginacion {
     limite: Option<i64>,
     antes_de: Option<i64>,

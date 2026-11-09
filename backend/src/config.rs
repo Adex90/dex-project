@@ -164,6 +164,8 @@ pub struct LimitesHttp {
     /// `X-Forwarded-For` (la que agregó el proxy). Sin proxy, nunca: cualquiera
     /// podría escribir esa cabecera.
     pub proxy_confiable: bool,
+    /// Peticiones por IP de cliente ([`crate::routes::limites`]).
+    pub por_ip: LimitesPorIp,
 }
 
 impl Default for LimitesHttp {
@@ -175,8 +177,62 @@ impl Default for LimitesHttp {
             max_conexiones: 512,
             apagado_seg: 20,
             proxy_confiable: false,
+            por_ip: LimitesPorIp::default(),
         }
     }
+}
+
+/// Cuota de un grupo de rutas: ritmo sostenido y ráfaga, por IP de cliente.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Cuota {
+    pub por_minuto: u32,
+    pub rafaga: u32,
+}
+
+/// Límites por IP del propio servicio, los mismos que el borde
+/// (`nginx/snippets/rate-limits.conf`).
+#[derive(Debug, Clone)]
+pub struct LimitesPorIp {
+    pub activo: bool,
+    /// `/api/v1/auth/*`: registro, inicio de sesión, segundo factor, contraseña.
+    pub auth: Cuota,
+    /// `POST /api/v1/kyc/verificar` (hasta 12 MB y una llamada al proveedor).
+    pub kyc: Cuota,
+    /// El resto de `/api/v1` (auth y kyc también cuentan aquí).
+    pub api: Cuota,
+    /// Webhooks de los proveedores (fuera del límite general).
+    pub webhook: Cuota,
+}
+
+impl Default for LimitesPorIp {
+    fn default() -> Self {
+        Self {
+            activo: true,
+            auth: Cuota { por_minuto: 5, rafaga: 10 },
+            kyc: Cuota { por_minuto: 4, rafaga: 4 },
+            api: Cuota { por_minuto: 600, rafaga: 50 },
+            webhook: Cuota { por_minuto: 3_000, rafaga: 200 },
+        }
+    }
+}
+
+impl Cuota {
+    /// Ni el ritmo ni la ráfaga pueden ser 0: no se atendería a nadie.
+    fn validar(self, grupo: &str) -> anyhow::Result<Self> {
+        if self.por_minuto == 0 || self.rafaga == 0 {
+            bail!("HTTP_LIMITE_{grupo}_POR_MINUTO y HTTP_LIMITE_{grupo}_RAFAGA deben ser mayores que 0");
+        }
+        Ok(self)
+    }
+}
+
+/// `HTTP_LIMITE_<GRUPO>_POR_MINUTO` y `HTTP_LIMITE_<GRUPO>_RAFAGA`.
+fn cuota(grupo: &str, defecto: Cuota) -> anyhow::Result<Cuota> {
+    Cuota {
+        por_minuto: var_o(&format!("HTTP_LIMITE_{grupo}_POR_MINUTO"), defecto.por_minuto)?,
+        rafaga: var_o(&format!("HTTP_LIMITE_{grupo}_RAFAGA"), defecto.rafaga)?,
+    }
+    .validar(grupo)
 }
 
 /// Monitoreo PLD/FT. Los umbrales y reglas viven en la base de datos (aml.reglas_riesgo,
@@ -494,6 +550,13 @@ impl Config {
                     max_conexiones: var_o("HTTP_MAX_CONEXIONES", d.max_conexiones)?.max(1),
                     apagado_seg: var_o("HTTP_APAGADO_SEG", d.apagado_seg)?,
                     proxy_confiable: var_o("HTTP_PROXY_CONFIABLE", d.proxy_confiable)?,
+                    por_ip: LimitesPorIp {
+                        activo: var_o("HTTP_LIMITE_IP", d.por_ip.activo)?,
+                        auth: cuota("AUTH", d.por_ip.auth)?,
+                        kyc: cuota("KYC", d.por_ip.kyc)?,
+                        api: cuota("API", d.por_ip.api)?,
+                        webhook: cuota("WEBHOOK", d.por_ip.webhook)?,
+                    },
                 }
             },
             kyc: {
@@ -558,7 +621,12 @@ impl Config {
             caja_cuenta: "SC-SOFOM-CAJA-001".into(),
             operador_email: None,
             operador_password: None,
-            http: LimitesHttp::default(),
+            // Las pruebas llaman al router sin conexión TCP (sin IP): los límites
+            // por IP se prueban aparte, encendidos (tests/limites.rs).
+            http: LimitesHttp {
+                por_ip: LimitesPorIp { activo: false, ..LimitesPorIp::default() },
+                ..LimitesHttp::default()
+            },
             spei: ConfigSpei {
                 webhook_secretos: vec!["secreto-webhook-spei-de-pruebas-0123456789abcdef".into()],
                 despacho_intervalo_ms: 0,
@@ -579,7 +647,14 @@ impl Config {
 mod pruebas {
     use std::{collections::HashMap, path::PathBuf};
 
-    use super::{validar_secreto_jwt, valor, LoginAplicacion, MAX_ARCHIVO};
+    use super::{validar_secreto_jwt, valor, Cuota, LoginAplicacion, MAX_ARCHIVO};
+
+    #[test]
+    fn una_cuota_en_cero_se_rechaza() {
+        assert!(Cuota { por_minuto: 5, rafaga: 10 }.validar("AUTH").is_ok());
+        assert!(Cuota { por_minuto: 0, rafaga: 10 }.validar("AUTH").is_err());
+        assert!(Cuota { por_minuto: 5, rafaga: 0 }.validar("AUTH").is_err());
+    }
 
     #[test]
     fn rechaza_secretos_debiles() {

@@ -8,7 +8,7 @@ use comun::*;
 use sqlx::{postgres::PgPoolOptions, PgPool};
 use synthetic_capital::{
     cli,
-    config::{Config, LimitesHttp},
+    config::{Config, LimitesHttp, LimitesPorIp},
     routes, servidor, AppState,
 };
 use tokio::{
@@ -53,6 +53,8 @@ fn limites() -> LimitesHttp {
         max_conexiones: 64,
         apagado_seg: 1,
         proxy_confiable: false,
+        // Aquí se prueban plazos y conexiones; los límites por IP, en tests/limites.rs.
+        por_ip: LimitesPorIp { activo: false, ..LimitesPorIp::default() },
     }
 }
 

@@ -1,0 +1,23 @@
+# cargo audit: Cargo.lock against the RustSec advisory database. The `audit` stage of
+# backend/Dockerfile runs it on every image build, and the build fails on any known
+# vulnerability, unsound crate or yanked version. Unmaintained crates are reported but
+# do not fail the build. Locally, from backend/: cargo audit
+#
+# An exception goes in `ignore` only with its ticket in a comment: the advisory, why it
+# does not apply here or why there is no fix yet, who approved it and when it expires.
+# Prefer updating the dependency (cargo update -p <crate>) to ignoring the advisory.
+
+[advisories]
+ignore = [
+    # RUSTSEC-2023-0071, rsa (Marvin attack; no fixed version). rsa is in Cargo.lock only
+    # through sqlx's optional MySQL driver, which this crate never enables: the lockfile
+    # lists every optional dependency, but `cargo tree -i rsa` is empty, so the code is
+    # never compiled. backend/Dockerfile fails the build if rsa ever enters the build
+    # graph, which would make this exception stale. Approved with the dependency-audit
+    # change; review when sqlx moves to 0.9.
+    "RUSTSEC-2023-0071",
+]
+
+[output]
+deny = ["unsound", "yanked"]
+quiet = false

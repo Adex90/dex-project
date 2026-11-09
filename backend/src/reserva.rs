@@ -399,6 +399,7 @@ fn hoja_de_fila(h: &HojaCorte) -> AppResult<Hoja> {
 // -----------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct HojaJson {
     pub cuenta_id: Uuid,
     /// Saldo con 8 decimales (las unidades del árbol son este valor × 10^8).
@@ -410,6 +411,7 @@ pub struct HojaJson {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PasoJson {
     pub lado: Lado,
     pub hash: String,
@@ -557,6 +559,7 @@ async fn prueba_en_ultimo_corte(
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SolicitudVerificacion {
     pub corte_id: Uuid,
     pub hoja: HojaJson,

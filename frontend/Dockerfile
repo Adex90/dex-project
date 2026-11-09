@@ -26,6 +26,12 @@
 #   --secret id=extra_ca,src=/path/to/corporate-ca.pem
 # plus the usual HTTPS_PROXY/HTTP_PROXY/NO_PROXY build args (predefined by BuildKit and
 # kept out of the image history).
+#
+# Dependency audit: the `audit` stage runs `npm audit` against the registry's advisory
+# database and the build fails on a moderate or worse advisory in a runtime dependency,
+# or a high or worse one anywhere in the tree (build tools run code during the build).
+# It runs alongside the build. CI passes --build-arg AUDIT_EPOCH=<run id> so a cached
+# layer never hides a new advisory.
 
 FROM docker.io/library/node:22.23.4-trixie-slim@sha256:2117f713a417f3aff682ac8f5bc2ebbdf1beed51f36e67ab1e0fd3866b6d2d8f AS node
 
@@ -46,6 +52,22 @@ RUN --mount=type=secret,id=extra_ca,required=false \
     --mount=type=cache,target=/root/.npm,sharing=locked \
     if [ -s /run/secrets/extra_ca ]; then export NODE_EXTRA_CA_CERTS=/run/secrets/extra_ca; fi; \
     npm ci --ignore-scripts
+
+# ---------------------------------------------------------------------------------------
+# audit: package-lock.json against the npm advisory database (no install needed).
+# ---------------------------------------------------------------------------------------
+FROM node AS audit
+WORKDIR /audit
+ENV npm_config_fund=false \
+    npm_config_update_notifier=false
+COPY package.json package-lock.json ./
+ARG AUDIT_EPOCH=local
+RUN --mount=type=secret,id=extra_ca,required=false \
+    if [ -s /run/secrets/extra_ca ]; then export NODE_EXTRA_CA_CERTS=/run/secrets/extra_ca; fi; \
+    echo "npm audit (${AUDIT_EPOCH})" \
+ && npm audit --omit=dev --audit-level=moderate \
+ && npm audit --audit-level=high \
+ && touch /audit.ok
 
 # ---------------------------------------------------------------------------------------
 # build: `next build` with output: "standalone" (toggled by NEXT_OUTPUT in next.config.ts).
@@ -80,6 +102,8 @@ RUN case "${NEXT_PUBLIC_API_URL:-}" in \
     cp -a .next/standalone/. /out/; \
     cp -a .next/static /out/.next/static; \
     if [ -d public ]; then cp -a public /out/public; fi
+# Gate: no image without a passing dependency audit (the marker stays in this stage).
+COPY --from=audit /audit.ok /tmp/audit.ok
 
 # ---------------------------------------------------------------------------------------
 # runtime: distroless Node.js 22 (no shell, no package manager), uid/gid 65532.

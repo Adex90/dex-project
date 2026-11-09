@@ -69,6 +69,10 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "serd
 thiserror = "2"
 # IP del cliente (ConnectInfo) en cada petición.
 tower = { version = "0.5", features = ["util", "limit"] }
+# Límite de peticiones por IP (routes/limites.rs): la capa de Tower sobre governor (GCRA).
+# governor aparte solo para nombrar sus tipos; la misma versión que usa tower_governor.
+tower_governor = { version = "0.8", default-features = false, features = ["axum"] }
+governor = "0.10"
 # Nombres en NFC antes de cotejarlos (CURP, OCR, MRZ).
 unicode-normalization = "0.1"
 anyhow = "1"
