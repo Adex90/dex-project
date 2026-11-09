@@ -18,12 +18,15 @@ function useSecondsSince(timestamp: number | null): number | null {
 }
 
 export function DashboardHeader({
+  title,
   client,
   lastUpdated,
   refreshing,
   onRefresh,
   onLogout,
 }: {
+  /** The section on screen (the page's heading). */
+  title: string;
   client: Cliente | null;
   lastUpdated: number | null;
   refreshing: boolean;
@@ -36,14 +39,20 @@ export function DashboardHeader({
     : null;
 
   return (
-    <header className="sticky top-0 z-20 border-b border-border bg-bg/85 backdrop-blur">
-      <div className="mx-auto flex h-14 max-w-7xl items-center justify-between gap-4 px-4 sm:px-6">
-        <Brand href="/dashboard" />
+    <header className="sticky top-0 z-20 border-b border-border bg-bg/85 backdrop-blur-md">
+      <div className="mx-auto flex h-16 max-w-7xl items-center justify-between gap-4 px-4 sm:px-6">
+        <div className="flex min-w-0 items-center gap-3">
+          {/* From lg up the sidebar carries the brand: the header names the section. */}
+          <span className="shrink-0 lg:hidden">
+            <Brand href="/dashboard" compact />
+          </span>
+          <h1 className="truncate text-lg font-semibold tracking-tight text-ink">{title}</h1>
+        </div>
         <div className="flex items-center gap-2 sm:gap-3">
           <span className="hidden items-center gap-1.5 text-xs text-muted sm:inline-flex" aria-live="polite">
             <span className="relative flex size-2">
-              <span className="absolute inline-flex size-full animate-ping rounded-full bg-verified opacity-60" />
-              <span className="relative inline-flex size-2 rounded-full bg-verified" />
+              <span className="absolute inline-flex size-full rounded-full bg-synthetic-yellow opacity-60 motion-safe:animate-ping" />
+              <span className="relative inline-flex size-2 rounded-full bg-synthetic-yellow" />
             </span>
             Live{seconds !== null ? ` · updated ${seconds}s ago` : ""}
           </span>
@@ -57,7 +66,8 @@ export function DashboardHeader({
             </div>
           ) : null}
           {client ? <KycHeaderBadge status={client.estatus_kyc} /> : null}
-          <Button variant="secondary" size="sm" onClick={onLogout}>
+          {/* Named for screen readers on phones too, where only the icon shows. */}
+          <Button variant="secondary" size="sm" onClick={onLogout} aria-label="Sign out">
             <LogOut className="size-3.5" aria-hidden />
             <span className="hidden sm:inline">Sign out</span>
           </Button>

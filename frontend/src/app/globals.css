@@ -1,53 +1,69 @@
 @import "tailwindcss";
 
 /*
- * Design tokens. Ink and parchment with a gold accent (sound money) and an
- * emerald "verified" signal. Light and dark palettes share token names.
+ * "Sovereign Gold": the Synthetic Capital identity, an Austrian-school bank.
+ *
+ * One dark theme: a deep black ground, charcoal surfaces, and one brand color,
+ * Synthetic Capital Yellow, for everything the brand owns: primary actions,
+ * active states and icons, focus rings, selection and highlights. Color is
+ * otherwise reserved for meaning: green and red for money gained and lost
+ * (and for verified and failed states), orange for warnings, so nothing
+ * competes with the yellow.
+ *
+ * Contrast (WCAG 2.2): the yellow is 10.9:1 on black and 9.8:1 on charcoal,
+ * and black text on the yellow is 10.9:1; muted text is 7.4:1 on charcoal;
+ * the strong border (inputs, outlined buttons) is 3.3:1.
  */
-:root {
-  --bg: #f6f4ef;
-  --surface: #ffffff;
-  --surface-2: #f1eee6;
-  --border: #e2ddd1;
-  --border-strong: #cfc8b8;
-  --ink: #16181d;
-  --ink-2: #3b3f48;
-  --muted: #6b6f78;
-  --accent: #9a6b14;
-  --accent-ink: #ffffff;
-  --accent-soft: #f5ead2;
-  --verified: #0f7a52;
-  --verified-soft: #dff3ea;
-  --danger: #b42318;
-  --danger-soft: #fde7e4;
-  --warning: #a15c07;
-  --warning-soft: #fdf0d8;
-  --info: #1d4f91;
-  --info-soft: #e3ecf8;
+
+/* The app is always dark: `dark:` utilities always apply. */
+@custom-variant dark (&:where(.dark, .dark *));
+
+/*
+ * Brand primitives. `static`: always emitted as CSS variables, so SVG and
+ * inline styles can use them too (the portfolio chart strokes its line with
+ * var(--color-synthetic-yellow)). Utilities: bg-synthetic-yellow,
+ * text-synthetic-yellow, ring-synthetic-yellow, bg-synthetic-yellow/10, ...
+ */
+@theme static {
+  --color-synthetic-yellow: #eab308;
+  --color-synthetic-yellow-hover: #facc15;
+  --color-synthetic-yellow-pressed: #ca8a04;
+  --color-charcoal: #121212;
+  --color-charcoal-raised: #1b1b1b;
 }
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    --bg: #0d0f13;
-    --surface: #14171d;
-    --surface-2: #1a1e25;
-    --border: #262b34;
-    --border-strong: #353b47;
-    --ink: #eef0f3;
-    --ink-2: #c7cbd3;
-    --muted: #8b919c;
-    --accent: #d9a84a;
-    --accent-ink: #14110a;
-    --accent-soft: #2a2213;
-    --verified: #34c48b;
-    --verified-soft: #0f2a20;
-    --danger: #f2705f;
-    --danger-soft: #34160f;
-    --warning: #f0b453;
-    --warning-soft: #2e2210;
-    --info: #7fb0f0;
-    --info-soft: #132034;
-  }
+/* Semantic tokens: what components use. */
+:root {
+  /* Ground and surfaces: black, then charcoal steps for cards and what sits on them. */
+  --bg: #000000;
+  --surface: var(--color-charcoal);
+  --surface-2: var(--color-charcoal-raised);
+  --border: #262626;
+  --border-strong: #666666;
+
+  /* Text. */
+  --ink: #fafafa;
+  --ink-2: #d4d4d4;
+  --muted: #a3a3a3;
+
+  /* Brand: the yellow, black text on it, and a tint for quiet backgrounds. */
+  --accent: var(--color-synthetic-yellow);
+  --accent-ink: #000000;
+  --accent-soft: #2b2306;
+
+  /* Money gained and lost (profit and loss). */
+  --gain: #34d399;
+  --loss: #f87171;
+
+  /* States. */
+  --verified: #34d399;
+  --verified-soft: #0c2a1f;
+  --danger: #f87171;
+  --danger-soft: #2f1414;
+  --warning: #fb923c;
+  --warning-soft: #301b0c;
+  --info: #7fb0f0;
+  --info-soft: #132034;
 }
 
 @theme inline {
@@ -62,6 +78,8 @@
   --color-accent: var(--accent);
   --color-accent-ink: var(--accent-ink);
   --color-accent-soft: var(--accent-soft);
+  --color-gain: var(--gain);
+  --color-loss: var(--loss);
   --color-verified: var(--verified);
   --color-verified-soft: var(--verified-soft);
   --color-danger: var(--danger);
@@ -75,7 +93,7 @@
 }
 
 html {
-  color-scheme: light dark;
+  color-scheme: dark;
 }
 
 body {
@@ -86,7 +104,8 @@ body {
 }
 
 ::selection {
-  background: var(--accent-soft);
+  background: var(--accent);
+  color: var(--accent-ink);
 }
 
 @keyframes reveal {

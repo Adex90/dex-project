@@ -11,15 +11,14 @@ export const metadata: Metadata = {
 };
 
 export const viewport: Viewport = {
-  themeColor: [
-    { media: "(prefers-color-scheme: light)", color: "#f6f4ef" },
-    { media: "(prefers-color-scheme: dark)", color: "#0d0f13" },
-  ],
+  // "Sovereign Gold" is dark only (globals.css): the browser chrome matches the black ground.
+  themeColor: "#000000",
+  colorScheme: "dark",
 };
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {
   return (
-    <html lang="en" className={`${GeistSans.variable} ${GeistMono.variable}`}>
+    <html lang="en" className={`dark ${GeistSans.variable} ${GeistMono.variable}`}>
       <body className="min-h-dvh font-sans antialiased">{children}</body>
     </html>
   );

@@ -9,10 +9,14 @@
  * install) and a Chromium build (PLAYWRIGHT_BROWSERS_PATH). Chromium runs with
  * a fake camera (an animated test pattern), so the liveness frames differ.
  *
- * Light pass: landing -> sign-up -> KYC-locked dashboard -> full onboarding
+ * First pass: landing -> sign-up -> KYC-locked dashboard -> full onboarding
  * (personal data, INE photos and details, biometric consent + liveness) ->
- * VERIFICADO -> deposit, fixed-term investment, Proof of Reserve, ledger.
- * Dark pass: signing in again lands directly on the dashboard.
+ * VERIFICADO -> deposit, fixed-term investment, Proof of Reserve, ledger,
+ * moving between the dashboard's tabs (Vault, Account, Invest, Reserve).
+ * Second pass: signing in again lands directly on the Vault, then the same
+ * dashboard on a phone-sized screen (bottom tab bar instead of the sidebar).
+ * The theme is dark only ("Sovereign Gold"); the passes still differ in the
+ * browser's preferred color scheme, which must not change it.
  */
 import { createRequire } from "node:module";
 import { mkdirSync } from "node:fs";
@@ -42,6 +46,17 @@ const errors = [];
 function check(condition, message) {
   if (!condition) throw new Error(`FAILED: ${message}`);
   console.log(`ok - ${message}`);
+}
+
+/** The dashboard's main navigation (the sidebar from lg up, the bottom tab bar below). */
+const mainNav = (page) => page.getByRole("navigation", { name: "Main" });
+
+/** Opens a dashboard tab from the main navigation and checks it is marked current. */
+async function openTab(page, name) {
+  const link = mainNav(page).getByRole("link", { name, exact: true });
+  await link.click();
+  await page.waitForURL(name === "Vault" ? "**/dashboard" : `**/dashboard/${name.toLowerCase()}`);
+  check((await link.getAttribute("aria-current")) === "page", `the ${name} tab is the current page`);
 }
 
 /** Full-page screenshot once finite animations (step reveal, transitions) have finished. */
@@ -118,14 +133,35 @@ try {
       await page.click("button[type=submit]");
       await page.waitForURL("**/dashboard");
       check(true, "a verified client signs in straight to the dashboard (no onboarding detour)");
-      await page.getByTestId("vault-available").filter({ hasText: "15,000.00" }).waitFor();
+      // The Vault home: 15,000 cash plus 10,000 invested, under the reserve seal of the first pass's cut.
+      await page.getByTestId("vault-total").filter({ hasText: "25,000" }).waitFor();
+      await page.getByTestId("reserve-badge").and(page.locator("[data-status=verified]")).waitFor();
+      check(
+        (await page.getByTestId("reserve-badge").innerText()).includes("100% Reserve Verified"),
+        "the vault shows the verified reserve seal",
+      );
       await page.getByTestId("kyc-header-badge").and(page.locator("[data-status=VERIFICADO]")).waitFor();
-      check((await page.getByTestId("kyc-banner").count()) === 0, "dark mode: no KYC banner for the verified client");
+      check((await page.getByTestId("kyc-banner").count()) === 0, "second pass: no KYC banner for the verified client");
+      await shot(page, "vault-desktop");
+      await openTab(page, "Account");
+      await page.getByTestId("vault-available").filter({ hasText: "15,000.00" }).waitFor();
+      check(true, "the Account tab shows the cash balance");
+
+      // A phone: the sidebar gives way to the bottom tab bar.
+      await page.setViewportSize({ width: 390, height: 844 });
+      const tabBar = mainNav(page);
+      const box = await tabBar.boundingBox();
+      check(box !== null && box.y + box.height >= 844 - 1 && box.width === 390, "phones get the bottom tab bar");
+      await openTab(page, "Vault");
+      await page.getByTestId("vault-total").filter({ hasText: "25,000" }).waitFor();
+      await page.getByTestId("portfolio-line").waitFor();
+      await shot(page, "vault-mobile");
+      await openTab(page, "Reserve");
       await page.getByRole("button", { name: "Verify My Merkle Proof" }).click();
       await page.getByTestId("proof-verdict").waitFor({ timeout: 15_000 });
       await page.waitForTimeout(1500);
-      await shot(page, "dashboard-dark");
-      check(true, "dark mode dashboard renders after sign-in");
+      await shot(page, "reserve-mobile");
+      check(true, "the dashboard works on a phone-sized screen");
       await context.close();
       continue;
     }
@@ -157,13 +193,24 @@ try {
     await page.goto(`${BASE}/dashboard`);
     const banner = page.getByTestId("kyc-banner");
     await banner.waitFor();
-    await page.getByTestId("vault-available").filter({ hasText: "0.00" }).waitFor();
     check((await banner.getAttribute("data-status")) === "PENDIENTE", "dashboard shows the KYC banner (pending)");
     const headerBadge = page.getByTestId("kyc-header-badge");
+    await headerBadge.waitFor();
     check(
       (await headerBadge.getAttribute("data-status")) === "PENDIENTE" && (await headerBadge.innerText()).includes("Pending"),
       "header badge reads Pending",
     );
+    // The Vault home offers no CLABE to deposit to: the bank would return the transfer.
+    check(
+      (await mainNav(page).getByRole("link", { name: "Vault", exact: true }).getAttribute("aria-current")) === "page",
+      "the dashboard opens on the Vault tab",
+    );
+    await page.getByTestId("vault-deposit-locked").waitFor();
+    check((await page.getByTestId("spei-copy").count()) === 0, "the vault offers no CLABE to copy until verified");
+    await shot(page, "dashboard-kyc-pending");
+
+    await openTab(page, "Account");
+    await page.getByTestId("vault-available").filter({ hasText: "0.00" }).waitFor();
     check(await page.getByText("100% Fully Backed in Custody").isVisible(), "vault shows the 100% backed badge");
     check(
       (await page.getByTestId("deposit-locked").getAttribute("aria-disabled")) === "true",
@@ -172,12 +219,12 @@ try {
     // Playwright treats aria-disabled as disabled, so force the click to prove it does nothing.
     await page.getByTestId("deposit-locked").click({ force: true });
     check((await page.locator("#demo-amount").count()) === 0, "clicking the locked deposit control opens no deposit form");
+    await openTab(page, "Invest");
     check(await page.locator("#bridge-amount").isDisabled(), "investment amount is disabled until verified");
     check(
       await page.getByRole("button", { name: /Lock funds/ }).isDisabled(),
       "investment submit is disabled until verified",
     );
-    await shot(page, "dashboard-kyc-pending");
 
     // ---------------------------------------------------------------------
     // Onboarding step 1: personal data (a unique, valid identity).
@@ -389,6 +436,22 @@ try {
     // ---------------------------------------------------------------------
     await page.getByTestId("kyc-header-badge").and(page.locator("[data-status=VERIFICADO]")).waitFor();
     check((await page.getByTestId("kyc-banner").count()) === 0, "KYC banner is gone once verified");
+
+    // The Vault offers the CLABE: one tap copies it, on a solid yellow button.
+    // (The pointer moves away first: a hover would brighten the yellow.)
+    await page.mouse.move(0, 0);
+    const copy = page.getByTestId("spei-copy");
+    await copy.waitFor();
+    check(
+      (await copy.evaluate((el) => getComputedStyle(el).backgroundColor)) === "rgb(234, 179, 8)",
+      "Copy CLABE is solid Synthetic Capital Yellow",
+    );
+    await copy.click();
+    await copy.filter({ hasText: "Copied!" }).waitFor();
+    check(true, "Copy CLABE confirms the copy");
+    check((await page.getByTestId("asset-list-empty").count()) === 1, "the asset list shows its empty state");
+
+    await openTab(page, "Account");
     check((await page.getByTestId("deposit-locked").count()) === 0, "deposit control is unlocked");
 
     // Demo SPEI deposit.
@@ -399,6 +462,7 @@ try {
     check(true, "simulated deposit credits the vault");
 
     // IFPE -> SOFOM bridge.
+    await openTab(page, "Invest");
     check(await page.locator("#bridge-amount").isEnabled(), "investment form is enabled once verified");
     await page.fill("#bridge-amount", "10000");
     await page.getByText("182d").click();
@@ -407,11 +471,13 @@ try {
     await page.getByLabel(/no early withdrawal/).check();
     await page.getByRole("button", { name: /Lock funds/ }).click();
     await page.getByText(/Contract #\d+ created/).waitFor();
-    await page.getByTestId("vault-available").filter({ hasText: "15,000.00" }).waitFor();
     await page.getByTestId("sofom-locked").filter({ hasText: "10,000.00" }).waitFor();
+    await openTab(page, "Account");
+    await page.getByTestId("vault-available").filter({ hasText: "15,000.00" }).waitFor();
     check(true, "bridge moves 10,000 from the vault into a mutuum contract");
 
     // Proof of Reserve.
+    await openTab(page, "Reserve");
     await page.getByRole("button", { name: "Verify My Merkle Proof" }).click();
     const proof = page.getByTestId("proof-verdict");
     await proof.waitFor({ timeout: 15_000 });
@@ -420,6 +486,7 @@ try {
     check(true, "server-side verification agrees");
 
     // Immutable ledger feed.
+    await openTab(page, "Account");
     const rows = page.locator("tbody tr");
     await rows.nth(1).waitFor();
     check((await rows.count()) === 2, "ledger feed lists the deposit and the transfer to fixed term");
@@ -427,10 +494,29 @@ try {
     await rows.first().click();
     await page.getByText("Previous hash (chain link)").waitFor();
     check(true, "ledger row expands to show the hash chain");
-    await shot(page, "dashboard-light");
+    await shot(page, "dashboard-account");
+
+    // The Vault home after it all: 15,000 cash and 10,000 invested, and the cash line drawn in yellow.
+    await openTab(page, "Vault");
+    await page.getByRole("button", { name: "Refresh balances" }).click();
+    await page.getByTestId("vault-total").filter({ hasText: "25,000" }).waitFor();
+    const line = page.getByTestId("portfolio-line");
+    await line.waitFor();
+    check(
+      (await line.evaluate((el) => getComputedStyle(el).stroke)) === "rgb(234, 179, 8)",
+      "the balance line is drawn in Synthetic Capital Yellow",
+    );
+    check(
+      (await page.getByTestId("portfolio-chart").innerText()).includes("15,000.00"),
+      "the chart reads the current cash balance",
+    );
+    await shot(page, "vault-desktop-first-pass");
 
     // A dishonest server: a private root (differs from the public copy of the
     // cut) or a leaf for another account must both fail in the browser.
+    await openTab(page, "Reserve");
+    await page.getByRole("button", { name: "Verify My Merkle Proof" }).click();
+    await page.getByTestId("proof-verdict").waitFor({ timeout: 15_000 });
     const tamper = async (pattern, edit) => {
       await page.route(pattern, async (route) => {
         const response = await route.fetch();
@@ -450,8 +536,9 @@ try {
     }));
     check(issues.includes("different account"), "a proof for another account fails verification");
 
-    // Overdraft attempt through the bridge is blocked client-side.
-    await page.getByRole("button", { name: "Make another investment" }).click();
+    // Overdraft attempt through the bridge is blocked client-side. Back on the
+    // Invest tab the form starts fresh (the receipt stayed with the old page).
+    await openTab(page, "Invest");
     await page.fill("#bridge-amount", "15000.01");
     check(await page.getByText("More than your available vault balance.").isVisible(), "bridge blocks amounts above the balance");
 

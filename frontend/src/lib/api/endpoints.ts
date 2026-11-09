@@ -76,6 +76,12 @@ export const api = {
 
   dashboard: (token: string, signal?: AbortSignal) => request<Tablero>("/api/v1/tablero", { token, signal }),
 
+  /**
+   * The Sovereign Vault snapshot (src/types/vault.ts). Untyped on purpose:
+   * `useVaultStore.load` validates the body before anything renders it.
+   */
+  vault: (token: string, signal?: AbortSignal) => request<unknown>("/api/v1/vault", { token, signal }),
+
   movements: (token: string, params: { limit?: number; before?: number } = {}, signal?: AbortSignal) =>
     request<TransaccionIfpe[]>("/api/v1/ifpe/movimientos", {
       token,

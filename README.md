@@ -592,7 +592,8 @@ into `aml.alertas` and `GET /api/v1/operaciones/alertas` was removed.
 
 The dashboard's vault (Bóveda Soberana) comes from two client-only routes in
 the `API` rate-limit group. Their JSON contract is
-`frontend/src/types/vault.ts`.
+`frontend/src/types/vault.ts`; the dashboard's home tab (`/dashboard`) renders
+it, with a cash-balance chart rebuilt from the IFPE ledger.
 
 - **`GET /api/v1/vault`** returns the whole vault in one call, read as the
   client with row-level security (`sc_cliente`, one REPEATABLE READ snapshot):
@@ -707,7 +708,8 @@ backend/      Rust: axum + sqlx + tokio
   src/spei/              CLABE, signed SPEI webhooks, outbound dispatcher, gateway
   src/boveda/            Sovereign Vault: snapshot, LISTEN/NOTIFY fan-out, WebSocket
   src/routes/            HTTP API (/api/v1)
-frontend/     Next.js dashboard (Task 3)
+frontend/     Next.js app: the client dashboard (tabs Vault, Account, Invest, Reserve), onboarding,
+              the compliance console; "Sovereign Gold" theme tokens in src/app/globals.css
 tests/db/     SQL invariant tests for the schema
 terraform/    AWS reference architecture (VPC, RDS, ECS Fargate, ALB + WAF)
 nginx/        TLS edge for the single-host deployment

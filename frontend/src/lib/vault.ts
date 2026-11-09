@@ -62,6 +62,15 @@ export function moneyParts(value: DecimalString, decimals = 2): MoneyParts {
   return { negative, integer, fraction };
 }
 
+/**
+ * A quantity of shares or units: at most `maxDecimals` places (half-even),
+ * without trailing zeros. "12.50000000" gives "12.5"; "7000" gives "7,000".
+ */
+export function formatShares(value: DecimalString, maxDecimals = 4): string {
+  const shown = formatAmount(value, maxDecimals);
+  return shown.includes(".") ? shown.replace(/\.?0+$/, "") : shown;
+}
+
 /** "0x3f9a2b…c21b": enough to recognize a hash at a glance. Show the full value on demand. */
 export function shortHash(hash: string, head = 6, tail = 4): string {
   const prefix = hash.startsWith("0x") ? "0x" : "";

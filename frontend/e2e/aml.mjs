@@ -293,7 +293,18 @@ async function withResponse(page, pred, action, timeout = 20_000) {
   const [r] = await Promise.all([page.waitForResponse(pred, { timeout }), action()]);
   return r;
 }
+/** Opens a client dashboard tab from its main navigation (the sidebar at this viewport). */
+async function openTab(page, name) {
+  await page.getByRole("navigation", { name: "Main" }).getByRole("link", { name, exact: true }).click();
+  await page.waitForURL(name === "Vault" ? "**/dashboard" : `**/dashboard/${name.toLowerCase()}`);
+}
+/** The tipping-off words in the text of the client page on screen. */
+async function tipOffWords(page) {
+  return [...(await page.locator("main").innerText()).matchAll(TIP_OFF)].map((m) => m[0]);
+}
 async function demoDeposit(page, amount) {
+  // The demo deposit lives on the Account tab's vault card.
+  if (new URL(page.url()).pathname !== "/dashboard/account") await openTab(page, "Account");
   await page.getByRole("button", { name: /Add funds/ }).click();
   await page.fill("#demo-amount", amount);
   const r = await withResponse(page, (x) => x.url().includes("/ifpe/depositos/simulados") && x.request().method() === "POST", () =>
@@ -485,11 +496,19 @@ try {
   const hits = [...vaultText.matchAll(TIP_OFF)].map((m) => m[0]);
   check(hits.length === 0, `dashboard text has no tipping-off words (${hits.join(", ") || "none"})`, hits);
   await shot(cp, "client-dashboard-frozen");
+  // The Vault home (balance, reserve seal, deposit card, chart) must not tip off either.
+  await openTab(cp, "Vault");
+  await cp.getByTestId("vault-total").waitFor();
+  await cp.getByTestId("spei-copy").waitFor();
+  const homeHits = await tipOffWords(cp);
+  check(homeHits.length === 0, `vault home text has no tipping-off words (${homeHits.join(", ") || "none"})`, homeHits);
+  await shot(cp, "client-vault-frozen");
 
   // =========================================================================
   phase("4-client-operations-refused");
   // =========================================================================
   // Invest through the UI.
+  await openTab(cp, "Invest");
   await cp.fill("#bridge-amount", "1000");
   await cp.getByText("182d").click();
   await cp.getByLabel(/no early withdrawal/).check();
@@ -682,7 +701,7 @@ try {
   await shot(cp, "cliente-admin-blocked");
   const cliAml = await pageFetch(cp, "GET", "/api/v1/aml/alertas");
   check(cliAml.status === 403, `CLIENTE GET /aml/alertas answered ${cliAml.status}`);
-  await cp.goto(`${BASE}/dashboard`);
+  await cp.goto(`${BASE}/dashboard/account`);
   await cp.getByTestId("vault-available").waitFor();
 
   const opCtx = await newContext("operator");
@@ -748,6 +767,7 @@ try {
   const tab2 = lastResponse((e) => e.label === "client" && e.path === "/api/v1/tablero" && e.status === 200);
   check(/^0(\.0+)?$/.test(tab2?.resBody?.boveda?.saldo_bloqueado ?? "x"), `held funds released (saldo_bloqueado ${tab2?.resBody?.boveda?.saldo_bloqueado})`);
   check((await cp.getByText(/on hold \(still fully backed\)/).count()) === 0, "no hold line on the vault after release");
+  await openTab(cp, "Invest");
   await cp.fill("#bridge-amount", "1000");
   await cp.getByText("182d").click();
   await cp.getByLabel(/no early withdrawal/).check();
@@ -758,10 +778,17 @@ try {
   await cp.getByText(/Contract #\d+ created/).waitFor({ timeout: 10_000 }).catch(() => undefined);
   const tr2 = await pageFetch(cp, "POST", "/api/v1/ifpe/transferencias", { clabe_destino: internalClabe, monto: "100.00", clave_idempotencia: crypto.randomUUID() });
   check(tr2.body?.error?.codigo !== "OPERACION_NO_DISPONIBLE", `transfer after the approval answered ${tr2.status} ${tr2.body?.error?.codigo ?? "ok"}`, tr2.body);
-  const ledgerText = await cp.locator("main").innerText();
-  const hits2 = [...ledgerText.matchAll(TIP_OFF)].map((m) => m[0]);
+  // The ledger (Account) and the Vault home, after it all.
+  await openTab(cp, "Account");
+  await cp.getByTestId("vault-available").waitFor();
+  await cp.locator("tbody tr").first().waitFor();
+  const hits2 = await tipOffWords(cp);
   check(hits2.length === 0, `dashboard after release has no tipping-off words (${hits2.join(", ") || "none"})`);
   await shot(cp, "client-dashboard-released");
+  await openTab(cp, "Vault");
+  await cp.getByTestId("vault-total").waitFor();
+  const homeHits2 = await tipOffWords(cp);
+  check(homeHits2.length === 0, `vault home after release has no tipping-off words (${homeHits2.join(", ") || "none"})`, homeHits2);
 
   // =========================================================================
   phase("10-new-alert-reaches-open-console");

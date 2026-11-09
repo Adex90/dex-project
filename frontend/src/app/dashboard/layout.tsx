@@ -3,17 +3,21 @@
 import { Loader2 } from "lucide-react";
 import Link from "next/link";
 
+import { DashboardShell } from "@/components/layout/dashboard-shell";
 import { homeForStaff } from "@/hooks/use-client-home";
 import { useSession } from "@/hooks/use-session";
 
-/** Client-side guard: only authenticated account holders see the dashboard. */
+/**
+ * Client-side guard: only authenticated account holders see the dashboard,
+ * inside its shell (navigation, header, data).
+ */
 export default function DashboardLayout({ children }: { children: React.ReactNode }) {
   const { hydrated, valid, role, logout } = useSession({ redirect: true });
 
   if (!hydrated || !valid) {
     return (
       <div className="flex min-h-dvh items-center justify-center text-sm text-muted">
-        <Loader2 className="mr-2 size-4 animate-spin" aria-hidden /> Checking your session…
+        <Loader2 className="mr-2 size-4 animate-spin text-synthetic-yellow" aria-hidden /> Checking your session…
       </div>
     );
   }
@@ -39,5 +43,5 @@ export default function DashboardLayout({ children }: { children: React.ReactNod
       </div>
     );
   }
-  return <>{children}</>;
+  return <DashboardShell>{children}</DashboardShell>;
 }

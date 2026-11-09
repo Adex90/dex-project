@@ -4,6 +4,7 @@ import { test } from "node:test";
 
 import type { VaultSnapshot } from "../types/vault.ts";
 import {
+  formatShares,
   isDecimalString,
   moneyParts,
   parseRealtimeMessage,
@@ -72,6 +73,14 @@ test("money splits into grouped integer and cents, exactly", () => {
   });
   assert.deepEqual(moneyParts("-5"), { negative: true, integer: "5", fraction: "00" });
   assert.deepEqual(moneyParts("1234.5", 0), { negative: false, integer: "1,234", fraction: "" });
+});
+
+test("share quantities: up to 4 places, half-even, without trailing zeros", () => {
+  assert.equal(formatShares("12.50000000"), "12.5");
+  assert.equal(formatShares("7000"), "7,000");
+  assert.equal(formatShares("0.123456"), "0.1235");
+  assert.equal(formatShares("1.00005"), "1", "a tie rounds to even");
+  assert.equal(formatShares("0.5", 0), "0", "half-even to zero places");
 });
 
 test("hashes shorten around an ellipsis and keep the 0x prefix", () => {
