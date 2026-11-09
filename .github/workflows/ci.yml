@@ -164,6 +164,23 @@ jobs:
           SELECT pg_reload_conf();
           SQL
 
+      # sqlx::test migrates a new database for every test, and runs the tests in
+      # parallel. Roles belong to the cluster, so on this fresh cluster the first tests'
+      # migrations race to CREATE ROLE the same sc_* role (duplicate key in pg_authid)
+      # and fail before their test starts. Migrating one throwaway database first creates
+      # the roles; the tests' migrations then find them and write no shared catalog.
+      - name: Create the shared sc_* roles once (all migrations on a throwaway database)
+        id: roles
+        env:
+          PGUSER: synthetic
+          PGPASSWORD: synthetic
+        run: |
+          psql -X -q -v ON_ERROR_STOP=1 -d postgres -c "CREATE DATABASE ci_roles ENCODING 'UTF8' TEMPLATE template0"
+          for migration in migrations/0*.sql; do
+            psql -X -q -v ON_ERROR_STOP=1 --single-transaction -d ci_roles -f "${migration}" >/dev/null
+          done
+          psql -X -q -v ON_ERROR_STOP=1 -d postgres -c "DROP DATABASE ci_roles"
+
       - name: Install Rust ${{ env.RUST_TOOLCHAIN }}
         id: rust
         run: |
@@ -191,7 +208,7 @@ jobs:
         run: cargo clippy --all-targets --locked -- -D warnings
 
       - name: cargo test
-        if: ${{ !cancelled() && steps.rust.outcome == 'success' && steps.role.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.rust.outcome == 'success' && steps.role.outcome == 'success' && steps.roles.outcome == 'success' }}
         working-directory: backend
         # sqlx::test gives every test a fresh database with all migrations applied.
         run: cargo test --locked --no-fail-fast

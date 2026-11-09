@@ -622,7 +622,9 @@ docker compose -f docker-compose.dev.yml up -d   # PostgreSQL 16 on 127.0.0.1:54
 cd backend && cargo run                       # applies migrations and starts on :8080
 ```
 
-Tests (need a user with `CREATEDB` and `CREATEROLE`):
+Tests (need a user with `CREATEDB` and `CREATEROLE`). On a brand-new PostgreSQL cluster, run
+the migrations once first (`cargo run`, above, does it): the tests migrate their databases
+in parallel and would otherwise race to create the cluster-wide `sc_*` roles. CI does the same.
 
 ```bash
 cd backend && DATABASE_URL=postgres://synthetic:synthetic@localhost:5432/synthetic_capital cargo test
