@@ -76,7 +76,7 @@ export function KycHeaderBadge({ status }: { status: EstatusKyc }) {
   return (
     <Link
       href={ONBOARDING_PATH}
-      className="inline-flex rounded-full focus-visible:ring-2 focus-visible:ring-accent focus-visible:outline-none"
+      className="inline-flex rounded-sm focus-visible:ring-2 focus-visible:ring-accent focus-visible:outline-none"
       data-testid="kyc-header-badge"
       data-status={status}
       title={`${title}. Open verification`}

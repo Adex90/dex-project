@@ -143,7 +143,7 @@ function ChartSkeleton() {
       <span className="sr-only">Loading your balance history…</span>
       <div aria-hidden className="motion-safe:animate-pulse">
         <div className="flex items-center justify-between gap-3">
-          <div className="h-4 w-32 rounded-full bg-surface-2" />
+          <div className="h-4 w-32 rounded-sm bg-surface-2" />
           <div className="h-8 w-48 rounded-lg bg-surface-2" />
         </div>
         <div className="mt-5 h-8 w-44 rounded-lg bg-surface-2" />

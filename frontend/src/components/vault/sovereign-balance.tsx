@@ -126,7 +126,7 @@ function ReserveBadge({ status }: { status: ReserveProofStatus }) {
   const badge = RESERVE_BADGE[status];
   return (
     <span
-      className={cx("inline-flex items-center gap-2 rounded-full border px-3 py-1 text-xs font-semibold", badge.pill)}
+      className={cx("inline-flex items-center gap-2 rounded-sm border px-3 py-1 text-xs font-semibold tracking-wide uppercase", badge.pill)}
       data-testid="reserve-badge"
       data-status={status}
     >
@@ -163,12 +163,12 @@ export function SovereignBalanceSkeleton({ className }: { className?: string }) 
       <span className="sr-only">Loading your vault…</span>
       <div aria-hidden className="motion-safe:animate-pulse">
         <div className="flex items-center justify-between gap-3">
-          <div className="h-3 w-28 rounded-full bg-surface-2" />
-          <div className="h-6 w-40 rounded-full bg-surface-2" />
+          <div className="h-3 w-28 rounded-sm bg-surface-2" />
+          <div className="h-6 w-40 rounded-sm bg-surface-2" />
         </div>
-        <div className="mt-7 h-3 w-24 rounded-full bg-surface-2" />
+        <div className="mt-7 h-3 w-24 rounded-sm bg-surface-2" />
         <div className="mt-3 h-14 w-4/5 max-w-md rounded-2xl bg-surface-2" />
-        <div className="mt-5 h-4 w-44 rounded-full bg-surface-2" />
+        <div className="mt-5 h-4 w-44 rounded-sm bg-surface-2" />
         <div className="mt-7 h-[74px] rounded-xl bg-surface-2" />
       </div>
     </div>

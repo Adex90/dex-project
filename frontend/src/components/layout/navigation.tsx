@@ -116,7 +116,7 @@ function SidebarLink({ item, active }: { item: NavItem; active: boolean }) {
     >
       {/* The active bar sits on the sidebar's inner edge. */}
       {active ? (
-        <span aria-hidden className="absolute inset-y-2 -left-3 w-[3px] rounded-r-full bg-synthetic-yellow" />
+        <span aria-hidden className="absolute inset-y-2 -left-3 w-[3px] bg-synthetic-yellow" />
       ) : null}
       <Icon className="size-[18px] shrink-0" strokeWidth={active ? 2.25 : 1.75} aria-hidden />
       {item.label}
@@ -134,7 +134,7 @@ function TabLink({ item, active }: { item: NavItem; active: boolean }) {
     >
       <span
         className={cx(
-          "grid h-8 w-14 place-items-center rounded-full transition-colors",
+          "grid h-8 w-14 place-items-center rounded-sm transition-colors",
           "group-focus-visible:ring-2 group-focus-visible:ring-synthetic-yellow",
           active ? "bg-synthetic-yellow text-black" : "text-muted group-hover:text-ink",
         )}

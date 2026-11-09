@@ -74,11 +74,20 @@ what the module waits on. They do not change its scope.
 ## Phase 1: Core Trading & Execution
 
 - [ ] **1. Asset Detail View** (Chart, Key Stats, Sticky Buy/Sell)
-  - Waits on the instruments and quotes API. Reuses the chart scales in
-    `lib/portfolio.ts` and the streaming pattern.
+  - Component built against the draft contract `types/market.ts`:
+    `components/markets/asset-detail.tsx`, with the price chart on the shared
+    `components/charts/trend-chart.tsx` (the vault's balance chart uses it too).
+  - Waits on the instruments and quotes API: then a runtime validator for
+    quotes, a market-data stream on the vault socket's pattern, a route, and
+    smoke e2e coverage. Not mounted until then.
 - [ ] **2. Order Execution Checkout** (Numpad, swipe-to-trade, zero-commission summary)
-  - Waits on order placement. Swipe-to-trade needs a keyboard-accessible
-    equivalent.
+  - Component built against the same contract:
+    `components/markets/order-checkout-drawer.tsx` (numpad, $0.00 commission
+    summary, Confirm Order, one idempotency key per order kept on retry).
+    Order math in `lib/market.ts`, unit tested.
+  - Waits on order placement; not mounted until then. Swipe-to-trade is not
+    built: Confirm Order is the keyboard-accessible path a swipe would need
+    anyway.
 - [ ] **3. Advanced Order Engine** (Limit, Stop-Loss, Trailing, Day/GTC)
   - Builds on module 2.
 - [ ] **4. Savings Plans / DCA** (Automated fractional recurring buys)

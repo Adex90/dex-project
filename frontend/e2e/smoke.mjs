@@ -183,7 +183,8 @@ try {
       await page.getByTestId("vault-total").filter({ hasText: "25,000" }).waitFor();
       await page.getByTestId("reserve-badge").and(page.locator("[data-status=verified]")).waitFor();
       check(
-        (await page.getByTestId("reserve-badge").innerText()).includes("100% Reserve Verified"),
+        // Case-blind: the seal is set in capitals by CSS, which innerText reports.
+        /100% reserve verified/i.test(await page.getByTestId("reserve-badge").innerText()),
         "the vault shows the verified reserve seal",
       );
       await page.getByTestId("kyc-header-badge").and(page.locator("[data-status=VERIFICADO]")).waitFor();

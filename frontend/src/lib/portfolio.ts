@@ -85,6 +85,7 @@ export function cashBalanceHistory(
 /* ------------------------------------------------------------------------ */
 
 export const CHART_RANGES = [
+  { id: "1D", label: "1D", name: "the last day", days: 1 },
   { id: "1W", label: "1W", name: "the last week", days: 7 },
   { id: "1M", label: "1M", name: "the last month", days: 30 },
   { id: "3M", label: "3M", name: "the last 3 months", days: 90 },
@@ -117,6 +118,14 @@ export function pointsInRange(points: readonly BalancePoint[], range: ChartRange
   }
   if (firstInside === 0) return [...points];
   return [{ at: start, value: points[firstInside - 1]!.value }, ...points.slice(firstInside)];
+}
+
+/**
+ * The points to draw: a single point (a balance nothing has moved yet) gets a
+ * twin one millisecond earlier, so it draws as a flat line across the plot.
+ */
+export function drawable(points: readonly BalancePoint[]): BalancePoint[] {
+  return points.length === 1 ? [{ ...points[0]!, at: points[0]!.at - 1 }, points[0]!] : [...points];
 }
 
 export interface RangeChange {
@@ -236,6 +245,20 @@ const compact = new Intl.NumberFormat("en-US", { notation: "compact", maximumFra
 export function compactMoney(value: number): string {
   const text = compact.format(Math.abs(value));
   return `${value < 0 ? "−" : ""}$${text}`;
+}
+
+/**
+ * Labels for a value axis: compact ("$25K", "$1.2M") when that tells every
+ * tick apart; otherwise in full with the decimals the ticks need ("$1,575",
+ * "$1,607.5"). A narrow range, such as a price over one day, would otherwise
+ * print "$1.6K" on every line.
+ */
+export function axisMoney(ticks: readonly number[]): string[] {
+  const short = ticks.map(compactMoney);
+  if (new Set(short).size === short.length) return short;
+  const decimals = Math.min(8, Math.max(0, ...ticks.map((t) => String(t).split(".")[1]?.length ?? 0)));
+  const full = new Intl.NumberFormat("en-US", { minimumFractionDigits: decimals, maximumFractionDigits: decimals });
+  return ticks.map((t) => `${t < 0 ? "−" : ""}$${full.format(Math.abs(t))}`);
 }
 
 const shortDate = new Intl.DateTimeFormat("en-US", { month: "short", day: "numeric" });

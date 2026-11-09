@@ -147,14 +147,14 @@ function ContractRow({
       {c.estado === "VIGENTE" ? (
         <div>
           <div
-            className="h-1.5 overflow-hidden rounded-full bg-surface-2"
+            className="h-1.5 overflow-hidden rounded-sm bg-surface-2"
             role="progressbar"
             aria-valuenow={progress}
             aria-valuemin={0}
             aria-valuemax={100}
             aria-label={`Contract ${c.folio} term elapsed`}
           >
-            <div className="h-full rounded-full bg-accent transition-all" style={{ width: `${progress}%` }} />
+            <div className="h-full rounded-sm bg-accent transition-all" style={{ width: `${progress}%` }} />
           </div>
           <div className="mt-1.5 flex justify-between text-[11px] text-muted">
             <span>{formatDate(c.fecha_inicio)}</span>

@@ -30,6 +30,25 @@
   --color-synthetic-yellow-pressed: #ca8a04;
   --color-charcoal: #121212;
   --color-charcoal-raised: #1b1b1b;
+  --color-charcoal-hover: #262626;
+}
+
+/*
+ * Square, app-wide: Sovereign Gold is brutalist, with no soft corners. Every
+ * rounded-* utility reads this scale, so a future softening (2px, say) is one
+ * edit here. rounded-full is untouched: it stays for true circles (status
+ * dots, the chart's marker), never for chrome like badges or buttons.
+ */
+@theme {
+  --radius: 0;
+  --radius-xs: 0;
+  --radius-sm: 0;
+  --radius-md: 0;
+  --radius-lg: 0;
+  --radius-xl: 0;
+  --radius-2xl: 0;
+  --radius-3xl: 0;
+  --radius-4xl: 0;
 }
 
 /* Semantic tokens: what components use. */
@@ -38,6 +57,8 @@
   --bg: #000000;
   --surface: var(--color-charcoal);
   --surface-2: var(--color-charcoal-raised);
+  /* A raised surface under the pointer, as the yellow has its hover step. */
+  --surface-hover: var(--color-charcoal-hover);
   --border: #262626;
   --border-strong: #666666;
 
@@ -70,6 +91,7 @@
   --color-bg: var(--bg);
   --color-surface: var(--surface);
   --color-surface-2: var(--surface-2);
+  --color-surface-hover: var(--surface-hover);
   --color-border: var(--border);
   --color-border-strong: var(--border-strong);
   --color-ink: var(--ink);

@@ -113,7 +113,7 @@ function AssetRow({ holding }: { holding: Holding }) {
         className={cx(
           "relative px-5 py-3.5 text-left font-normal sm:px-6",
           // The yellow edge: invisible at rest, drawn on hover.
-          "before:absolute before:inset-y-2 before:left-0 before:w-[3px] before:rounded-r-full before:bg-synthetic-yellow",
+          "before:absolute before:inset-y-2 before:left-0 before:w-[3px] before:bg-synthetic-yellow",
           "before:opacity-0 before:transition-opacity group-hover:before:opacity-100",
         )}
       >
@@ -184,17 +184,17 @@ export function AssetListSkeleton({ className, rows = 3 }: { className?: string;
         <div className="flex items-center gap-3 border-b border-border px-5 py-4 sm:px-6">
           <div className="size-10 rounded-xl bg-surface-2" />
           <div className="space-y-2">
-            <div className="h-4 w-20 rounded-full bg-surface-2" />
-            <div className="h-3 w-28 rounded-full bg-surface-2" />
+            <div className="h-4 w-20 rounded-sm bg-surface-2" />
+            <div className="h-3 w-28 rounded-sm bg-surface-2" />
           </div>
         </div>
         {Array.from({ length: rows }, (_, i) => (
           <div key={i} className="flex items-center justify-between gap-4 border-b border-border px-5 py-4 last:border-b-0 sm:px-6">
             <div className="flex items-center gap-3">
               <div className="h-7 w-14 rounded-md bg-surface-2" />
-              <div className="h-4 w-32 rounded-full bg-surface-2" />
+              <div className="h-4 w-32 rounded-sm bg-surface-2" />
             </div>
-            <div className="h-4 w-20 rounded-full bg-surface-2" />
+            <div className="h-4 w-20 rounded-sm bg-surface-2" />
           </div>
         ))}
       </div>

@@ -194,12 +194,12 @@ export function SpeiDepositCardSkeleton({ className }: { className?: string }) {
         <div className="flex items-start gap-3">
           <div className="size-10 rounded-xl bg-surface-2" />
           <div className="flex-1 space-y-2 pt-1">
-            <div className="h-4 w-36 rounded-full bg-surface-2" />
-            <div className="h-3 w-3/4 rounded-full bg-surface-2" />
+            <div className="h-4 w-36 rounded-sm bg-surface-2" />
+            <div className="h-3 w-3/4 rounded-sm bg-surface-2" />
           </div>
         </div>
         <div className="mt-6 h-[92px] rounded-xl bg-surface-2" />
-        <div className="mt-5 h-4 rounded-full bg-surface-2" />
+        <div className="mt-5 h-4 rounded-sm bg-surface-2" />
       </div>
     </div>
   );

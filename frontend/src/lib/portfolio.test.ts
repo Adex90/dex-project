@@ -5,7 +5,9 @@ import { test } from "node:test";
 import type { TransaccionIfpe } from "./api/types.ts";
 import {
   cashBalanceHistory,
+  drawable,
   cashDelta,
+  axisMoney,
   compactMoney,
   linePath,
   nearestIndex,
@@ -179,4 +181,32 @@ test("compactMoney: short axis labels", () => {
   assert.equal(compactMoney(1_250_000), "$1.3M");
   assert.equal(compactMoney(950), "$950");
   assert.equal(compactMoney(-1_500), "−$1.5K");
+});
+
+test("axisMoney: compact when the labels differ, in full when compact would repeat", () => {
+  assert.deepEqual(axisMoney([0, 5_000, 10_000, 15_000]), ["$0", "$5K", "$10K", "$15K"]);
+  assert.deepEqual(axisMoney([15_000, 15_100, 15_200]), ["$15K", "$15.1K", "$15.2K"]);
+  // A price over a day: "$1.6K" three times would say nothing.
+  assert.deepEqual(axisMoney([1_575, 1_600, 1_625]), ["$1,575", "$1,600", "$1,625"]);
+  assert.deepEqual(axisMoney([1_607.5, 1_610, 1_612.5]), ["$1,607.5", "$1,610.0", "$1,612.5"]);
+  assert.deepEqual(axisMoney([1_500_000, 1_502_000]), ["$1,500,000", "$1,502,000"]);
+  assert.deepEqual(axisMoney([-1_520, -1_510]), ["−$1,520", "−$1,510"]);
+  assert.deepEqual(axisMoney([15_000.37]), ["$15K"], "a flat line's one label");
+  assert.deepEqual(axisMoney([]), []);
+});
+
+test("pointsInRange: 1D keeps the last day, opened by the balance in force a day ago", () => {
+  assert.deepEqual(pointsInRange(series, "1D", NOW), [
+    { at: NOW - DAY, value: "120" },
+    { at: NOW, value: "120" },
+  ]);
+});
+
+test("drawable: a lone point gets a twin a millisecond earlier; anything else is unchanged", () => {
+  assert.deepEqual(drawable([{ at: 10, value: "5" }]), [
+    { at: 9, value: "5" },
+    { at: 10, value: "5" },
+  ]);
+  assert.deepEqual(drawable(series), series);
+  assert.deepEqual(drawable([]), []);
 });
