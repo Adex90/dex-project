@@ -16,7 +16,7 @@ name: synthetic-capital-dev
 
 services:
   postgres:
-    image: docker.io/library/postgres:16.15-alpine@sha256:0cefaabd882e42bcb2a2f3dc56d3ce4770560ba62fd7f197f1a2e008fd5731ab
+    image: docker.io/library/postgres:18.4-alpine@sha256:9a8afca54e7861fd90fab5fdf4c42477a6b1cb7d293595148e674e0a3181de15
     user: "70:70"
     read_only: true
     cap_drop: [ALL]
