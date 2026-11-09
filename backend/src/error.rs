@@ -174,6 +174,10 @@ fn es_invariante(codigo: &str) -> bool {
             | "SPEI_DESCUADRE"
             | "SPEI_TRANSICION"
             | "RETORNO_SIN_CONTRATO"
+            | "MERCADO_SIN_ORDEN"
+            | "ORDEN_SIN_MOVIMIENTO"
+            | "ORDEN_INCOHERENTE"
+            | "POSICION_SIN_LEDGER"
             | "MUTUO_TITULAR"
             | "AML_ESPEJO"
             | "AML_AISLAMIENTO"
@@ -214,6 +218,11 @@ fn traducir_error_bd(codigo_sql: &str, mensaje: &str, restriccion: &str) -> Opti
         let (codigo, detalle) = resto.split_once(':').unwrap_or((resto, ""));
         let detalle = detalle.trim();
         let detalle = if detalle.is_empty() { mensaje } else { detalle };
+        if codigo == "MERCADO_PRECIO_CAMBIO" {
+            // El precio cambió entre la cotización y la orden: la operación
+            // completa se repite con el precio nuevo (orden de mercado).
+            return Some(AppError::Reintentable);
+        }
         if codigo == "OPERACION_NO_DISPONIBLE" {
             tracing::warn!(target: "aml", "débito rechazado por la guardia PLD de la base de datos");
             return Some(AppError::OperacionNoDisponible); // ignora `detalle` a propósito (sin aviso)
@@ -381,11 +390,31 @@ mod pruebas {
             "SC_LEDGER_INMUTABLE: el ledger es de solo inserción",
             "SC_CORTE_INVALIDO: el ancla retrocede",
             "SC_MUTUO_INMUTABLE: los términos no se modifican",
+            "SC_MERCADO_SIN_ORDEN: el movimiento x no tiene su orden",
+            "SC_ORDEN_SIN_MOVIMIENTO: la orden x no tiene su movimiento IFPE",
+            "SC_ORDEN_INCOHERENTE: 0.7751 AUG1 no es lo que compran 1250 MXN",
+            "SC_POSICION_SIN_LEDGER: la posición no coincide con el ledger",
+            "SC_ACTIVO_INMUTABLE: el incremento no cambia",
         ] {
             let e = traducir_error_bd("P0001", mensaje, "").unwrap();
             assert_eq!(e.codigo(), "INTEGRIDAD", "{mensaje}");
             assert_eq!(e.status(), StatusCode::INTERNAL_SERVER_ERROR);
             assert!(e.to_string().contains(mensaje.split(':').next().unwrap()));
+        }
+    }
+
+    #[test]
+    fn mercado_reintenta_un_precio_que_cambio_y_traduce_sus_reglas() {
+        // La orden completa se repite con el precio nuevo (con_reintentos).
+        let e = traducir_error_bd("23514", "SC_MERCADO_PRECIO_CAMBIO: el precio de AUG1 cambió", "").unwrap();
+        assert!(matches!(e, AppError::Reintentable));
+        for (mensaje, codigo) in [
+            ("SC_MERCADO_CERRADO: AUG1 no opera en este momento", "MERCADO_CERRADO"),
+            ("SC_POSICION_INSUFICIENTE: excede lo que vale la posición", "POSICION_INSUFICIENTE"),
+            ("SC_CUENTA_CONGELADA: la cuenta IFPE está congelada", "CUENTA_CONGELADA"),
+        ] {
+            let e = traducir_error_bd("23514", mensaje, "").unwrap();
+            assert_eq!((e.status(), e.codigo()), (StatusCode::UNPROCESSABLE_ENTITY, codigo), "{mensaje}");
         }
     }
 

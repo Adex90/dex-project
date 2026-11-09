@@ -224,7 +224,7 @@ async fn verificar_login_aplicacion(tx: &mut db::Tx, usuario: &str, version: i32
                     (SELECT bool_and(pg_has_role(r.oid, g, $3)) FROM unnest($2::name[]) g), \
                     (SELECT bool_or(pg_has_role(r.oid, g, 'USAGE')) FROM unnest($2::name[]) g), \
                     EXISTS (SELECT 1 FROM pg_namespace n \
-                             WHERE n.nspname IN ('nucleo', 'kyc', 'ifpe', 'sofom', 'aml') \
+                             WHERE n.nspname IN ('nucleo', 'kyc', 'ifpe', 'sofom', 'aml', 'mercado') \
                                AND pg_has_role(r.oid, n.nspowner, 'MEMBER')) \
                FROM pg_roles r WHERE r.rolname = $1",
         )

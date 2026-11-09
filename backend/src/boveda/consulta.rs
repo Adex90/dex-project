@@ -8,13 +8,15 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use super::modelos::{
-    Boveda, Direccion, EstadoPrueba, EstadoTransferencia, Mensaje, PruebaReserva, SaldoBoveda, TransferenciaSpei,
+    Boveda, Direccion, EstadoPrueba, EstadoTransferencia, Mensaje, Posicion, PruebaReserva, SaldoBoveda,
+    TransferenciaSpei,
 };
 use crate::{
     config::Config,
     db::{self, Rol},
     dinero,
     error::{AppError, AppResult},
+    mercado::calculo,
 };
 
 /// La raíz que se informa mientras no se ha publicado ningún corte.
@@ -37,9 +39,19 @@ struct FilaCuenta {
     seq: i64,
 }
 
-/// Una sola foto (REPEATABLE READ): la versión, los saldos y el principal
-/// invertido vienen de la misma confirmación. Si no, una inversión a medio
-/// leer mostraría el dinero dos veces o ninguna.
+#[derive(sqlx::FromRow)]
+struct FilaPosicion {
+    ticker: String,
+    nombre: String,
+    cantidad: Decimal,
+    costo: Decimal,
+    precio: Decimal,
+    precio_cierre_previo: Decimal,
+}
+
+/// Una sola foto (REPEATABLE READ): la versión, los saldos, el principal
+/// invertido y las posiciones vienen de la misma confirmación. Si no, una
+/// inversión o una orden a medio leer mostraría el dinero dos veces o ninguna.
 pub async fn leer(pool: &PgPool, config: &Config, cliente_id: Uuid) -> AppResult<Lectura> {
     let mut tx = db::begin_lectura_instantanea_cliente(pool, cliente_id).await?;
     let cuenta: Option<FilaCuenta> = sqlx::query_as(
@@ -58,16 +70,49 @@ pub async fn leer(pool: &PgPool, config: &Config, cliente_id: Uuid) -> AppResult
     .bind(cliente_id)
     .fetch_one(&mut *tx)
     .await?;
+    // Las posiciones del mercado de valores (0013) al precio vigente del catálogo.
+    let filas: Vec<FilaPosicion> = sqlx::query_as(
+        "SELECT p.ticker, a.nombre, p.cantidad, p.costo, a.precio, a.precio_cierre_previo \
+           FROM mercado.posiciones p JOIN mercado.activos a ON a.ticker = p.ticker \
+          WHERE p.cliente_id = $1 AND p.cantidad > 0 ORDER BY p.ticker",
+    )
+    .bind(cliente_id)
+    .fetch_all(&mut *tx)
+    .await?;
     tx.commit().await?;
 
     let cuenta = cuenta.ok_or_else(|| AppError::NoEncontrado("la bóveda del cliente".into()))?;
     let prueba_reserva = prueba_reserva(pool).await?;
+    let posiciones: Vec<Posicion> = filas
+        .iter()
+        .map(|p| Posicion {
+            ticker: p.ticker.clone(),
+            nombre: p.nombre.clone(),
+            titulos: dinero::con_escala(p.cantidad),
+            precio: dinero::con_escala(p.precio),
+            valor: calculo::valor(p.cantidad, p.precio),
+            cambio_diario: calculo::cambio_pct(p.precio, p.precio_cierre_previo),
+        })
+        .collect();
+    let en_mercado: Decimal = posiciones.iter().map(|p| p.valor).sum();
+    let costo_mercado: Decimal = filas.iter().map(|p| p.costo).sum();
+    // Los mutuos van a costo (su interés se realiza al liquidarse): solo las
+    // posiciones del mercado ganan o pierden mientras se tienen.
+    let base = invertido + costo_mercado;
+    let rendimiento_no_realizado = if base > Decimal::ZERO {
+        let mut r = ((en_mercado - costo_mercado) * Decimal::ONE_HUNDRED / base).round_dp(2);
+        r.rescale(2);
+        r
+    } else {
+        Decimal::new(0, 2)
+    };
+    let invertido = invertido + en_mercado;
     // Escala 8, como todo importe de la API (sin mutuos, la suma es un 0 sin decimales).
     let saldo = SaldoBoveda {
         total: dinero::con_escala(cuenta.saldo_disponible + cuenta.saldo_bloqueado + invertido),
         disponible: dinero::con_escala(cuenta.saldo_disponible),
         invertido: dinero::con_escala(invertido),
-        rendimiento_no_realizado: Decimal::new(0, 2),
+        rendimiento_no_realizado,
     };
     Ok(Lectura {
         boveda: Boveda {
@@ -76,7 +121,7 @@ pub async fn leer(pool: &PgPool, config: &Config, cliente_id: Uuid) -> AppResult
             banco: config.spei.banco_nombre.clone(),
             saldo,
             prueba_reserva,
-            posiciones: Vec::new(),
+            posiciones,
         },
         seq: cuenta.seq,
         cuenta_id: cuenta.id,

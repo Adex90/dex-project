@@ -99,6 +99,7 @@ internet -> host 80/443 (UFW, fail2ban) -> nginx (edge network)
 | Staff authenticate with two factors; TOTP secrets never in clear | Same code on both: two-step verification (TOTP) is mandatory for `OPERADOR`, `AUDITOR` and `CUMPLIMIENTO` and re-checked on every request; secrets encrypted with `MFA_CLAVE_CIFRADO` (Secrets Manager) | Same; key in `secrets/mfa_encryption_key` | `tests/mfa.rs`, `tests/db/0010_auth_mfa.sql`, AML e2e (Appendix C) |
 | A client's reads return only that client's rows, even if the query is wrong | Same code on both: role `sc_cliente` (SELECT only) and RESTRICTIVE RLS policies keyed to `sc.cliente_actual` on users, accounts, movements, SPEI and SOFOM tables (migration `0011`) | Same | `tests/rls.rs`, `tests/db/0011_rls_por_cliente.sql` |
 | A client's live vault channel carries only that client's data, and only while the session is valid | Same code on both: the WebSocket handshake runs the same JWT and database checks as every route (token as a subprotocol entry, never echoed), requires `Origin` = `FRONTEND_ORIGIN`, sits in the `API` rate-limit group and is capped per client and per task; the session is re-checked every 60 s and at JWT expiry (close 4001); reads run as `sc_cliente` under RLS | Same, plus nginx's dedicated location (`limit_conn` 20 per IP) | `tests/boveda.rs`, `tests/db/0012_boveda_tiempo_real.sql` |
+| A market order moves exactly the cash it records, at the catalog's price, for a client allowed to trade | Same code on both: one transaction under `sc_mercado` (in the IFPE ledger it may write only its two movement types, and only `saldo_disponible` and the reserve). Each order is paired with its IFPE movement in the same transaction (deferred triggers). The database checks each order against the catalog price, the asset's increment, the maximal quantity, the cent-rounded amount, the position and the average cost; positions must replay their hash-chained ledger on commit. KYC is enforced by RLS. A buy is an AML channel with the freeze guard, and frozen clients cannot sell. Simulated prices trade only with `MODO_DEMO` | Same | `tests/mercado.rs`, `tests/db/0013_mercado_valores.sql` |
 | No request field outside the API contract is accepted | Same code on both: `deny_unknown_fields` on every body and query type (400 `VALIDACION`) | Same | `tests/entrada.rs` (source scan and HTTP) |
 | Least-privilege database identities | Service holds only `sc_app` (NOINHERIT, no owner rights); owner credentials only in the migrate task and with DBAs holding the `dba-tunnel` policy | Same, plus the schema owner is **not** a superuser (`deploy/postgres/10-schema-owner.sh`); the `postgres` superuser is break-glass only | `pg_authid` query in Appendix C |
 | Containers non-root, read-only, least capability, resource-limited | uid 65532, read-only rootfs, `drop ALL`, task CPU/memory | uid 65532 / 70 / 101, `read_only`, `cap_drop: ALL`, `no-new-privileges`, CPU/memory/PID limits | `docker inspect` in Appendix C |
@@ -1014,6 +1015,22 @@ following to operations.
     to it meanwhile.
 
   On large tables, run it at a quiet moment.
+- **Migration `0013`** (market) is additive too: deploy migrate, then the
+  backend. The new role `sc_mercado` reaches the app login through `migrar`,
+  which grants every `sc_*` role (§6). The old binary keeps working: it never
+  uses the new movement types, and the AML functions keep their signatures. What
+  it does:
+  - creates the `mercado` schema with the asset catalog (three assets with
+    `SIMULADO` prices) and empty orders and positions;
+  - widens the IFPE ledger's type and shape checks with `NOT VALID`. The new
+    checks admit everything the old ones did, so there is no scan under the
+    table's lock;
+  - replaces seven AML functions with the same signatures and recreates the
+    coverage trigger;
+  - builds one partial index on `ifpe.transacciones` for market buys. It is
+    empty for existing rows, but the build scans the ledger and blocks its
+    writes meanwhile, so on a large ledger create it first with
+    `CONCURRENTLY` (the migration uses `IF NOT EXISTS`).
 
 ---
 
@@ -1283,6 +1300,50 @@ available, so Session Manager itself was not exercised. Everything around it was
     ran, it had read the announcer and failed: 3 of 4 times on one run.
 - **Backend:** rustfmt and clippy `-D warnings` clean; 314 tests passed, 0 failed.
   hadolint, actionlint and ShellCheck (with the CI settings) are clean.
+
+**Market engine** (migration `0013`, `GET /api/v1/market/quote/{ticker}` and
+`POST /api/v1/market/order`):
+
+- **SQL suite** `tests/db/0013_mercado_valores.sql`: 66 checks, on a freshly
+  migrated database, as a role that is not a superuser. The other eight suites pass
+  unchanged (39, 47, 17, 40, 409, 32, 17 and 24 checks). The `0011` suite now counts
+  only its own tables.
+- **`backend/tests/mercado.rs`** (9 tests, through the router):
+  - **Quote:** the exact `MarketAsset` contract, a year of history ending at the
+    price, and 404 for unknown or lowercase tickers. Without a session it is 401.
+  - **Orders:**
+    - A buy fills 0.7752 g for 1,249.93 out of 1,250, with zero commission.
+    - The IFPE movement and the order reference each other, and AML evaluated
+      the buy online.
+    - The vault shows the holding, the invested market value and the P&L.
+    - A partial sale releases the average cost. Selling what the rest is worth
+      sells all of it.
+    - Buying and selling everything at the same price returns exactly the cash
+      paid.
+  - **Idempotency:** a repeat returns 200 with the same receipt. The same key
+    with another order, or one used for a transfer, is 409. Two clients can use
+    the same key.
+  - **Rules:**
+    - 422 for insufficient cash, less than one increment, more than the position
+      is worth, a suspended asset, no KYC (including KYC revoked after buying),
+      and an AML freeze. A frozen client's blocked buy is recorded; its sale
+      never reaches AML.
+    - 400 for fractions of a cent, numbers, unknown fields and an unknown side.
+    - 403 for staff placing orders. The ledger audit is for staff only.
+  - **Concurrency:** two simultaneous 15,000 buys on 20,000 cash: one fills, the
+    other gets `SALDO_INSUFICIENTE`.
+  - **Tampering:** with the owner's triggers disabled, an edited position or
+    order is caught by `GET /api/v1/auditoria/ledger/mercado`.
+  - **Production guard:** without `MODO_DEMO`, simulated prices answer 503. An
+    `ORACULO` price trades.
+- **`backend/tests/boveda.rs`:** an order through the API pushes `vault.snapshot`
+  with the next `seq`, the cash, the holding and the invested value. A repeated
+  key pushes nothing, and selling everything empties the holdings.
+- Every money-path test's invariants now include the market chain, its replayed
+  positions and its IFPE pairs. The AML source scan lists the market buy's one
+  `aml::evaluar` call.
+- **End to end:** on a fresh stack that migrates through `0013`, the smoke suite
+  (79 checks) and the AML console suite (123 checks) pass unchanged.
 
 **Sovereign Vault backend** (migration `0012`, `GET /api/v1/vault` and its WebSocket):
 

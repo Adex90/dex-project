@@ -25,6 +25,7 @@ use crate::{
     db::{self, Rol},
     dinero,
     error::AppResult,
+    mercado::{calculo, Lado, Orden},
     models::{
         ifpe::{LedgerCabeza, TipoTxIfpe, TransaccionIfpe},
         sofom::{ContratoMutuo, TipoTxSofom, TransaccionSofom},
@@ -37,6 +38,7 @@ pub const GENESIS: &str = "00000000000000000000000000000000000000000000000000000
 
 const VERSION_IFPE: &str = "SC-IFPE-v1";
 const VERSION_SOFOM: &str = "SC-SOFOM-v1";
+const VERSION_MERCADO: &str = "SC-MERCADO-v1";
 
 pub fn sha256_hex(datos: &[u8]) -> String {
     hex::encode(Sha256::digest(datos))
@@ -115,6 +117,34 @@ pub fn payload_sofom(t: &TransaccionSofom) -> String {
         .texto(&epoch_micros(&t.creado_en))
         .texto(&t.hash_anterior);
     p.0
+}
+
+/// Payload canónico de una orden (`mercado.payload_canonico`, migración 0013).
+pub fn payload_mercado(o: &Orden) -> String {
+    let mut p = Payload::default();
+    p.texto(VERSION_MERCADO)
+        .texto(&o.secuencia.to_string())
+        .texto(&o.id.to_string())
+        .texto(&o.cliente_id.to_string())
+        .texto(&o.cuenta_ifpe_id.to_string())
+        .texto(&o.ticker)
+        .texto(o.lado.as_str())
+        .texto(&dinero::canonico(o.monto_solicitado))
+        .texto(&dinero::canonico(o.cantidad))
+        .texto(&dinero::canonico(o.precio))
+        .texto(&dinero::canonico(o.monto))
+        .texto(&dinero::canonico(o.comision))
+        .opcional(o.costo_liberado.map(dinero::canonico))
+        .texto(o.fuente_precio.as_str())
+        .texto(&o.tx_ifpe_id.to_string())
+        .texto(&o.clave_idempotencia)
+        .texto(&epoch_micros(&o.creado_en))
+        .texto(&o.hash_anterior);
+    p.0
+}
+
+pub fn hash_mercado(o: &Orden) -> String {
+    sha256_hex(payload_mercado(o).as_bytes())
 }
 
 pub fn hash_ifpe(t: &TransaccionIfpe) -> String {
@@ -336,11 +366,11 @@ pub async fn verificar_cadena_ifpe(pool: &PgPool) -> AppResult<ResultadoVerifica
             let m = t.monto;
             let cero = Decimal::ZERO;
             match t.tipo {
-                TipoTxIfpe::Deposito | TipoTxIfpe::RetornoDeSofom => {
+                TipoTxIfpe::Deposito | TipoTxIfpe::RetornoDeSofom | TipoTxIfpe::VentaMercado => {
                     cuentas.mover(t.cuenta_destino_id, m, cero);
                     reservas.mover(t.reserva_id, m, cero);
                 }
-                TipoTxIfpe::Retiro | TipoTxIfpe::TraspasoASofom => {
+                TipoTxIfpe::Retiro | TipoTxIfpe::TraspasoASofom | TipoTxIfpe::CompraMercado => {
                     cuentas.mover(t.cuenta_origen_id, -m, cero);
                     reservas.mover(t.reserva_id, -m, cero);
                 }
@@ -512,6 +542,103 @@ async fn verificar_espejos(pool: &PgPool) -> AppResult<Vec<String>> {
         .into_iter()
         .map(|(ledger, sec, tipo)| format!("{ledger} secuencia {sec} ({tipo}) sin movimiento espejo válido"))
         .collect())
+}
+
+/// Recorre todo el ledger del mercado (foto consistente): cadena de hashes,
+/// reproducción de cada posición (cantidad y costo), el costo promedio que
+/// liberó cada venta y el par de cada orden con su movimiento IFPE.
+pub async fn verificar_cadena_mercado(pool: &PgPool) -> AppResult<ResultadoVerificacion> {
+    let mut tx = db::begin_lectura_instantanea(pool, Rol::Mercado).await?;
+    let cabeza: LedgerCabeza =
+        sqlx::query_as("SELECT ultima_secuencia, ultimo_hash FROM mercado.ledger_cabeza").fetch_one(&mut *tx).await?;
+    let mut v = VerificadorCadena::default();
+    // (cliente, ticker) -> (cantidad, costo), reproducidos orden por orden.
+    let mut posiciones: HashMap<(Uuid, String), (Decimal, Decimal)> = HashMap::new();
+    let mut discrepancias = Vec::new();
+    let mut falla = None;
+    let mut desde = i64::MIN;
+    'lotes: loop {
+        let lote: Vec<Orden> =
+            sqlx::query_as("SELECT * FROM mercado.ordenes WHERE secuencia > $1 ORDER BY secuencia LIMIT $2")
+                .bind(desde)
+                .bind(LOTE)
+                .fetch_all(&mut *tx)
+                .await?;
+        let Some(ultima) = lote.last() else { break };
+        desde = ultima.secuencia;
+        for o in &lote {
+            if let Err(f) = v.verificar(o.secuencia, &o.hash_anterior, &o.tx_hash, &hash_mercado(o)) {
+                falla = Some(f);
+                break 'lotes;
+            }
+            let p = posiciones.entry((o.cliente_id, o.ticker.clone())).or_default();
+            match o.lado {
+                Lado::Compra => {
+                    p.0 += o.cantidad;
+                    p.1 += o.monto;
+                }
+                Lado::Venta => {
+                    let esperado = calculo::costo_de_venta(p.1, o.cantidad, p.0).ok();
+                    if o.costo_liberado.is_none() || esperado != o.costo_liberado {
+                        discrepancias.push(format!(
+                            "la venta {} (secuencia {}) libera {:?} de costo; el costo promedio de la posición da {:?}",
+                            o.id, o.secuencia, o.costo_liberado, esperado
+                        ));
+                    }
+                    p.0 -= o.cantidad;
+                    p.1 -= o.costo_liberado.unwrap_or_default();
+                }
+            }
+        }
+    }
+    let mut r = v.resultado("MERCADO", &cabeza, falla);
+    r.discrepancias.append(&mut discrepancias);
+    if r.falla.is_none() {
+        verificar_conteo(&mut r, conteo_ledger(&mut tx, "mercado.ordenes").await?, &cabeza);
+
+        let vivas: Vec<(Uuid, String, Decimal, Decimal)> =
+            sqlx::query_as("SELECT cliente_id, ticker, cantidad, costo FROM mercado.posiciones")
+                .fetch_all(&mut *tx)
+                .await?;
+        let cero = (Decimal::ZERO, Decimal::ZERO);
+        for (cliente, ticker, cantidad, costo) in &vivas {
+            let esperado = posiciones.remove(&(*cliente, ticker.clone())).unwrap_or(cero);
+            if (*cantidad, *costo) != esperado {
+                r.discrepancias.push(format!(
+                    "posición de {cliente} en {ticker}: ({cantidad}, {costo}) pero el ledger justifica ({}, {})",
+                    esperado.0, esperado.1
+                ));
+            }
+            r.saldos_conciliados += 1;
+        }
+        for ((cliente, ticker), (cantidad, costo)) in posiciones {
+            if (cantidad, costo) != cero {
+                r.discrepancias.push(format!(
+                    "posición de {cliente} en {ticker}: el ledger justifica ({cantidad}, {costo}) pero no existe"
+                ));
+            }
+        }
+
+        // Cada orden con su movimiento IFPE (monto, lado, cuenta y referencias) y viceversa.
+        let sin_movimiento: Vec<(Uuid,)> = sqlx::query_as(
+            "SELECT o.id FROM mercado.ordenes o LEFT JOIN ifpe.transacciones t ON t.id = o.tx_ifpe_id               WHERE t.id IS NULL OR t.ref_movimiento_espejo IS DISTINCT FROM o.id OR t.monto <> o.monto                  OR NOT ((o.lado = 'COMPRA' AND t.tipo = 'COMPRA_MERCADO' AND t.cuenta_origen_id = o.cuenta_ifpe_id)                       OR (o.lado = 'VENTA' AND t.tipo = 'VENTA_MERCADO' AND t.cuenta_destino_id = o.cuenta_ifpe_id))               ORDER BY o.secuencia LIMIT 100",
+        )
+        .fetch_all(&mut *tx)
+        .await?;
+        for (id,) in sin_movimiento {
+            r.discrepancias.push(format!("la orden {id} no tiene su movimiento IFPE"));
+        }
+        let sin_orden: Vec<(Uuid,)> = sqlx::query_as(
+            "SELECT t.id FROM ifpe.transacciones t LEFT JOIN mercado.ordenes o ON o.id = t.ref_movimiento_espejo               WHERE t.tipo IN ('COMPRA_MERCADO', 'VENTA_MERCADO') AND (o.id IS NULL OR o.tx_ifpe_id IS DISTINCT FROM t.id)               ORDER BY t.secuencia LIMIT 100",
+        )
+        .fetch_all(&mut *tx)
+        .await?;
+        for (id,) in sin_orden {
+            r.discrepancias.push(format!("el movimiento IFPE {id} es del mercado y no tiene su orden"));
+        }
+    }
+    tx.commit().await?;
+    Ok(r.cerrar())
 }
 
 #[cfg(test)]

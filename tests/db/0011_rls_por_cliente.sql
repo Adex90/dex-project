@@ -128,12 +128,16 @@ SELECT pg_temp.exigir('RLS activa en las 8 tablas del cliente', (
      'kyc.clientes', 'ifpe.cuentas', 'ifpe.transacciones', 'ifpe.spei_outbound', 'ifpe.spei_inbound',
      'sofom.cuentas', 'sofom.contratos_mutuo', 'sofom.transacciones')) = 8);
 
+-- Las de esta migración; las tablas de migraciones posteriores (mercado, 0013)
+-- las revisa su propia suite.
 SELECT pg_temp.exigir('política RESTRICTIVE FOR ALL solo para sc_cliente en las 8 tablas', (
   SELECT count(*) FROM pg_policies
-   WHERE policyname = 'solo_del_cliente' AND permissive = 'RESTRICTIVE' AND cmd = 'ALL' AND roles = '{sc_cliente}') = 8);
+   WHERE policyname = 'solo_del_cliente' AND permissive = 'RESTRICTIVE' AND cmd = 'ALL' AND roles = '{sc_cliente}'
+     AND schemaname IN ('kyc', 'ifpe', 'sofom')) = 8);
 
-SELECT pg_temp.exigir('sc_cliente: SELECT en las 8 tablas y ningún otro privilegio', (
-  SELECT count(*) FILTER (WHERE privilege_type = 'SELECT') = 8 AND count(*) FILTER (WHERE privilege_type <> 'SELECT') = 0
+SELECT pg_temp.exigir('sc_cliente: SELECT en las 8 tablas y ningún otro privilegio en ninguna', (
+  SELECT count(*) FILTER (WHERE privilege_type = 'SELECT' AND table_schema IN ('kyc', 'ifpe', 'sofom')) = 8
+         AND count(*) FILTER (WHERE privilege_type <> 'SELECT') = 0
     FROM information_schema.role_table_grants WHERE grantee = 'sc_cliente'));
 
 SELECT pg_temp.exigir('sc_cliente no inicia sesión ni salta RLS', (

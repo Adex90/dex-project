@@ -592,6 +592,7 @@ const CHANNELS: readonly CanalAml[] = [
   "TRANSFERENCIA_ENVIADA",
   "SPEI_ENVIADO",
   "INVERSION_MUTUO",
+  "COMPRA_MERCADO",
   "DESEMBOLSO_CREDITO",
   "COBRO_CREDITO",
 ];
@@ -691,6 +692,7 @@ export const CHANNEL_LABEL: Record<CanalAml, string> = {
   TRANSFERENCIA_ENVIADA: "Transfer sent",
   SPEI_ENVIADO: "SPEI sent",
   INVERSION_MUTUO: "Mutuum investment",
+  COMPRA_MERCADO: "Market buy",
   DESEMBOLSO_CREDITO: "Credit disbursement",
   COBRO_CREDITO: "Credit repayment",
 };

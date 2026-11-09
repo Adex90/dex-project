@@ -33,7 +33,9 @@
 //! | POST | `/api/v1/reserva/verificar` | público |
 //! | GET  | `/api/v1/reserva/prueba` | cliente |
 //! | POST | `/api/v1/reserva/cortes` | operador / auditor |
-//! | GET  | `/api/v1/auditoria/ledger/{ifpe,sofom}` | operador / auditor |
+//! | GET  | `/api/v1/auditoria/ledger/{ifpe,sofom,mercado}` | operador / auditor |
+//! | GET  | `/api/v1/market/quote/{ticker}` | cualquier sesión: el activo y su historial de precios |
+//! | POST | `/api/v1/market/order` | cliente: orden de mercado (compra o venta), ejecutada al precio vigente |
 //! | GET  | `/api/v1/kyc/expediente` | cliente: estado, intentos, bloqueo y último resultado |
 //! | POST | `/api/v1/kyc/perfil` | cliente: datos personales y domicilio |
 //! | POST | `/api/v1/kyc/verificar` | cliente: INE + selfie (hasta 12 MB) |
@@ -84,6 +86,7 @@ mod extraccion;
 mod ifpe;
 mod kyc;
 pub mod limites;
+mod mercado;
 mod operaciones;
 mod reserva;
 mod sofom;
@@ -130,7 +133,8 @@ pub fn router(estado: AppState) -> Router {
         .merge(operaciones::rutas())
         .merge(spei::rutas())
         .merge(aml::rutas(estado.clone()))
-        .merge(boveda::rutas());
+        .merge(boveda::rutas())
+        .merge(mercado::rutas());
     let api = limites::aplicar(api, &por_ip.api)
         .merge(limites::aplicar(spei::webhooks().merge(kyc::webhooks()), &por_ip.webhook));
 

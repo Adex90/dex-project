@@ -75,6 +75,15 @@ pub enum TipoTxIfpe {
     #[sqlx(rename = "LIBERACION_RETENCION")]
     #[serde(rename = "LIBERACION_RETENCION")]
     LiberacionRetencion,
+    /// Compra de valores: el efectivo sale de la bóveda y de la custodia a
+    /// liquidar la compra (migración 0013). Su orden está en `mercado.ordenes`.
+    #[sqlx(rename = "COMPRA_MERCADO")]
+    #[serde(rename = "COMPRA_MERCADO")]
+    CompraMercado,
+    /// Venta de valores: el importe regresa a la bóveda y a la custodia.
+    #[sqlx(rename = "VENTA_MERCADO")]
+    #[serde(rename = "VENTA_MERCADO")]
+    VentaMercado,
 }
 
 impl TipoTxIfpe {
@@ -87,6 +96,8 @@ impl TipoTxIfpe {
             TipoTxIfpe::RetornoDeSofom => "RETORNO_DE_SOFOM",
             TipoTxIfpe::Retencion => "RETENCION",
             TipoTxIfpe::LiberacionRetencion => "LIBERACION_RETENCION",
+            TipoTxIfpe::CompraMercado => "COMPRA_MERCADO",
+            TipoTxIfpe::VentaMercado => "VENTA_MERCADO",
         }
     }
 }

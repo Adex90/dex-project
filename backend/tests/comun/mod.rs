@@ -419,6 +419,9 @@ pub async fn verificar_invariantes(pool: &PgPool) {
     assert!(ifpe.valido, "cadena IFPE inválida: {ifpe:?}");
     let sofom = hash::verificar_cadena_sofom(pool).await.unwrap();
     assert!(sofom.valido, "cadena SOFOM inválida: {sofom:?}");
+    // Mercado: cadena, posiciones reproducidas y cada orden con su movimiento IFPE.
+    let mercado = hash::verificar_cadena_mercado(pool).await.unwrap();
+    assert!(mercado.valido, "cadena del mercado inválida: {mercado:?}");
 }
 
 /// Crea `n` cuentas IFPE vacías directamente (como dueño del esquema), sin

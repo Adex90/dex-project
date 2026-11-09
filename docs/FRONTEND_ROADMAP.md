@@ -77,17 +77,21 @@ what the module waits on. They do not change its scope.
   - Component built against the draft contract `types/market.ts`:
     `components/markets/asset-detail.tsx`, with the price chart on the shared
     `components/charts/trend-chart.tsx` (the vault's balance chart uses it too).
-  - Waits on the instruments and quotes API: then a runtime validator for
-    quotes, a market-data stream on the vault socket's pattern, a route, and
-    smoke e2e coverage. Not mounted until then.
+  - The quotes API exists: `GET /api/v1/market/quote/{ticker}`
+    (`MarketQuote`, migration `0013`), with simulated prices and history
+    until the pricing oracle, served only with `MODO_DEMO`. Left: a runtime
+    validator for quotes, a route that mounts the view, smoke e2e coverage,
+    and later a market-data stream on the vault socket's pattern.
 - [ ] **2. Order Execution Checkout** (Numpad, swipe-to-trade, zero-commission summary)
   - Component built against the same contract:
     `components/markets/order-checkout-drawer.tsx` (numpad, $0.00 commission
     summary, Confirm Order, one idempotency key per order kept on retry).
     Order math in `lib/market.ts`, unit tested.
-  - Waits on order placement; not mounted until then. Swipe-to-trade is not
-    built: Confirm Order is the keyboard-accessible path a swipe would need
-    anyway.
+  - Order placement exists: `POST /api/v1/market/order` fills at once and
+    pushes the new vault over the WebSocket. Left: wire `onConfirm` to it,
+    a runtime validator for the receipt, and smoke e2e coverage. Swipe-to-
+    trade is not built: Confirm Order is the keyboard-accessible path a
+    swipe would need anyway.
 - [ ] **3. Advanced Order Engine** (Limit, Stop-Loss, Trailing, Day/GTC)
   - Builds on module 2.
 - [ ] **4. Savings Plans / DCA** (Automated fractional recurring buys)

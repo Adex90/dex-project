@@ -601,16 +601,20 @@ it, with a cash-balance chart rebuilt from the IFPE ledger.
   - `balance`:
     - `available_cash`: the IFPE account's available balance;
     - `invested_assets`: the principal of the client's SOFOM mutuums that are
-      in force or matured and not yet settled;
+      in force or matured and not yet settled, plus the market value of their
+      positions in the market (migration `0013`);
     - `total_mxn`: available plus held plus invested;
-    - `unrealized_pnl_percentage`: `"0.00"`. Mutuums are carried at cost and
-      their interest is realized at settlement.
+    - `unrealized_pnl_percentage`: (market value − cost of the positions) /
+      (mutuums + cost of the positions), in percent. Mutuums are carried at
+      cost and their interest is realized at settlement, so only market
+      positions move it; `"0.00"` with nothing invested.
   - `reserve_proof`: the Merkle root of the last published reserve cut
     (`zk_root_hash`) and its status:
     - `verified` when that cut covers the deposits and the live reserve is at 100 %;
     - `failed` otherwise;
     - `pending`, with a root of 64 zeros, until the first cut.
-  - `holdings`: `[]` until the RWA pricing oracle.
+  - `holdings`: the client's market positions at the current price
+    (`shares`, `current_price`, `total_value`, `daily_change_pct`); `[]` with none.
   - Amounts are decimal strings with 8 decimals, like the rest of the API.
 - **`GET /api/v1/vault/ws`** is a WebSocket (`backend/src/boveda/`) that
   pushes every change to the vault.
@@ -652,7 +656,7 @@ it, with a cash-balance chart rebuilt from the IFPE ledger.
       `counterparty_bank` is the 3-digit bank code of the CLABE (`012` is BBVA
       México); there is no name catalog yet.
     - **Any other balance change** (internal transfer, outgoing order,
-      investment, hold) arrives as a `vault.snapshot`.
+      investment, market order, hold) arrives as a `vault.snapshot`.
     - **Ordering.**
       - A delta is only sent with a `seq` above the last one sent.
       - A gap means messages were skipped. The browser marks the vault stale
@@ -709,6 +713,86 @@ it, with a cash-balance chart rebuilt from the IFPE ledger.
       WebSocket end to end against the real server (handshake rules, caps,
       rate limit, heartbeat, revocation, LISTEN reconnection, shutdown).
 
+## Markets: quotes and market orders (migration `0013`)
+
+The trading screens (`frontend/src/components/markets/`) read one contract,
+`frontend/src/types/market.ts`. The backend is `backend/src/mercado/`, with
+two routes in the `API` rate-limit group, both behind the JWT extractor:
+
+- **`GET /api/v1/market/quote/{ticker}`** (any signed-in session): the asset
+  (`MarketAsset`: price, 24-hour change against the previous close, market
+  cap, volume, yield, quantity increment) and its price history for the
+  chart: every 15 minutes over the last day, hourly over the last week, daily
+  for a year. Unknown tickers are 404.
+- **`POST /api/v1/market/order`** (clients):
+  `{"ticker", "side": "buy" | "sell", "amount": "1250.00", "idempotency_key"}`.
+  A market order fills at once at the current price and answers an
+  `OrderReceipt` (201; 200 with the same receipt when the key repeats; 409
+  when the key was used for something else).
+  - **Buy:** as many units as the amount covers in the asset's increment
+    (0.0001 g of gold, one whole bill). The charge is `quantity × price` to
+    the cent, never more than asked; the rest stays as cash. 1,250 MXN of
+    gold at 1,612.40 buys 0.7752 g for 1,249.93.
+  - **Sell:** the amount in pesos to sell. An amount worth the whole position
+    (the checkout's Max) sells all of it, with no dust; more than the
+    position is worth is 422 `POSICION_INSUFICIENTE`. A sale releases the
+    position's cost at average cost.
+  - **Commission:** zero, and a database constraint keeps it so.
+  - **Errors:** 422 `SALDO_INSUFICIENTE`, `MONTO_INSUFICIENTE` (less than one
+    increment), `POSICION_INSUFICIENTE`, `MERCADO_CERRADO`,
+    `KYC_NO_VERIFICADO`, `OPERACION_NO_DISPONIBLE` (AML freeze, the constant
+    message); 400 for fractions of a cent, numbers instead of strings or
+    unknown fields.
+- **Money path.** One transaction under the role `sc_mercado`, in the global
+  lock order: the client's IFPE account, the AML lock (buys), the custody
+  reserve, then the ledger heads, the asset (`FOR SHARE`) and the position.
+  - The cash leg is an IFPE ledger movement: `COMPRA_MERCADO` takes cash out
+    of the vault and the custody reserve (like an investment in a mutuum);
+    `VENTA_MERCADO` brings it back. The 100 % reserve, the shadow balances
+    and the hash chain hold as for every other movement.
+  - The order itself is a row in `mercado.ordenes`, the market's own
+    append-only ledger, hash-chained like the IFPE and SOFOM ledgers
+    (`SC-MERCADO-v1`). Each movement has its order in the same transaction,
+    and each order its movement.
+  - Before inserting, the database checks the order against the catalog and
+    the position:
+    - the current price and source, and a quantity in the asset's increment;
+    - for a buy, the largest quantity the amount covers;
+    - an amount equal to `quantity × price` to the cent;
+    - for a sale, a position that covers it and the exact average cost it
+      releases.
+  - `mercado.posiciones` is written only by the order trigger, and on commit
+    it must equal the replay of its ledger (`SC_POSICION_SIN_LEDGER`).
+  - The balance change raises the vault's `seq`, so the WebSocket pushes the
+    new vault (cash, holdings, invested, P&L) when the order commits.
+- **KYC and AML.** Only clients with verified KYC trade (RLS on the order and
+  on the IFPE movement).
+  - A buy is a new AML channel, `COMPRA_MERCADO` (outgoing). It works like
+    an investment in a mutuum: online evaluation before any write, the
+    freeze guard, coverage and velocity. It does not count toward
+    structuring or pass-through.
+  - A sale is the client's own money coming back, like a matured mutuum: it
+    is not evaluated.
+  - A frozen client neither buys nor sells. A blocked buy still records the
+    attempt.
+- **Simulated prices.** Until the pricing oracle is connected, the catalog
+  (`AUG1` tokenized gold, `AGT1` tokenized silver, `SCT28` a 28-day bill)
+  has `SIMULADO` prices and the history is generated. It is deterministic,
+  decimal-only, ends at the current price and passes through the previous
+  close exactly 24 hours earlier. Outside `MODO_DEMO`, a simulated price is
+  neither quoted nor traded (503 `MERCADO_NO_DISPONIBLE`), so production
+  never fills at a demo price. The oracle will update `mercado.activos`
+  (price, previous close, source `ORACULO`).
+- **Audit:** `GET /api/v1/auditoria/ledger/mercado` (operator / auditor)
+  re-verifies the chain, replays every position and every sale's average
+  cost, and checks each order against its IFPE movement.
+- Tests:
+  - `tests/db/0013_mercado_valores.sql`: the database rules, in one
+    transaction.
+  - `backend/tests/mercado.rs`: the API (quote, buy and sell, idempotency,
+    rules, KYC, roles, AML freeze, concurrent orders, tamper detection).
+  - `backend/tests/boveda.rs`: an order pushed over the WebSocket.
+
 ## Layout
 
 ```
@@ -762,6 +846,7 @@ psql "$EMPTY_DATABASE_URL" -f tests/db/0009_aml.sql
 psql "$EMPTY_DATABASE_URL" -f tests/db/0010_auth_mfa.sql
 psql "$EMPTY_DATABASE_URL" -f tests/db/0011_rls_por_cliente.sql
 psql "$EMPTY_DATABASE_URL" -f tests/db/0012_boveda_tiempo_real.sql
+psql "$EMPTY_DATABASE_URL" -f tests/db/0013_mercado_valores.sql
 cd frontend && npm test && npm run build
 FRONTEND_URL=http://localhost:3000 node e2e/smoke.mjs   # needs backend (MODO_DEMO=true) + next start
 # AML/PLD console against the real stack (structuring -> freeze -> four-eyes unfreeze, roles, no tipping off):
@@ -808,7 +893,7 @@ The backend uses two database identities:
 | Identity | Variable | Used by |
 |---|---|---|
 | Schema owner (needs `CREATEROLE` the first time; on RDS, the master user) | `DATABASE_URL_PROPIETARIO` | only the one-shot `synthetic-capital migrar` |
-| App login `sc_app`: `NOINHERIT`, member of `sc_ifpe`, `sc_sofom`, `sc_puente`, `sc_auditor`, `sc_kyc`, `sc_kyc_verificador`, `sc_spei`, `sc_aml`, `sc_auth` and `sc_cliente` | `DATABASE_URL` | the long-running service |
+| App login `sc_app`: `NOINHERIT`, member of `sc_ifpe`, `sc_sofom`, `sc_puente`, `sc_auditor`, `sc_kyc`, `sc_kyc_verificador`, `sc_spei`, `sc_aml`, `sc_auth`, `sc_cliente` and `sc_mercado` | `DATABASE_URL` | the long-running service |
 
 The owner can disable triggers; the app login has no privileges of its own and
 acts only through `SET LOCAL ROLE` to one `sc_*` role per transaction. By
@@ -864,6 +949,8 @@ GRANT sc_ifpe, sc_sofom, sc_puente, sc_auditor, sc_kyc, sc_kyc_verificador, sc_s
 GRANT sc_aml TO sc_app WITH INHERIT FALSE, SET TRUE;
 -- Two-step verification and password reset (0010); a client's own reads under RLS (0011).
 GRANT sc_auth, sc_cliente TO sc_app WITH INHERIT FALSE, SET TRUE;
+-- Market orders: quotes, orders and their cash through the vault (0013).
+GRANT sc_mercado TO sc_app WITH INHERIT FALSE, SET TRUE;
 -- Optional: an external job that re-verifies the whole AML audit log
 -- (SELECT * FROM aml.verificar_bitacora(1)) and can do nothing else.
 CREATE ROLE audit_job LOGIN PASSWORD '...';
@@ -937,6 +1024,8 @@ the password is hashed, so a parallel burst cannot test more than 5 passwords.
 | GET | `/api/v1/tablero` | client: vault + investment + live reserve |
 | GET | `/api/v1/vault` | client: Sovereign Vault snapshot (balance, reserve proof, holdings) |
 | GET | `/api/v1/vault/ws` | client: Sovereign Vault real-time channel (WebSocket, subprotocol `sc.vault.v1`) |
+| GET | `/api/v1/market/quote/{ticker}` | any session: the asset and its price history (`MarketQuote`) |
+| POST | `/api/v1/market/order` | client: market order by amount (`OrderRequest` → `OrderReceipt`), filled at the current price |
 | GET | `/api/v1/ifpe/cuenta`, `/api/v1/ifpe/movimientos` | client |
 | POST | `/api/v1/ifpe/transferencias` | client: internal transfer |
 | POST | `/api/v1/ifpe/retiros` | client: withdrawal to own external CLABE (an outgoing SPEI) |
@@ -949,7 +1038,7 @@ the password is hashed, so a parallel burst cannot test more than 5 passwords.
 | GET | `/api/v1/reserva/cortes?antes=&limite=`, `/api/v1/reserva/cortes/{id}` | public: history of published anchors (root, totals, ledger sequence and hash) |
 | GET | `/api/v1/reserva/prueba` | client: Merkle proof for their account |
 | POST | `/api/v1/reserva/verificar` | public: verify a proof against the published root |
-| GET | `/api/v1/auditoria/ledger/{ifpe,sofom}` | operator / auditor |
+| GET | `/api/v1/auditoria/ledger/{ifpe,sofom,mercado}` | operator / auditor |
 | POST | `/api/v1/operaciones/depositos` | operator: manual entry of an incoming SPEI (5-digit `banco_emisor`, `fecha_operacion`, `clave_rastreo`); same path and same identity as the webhook, so a payment entered by hand and notified by the provider is credited once |
 | POST | `/api/v1/operaciones/creditos`, `.../{id}/pagos`, `.../{id}/castigo` | operator: loans, collections, write-offs (losses absorbed by SOFOM capital) |
 | POST | `/api/v1/operaciones/usuarios/{id}/revocar-sesiones` | operator: invalidate a user's JWTs immediately |

@@ -51,13 +51,17 @@ pub enum Rol {
     /// las filas del cliente de la transacción. Se abre con
     /// [`begin_lectura_cliente`]; sin cliente no ve nada.
     Cliente,
+    /// Mercado de valores: coloca órdenes (compra y venta) y mueve su
+    /// efectivo entre la bóveda y el mercado. En la IFPE solo escribe
+    /// `saldo_disponible`, la reserva y sus dos movimientos; nunca la SOFOM.
+    Mercado,
 }
 
 impl Rol {
     /// Todos los roles transaccionales: el login de la aplicación es miembro
     /// de cada uno (sin heredar sus privilegios) y actúa con `SET LOCAL ROLE`.
     /// `sc_auditor_pld` no está: es para un verificador externo de la bitácora PLD.
-    pub const TODOS: [Rol; 10] = [
+    pub const TODOS: [Rol; 11] = [
         Rol::Ifpe,
         Rol::Sofom,
         Rol::Puente,
@@ -68,6 +72,7 @@ impl Rol {
         Rol::Aml,
         Rol::Auth,
         Rol::Cliente,
+        Rol::Mercado,
     ];
 
     pub const fn nombre(self) -> &'static str {
@@ -82,6 +87,7 @@ impl Rol {
             Rol::Aml => "sc_aml",
             Rol::Auth => "sc_auth",
             Rol::Cliente => "sc_cliente",
+            Rol::Mercado => "sc_mercado",
         }
     }
 
@@ -99,6 +105,7 @@ impl Rol {
             Rol::Aml => "SET LOCAL ROLE sc_aml",
             Rol::Auth => "SET LOCAL ROLE sc_auth",
             Rol::Cliente => "SET LOCAL ROLE sc_cliente",
+            Rol::Mercado => "SET LOCAL ROLE sc_mercado",
         }
     }
 }
@@ -209,12 +216,13 @@ pub async fn verificar_usuario_de_aplicacion(pool: &PgPool) -> Result<(), sqlx::
                 AND pg_has_role(current_user, 'sc_kyc', 'MEMBER') AND pg_has_role(current_user, 'sc_spei', 'MEMBER') \
                 AND pg_has_role(current_user, 'sc_kyc_verificador', 'MEMBER') \
                 AND pg_has_role(current_user, 'sc_aml', 'MEMBER') AND pg_has_role(current_user, 'sc_auth', 'MEMBER') \
-                AND pg_has_role(current_user, 'sc_cliente', 'MEMBER')",
+                AND pg_has_role(current_user, 'sc_cliente', 'MEMBER') \
+                AND pg_has_role(current_user, 'sc_mercado', 'MEMBER')",
     )
     .fetch_one(pool)
     .await?;
     if !miembro {
-        tracing::error!(%usuario, "el usuario de la aplicación no es miembro de sc_ifpe, sc_sofom, sc_puente, sc_auditor, sc_kyc, sc_kyc_verificador, sc_spei, sc_aml, sc_auth y sc_cliente");
+        tracing::error!(%usuario, "el usuario de la aplicación no es miembro de sc_ifpe, sc_sofom, sc_puente, sc_auditor, sc_kyc, sc_kyc_verificador, sc_spei, sc_aml, sc_auth, sc_cliente y sc_mercado");
     }
     if superusuario || dueno {
         tracing::warn!(

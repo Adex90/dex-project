@@ -816,3 +816,64 @@ async fn el_latido_mantiene_al_que_responde_y_cierra_al_mudo(pool: PgPool) {
     pedir_resync(&mut vivo).await;
     assert_eq!(recibir(&mut vivo).await["type"], "vault.snapshot");
 }
+
+#[sqlx::test(migrations = "../migrations")]
+async fn una_orden_de_mercado_llega_por_el_socket(pool: PgPool) {
+    let cfg = preparar(&pool).await;
+    let srv = arrancar(AppState::nuevo(pool.clone(), cfg.clone())).await;
+    let ana = cliente(&pool, &cfg, "Ana").await;
+    let cuenta = ana.cuenta_ifpe.id;
+    depositar(&pool, &cfg, cuenta, "20000").await;
+    let token = token_cliente(&srv.estado, ana.cliente.id);
+
+    let mut ws = abrir(srv.dir, &token).await.unwrap();
+    let foto = recibir(&mut ws).await;
+    assert_eq!((foto["seq"].as_i64(), &foto["vault"]["holdings"]), (Some(1), &json!([])), "{foto}");
+    let oyente = tokio::spawn(central::escuchar(srv.estado.boveda.clone()));
+    assert_eq!(recibir(&mut ws).await["seq"], 1, "la foto al empezar a escuchar");
+
+    // La compra por la API: una transacción que mueve el saldo, así que la
+    // versión sube y, al confirmar, el socket recibe la bóveda nueva.
+    let api = routes::router(srv.estado.clone());
+    let orden = json!({ "ticker": "AUG1", "side": "buy", "amount": "1250.00", "idempotency_key": "orden-por-socket" });
+    let (s, recibo) = llamar_json(&api, "POST", "/api/v1/market/order", Some(&token), Some(orden.clone())).await;
+    assert_eq!(s, StatusCode::CREATED, "{recibo}");
+    let m = recibir(&mut ws).await;
+    assert_eq!((m["type"].as_str(), m["seq"].as_i64()), (Some("vault.snapshot"), Some(2)), "{m}");
+    subio_una(&pool, cuenta, 1).await;
+    assert_eq!(
+        m["vault"]["balance"],
+        json!({
+            "total_mxn": "20000.00248000",
+            "available_cash": "18750.07000000",
+            "invested_assets": "1249.93248000",
+            "unrealized_pnl_percentage": "0.00",
+        })
+    );
+    assert_eq!(
+        m["vault"]["holdings"],
+        json!([{
+            "ticker": "AUG1",
+            "name": "Tokenized gold, 1 g",
+            "shares": "0.77520000",
+            "current_price": "1612.40000000",
+            "total_value": "1249.93248000",
+            "daily_change_pct": "0.84",
+        }])
+    );
+
+    // Repetir la orden (la misma clave) no mueve nada: ni versión nueva ni aviso.
+    let (s, repetido) = llamar_json(&api, "POST", "/api/v1/market/order", Some(&token), Some(orden)).await;
+    assert_eq!((s, &repetido), (StatusCode::OK, &recibo));
+    nada_mas(&mut ws, Duration::from_millis(300)).await;
+
+    // Vender todo devuelve el efectivo y vacía las posiciones, en la versión siguiente.
+    let venta = json!({ "ticker": "AUG1", "side": "sell", "amount": "1249.93", "idempotency_key": "venta-por-socket" });
+    let (s, r) = llamar_json(&api, "POST", "/api/v1/market/order", Some(&token), Some(venta)).await;
+    assert_eq!((s, &r["quantity"]), (StatusCode::CREATED, &json!("0.77520000")), "{r}");
+    let m = recibir(&mut ws).await;
+    assert_eq!((m["type"].as_str(), m["seq"].as_i64()), (Some("vault.snapshot"), Some(3)), "{m}");
+    assert_eq!(m["vault"]["balance"]["available_cash"], "20000.00000000");
+    assert_eq!(m["vault"]["holdings"], json!([]));
+    oyente.abort();
+}

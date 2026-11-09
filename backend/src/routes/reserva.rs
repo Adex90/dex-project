@@ -29,6 +29,7 @@ pub fn rutas() -> Router<AppState> {
         .route("/reserva/verificar", post(verificar))
         .route("/auditoria/ledger/ifpe", get(auditar_ifpe))
         .route("/auditoria/ledger/sofom", get(auditar_sofom))
+        .route("/auditoria/ledger/mercado", get(auditar_mercado))
 }
 
 async fn estado(State(e): State<AppState>) -> AppResult<Json<EstadoReservaVista>> {
@@ -86,4 +87,9 @@ async fn auditar_ifpe(State(e): State<AppState>, u: Usuario) -> AppResult<Json<R
 async fn auditar_sofom(State(e): State<AppState>, u: Usuario) -> AppResult<Json<ResultadoVerificacion>> {
     u.exigir_operador_o_auditor()?;
     Ok(Json(hash::verificar_cadena_sofom(&e.pool).await?))
+}
+
+async fn auditar_mercado(State(e): State<AppState>, u: Usuario) -> AppResult<Json<ResultadoVerificacion>> {
+    u.exigir_operador_o_auditor()?;
+    Ok(Json(hash::verificar_cadena_mercado(&e.pool).await?))
 }

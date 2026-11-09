@@ -38,6 +38,9 @@ pub enum Canal {
     TransferenciaEnviada,
     SpeiEnviado,
     InversionMutuo,
+    /// Compra en el mercado de valores (migración 0013). La venta no es un
+    /// canal: como el retorno de un mutuo, es dinero del cliente que regresa.
+    CompraMercado,
     // SALIDA (SOFOM)
     DesembolsoCredito,
     // ENTRADA (SOFOM)
@@ -54,6 +57,7 @@ impl Canal {
             Canal::TransferenciaEnviada => "TRANSFERENCIA_ENVIADA",
             Canal::SpeiEnviado => "SPEI_ENVIADO",
             Canal::InversionMutuo => "INVERSION_MUTUO",
+            Canal::CompraMercado => "COMPRA_MERCADO",
             Canal::DesembolsoCredito => "DESEMBOLSO_CREDITO",
             Canal::CobroCredito => "COBRO_CREDITO",
         }
@@ -66,9 +70,11 @@ impl Canal {
             | Canal::SpeiDemo
             | Canal::TransferenciaRecibida
             | Canal::CobroCredito => Sentido::Entrada,
-            Canal::TransferenciaEnviada | Canal::SpeiEnviado | Canal::InversionMutuo | Canal::DesembolsoCredito => {
-                Sentido::Salida
-            }
+            Canal::TransferenciaEnviada
+            | Canal::SpeiEnviado
+            | Canal::InversionMutuo
+            | Canal::CompraMercado
+            | Canal::DesembolsoCredito => Sentido::Salida,
         }
     }
 
@@ -284,6 +290,7 @@ mod pruebas {
             TransferenciaEnviada,
             SpeiEnviado,
             InversionMutuo,
+            CompraMercado,
             DesembolsoCredito,
             CobroCredito,
         ];

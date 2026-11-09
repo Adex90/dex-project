@@ -6,6 +6,8 @@
 //! - [`sofom`]: puente IFPE -> contratos de mutuo y originación de crédito con calce de plazos.
 //! - [`crypto::merkle`]: árbol Merkle de sumas para Proof of Reserve.
 //! - [`reserva`]: cortes de Proof of Reserve y pruebas de inclusión por cliente.
+//! - [`mercado`]: mercado de valores: cotizaciones y órdenes de mercado, con su
+//!   ledger encadenado y el efectivo por la bóveda.
 //! - [`aml`]: monitoreo PLD/FT en línea (el esquema `aml` califica; Rust pasa hechos).
 //! - [`routes`]: API HTTP (Axum).
 //! - [`cli`]: comandos del binario (servir, migrar, salud).
@@ -26,6 +28,7 @@ pub mod dinero;
 pub mod error;
 pub mod kyc;
 pub mod ledger;
+pub mod mercado;
 pub mod models;
 pub mod pld;
 pub mod reserva;

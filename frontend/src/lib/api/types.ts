@@ -462,7 +462,7 @@ export type EntidadAml = "IFPE" | "SOFOM";
 export type SentidoAlertaAml = "ENTRADA" | "SALIDA" | "NINGUNO";
 export type SentidoMovimientoAml = "ENTRADA" | "SALIDA";
 export type CanalAml = "SPEI_WEBHOOK" | "SPEI_OPERADOR" | "SPEI_DEMO" | "TRANSFERENCIA_RECIBIDA" | "TRANSFERENCIA_ENVIADA"
-  | "SPEI_ENVIADO" | "INVERSION_MUTUO" | "DESEMBOLSO_CREDITO" | "COBRO_CREDITO";
+  | "SPEI_ENVIADO" | "INVERSION_MUTUO" | "COMPRA_MERCADO" | "DESEMBOLSO_CREDITO" | "COBRO_CREDITO";
 export type EstadoCongelamientoAml = "ACTIVO" | "LEVANTADO";
 export type OrigenCongelamientoAml = "AUTOMATICO" | "LOTE" | "MANUAL" | "LISTA_BLOQUEADAS";
 export type TipoSolicitudAml = "LEVANTAR_Y_LIBERAR" | "LEVANTAR_CONSERVANDO_RETENCIONES" | "LIBERAR_RETENCIONES";

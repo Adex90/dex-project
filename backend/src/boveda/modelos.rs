@@ -22,7 +22,7 @@ pub struct Boveda {
     pub saldo: SaldoBoveda,
     #[serde(rename = "reserve_proof")]
     pub prueba_reserva: PruebaReserva,
-    /// Vacío hasta el oráculo de precios de activos (RWA).
+    /// Las posiciones del mercado de valores (migración 0013), al precio vigente.
     #[serde(rename = "holdings")]
     pub posiciones: Vec<Posicion>,
 }
@@ -37,11 +37,14 @@ pub struct SaldoBoveda {
     /// Libre disposición: `saldo_disponible` de la cuenta IFPE.
     #[serde(rename = "available_cash")]
     pub disponible: Decimal,
-    /// Principal en mutuos SOFOM vigentes, o vencidos y aún por liquidar.
+    /// Principal en mutuos SOFOM vigentes (o vencidos y aún por liquidar) más
+    /// el valor de las posiciones del mercado al precio vigente.
     #[serde(rename = "invested_assets")]
     pub invertido: Decimal,
-    /// Cero mientras no haya posiciones con precio de mercado: los mutuos se
-    /// llevan a costo y su interés se realiza al liquidarse.
+    /// Ganancia o pérdida no realizada sobre lo invertido, en por ciento:
+    /// (valor de las posiciones − su costo) / (mutuos + costo de las
+    /// posiciones). Los mutuos se llevan a costo y su interés se realiza al
+    /// liquidarse, así que solo el mercado la mueve; 0.00 sin inversiones.
     #[serde(rename = "unrealized_pnl_percentage")]
     pub rendimiento_no_realizado: Decimal,
 }
@@ -69,7 +72,7 @@ pub struct PruebaReserva {
     pub raiz: String,
 }
 
-/// Una posición del portafolio. Sin uso hasta el oráculo de precios.
+/// Una posición del portafolio en el mercado de valores.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Posicion {
     pub ticker: String,
