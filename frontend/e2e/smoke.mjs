@@ -13,8 +13,11 @@
  * (personal data, INE photos and details, biometric consent + liveness) ->
  * VERIFICADO -> deposit, fixed-term investment, Proof of Reserve, ledger,
  * moving between the dashboard's tabs (Vault, Account, Invest, Reserve).
- * Second pass: signing in again lands directly on the Vault, then the same
- * dashboard on a phone-sized screen (bottom tab bar instead of the sidebar).
+ * Second pass: signing in again lands directly on the Vault, which is live
+ * over its WebSocket: a deposit made outside the browser reaches the screen
+ * with REST blocked, a server restart (1001) reconnects, and a session the
+ * server ends (4001) returns to sign-in. In between, the same dashboard on a
+ * phone-sized screen (bottom tab bar instead of the sidebar).
  * The theme is dark only ("Sovereign Gold"); the passes still differ in the
  * browser's preferred color scheme, which must not change it.
  */
@@ -29,6 +32,8 @@ import { sampleIdentity, SAMPLE_IDENTITY_SPACE, todayInMexicoCity } from "../src
 const { chromium } = createRequire(import.meta.url)("playwright");
 
 const BASE = process.env.FRONTEND_URL ?? "http://localhost:3000";
+// The backend the frontend was built against (NEXT_PUBLIC_API_URL): for deposits made outside the browser.
+const API = process.env.API_URL ?? "http://localhost:8080";
 const OUT = process.argv[2] ?? ".";
 mkdirSync(OUT, { recursive: true });
 
@@ -46,6 +51,33 @@ const errors = [];
 function check(condition, message) {
   if (!condition) throw new Error(`FAILED: ${message}`);
   console.log(`ok - ${message}`);
+}
+
+/** Signs in through the API, as another device would: a session of its own. */
+async function apiLogin(emailAddress, secret) {
+  const response = await fetch(`${API}/api/v1/auth/login`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ email: emailAddress, password: secret }),
+  });
+  const body = await response.json();
+  if (body.estado !== "OK") throw new Error(`API sign-in failed: ${JSON.stringify(body)}`);
+  return body.token;
+}
+
+/** A demo SPEI deposit through the API (MODO_DEMO), not through this browser. */
+async function apiDeposit(token, monto) {
+  const response = await fetch(`${API}/api/v1/ifpe/depositos/simulados`, {
+    method: "POST",
+    headers: { "content-type": "application/json", authorization: `Bearer ${token}` },
+    body: JSON.stringify({ monto, clave_idempotencia: crypto.randomUUID() }),
+  });
+  return response.status;
+}
+
+/** Waits for the header's stream indicator to read `status` ("live" only once a snapshot applied). */
+async function streamStatus(page, status, timeout = 15_000) {
+  await page.getByTestId("realtime-status").and(page.locator(`[data-status=${status}]`)).waitFor({ timeout });
 }
 
 /** The dashboard's main navigation (the sidebar from lg up, the bottom tab bar below). */
@@ -126,7 +158,21 @@ try {
     page.on("pageerror", (e) => errors.push(`[${colorScheme}] ${e.message}`));
 
     if (colorScheme === "dark") {
-      // Second pass: a verified client signs in and lands directly on the dashboard.
+      // Second pass. Every vault WebSocket the page opens goes through this route:
+      // forwarded to the real backend (same handshake), recorded, and closable by
+      // the test as the server would close it.
+      const vaultSockets = [];
+      const frames = [];
+      await page.routeWebSocket(/\/api\/v1\/vault\/ws$/, (ws) => {
+        const server = ws.connectToServer();
+        server.onMessage((message) => {
+          frames.push(JSON.parse(String(message)));
+          ws.send(message);
+        });
+        vaultSockets.push(ws);
+      });
+
+      // A verified client signs in and lands directly on the dashboard.
       await page.goto(`${BASE}/auth/login`);
       await page.fill("#email", email);
       await page.fill("#password", password);
@@ -142,10 +188,38 @@ try {
       );
       await page.getByTestId("kyc-header-badge").and(page.locator("[data-status=VERIFICADO]")).waitFor();
       check((await page.getByTestId("kyc-banner").count()) === 0, "second pass: no KYC banner for the verified client");
+      await streamStatus(page, "live");
+      check(frames[0]?.type === "vault.snapshot", "the vault stream opens with a snapshot");
       await shot(page, "vault-desktop");
+
+      // Live: a deposit made elsewhere reaches this screen over the WebSocket. REST
+      // for the vault is blocked meanwhile, so nothing else could have brought it.
+      await page.route("**/api/v1/vault", (route) => route.abort());
+      const otherDevice = await apiLogin(email, password);
+      check((await apiDeposit(otherDevice, "1234.56")) === 201, "a deposit of 1,234.56 is made outside this browser");
+      await page.getByTestId("vault-total").filter({ hasText: "26,234" }).waitFor({ timeout: 5_000 });
+      check(true, "the total updates live, without a reload or a REST call");
+      const spei = frames.find((m) => m.type === "spei.transfer");
+      check(
+        spei?.transfer.direction === "inbound" && spei.transfer.amount === "1234.56000000" && spei.seq > frames[0].seq,
+        `the deposit arrived as spei.transfer at a newer version (seq ${frames[0]?.seq} -> ${spei?.seq})`,
+      );
+      // The rest of the dashboard follows: the chart's cash reads the new balance.
+      await page.getByTestId("portfolio-chart").filter({ hasText: "16,234.56" }).waitFor({ timeout: 5_000 });
+      check(true, "the cash chart follows the deposit");
+      await page.unroute("**/api/v1/vault");
+
+      // A deploy: the server closes with 1001; the dashboard reconnects and catches up.
+      await vaultSockets.at(-1).close({ code: 1001, reason: "el servidor se reinicia" });
+      await streamStatus(page, "reconnecting", 5_000);
+      await streamStatus(page, "live");
+      check(vaultSockets.length === 2, "after the server goes away (1001) the dashboard reconnects on its own");
+      await page.getByTestId("vault-total").filter({ hasText: "26,234" }).waitFor();
+
       await openTab(page, "Account");
-      await page.getByTestId("vault-available").filter({ hasText: "15,000.00" }).waitFor();
-      check(true, "the Account tab shows the cash balance");
+      await page.getByTestId("vault-available").filter({ hasText: "16,234.56" }).waitFor();
+      check(true, "the Account tab shows the cash balance, deposit included");
+      check(vaultSockets.length === 2, "switching tabs keeps the same socket");
 
       // A phone: the sidebar gives way to the bottom tab bar.
       await page.setViewportSize({ width: 390, height: 844 });
@@ -153,7 +227,7 @@ try {
       const box = await tabBar.boundingBox();
       check(box !== null && box.y + box.height >= 844 - 1 && box.width === 390, "phones get the bottom tab bar");
       await openTab(page, "Vault");
-      await page.getByTestId("vault-total").filter({ hasText: "25,000" }).waitFor();
+      await page.getByTestId("vault-total").filter({ hasText: "26,234" }).waitFor();
       await page.getByTestId("portfolio-line").waitFor();
       await shot(page, "vault-mobile");
       await openTab(page, "Reserve");
@@ -162,6 +236,12 @@ try {
       await page.waitForTimeout(1500);
       await shot(page, "reserve-mobile");
       check(true, "the dashboard works on a phone-sized screen");
+
+      // The server ends the session (4001: expired or revoked): back to sign-in, no reconnection.
+      await vaultSockets.at(-1).close({ code: 4001, reason: "sesión revocada" });
+      await page.waitForURL("**/auth/login?expired=1");
+      await page.waitForTimeout(1500);
+      check(vaultSockets.length === 2, "a session the server ends (4001) signs out instead of reconnecting");
       await context.close();
       continue;
     }
@@ -200,6 +280,9 @@ try {
       (await headerBadge.getAttribute("data-status")) === "PENDIENTE" && (await headerBadge.innerText()).includes("Pending"),
       "header badge reads Pending",
     );
+    // The vault stream is live for a brand-new account: its snapshot carries version 0.
+    await streamStatus(page, "live");
+    check(true, "the vault stream is live for a new account (snapshot at version 0)");
     // The Vault home offers no CLABE to deposit to: the bank would return the transfer.
     check(
       (await mainNav(page).getByRole("link", { name: "Vault", exact: true }).getAttribute("aria-current")) === "page",

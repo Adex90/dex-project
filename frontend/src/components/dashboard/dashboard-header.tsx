@@ -5,8 +5,9 @@ import { LogOut, RefreshCw } from "lucide-react";
 
 import { Brand } from "@/components/brand";
 import { KycHeaderBadge } from "@/components/dashboard/kyc-status";
-import { Button } from "@/components/ui/primitives";
+import { Button, cx } from "@/components/ui/primitives";
 import type { Cliente } from "@/lib/api/types";
+import type { RealtimeStatus } from "@/store/vault";
 
 function useSecondsSince(timestamp: number | null): number | null {
   const [now, setNow] = useState(() => Date.now());
@@ -20,6 +21,7 @@ function useSecondsSince(timestamp: number | null): number | null {
 export function DashboardHeader({
   title,
   client,
+  realtime,
   lastUpdated,
   refreshing,
   onRefresh,
@@ -28,6 +30,8 @@ export function DashboardHeader({
   /** The section on screen (the page's heading). */
   title: string;
   client: Cliente | null;
+  /** The vault's WebSocket: "live" when changes arrive as they happen. */
+  realtime: RealtimeStatus;
   lastUpdated: number | null;
   refreshing: boolean;
   onRefresh: () => void;
@@ -49,13 +53,7 @@ export function DashboardHeader({
           <h1 className="truncate text-lg font-semibold tracking-tight text-ink">{title}</h1>
         </div>
         <div className="flex items-center gap-2 sm:gap-3">
-          <span className="hidden items-center gap-1.5 text-xs text-muted sm:inline-flex" aria-live="polite">
-            <span className="relative flex size-2">
-              <span className="absolute inline-flex size-full rounded-full bg-synthetic-yellow opacity-60 motion-safe:animate-ping" />
-              <span className="relative inline-flex size-2 rounded-full bg-synthetic-yellow" />
-            </span>
-            Live{seconds !== null ? ` · updated ${seconds}s ago` : ""}
-          </span>
+          <LiveStatus realtime={realtime} seconds={seconds} />
           <Button variant="ghost" size="sm" onClick={onRefresh} aria-label="Refresh balances" disabled={refreshing}>
             <RefreshCw className={`size-4 ${refreshing ? "animate-spin" : ""}`} aria-hidden />
           </Button>
@@ -74,5 +72,38 @@ export function DashboardHeader({
         </div>
       </div>
     </header>
+  );
+}
+
+/**
+ * The vault's connection, in words: "Live" while its WebSocket streams
+ * changes, "Reconnecting…" while it comes back, and the age of the last
+ * refresh while the dashboard falls back to polling.
+ */
+function LiveStatus({ realtime, seconds }: { realtime: RealtimeStatus; seconds: number | null }) {
+  const live = realtime === "live";
+  const words = live
+    ? "Live"
+    : realtime === "connecting"
+      ? "Connecting…"
+      : realtime === "reconnecting"
+        ? "Reconnecting…"
+        : "Updated";
+  return (
+    <span
+      className="hidden items-center gap-1.5 text-xs text-muted sm:inline-flex"
+      data-testid="realtime-status"
+      data-status={realtime}
+    >
+      <span className="relative flex size-2" aria-hidden>
+        {live ? (
+          <span className="absolute inline-flex size-full rounded-full bg-synthetic-yellow opacity-60 motion-safe:animate-ping" />
+        ) : null}
+        <span className={cx("relative inline-flex size-2 rounded-full", live ? "bg-synthetic-yellow" : "bg-muted")} />
+      </span>
+      {/* The state is announced when it changes; the ticking age is not, every second. */}
+      <span aria-live="polite">{words}</span>
+      {realtime === "offline" && seconds !== null ? <span aria-hidden>{seconds}s ago</span> : null}
+    </span>
   );
 }

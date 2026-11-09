@@ -675,6 +675,21 @@ it, with a cash-balance chart rebuilt from the IFPE ledger.
       database pool at a time, so a burst waits instead of starving HTTP
       requests.
     - The browser may send 4 KB per message.
+- **The dashboard's side** (`frontend/src/lib/vault-socket.ts`, run by
+  `useVaultSocket` in the dashboard shell):
+  - **One socket** per signed-in browser tab, kept across the dashboard's tabs.
+  - **Messages:** every frame goes to the store's `receive()`, which applies
+    them in order. A gap, or a delta before any snapshot, sends `resync`.
+  - **Reconnection:** after a drop or a deploy (1001), with jittered backoff
+    from 1 s to 30 s. It reconnects at once when the browser comes back online
+    or the tab becomes visible.
+  - **Session end:** a 4001 signs out to the sign-in page instead of
+    reconnecting.
+  - **REST:** `GET /api/v1/vault` gives the first paint and fills in while the
+    stream is down; its polling pauses while the stream is live.
+  - **Other tabs:** a newer version reloads the summary and the ledger, so the
+    chart and the Account tab follow.
+  - **Header indicator:** reads "Live" only once a snapshot has applied.
 - **Where versions come from (migration `0012`).**
   - `ifpe.cuentas.seq` goes up by exactly one in every transaction that
     changes an account's balances. A trigger does it, so every code path is

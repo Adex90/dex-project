@@ -111,9 +111,12 @@ function isOneOf<T extends string>(options: readonly T[], value: unknown): value
   return typeof value === "string" && (options as readonly string[]).includes(value);
 }
 
-/** Strictly increasing stream position: a positive safe integer. */
+/**
+ * Stream position: the account's version, a non-negative safe integer. A new
+ * account starts at 0 (migration 0012) and its first snapshot carries it.
+ */
 function isSeq(value: unknown): value is number {
-  return typeof value === "number" && Number.isSafeInteger(value) && value > 0;
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
 }
 
 /** A decimal string the money helpers accept: optional minus, digits, at most 8 decimals, no spaces. */

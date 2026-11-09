@@ -114,6 +114,13 @@ test("unknown fields are dropped, at every level", () => {
   assert.equal("overdraft" in parsed.balance, false);
 });
 
+test("a new account's snapshot carries seq 0; a negative or fractional seq is refused", () => {
+  const message = (seq: number) => JSON.stringify({ type: "vault.snapshot", seq, vault: snapshot() });
+  assert.equal(parseRealtimeMessage(message(0))?.seq, 0);
+  assert.equal(parseRealtimeMessage(message(-1)), null);
+  assert.equal(parseRealtimeMessage(message(1.5)), null);
+});
+
 test("money sent as a JSON number is refused: floats never reach the store", () => {
   const raw = { ...snapshot(), balance: { ...snapshot().balance, total_mxn: 128450.75 } };
   assert.equal(parseVaultSnapshot(raw), null);
@@ -185,8 +192,8 @@ test("broken JSON, binary frames and unknown types give null", () => {
   assert.equal(parseRealtimeMessage(null), null);
 });
 
-test("seq must be a positive integer", () => {
-  for (const seq of [0, -1, 1.5, "2", Number.MAX_SAFE_INTEGER + 1, undefined]) {
+test("seq must be a non-negative safe integer", () => {
+  for (const seq of [-1, 1.5, "2", Number.MAX_SAFE_INTEGER + 1, undefined]) {
     const frame = { type: "reserve.updated", seq, reserve_proof: snapshot().reserve_proof };
     assert.equal(parseRealtimeMessage(frame), null, String(seq));
   }

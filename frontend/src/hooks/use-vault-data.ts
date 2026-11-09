@@ -11,11 +11,14 @@ import { useAuthStore } from "@/store/auth";
 import { useVaultStore } from "@/store/vault";
 
 /**
- * Loads the Sovereign Vault (GET /api/v1/vault) into `useVaultStore` and
- * keeps it fresh the way the rest of the dashboard is: it polls while the
- * tab is visible, refreshes when the tab becomes visible again, and signs out
- * on a 401. The store is cleared when the dashboard unmounts (sign-out), so
- * the next person in this tab never sees the previous one's vault.
+ * Loads the Sovereign Vault (GET /api/v1/vault) into `useVaultStore`: the
+ * first paint, and the fallback whenever the WebSocket (`useVaultSocket`) is
+ * not live. It polls while the tab is visible and the stream is down,
+ * refreshes when the tab becomes visible again, and signs out on a 401. While
+ * the stream is live a poll would change nothing (the store keeps the
+ * stream's newer state), so none is sent. The store is cleared when the
+ * dashboard unmounts (sign-out), so the next person in this tab never sees
+ * the previous one's vault.
  */
 export function useVaultData(token: string | null) {
   const router = useRouter();
@@ -36,7 +39,7 @@ export function useVaultData(token: string | null) {
     if (!token) return;
     void refresh();
     const tick = () => {
-      if (document.visibilityState === "visible") void refresh();
+      if (document.visibilityState === "visible" && useVaultStore.getState().realtime !== "live") void refresh();
     };
     const id = setInterval(tick, POLL_INTERVAL_MS);
     document.addEventListener("visibilitychange", tick);

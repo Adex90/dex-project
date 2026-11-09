@@ -10,9 +10,13 @@ import { Alert, Button } from "@/components/ui/primitives";
 import { useDashboardData } from "@/hooks/use-dashboard-data";
 import { useSession } from "@/hooks/use-session";
 import { useVaultData } from "@/hooks/use-vault-data";
+import { useVaultSocket } from "@/hooks/use-vault-socket";
 import { describeError } from "@/lib/api/client";
 import type { Cliente } from "@/lib/api/types";
+import { EXPIRED_LOGIN_PATH } from "@/lib/session";
+import { useAuthStore } from "@/store/auth";
 import { useDashboardStore } from "@/store/dashboard";
+import { displayedRealtime, useVaultStore } from "@/store/vault";
 
 /*
  * The dashboard's frame, shared by every tab (Vault, Account, Invest,
@@ -20,7 +24,10 @@ import { useDashboardStore } from "@/store/dashboard";
  *
  * It owns the data: the summary, the ledger and the vault load once here and
  * stay in their stores while the client moves between tabs, so switching
- * tabs never reloads or flashes skeletons. Pages read the stores and get the
+ * tabs never reloads or flashes skeletons. The vault stays live over its
+ * WebSocket; when the stream reports a newer version (a SPEI deposit, an
+ * investment) the summary and the ledger reload too, so every tab, the chart
+ * included, follows within a moment. Pages read the stores and get the
  * session, the KYC lock and `refresh` from `useDashboard()`.
  */
 
@@ -49,6 +56,12 @@ export function DashboardShell({ children }: { children: ReactNode }) {
   const { token, logout } = useSession();
   const { refresh: refreshDashboard } = useDashboardData(token);
   const { refresh: refreshVault } = useVaultData(token);
+  const endSession = useCallback(() => {
+    useAuthStore.getState().expire();
+    router.replace(EXPIRED_LOGIN_PATH);
+  }, [router]);
+  useVaultSocket(token, { onAdvance: () => void refreshDashboard(), onSessionEnded: endSession });
+  const realtime = useVaultStore(displayedRealtime);
   const summary = useDashboardStore((s) => s.summary);
   const loading = useDashboardStore((s) => s.loading);
   const error = useDashboardStore((s) => s.error);
@@ -82,6 +95,7 @@ export function DashboardShell({ children }: { children: ReactNode }) {
         <DashboardHeader
           title={section?.label ?? "Dashboard"}
           client={client}
+          realtime={realtime}
           lastUpdated={lastUpdated}
           refreshing={loading}
           onRefresh={() => void refresh()}

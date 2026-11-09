@@ -68,6 +68,15 @@ export type RealtimeStatus = "offline" | "connecting" | "live" | "reconnecting";
  */
 export type ApplyResult = "applied" | "gap" | "duplicate" | "no-baseline" | "invalid";
 
+/**
+ * The stream's state as the UI should name it: "live" only once a snapshot
+ * has set the baseline. An open socket whose snapshot has not arrived, or was
+ * refused, is still connecting: what is on screen came over REST.
+ */
+export function displayedRealtime(state: { realtime: RealtimeStatus; lastSeq: number | null }): RealtimeStatus {
+  return state.realtime === "live" && state.lastSeq === null ? "connecting" : state.realtime;
+}
+
 /** Fetches the vault over REST and resolves with the parsed JSON body; the store validates it. */
 export type VaultFetcher = (signal: AbortSignal) => Promise<unknown>;
 

@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { beforeEach, test } from "node:test";
 
 import type { Holding, SpeiTransfer, VaultBalance, VaultSnapshot } from "../types/vault.ts";
-import { MAX_RECENT_TRANSFERS, useVaultStore } from "./vault.ts";
+import { MAX_RECENT_TRANSFERS, displayedRealtime, useVaultStore } from "./vault.ts";
 
 const vault = () => useVaultStore.getState();
 
@@ -274,4 +274,15 @@ test("reset clears data and the stream baseline", () => {
   assert.equal(s.lastSeq, null);
   assert.equal(s.status, "idle");
   assert.equal(s.realtime, "offline");
+});
+
+test("the UI calls the stream live only once a snapshot has set the baseline", () => {
+  vault().setRealtimeStatus("connecting");
+  assert.equal(displayedRealtime(vault()), "connecting");
+  vault().setRealtimeStatus("live");
+  assert.equal(displayedRealtime(vault()), "connecting", "open, but no snapshot yet");
+  vault().receive(frame({ type: "vault.snapshot", seq: 0, vault: snapshot("0.00") }));
+  assert.equal(displayedRealtime(vault()), "live", "a new account's snapshot at seq 0 counts");
+  vault().setRealtimeStatus("reconnecting");
+  assert.equal(displayedRealtime(vault()), "reconnecting");
 });
