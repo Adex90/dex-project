@@ -52,7 +52,7 @@ argon2 = "0.5"
 rand = "0.8"
 # Segundo factor: TOTP (RFC 6238) y su URL otpauth://; el secreto se guarda
 # cifrado con AES-256-GCM; el QR de inscripción se dibuja como SVG.
-totp-rs = { version = "5", features = ["otpauth", "zeroize"] }
+totp-rs = { version = "6", features = ["otpauth", "zeroize"] }
 aes-gcm = "0.10"
 qrcodegen = "1"
 # Comparaciones en tiempo constante (códigos TOTP, hashes de tokens).
