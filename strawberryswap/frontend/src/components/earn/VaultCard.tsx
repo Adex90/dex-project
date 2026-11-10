@@ -4,7 +4,7 @@ import { useState } from "react";
 import { bpsToPct, fmt, parseAmount, shortAddr } from "@/lib/format";
 import { useApp } from "@/components/AppState";
 import { IconChevron, IconVault } from "@/components/ui/icons";
-import { Card, Loading, Notice, Reveal, Row, Skeleton, TokenIcon } from "@/components/ui/primitives";
+import { Card, Loading, Notice, PreLaunch, Reveal, Row, Skeleton, TokenIcon } from "@/components/ui/primitives";
 
 const WAD = 10n ** 18n;
 
@@ -45,7 +45,9 @@ export function VaultCard() {
   if (!v.configured) {
     return (
       <Card>
-        <Notice tone="warn">No vault address in this build. Set NEXT_PUBLIC_VAULT_ADDRESS and rebuild.</Notice>
+        <PreLaunch title="Strategy vaults launch with Mainnet">
+          Deposits, the share price and the high-water mark appear here once the vault contract is deployed.
+        </PreLaunch>
       </Card>
     );
   }

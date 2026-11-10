@@ -1,7 +1,7 @@
 "use client";
 
 import { useId, useRef, type KeyboardEvent, type ReactNode } from "react";
-import { IconChevron } from "./icons";
+import { IconChevron, IconClock } from "./icons";
 
 /* ------------------------------------------------------------------------------------------------ surfaces */
 
@@ -100,6 +100,21 @@ export function Row({ label, children }: { label: ReactNode; children: ReactNode
 }
 
 /* ------------------------------------------------------------------------------------------------ notices */
+
+/** Pre-launch state for a contract that is not deployed yet: a calm status line, no developer instructions. */
+export function PreLaunch({ title, children, className = "" }: { title: string; children: ReactNode; className?: string }) {
+  return (
+    <div role="status" className={`card-inset flex items-start gap-3 ${className}`}>
+      <span className="grid h-10 w-10 shrink-0 place-items-center rounded-2xl bg-plum-700 text-lavender shadow-inset">
+        <IconClock />
+      </span>
+      <span className="min-w-0">
+        <span className="block font-semibold text-ink">{title}</span>
+        <span className="mt-1 block text-sm text-lavender">{children}</span>
+      </span>
+    </div>
+  );
+}
 
 export function Notice({ tone, children, className = "" }: { tone: "warn" | "err" | "ok" | "info"; children: ReactNode; className?: string }) {
   const style = {

@@ -42,7 +42,7 @@ function PoolTicker({ series, selected, onSelect }: { series: PriceSeries; selec
             live
           </span>
         ) : (
-          <span className="pill-plum">offline</span>
+          <span className="pill-plum">pre-launch</span>
         )}
       </span>
       {loading ? (
@@ -56,7 +56,7 @@ function PoolTicker({ series, selected, onSelect }: { series: PriceSeries; selec
           <span className="num block text-2xl font-semibold leading-7">{last ? fmt6(last.price) : "—"}</span>
           <Sparkline points={pts.slice(-60).map((p) => p.price)} pending={!last} className="mt-2 h-10 w-full" />
           <span className="mt-2 flex h-5 items-center justify-between text-xs">
-            <span className="text-haze">{series.symbol1 ? `${series.symbol1} per ${series.symbol0}` : "No pool in this build"}</span>
+            <span className="text-haze">{series.symbol1 ? `${series.symbol1} per ${series.symbol0}` : "Launches with Mainnet"}</span>
             {change ? <span className={up ? "pill-mint" : "pill-berry"}>{`${up ? "+" : ""}${change.pct.toFixed(2)}% ${change.full ? "24h" : "range"}`}</span> : null}
           </span>
         </span>

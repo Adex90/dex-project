@@ -23,15 +23,21 @@ const httpsUrl = (u: string | undefined) => (u && /^https:\/\/[^\s"'<>]+$/.test(
 
 type Social = { name: string; href: string | undefined; Icon: typeof IconX };
 /**
- * Official accounts only. X, Telegram and Discord come from the build (NEXT_PUBLIC_SOCIAL_X, NEXT_PUBLIC_SOCIAL_TELEGRAM,
- * NEXT_PUBLIC_SOCIAL_DISCORD) and stay hidden until set, so the footer never sends anyone to a guessed handle:
- * look-alike Telegram and Discord groups are a common way crypto users get phished. GitHub is the repository.
+ * X, Telegram and Discord: PLACEHOLDER handles until the official accounts exist. They are not verified as ours, and a
+ * link to a handle someone else controls is a common way crypto users get phished, so set NEXT_PUBLIC_SOCIAL_X,
+ * NEXT_PUBLIC_SOCIAL_TELEGRAM and NEXT_PUBLIC_SOCIAL_DISCORD to the official URLs before any public deployment (a value
+ * set at build time replaces the placeholder). GitHub is the repository.
  */
+const PLACEHOLDER_SOCIALS = {
+  x: "https://x.com/StrawberrySwap",
+  telegram: "https://t.me/StrawberrySwap",
+  discord: "https://discord.gg/StrawberrySwap",
+} as const;
 const SOCIALS = (
   [
-    { name: "X", href: httpsUrl(process.env.NEXT_PUBLIC_SOCIAL_X), Icon: IconX },
-    { name: "Telegram", href: httpsUrl(process.env.NEXT_PUBLIC_SOCIAL_TELEGRAM), Icon: IconTelegram },
-    { name: "Discord", href: httpsUrl(process.env.NEXT_PUBLIC_SOCIAL_DISCORD), Icon: IconDiscord },
+    { name: "X", href: httpsUrl(process.env.NEXT_PUBLIC_SOCIAL_X) ?? PLACEHOLDER_SOCIALS.x, Icon: IconX },
+    { name: "Telegram", href: httpsUrl(process.env.NEXT_PUBLIC_SOCIAL_TELEGRAM) ?? PLACEHOLDER_SOCIALS.telegram, Icon: IconTelegram },
+    { name: "Discord", href: httpsUrl(process.env.NEXT_PUBLIC_SOCIAL_DISCORD) ?? PLACEHOLDER_SOCIALS.discord, Icon: IconDiscord },
     { name: "GitHub", href: REPO, Icon: IconGitHub },
   ] as Social[]
 ).filter((s): s is Social & { href: string } => !!s.href);

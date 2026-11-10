@@ -3,24 +3,35 @@
 import { bpsToPct, fmt } from "@/lib/format";
 import { useApp } from "@/components/AppState";
 import { IconZap } from "@/components/ui/icons";
-import { Card, CardHeader, Notice, StatTile } from "@/components/ui/primitives";
+import { Card, CardHeader, Notice, PreLaunch, StatTile } from "@/components/ui/primitives";
 
 /** Live pool market data (read-only). Trading itself happens privately through the swap card. */
 export function PoolCard({ className = "" }: { className?: string }) {
   const { pool } = useApp();
   const s = pool.state;
   const loading = pool.configured && !s && !pool.error;
+  const how = (
+    <p className="mt-4 text-sm text-lavender">
+      Swaps execute in batches at one uniform price derived from the curve; only the net flow per asset is public. Arbitrageurs pay the
+      Treasury to rebalance the pool, which is what keeps the retail fee at zero.
+    </p>
+  );
 
   return (
     <Card className={className} aria-labelledby="pool-title">
       <CardHeader
         icon={<IconZap />}
         title={<span id="pool-title">Dark pool</span>}
-        subtitle="Live reserves · refreshed every 12 s"
+        subtitle={pool.configured ? "Live reserves · refreshed every 12 s" : "Zero-fee batch settlement"}
         right={<span className="pill-mint">{s ? bpsToPct(s.feeBps) : "0.00%"} retail fee</span>}
       />
       {!pool.configured ? (
-        <Notice tone="warn">No DarkPool address in this build. Set NEXT_PUBLIC_DARKPOOL_ADDRESS and rebuild.</Notice>
+        <>
+          <PreLaunch title="The Dark Pool launches with Mainnet">
+            Live reserves, the spot price and the MEV bounty appear here once the pool contract is deployed.
+          </PreLaunch>
+          {how}
+        </>
       ) : (
         <>
           <div className="grid grid-cols-2 gap-3">
@@ -35,10 +46,7 @@ export function PoolCard({ className = "" }: { className?: string }) {
               loading={loading}
             />
           </div>
-          <p className="mt-4 text-sm text-lavender">
-            Swaps execute in batches at one uniform price derived from the curve; only the net flow per asset is public. Arbitrageurs pay the
-            Treasury to rebalance the pool, which is what keeps the retail fee at zero.
-          </p>
+          {how}
           {pool.error ? <Notice tone="err" className="mt-3">Pool read failed: {pool.error}</Notice> : null}
         </>
       )}
