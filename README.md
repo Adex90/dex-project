@@ -823,6 +823,24 @@ three routes in the `API` rate-limit group, all behind the JWT extractor:
   - Each row of the vault's asset list opens its asset's page. The ledger
     shows the cash legs as "Market buy" and "Market sale", and the cash chart
     counts them.
+- **Frontend: order types** (the checkout drawer,
+  `frontend/src/components/markets/order-checkout-drawer.tsx`):
+  - A toggle at the top chooses Market, Limit, Stop or, to buy, Savings plan.
+    A limit or stop adds its price, typed on the same numpad as the amount. A
+    savings plan asks how often (weekly, every 2 weeks, monthly) and shows
+    what that adds up to in a month.
+  - Each type has its own estimate and rules (`assessOrder` in
+    `frontend/src/lib/market.ts`):
+    - a limit estimates at its price, and says when the price already meets it;
+    - a stop must be above the price to buy and below it to sell;
+    - a sale can take what the position is worth at the order's price;
+    - an amount too small for one unit is refused before it is sent.
+  - The contract is `OrderRequest` in `frontend/src/types/market.ts`, a union
+    on `order_type` with `limit_price`, `stop_price` and `frequency`. Only
+    market orders are live (`LIVE_ORDER_TYPES`). The others can be set up and
+    previewed, but their button stays disabled with a note saying why, and
+    `api.placeOrder` sends market orders only, in today's wire format. A limit
+    order can never reach the market endpoint and fill at the current price.
 - **Audit:** `GET /api/v1/auditoria/ledger/mercado` (operator / auditor)
   re-verifies the chain, replays every position and every sale's average
   cost, and checks each order against its IFPE movement.

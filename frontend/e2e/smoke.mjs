@@ -432,6 +432,14 @@ try {
       await detail.getByText("1.5504 AUG1").waitFor();
       await shot(page, "asset-mobile");
       await page.getByRole("button", { name: "Sell", exact: true }).click();
+      await checkout.getByTestId("order-type").getByText("Limit", { exact: true }).click();
+      await checkout.getByTestId("order-price").waitFor();
+      await shot(page, "checkout-limit-mobile");
+      check(
+        await checkout.evaluate((sheet) => sheet.scrollWidth <= sheet.clientWidth),
+        "on a phone the order types and the price fit the sheet's width",
+      );
+      await checkout.getByTestId("order-type").getByText("Market", { exact: true }).click();
       await checkout.getByRole("button", { name: "Max" }).click();
       check(
         (await checkout.getByTestId("order-amount").inputValue()) === "2,499.86" &&
@@ -982,9 +990,87 @@ try {
         /back to discover/i.test(await assetBack.innerText()),
       "an asset opened from Discover stays under Discover, and its Back link returns there",
     );
+    // The order types first. A limit or a stop takes its price on the same
+    // numpad, a savings plan its frequency; only market orders are live, so
+    // none of the others is ever sent.
+    let ordersSent = 0;
+    page.on("request", (r) => {
+      if (r.method() === "POST" && r.url().endsWith("/api/v1/market/order")) ordersSent += 1;
+    });
     await page.getByTestId("asset-buy").click();
     const drawer = page.getByTestId("order-checkout");
-    for (const key of ["1", "0", "0", "0"]) await drawer.getByRole("button", { name: key, exact: true }).click();
+    const orderTypes = drawer.getByTestId("order-type");
+    const chooseType = (label) => orderTypes.getByText(label, { exact: true }).click();
+    const typeKeys = async (keys) => {
+      for (const key of keys) await drawer.getByRole("button", { name: key, exact: true }).click();
+    };
+    const confirmButton = drawer.getByTestId("order-confirm");
+    const summary = drawer.getByTestId("order-summary");
+    const footnote = drawer.getByTestId("order-footnote");
+    const buttonText = async () => (await confirmButton.innerText()).toLowerCase();
+    check(
+      JSON.stringify(await orderTypes.getByRole("radio").evaluateAll((radios) => radios.map((r) => r.value))) ===
+        JSON.stringify(["market", "limit", "stop", "savings_plan"]) &&
+        (await orderTypes.getByRole("radio", { name: "Market" }).isChecked()),
+      "the buy drawer offers Market, Limit, Stop and Savings plan, Market first",
+    );
+
+    await chooseType("Limit");
+    const priceField = drawer.getByTestId("order-price");
+    await priceField.waitFor();
+    await typeKeys(["4", "2", "0", "0"]);
+    await drawer.getByTestId("order-amount").click();
+    await typeKeys(["1", "0", "0", "0"]);
+    const limitState = {
+      price: await priceField.inputValue(),
+      amount: await drawer.getByTestId("order-amount").inputValue(),
+      summary: (await summary.innerText()).replace(/\s+/g, " "),
+    };
+    const limitOk =
+      limitState.price === "4,200" &&
+      limitState.amount === "1,000" &&
+      limitState.summary.includes("$4,200.00") &&
+      limitState.summary.includes("0.238 STSLA");
+    check(
+      limitOk,
+      `a limit takes its price on the numpad, then the amount: 1,000.00 at 4,200.00 buys 0.238 STSLA${
+        limitOk ? "" : ` (${JSON.stringify(limitState)})`
+      }`,
+    );
+    check(
+      (await buttonText()) === "place limit order" &&
+        (await confirmButton.isDisabled()) &&
+        /not live yet/.test(await drawer.getByTestId("order-not-live").innerText()) &&
+        (await footnote.innerText()).includes("only at $4,200.00 or lower"),
+      "Place Limit Order stays disabled, and a note says limit orders are not live yet",
+    );
+
+    await chooseType("Stop");
+    await drawer.getByText("To buy, a stop must be above the current price.").waitFor();
+    check(await confirmButton.isDisabled(), "a stop to buy below the current price (4,200 < 4,415.30) is refused");
+    for (let i = 0; i < 4; i++) await drawer.getByRole("button", { name: "Delete last digit" }).click();
+    await typeKeys(["4", "6", "0", "0"]);
+    check(
+      (await footnote.innerText()).includes("when the price rises to $4,600.00") && (await buttonText()) === "place stop order",
+      "a stop to buy above the price says when it triggers",
+    );
+
+    await chooseType("Savings plan");
+    await drawer.getByTestId("order-frequency").getByText("Every 2 weeks", { exact: true }).click();
+    check(
+      (await priceField.count()) === 0 &&
+        (await buttonText()) === "create savings plan" &&
+        (await confirmButton.isDisabled()) &&
+        (await summary.innerText()).includes("$2,166.67"),
+      "a savings plan asks how often: 1,000.00 every 2 weeks is about $2,166.67 a month",
+    );
+    await shot(page, "checkout-plan-desktop");
+
+    await chooseType("Market");
+    check(
+      (await buttonText()) === "confirm order" && (await confirmButton.isEnabled()) && ordersSent === 0,
+      "back on Market the order can be placed, and nothing was sent for the other types",
+    );
     await drawer.getByTestId("order-confirm").click();
     const firstReceipt = drawer.getByTestId("order-receipt");
     await firstReceipt.waitFor();
@@ -1013,6 +1099,21 @@ try {
       "opened from the Vault's holdings, the asset's Back link returns to the Vault",
     );
     await page.getByRole("button", { name: "Sell", exact: true }).click();
+    check(
+      JSON.stringify(await orderTypes.getByRole("radio").evaluateAll((radios) => radios.map((r) => r.value))) ===
+        JSON.stringify(["market", "limit", "stop"]),
+      "the sell drawer offers Market, Limit and Stop (a savings plan only buys)",
+    );
+    await chooseType("Stop");
+    await typeKeys(["4", "0", "0", "0"]);
+    await drawer.getByRole("button", { name: "Max" }).click();
+    check(
+      (await drawer.getByTestId("order-amount").inputValue()) === "905.6" &&
+        (await buttonText()) === "place stop-loss" &&
+        (await confirmButton.isDisabled()),
+      "a stop-loss at 4,000.00 sells at most what the position is worth there (905.60); Place Stop-Loss stays disabled",
+    );
+    await chooseType("Market");
     await drawer.getByRole("button", { name: "Max" }).click();
     await drawer.getByTestId("order-confirm").click();
     await firstReceipt.waitFor();

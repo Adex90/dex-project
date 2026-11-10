@@ -7,10 +7,13 @@
  * - `GET /api/v1/market/assets` → `MarketCatalog` (any signed-in session): the
  *   Discover tab.
  * - `GET /api/v1/market/quote/{ticker}` → `MarketQuote` (any signed-in session).
- * - `POST /api/v1/market/order` with an `OrderRequest` → `OrderReceipt`
+ * - `POST /api/v1/market/order` with a market `OrderRequest` → `OrderReceipt`
  *   (clients only): 201 for a new order, 200 when the idempotency key repeats
  *   one already filled (the same receipt), 409 when it was used for something
  *   else.
+ * - Limit and stop orders and savings plans (roadmap modules 3 and 4) are
+ *   contract only: the checkout builds them, but nothing sends them until the
+ *   backend executes them (`LIVE_ORDER_TYPES` in lib/market.ts).
  *
  * Until the price oracle is connected, prices are simulated (`price_source`)
  * and the backend only quotes and fills them in demo mode (otherwise 503
@@ -84,15 +87,64 @@ export interface MarketQuote {
 
 export type OrderSide = "buy" | "sell";
 
-/** A market order by amount: buy (or sell) this many pesos' worth. */
-export interface OrderRequest {
+/**
+ * How an order executes: at once at the current price (`market`), only at a
+ * price or better (`limit`), once the price reaches a trigger (`stop`), or as
+ * a recurring purchase (`savings_plan`).
+ */
+export type OrderType = "market" | "limit" | "stop" | "savings_plan";
+
+/** How often a savings plan buys: every week, every two weeks, every month. */
+export type PlanFrequency = "weekly" | "biweekly" | "monthly";
+
+interface OrderFields {
   ticker: string;
-  side: OrderSide;
-  /** MXN with at most 2 decimals, as a string ("1250.00"). */
+  /** MXN with at most 2 decimals, as a string ("1250.00"): how much to buy, or to sell. */
   amount: DecimalString;
   /** 8 to 64 characters [A-Za-z0-9-_.]; one per order, reused on a retry. */
   idempotency_key: string;
 }
+
+/** Fills at once at the current price: the type the backend executes today. */
+export interface MarketOrderRequest extends OrderFields {
+  order_type: "market";
+  side: OrderSide;
+}
+
+/** Fills only at `limit_price` or better (at most that to buy, at least that to sell); it may never fill. */
+export interface LimitOrderRequest extends OrderFields {
+  order_type: "limit";
+  side: OrderSide;
+  /** MXN per unit, 2 to 4 decimals ("1580.00", "9.9439"). */
+  limit_price: DecimalString;
+}
+
+/**
+ * Becomes a market order once the price reaches `stop_price`: rising to it to
+ * buy, falling to it to sell (a stop-loss). It fills at the next available
+ * price, which may be past the stop.
+ */
+export interface StopOrderRequest extends OrderFields {
+  order_type: "stop";
+  side: OrderSide;
+  /** MXN per unit, 2 to 4 decimals: above the current price to buy, below it to sell. */
+  stop_price: DecimalString;
+}
+
+/** Buys `amount` of the asset every period from the vault's cash (dollar-cost averaging). */
+export interface SavingsPlanRequest extends OrderFields {
+  order_type: "savings_plan";
+  /** Plans only buy. */
+  side: "buy";
+  frequency: PlanFrequency;
+}
+
+/**
+ * An order, by type. Today's endpoint takes market orders without the
+ * `order_type` field (it rejects unknown fields); `api.placeOrder` sends
+ * exactly that, and only for market orders.
+ */
+export type OrderRequest = MarketOrderRequest | LimitOrderRequest | StopOrderRequest | SavingsPlanRequest;
 
 /**
  * What the backend answers for a placed order. A buy fills as many units as
@@ -102,7 +154,7 @@ export interface OrderRequest {
  */
 export interface OrderReceipt {
   order_id: string;
-  /** "filled" at once (market orders); "pending" is reserved for limit orders. */
+  /** "filled" at once (market orders); "pending" is reserved for limit and stop orders waiting for their price. */
   status: "filled" | "pending";
   ticker: string;
   side: OrderSide;

@@ -33,7 +33,9 @@ import type { MarketQuote, OrderReceipt, OrderRequest } from "@/types/market";
  *   shell's REST polling covers a stream that is down).
  * - Orders go to POST /api/v1/market/order with the checkout drawer's
  *   idempotency key, which the drawer reuses on a retry, so a retry never
- *   fills twice.
+ *   fills twice. Only market orders are live: the drawer previews limit and
+ *   stop orders and savings plans but never sends them, and this page refuses
+ *   them too.
  */
 
 type QuoteResult =
@@ -48,6 +50,7 @@ const UNREADABLE_QUOTE = "The quote could not be read. Please try again.";
 const UNREADABLE_RECEIPT =
   "The order was sent, but its receipt could not be read. Check your vault before trying again: retrying this same order cannot fill it twice.";
 const INVALID_AMOUNT = "Enter an amount in pesos, with at most two decimals.";
+const NOT_LIVE = "This kind of order is not live yet. Nothing was placed.";
 
 export default function AssetPage() {
   const params = useParams<{ ticker: string }>();
@@ -105,6 +108,7 @@ export default function AssetPage() {
 
   const placeOrder = useCallback(
     async (order: OrderRequest): Promise<OrderReceipt> => {
+      if (order.order_type !== "market") throw new Error(NOT_LIVE);
       let body: unknown;
       try {
         body = await api.placeOrder(token, order);

@@ -1,4 +1,4 @@
-import type { OrderRequest } from "@/types/market";
+import type { MarketOrderRequest } from "@/types/market";
 
 import { request } from "./client";
 import type {
@@ -101,10 +101,16 @@ export const api = {
   /**
    * A market order, filled at the current price. 201 for a new order, 200 with
    * the same receipt when the idempotency key repeats one already filled.
-   * Untyped on purpose: `parseOrderReceipt` validates the receipt.
+   * Market orders only, sent without `order_type`: the endpoint predates the
+   * other types and rejects unknown fields. Untyped on purpose:
+   * `parseOrderReceipt` validates the receipt.
    */
-  placeOrder: (token: string, order: OrderRequest) =>
-    request<unknown>("/api/v1/market/order", { method: "POST", token, body: order }),
+  placeOrder: (token: string, order: MarketOrderRequest) =>
+    request<unknown>("/api/v1/market/order", {
+      method: "POST",
+      token,
+      body: { ticker: order.ticker, side: order.side, amount: order.amount, idempotency_key: order.idempotency_key },
+    }),
 
   movements: (token: string, params: { limit?: number; before?: number } = {}, signal?: AbortSignal) =>
     request<TransaccionIfpe[]>("/api/v1/ifpe/movimientos", {

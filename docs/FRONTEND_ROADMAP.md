@@ -102,9 +102,24 @@ what the module waits on. They do not change its scope.
   - Left: swipe-to-trade. Confirm Order is the keyboard-accessible path a
     swipe would need anyway.
 - [ ] **3. Advanced Order Engine** (Limit, Stop-Loss, Trailing, Day/GTC)
-  - Builds on module 2.
+  - Frontend built: the checkout's order-type toggle offers Limit and Stop,
+    whose price is typed on the same numpad as the amount, with their
+    estimates and rules (`assessOrder` in `lib/market.ts`, unit tested; smoke
+    e2e). Contract: `LimitOrderRequest` and `StopOrderRequest` in
+    `types/market.ts` (`limit_price`, `stop_price`); a pending order's receipt
+    has `status: "pending"`.
+  - Not live: the button stays disabled until the backend executes these
+    types (`LIVE_ORDER_TYPES`). Left: the backend (accept `order_type`,
+    reserve the cash or units, trigger on the price), then trailing stops and
+    time in force (Day/GTC), and a list of open orders with cancel.
 - [ ] **4. Savings Plans / DCA** (Automated fractional recurring buys)
-  - Waits on recurring-order scheduling and fractional shares in the backend.
+  - Frontend built: Savings plan in the same toggle (buys only), with the
+    amount per purchase, the frequency (weekly, every 2 weeks, monthly), the
+    quantity at today's price and the monthly equivalent. Contract:
+    `SavingsPlanRequest` (`frequency`).
+  - Not live, like module 3. Left: the backend schedule (execution day,
+    business days, what happens without cash), the plan's own response
+    (next purchase date), and a screen to pause, edit or cancel plans.
 - [ ] **5. Options & Derivatives Chain** (Calls/Puts, Greeks, Expirations)
   - Gated by module 19. Waits on options market data.
 - [ ] **6. Multi-Currency FX Engine** (Live spread and exchange rates)

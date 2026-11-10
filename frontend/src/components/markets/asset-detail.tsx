@@ -235,7 +235,7 @@ export function AssetDetail({
         side={checkout ?? "buy"}
         onClose={() => setCheckout(null)}
         asset={asset}
-        available={checkout === "sell" ? worth : availableCash}
+        cash={availableCash}
         held={position}
         onConfirm={onPlaceOrder}
       />
