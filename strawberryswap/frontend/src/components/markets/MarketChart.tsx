@@ -219,14 +219,15 @@ export function MarketChart({ series, market, pendingName }: { series: PriceSeri
               role="img"
               aria-label={lastPoint ? `${pair} price chart, ${candles.length} ${tf} bars, last ${fmtPrice(lastPoint.price)}` : `${pair} price chart`}
             />
+            {/* overlays sit above the chart's canvases (z-10), which otherwise paint over them */}
             {!series.configured ? (
-              <p className="absolute inset-0 grid place-items-center text-sm text-haze">No pool in this build.</p>
+              <p className="absolute inset-0 z-10 grid place-items-center text-sm text-haze">The Dark Pool launches with Mainnet.</p>
             ) : series.status === "loading" && series.points.length === 0 ? (
-              <Loading label="Loading price history" className="absolute inset-0 flex flex-col justify-end gap-2 p-4">
+              <Loading label="Loading price history" className="absolute inset-0 z-10 flex flex-col justify-end gap-2 p-4">
                 <Skeleton className="h-full w-full" />
               </Loading>
             ) : series.points.length === 0 ? (
-              <p className="absolute inset-0 grid place-items-center px-6 text-center text-sm text-haze">No reserve changes yet: the chart starts with the first trade.</p>
+              <p className="absolute inset-0 z-10 grid place-items-center px-6 text-center text-sm text-haze">No reserve changes yet: the chart starts with the first trade.</p>
             ) : null}
           </div>
           <p className="mt-2 text-[11px] leading-relaxed text-haze">

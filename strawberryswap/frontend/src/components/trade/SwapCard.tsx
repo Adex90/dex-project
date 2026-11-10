@@ -85,6 +85,7 @@ export function SwapCard({ className = "" }: { className?: string }) {
   let cta: Cta;
   if (!wallet.account) cta = { label: "Connect Wallet", onClick: openWallet };
   else if (!wallet.chainOk) cta = { label: "Switch network", onClick: () => void wallet.switchChain() };
+  else if (!config.darkPool) cta = { label: "Private swaps open with Mainnet", disabled: true };
   else if (unavailable) cta = { label: "Private swaps unavailable in this build", disabled: true };
   else if (w.phase === "locked" || w.phase === "error") cta = { label: "Unlock shielded wallet", onClick: () => void w.unlock() };
   else if (w.phase === "unlocking") cta = { label: "Unlocking…", disabled: true };

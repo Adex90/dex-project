@@ -94,7 +94,7 @@ function ShieldedBalances() {
 function VaultPosition() {
   const { vault: v } = useApp();
   const s = v.state;
-  if (!v.configured) return <Empty>No strategy vault in this build.</Empty>;
+  if (!v.configured) return <Empty>Strategy vaults launch with Mainnet.</Empty>;
   if (!s) {
     return (
       <Loading label="Loading vault position">

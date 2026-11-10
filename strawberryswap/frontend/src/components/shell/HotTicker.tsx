@@ -62,7 +62,7 @@ export function HotTicker() {
             </span>
           </>
         ) : (
-          <span className="text-haze">{pool.configured ? "—" : t("ticker.offline")}</span>
+          <span className="text-haze">{pool.configured ? "—" : t("ticker.prelaunch")}</span>
         )}
       </Item>
       {ps ? (
