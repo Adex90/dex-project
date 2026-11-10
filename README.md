@@ -713,12 +713,18 @@ it, with a cash-balance chart rebuilt from the IFPE ledger.
       WebSocket end to end against the real server (handshake rules, caps,
       rate limit, heartbeat, revocation, LISTEN reconnection, shutdown).
 
-## Markets: quotes and market orders (migration `0013`)
+## Markets: catalog, quotes and market orders (migrations `0013`, `0014`)
 
 The trading screens (`frontend/src/components/markets/`) read one contract,
 `frontend/src/types/market.ts`. The backend is `backend/src/mercado/`, with
-two routes in the `API` rate-limit group, both behind the JWT extractor:
+three routes in the `API` rate-limit group, all behind the JWT extractor:
 
+- **`GET /api/v1/market/assets`** (any signed-in session): the catalog for
+  the Discover tab, by ticker. Each entry is the quote's `MarketAsset` plus
+  its `price_source`, read from `mercado.activos`: the table quotes and orders
+  use, so every listed asset can be opened and traded. Outside `MODO_DEMO`
+  only live prices are listed, and the answer is 503 `MERCADO_NO_DISPONIBLE`
+  when none is.
 - **`GET /api/v1/market/quote/{ticker}`** (any signed-in session): the asset
   (`MarketAsset`: price, 24-hour change against the previous close, market
   cap, volume, yield, quantity increment) and its price history for the
@@ -779,14 +785,33 @@ two routes in the `API` rate-limit group, both behind the JWT extractor:
   - A frozen client neither buys nor sells. A blocked buy still records the
     attempt.
 - **Simulated prices.** Until the pricing oracle is connected, the catalog
-  (`AUG1` tokenized gold, `AGT1` tokenized silver, `SCT28` a 28-day bill)
-  has `SIMULADO` prices and the history is generated. It is deterministic,
-  decimal-only, ends at the current price and passes through the previous
-  close exactly 24 hours earlier. Outside `MODO_DEMO`, a simulated price is
-  neither quoted nor traded (503 `MERCADO_NO_DISPONIBLE`), so production
-  never fills at a demo price. The oracle will update `mercado.activos`
-  (price, previous close, source `ORACULO`).
-- **Frontend:** `/dashboard/asset/[ticker]`, inside the dashboard shell.
+  has `SIMULADO` prices and the history is generated:
+  - `AUG1` tokenized gold and `AGT1` tokenized silver (0.0001 increments);
+  - `SCT28`, a 28-day synthetic bill, and `CETES28`, CETES at 28 days (whole
+    titles; `0014`);
+  - `STSLA`, a synthetic Tesla share (0.0001 increments; `0014`).
+
+  The history is deterministic, decimal-only, ends at the current price and
+  passes through the previous close exactly 24 hours earlier. Outside
+  `MODO_DEMO`, a simulated price is neither listed, quoted nor traded (503
+  `MERCADO_NO_DISPONIBLE`), so production never fills at a demo price. The
+  oracle will update `mercado.activos` (price, previous close, source
+  `ORACULO`).
+- **Frontend: Discover** (`/dashboard/discover`, a tab in the sidebar and the
+  phone's tab bar):
+  - The catalog is validated whole (`frontend/src/lib/market-data.ts`) and kept
+    in `frontend/src/store/market.ts` with the search, so coming back from an
+    asset shows the same results at once while the prices refresh.
+  - The search matches the ticker, the name or the class, accents and case
+    aside (`frontend/src/lib/discover.ts`). With nothing typed the list is
+    Trending: the most traded over the last 24 hours first.
+  - Every row opens the asset's page, where a first buy happens. The Vault's
+    empty asset list points here.
+- **Frontend: the asset's page** (`/dashboard/asset/[ticker]`, inside the
+  dashboard shell):
+  - It belongs to the tab that opened it: from Discover, Discover stays
+    current and Back returns there; from the Vault's holdings (or opened by
+    address), the Vault.
   - On load it reads the quote with the session's token and validates it
     whole (`frontend/src/lib/market-data.ts`) before `AssetDetail` renders it.
     An unknown ticker shows "No such asset"; a 503 says the market is not
@@ -795,24 +820,24 @@ two routes in the `API` rate-limit group, both behind the JWT extractor:
     checkout's idempotency key, kept on a retry, so a lost answer never fills
     twice. The page validates the receipt and never writes the store: the
     commit raises `seq`, and the WebSocket brings the new cash and position.
-  - Each row of the vault's asset list opens its asset's page, and the page
-    links back to the vault. The ledger shows the cash legs as "Market buy"
-    and "Market sale", and the cash chart counts them.
-  - There is no catalog to browse yet: a first buy starts from the address
-    (`/dashboard/asset/AUG1`).
+  - Each row of the vault's asset list opens its asset's page. The ledger
+    shows the cash legs as "Market buy" and "Market sale", and the cash chart
+    counts them.
 - **Audit:** `GET /api/v1/auditoria/ledger/mercado` (operator / auditor)
   re-verifies the chain, replays every position and every sale's average
   cost, and checks each order against its IFPE movement.
 - Tests:
   - `tests/db/0013_mercado_valores.sql`: the database rules, in one
     transaction.
-  - `backend/tests/mercado.rs`: the API (quote, buy and sell, idempotency,
-    rules, KYC, roles, AML freeze, concurrent orders, tamper detection).
+  - `backend/tests/mercado.rs`: the API (catalog, quote, buy and sell,
+    idempotency, rules, KYC, roles, AML freeze, concurrent orders, tamper
+    detection).
   - `backend/tests/boveda.rs`: an order pushed over the WebSocket.
-  - `frontend/e2e/smoke.mjs`: the trading loop in the browser. A buy on
-    another device appears live; its row opens the page; a buy whose answer
-    is lost fills once; refusals show their reason; "Max" sells everything on
-    a phone; the ledger lists the legs; a new reserve cut still succeeds.
+  - `frontend/e2e/smoke.mjs`: Discover and the trading loop in the browser.
+    The catalog and its search; a first buy from Discover, sold back from the
+    Vault; a buy on another device appears live; a buy whose answer is lost
+    fills once; refusals show their reason; "Max" sells everything on a
+    phone; the ledger lists the legs; a new reserve cut still succeeds.
 
 ## Layout
 
@@ -1045,6 +1070,7 @@ the password is hashed, so a parallel burst cannot test more than 5 passwords.
 | GET | `/api/v1/tablero` | client: vault + investment + live reserve |
 | GET | `/api/v1/vault` | client: Sovereign Vault snapshot (balance, reserve proof, holdings) |
 | GET | `/api/v1/vault/ws` | client: Sovereign Vault real-time channel (WebSocket, subprotocol `sc.vault.v1`) |
+| GET | `/api/v1/market/assets` | any session: the catalog that can be quoted and traded now (`MarketCatalog`) |
 | GET | `/api/v1/market/quote/{ticker}` | any session: the asset and its price history (`MarketQuote`) |
 | POST | `/api/v1/market/order` | client: market order by amount (`OrderRequest` → `OrderReceipt`), filled at the current price |
 | GET | `/api/v1/ifpe/cuenta`, `/api/v1/ifpe/movimientos` | client |

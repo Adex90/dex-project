@@ -85,6 +85,13 @@ export const api = {
   vault: (token: string, signal?: AbortSignal) => request<unknown>("/api/v1/vault", { token, signal }),
 
   /**
+   * The market catalog: every asset that can be quoted and traded now.
+   * Untyped on purpose: `parseMarketCatalog` validates it before it is stored.
+   */
+  marketAssets: (token: string, signal?: AbortSignal) =>
+    request<unknown>("/api/v1/market/assets", { token, signal }),
+
+  /**
    * A market quote: the asset and its price history (src/types/market.ts).
    * Untyped on purpose: `parseMarketQuote` validates the body before it renders.
    */

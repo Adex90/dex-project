@@ -1,9 +1,11 @@
 /**
  * Markets: the contract between the trading screens and the backend's market
- * engine (backend/src/mercado, migration 0013). English field names, amounts
- * as exact decimal strings, never floats, the way the vault's is
+ * engine (backend/src/mercado, migrations 0013 and 0014). English field names,
+ * amounts as exact decimal strings, never floats, the way the vault's is
  * (`types/vault.ts`).
  *
+ * - `GET /api/v1/market/assets` → `MarketCatalog` (any signed-in session): the
+ *   Discover tab.
  * - `GET /api/v1/market/quote/{ticker}` → `MarketQuote` (any signed-in session).
  * - `POST /api/v1/market/order` with an `OrderRequest` → `OrderReceipt`
  *   (clients only): 201 for a new order, 200 when the idempotency key repeats
@@ -39,6 +41,26 @@ export interface MarketAsset {
   quantity_decimals: number;
 }
 
+/** "simulated" until the price oracle is connected. */
+export type PriceSource = "simulated" | "oracle";
+
+/** An asset as the catalog lists it: the asset and where its price comes from. */
+export interface MarketListing extends MarketAsset {
+  price_source: PriceSource;
+}
+
+/**
+ * `GET /api/v1/market/assets`: every asset that can be quoted and traded now,
+ * by ticker; each opens at `/dashboard/asset/{ticker}`. Without demo mode only
+ * live prices are listed, and the backend answers 503 `MERCADO_NO_DISPONIBLE`
+ * when none is.
+ */
+export interface MarketCatalog {
+  assets: MarketListing[];
+  /** When the prices were read, ISO 8601. */
+  as_of: string;
+}
+
 /** A price at an instant: the chart's point (`BalancePoint` in lib/portfolio.ts). */
 export interface PricePoint {
   /** Epoch milliseconds. */
@@ -57,8 +79,7 @@ export interface MarketQuote {
   history: PricePoint[];
   /** When the price was read, ISO 8601: the right edge of every chart range. */
   as_of: string;
-  /** "simulated" until the price oracle is connected. */
-  price_source: "simulated" | "oracle";
+  price_source: PriceSource;
 }
 
 export type OrderSide = "buy" | "sell";

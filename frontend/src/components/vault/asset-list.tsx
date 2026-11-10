@@ -1,14 +1,23 @@
 "use client";
 
-import { useId, type MouseEvent } from "react";
+import { useId } from "react";
 import Link from "next/link";
-import { useRouter } from "next/navigation";
-import { ArrowDownRight, ArrowUpRight, Coins, Minus, type LucideIcon } from "lucide-react";
+import { Coins, Search } from "lucide-react";
 
+import {
+  AssetTableSkeleton,
+  DailyChange,
+  ROW,
+  ROW_HEADER,
+  RowLink,
+  TABLE_CARD,
+  TickerChip,
+  useRowNavigation,
+} from "@/components/markets/asset-table";
 import { cx } from "@/components/ui/primitives";
 import { addUnits, formatMoney } from "@/lib/decimal";
 import { assetPath } from "@/lib/market-data";
-import { formatShares, signedPercent, type Trend } from "@/lib/vault";
+import { formatShares } from "@/lib/vault";
 import type { Holding } from "@/types/vault";
 
 /*
@@ -16,13 +25,11 @@ import type { Holding } from "@/types/vault";
  * card ("Sovereign Gold", globals.css).
  *
  * - Each row opens its asset's page (/dashboard/asset/{ticker}), where the
- *   client buys and sells. The name is the row's link (keyboard, assistive
- *   technology, a new tab); a click anywhere else on the row follows it too.
- * - Rows raise to the lighter charcoal on hover or keyboard focus, with a
- *   yellow edge and the ticker in yellow.
+ *   client buys and sells; the rows, the ticker chip and the daily change are
+ *   the Discover catalog's too (components/markets/asset-table.tsx).
  * - Phones get two columns (asset with its shares, value with its daily
  *   change); wider screens get shares and price as their own columns.
- * - The daily change carries its sign and an arrow as well as green or red.
+ * - With nothing held, it points to Discover, where a first buy starts.
  *
  * Presentational apart from `useId` and the router. Feed it `holdings` from
  * `useVaultStore`; amounts are decimal strings, formatted exactly.
@@ -33,14 +40,12 @@ export interface AssetListProps {
   className?: string;
 }
 
-const CARD = "rounded-2xl border border-border bg-surface";
-
 export function AssetList({ holdings, className }: AssetListProps) {
   const titleId = useId();
   const total = holdings.length > 0 ? addUnits(...holdings.map((h) => h.total_value)) : null;
 
   return (
-    <section aria-labelledby={titleId} className={cx(CARD, className)} data-testid="asset-list">
+    <section aria-labelledby={titleId} className={cx(TABLE_CARD, className)} data-testid="asset-list">
       <header className="flex flex-wrap items-center justify-between gap-3 border-b border-border px-5 py-4 sm:px-6">
         <div className="flex min-w-0 items-center gap-3">
           <span
@@ -104,65 +109,19 @@ export function AssetList({ holdings, className }: AssetListProps) {
 
 /* ------------------------------------------------------------------------ */
 
-const TREND: Record<Trend, { Icon: LucideIcon; className: string }> = {
-  up: { Icon: ArrowUpRight, className: "text-gain" },
-  down: { Icon: ArrowDownRight, className: "text-loss" },
-  flat: { Icon: Minus, className: "text-muted" },
-};
-
 function AssetRow({ holding }: { holding: Holding }) {
-  const router = useRouter();
   const href = assetPath(holding.ticker);
-  const change = signedPercent(holding.daily_change_pct);
-  const trend = TREND[change.trend];
-
-  const openAsset = (event: MouseEvent<HTMLTableRowElement>) => {
-    // A click on the link itself is the link's (with its modifier keys: new tab, new window).
-    if (event.target instanceof Element && event.target.closest("a")) return;
-    // Selecting text across the row is not a click on it.
-    if (window.getSelection()?.isCollapsed === false) return;
-    router.push(href);
-  };
+  const open = useRowNavigation(href);
 
   return (
-    <tr
-      className="group cursor-pointer transition-colors focus-within:bg-surface-2 hover:bg-surface-2"
-      data-testid="asset-row"
-      data-ticker={holding.ticker}
-      onClick={openAsset}
-    >
-      <th
-        scope="row"
-        className={cx(
-          "relative px-5 py-3.5 text-left font-normal sm:px-6",
-          // The yellow edge: invisible at rest, drawn on hover or keyboard focus.
-          "before:absolute before:inset-y-2 before:left-0 before:w-[3px] before:bg-synthetic-yellow",
-          "before:opacity-0 before:transition-opacity group-focus-within:before:opacity-100 group-hover:before:opacity-100",
-        )}
-      >
+    <tr className={ROW} data-testid="asset-row" data-ticker={holding.ticker} onClick={open}>
+      <th scope="row" className={ROW_HEADER}>
         <div className="flex min-w-0 items-center gap-3">
-          <span
-            className={cx(
-              "inline-flex h-7 min-w-14 shrink-0 items-center justify-center rounded-md border border-border bg-bg px-2",
-              "font-mono text-xs font-semibold tracking-wide text-ink transition-colors",
-              "group-focus-within:border-synthetic-yellow/50 group-focus-within:text-synthetic-yellow",
-              "group-hover:border-synthetic-yellow/50 group-hover:text-synthetic-yellow",
-            )}
-          >
-            {holding.ticker}
-          </span>
+          <TickerChip ticker={holding.ticker} />
           <span className="min-w-0">
-            <Link
-              href={href}
-              className={cx(
-                "block truncate font-medium text-ink",
-                "focus-visible:ring-2 focus-visible:ring-synthetic-yellow focus-visible:ring-offset-2",
-                "focus-visible:ring-offset-surface-2 focus-visible:outline-none",
-              )}
-              data-testid="asset-row-link"
-            >
+            <RowLink href={href} testId="asset-row-link">
               {holding.name}
-            </Link>
+            </RowLink>
             {/* Shares have their own column from md up. */}
             <span className="block text-xs text-muted tabular-nums md:hidden">
               {formatShares(holding.shares)} shares
@@ -179,14 +138,7 @@ function AssetRow({ holding }: { holding: Holding }) {
       </td>
       <td className="px-5 py-3.5 text-right sm:px-6">
         <span className="block font-medium text-ink tabular-nums">{formatMoney(holding.total_value)}</span>
-        <span
-          className={cx("mt-0.5 inline-flex items-center gap-1 text-xs font-medium tabular-nums", trend.className)}
-          data-trend={change.trend}
-        >
-          <trend.Icon className="size-3.5" aria-hidden />
-          {change.text}
-          <span className="sr-only"> today</span>
-        </span>
+        <DailyChange pct={holding.daily_change_pct} suffix="today" className="mt-0.5" />
       </td>
     </tr>
   );
@@ -205,33 +157,23 @@ function EmptyAssets() {
       <p className="mt-1 max-w-sm text-sm text-muted">
         Assets you hold will be listed here with their price and daily change.
       </p>
+      <Link
+        href="/dashboard/discover"
+        className={cx(
+          "mt-5 inline-flex h-10 items-center gap-2 border border-synthetic-yellow/60 px-4",
+          "text-xs font-semibold tracking-[0.18em] text-synthetic-yellow uppercase transition-colors hover:bg-synthetic-yellow/10",
+          "focus-visible:ring-2 focus-visible:ring-synthetic-yellow focus-visible:ring-offset-2 focus-visible:ring-offset-surface focus-visible:outline-none",
+        )}
+        data-testid="asset-list-discover"
+      >
+        <Search className="size-4" aria-hidden />
+        Discover assets
+      </Link>
     </div>
   );
 }
 
 /** Placeholder with the same footprint, for while the vault loads. */
 export function AssetListSkeleton({ className, rows = 3 }: { className?: string; rows?: number }) {
-  return (
-    <div className={cx(CARD, className)} role="status">
-      <span className="sr-only">Loading your assets…</span>
-      <div aria-hidden className="motion-safe:animate-pulse">
-        <div className="flex items-center gap-3 border-b border-border px-5 py-4 sm:px-6">
-          <div className="size-10 rounded-xl bg-surface-2" />
-          <div className="space-y-2">
-            <div className="h-4 w-20 rounded-sm bg-surface-2" />
-            <div className="h-3 w-28 rounded-sm bg-surface-2" />
-          </div>
-        </div>
-        {Array.from({ length: rows }, (_, i) => (
-          <div key={i} className="flex items-center justify-between gap-4 border-b border-border px-5 py-4 last:border-b-0 sm:px-6">
-            <div className="flex items-center gap-3">
-              <div className="h-7 w-14 rounded-md bg-surface-2" />
-              <div className="h-4 w-32 rounded-sm bg-surface-2" />
-            </div>
-            <div className="h-4 w-20 rounded-sm bg-surface-2" />
-          </div>
-        ))}
-      </div>
-    </div>
-  );
+  return <AssetTableSkeleton label="Loading your assets…" className={className} rows={rows} />;
 }

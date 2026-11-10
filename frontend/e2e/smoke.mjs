@@ -12,9 +12,11 @@
  * First pass: landing -> sign-up -> KYC-locked dashboard -> full onboarding
  * (personal data, INE photos and details, biometric consent + liveness) ->
  * VERIFICADO -> deposit, fixed-term investment, Proof of Reserve, ledger,
- * moving between the dashboard's tabs (Vault, Account, Invest, Reserve).
- * It ends on asset pages opened by their address: AUG1, an unknown ticker, an
- * address that is not a ticker, and a market without live prices.
+ * moving between the dashboard's tabs (Vault, Discover, Account, Invest,
+ * Reserve). It ends on asset pages opened by their address (AUG1, an unknown
+ * ticker, an address that is not a ticker, a market without live prices) and
+ * on Discover: the catalog, its search, and a first buy from it (a fraction
+ * of STSLA), sold back from the Vault with "Max".
  * Second pass: signing in again lands directly on the Vault, which is live
  * over its WebSocket: a deposit made outside the browser reaches the screen
  * with REST blocked, a server restart (1001) reconnects, and a session the
@@ -22,8 +24,8 @@
  * the vault blocked: a gold buy on another device appears in the asset list,
  * its row opens the asset's page, a buy whose answer is lost is retried with
  * the same idempotency key and fills once, refusals show their reason; then,
- * on a phone-sized screen (bottom tab bar instead of the sidebar), "Max"
- * sells the whole position.
+ * on a phone-sized screen (bottom tab bar instead of the sidebar, Discover
+ * included), "Max" sells the whole position.
  * The theme is dark only ("Sovereign Gold"); the passes still differ in the
  * browser's preferred color scheme, which must not change it.
  */
@@ -392,6 +394,18 @@ try {
       const tabBar = mainNav(page);
       const box = await tabBar.boundingBox();
       check(box !== null && box.y + box.height >= 844 - 1 && box.width === 390, "phones get the bottom tab bar");
+      await openTab(page, "Discover");
+      await page.getByTestId("market-row").first().waitFor();
+      const tabWidths = await tabBar.getByRole("link").evaluateAll((links) => links.map((l) => l.getBoundingClientRect().width));
+      check(
+        tabWidths.length === 5 && tabWidths.every((w) => w >= 44),
+        `the tab bar fits five tabs, Discover included, each at least 44 px wide (${tabWidths.map(Math.round).join(", ")})`,
+      );
+      await shot(page, "discover-mobile");
+      check(
+        await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth),
+        "Discover fits a phone's width: long names truncate, nothing scrolls sideways",
+      );
       await openTab(page, "Vault");
       await page.getByTestId("vault-total").filter({ hasText: "26,234" }).waitFor();
       await page.getByTestId("portfolio-line").waitFor();
@@ -407,7 +421,13 @@ try {
       // bottom sheet sells the whole position (REST for the vault blocked again).
       await page.route("**/api/v1/vault", (route) => route.abort());
       await openTab(page, "Vault");
-      await page.getByTestId("asset-row-link").filter({ hasText: "Tokenized gold" }).click();
+      const goldLink = page.getByTestId("asset-row-link").filter({ hasText: "Tokenized gold" });
+      await goldLink.waitFor();
+      check(
+        await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth),
+        "the Vault with a holding fits a phone's width",
+      );
+      await goldLink.click();
       await page.waitForURL("**/dashboard/asset/AUG1");
       await detail.getByText("1.5504 AUG1").waitFor();
       await shot(page, "asset-mobile");
@@ -433,13 +453,14 @@ try {
       await page.unroute("**/api/v1/vault");
       check(vaultSockets.length === 2, "the sale empties the asset list live; the whole loop ran on one socket");
 
-      // The ledger lists each order's cash leg: two buys and the sale.
+      // The ledger lists each order's cash leg: the first pass's STSLA buy and
+      // sale, then this pass's two gold buys and the sale.
       await openTab(page, "Account");
-      await page.getByText("Market sale", { exact: true }).waitFor();
+      await page.getByText("Market sale", { exact: true }).nth(1).waitFor();
       check(
-        (await page.getByText("Market buy", { exact: true }).count()) === 2 &&
-          (await page.getByText("Market sale", { exact: true }).count()) === 1,
-        "the ledger lists two market buys and a market sale",
+        (await page.getByText("Market buy", { exact: true }).count()) === 3 &&
+          (await page.getByText("Market sale", { exact: true }).count()) === 2,
+        "the ledger lists three market buys and two market sales",
       );
       // A new Proof of Reserve cut still rebuilds every balance from the
       // ledger, the orders' legs included: a new account's first proof makes
@@ -750,6 +771,10 @@ try {
     await copy.filter({ hasText: "Copied!" }).waitFor();
     check(true, "Copy CLABE confirms the copy");
     check((await page.getByTestId("asset-list-empty").count()) === 1, "the asset list shows its empty state");
+    check(
+      (await page.getByTestId("asset-list-discover").getAttribute("href")) === "/dashboard/discover",
+      "with nothing held, the asset list points to Discover",
+    );
 
     await openTab(page, "Account");
     check((await page.getByTestId("deposit-locked").count()) === 0, "deposit control is unlocked");
@@ -891,6 +916,115 @@ try {
     check(true, "without live prices (503) the asset's page says the market is not open yet");
     await page.getByRole("link", { name: "Go to your vault" }).click();
     await page.waitForURL("**/dashboard");
+
+    // ---------------------------------------------------------------------
+    // Discover: the catalog, its search, and a first buy from it.
+    // ---------------------------------------------------------------------
+    await openTab(page, "Discover");
+    const marketRows = page.getByTestId("market-row");
+    await marketRows.first().waitFor();
+    /** Waits until the list shows exactly these tickers, in this order. */
+    const listing = (tickers) =>
+      page.waitForFunction(
+        (expected) =>
+          JSON.stringify(
+            [...document.querySelectorAll("[data-testid=market-row]")].map((r) => r.getAttribute("data-ticker")),
+          ) === expected,
+        JSON.stringify(tickers),
+      );
+    const TRENDING = ["STSLA", "AUG1", "CETES28", "AGT1", "SCT28"];
+    await listing(TRENDING);
+    check(true, "Discover lists the whole catalog, most traded first (STSLA, AUG1, CETES28, AGT1, SCT28)");
+    check(
+      (await page.getByRole("heading", { level: 1 }).innerText()) === "Discover" &&
+        (await page.getByTestId("market-list").getByRole("heading", { name: "Trending" }).count()) === 1 &&
+        (await page.getByTestId("discover-simulated").isVisible()),
+      "the Discover tab is titled, its list is Trending, and it says the prices are simulated",
+    );
+    await page.mouse.move(0, 0);
+    await shot(page, "discover-desktop");
+
+    const search = page.getByTestId("market-search");
+    for (const [query, tickers] of [
+      ["gold", ["AUG1"]],
+      ["CETES", ["CETES28"]],
+      ["fixed income", ["CETES28", "SCT28"]],
+      ["tsla", ["STSLA"]],
+    ]) {
+      await search.fill(query);
+      await listing(tickers);
+    }
+    check(true, "the search finds assets by name, ticker or class, whatever the case");
+    await search.fill("bitcoin");
+    await page.getByTestId("discover-no-match").waitFor();
+    check(
+      (await page.getByTestId("discover-status").textContent()) === "No assets match bitcoin",
+      "a search with no match says so, on screen and to screen readers",
+    );
+    await page.getByTestId("discover-no-match").getByRole("button", { name: "Clear search" }).click();
+    await listing(TRENDING);
+    check(
+      await search.evaluate((field) => field === document.activeElement && field.value === ""),
+      "Clear search empties the field and leaves the focus in it",
+    );
+
+    // A first buy, from Discover: a fraction of a synthetic Tesla share.
+    await search.fill("tesla");
+    await listing(["STSLA"]);
+    await marketRows.first().click();
+    await page.waitForURL("**/dashboard/asset/STSLA");
+    const assetBack = page.getByTestId("asset-back");
+    await page.getByTestId("asset-detail").waitFor();
+    check(
+      (await mainNav(page).getByRole("link", { name: "Discover", exact: true }).getAttribute("aria-current")) === "page" &&
+        (await page.getByRole("heading", { level: 1 }).innerText()) === "Discover" &&
+        (await assetBack.getAttribute("href")) === "/dashboard/discover" &&
+        /back to discover/i.test(await assetBack.innerText()),
+      "an asset opened from Discover stays under Discover, and its Back link returns there",
+    );
+    await page.getByTestId("asset-buy").click();
+    const drawer = page.getByTestId("order-checkout");
+    for (const key of ["1", "0", "0", "0"]) await drawer.getByRole("button", { name: key, exact: true }).click();
+    await drawer.getByTestId("order-confirm").click();
+    const firstReceipt = drawer.getByTestId("order-receipt");
+    await firstReceipt.waitFor();
+    check(
+      (await firstReceipt.innerText()).includes("Bought 0.2264 STSLA at $4,415.30."),
+      "a first buy from Discover: 1,000.00 buys 0.2264 STSLA",
+    );
+    await drawer.getByRole("button", { name: "Done" }).click();
+    await drawer.waitFor({ state: "detached" });
+    await page.getByTestId("asset-detail").getByText("0.2264 STSLA", { exact: true }).waitFor({ timeout: 5_000 });
+    await assetBack.click();
+    await page.waitForURL("**/dashboard/discover");
+    await listing(["STSLA"]);
+    check((await search.inputValue()) === "tesla", "back on Discover, the search and its results are as they were left");
+    await page.getByTestId("market-search-clear").click();
+    await listing(TRENDING);
+
+    // The Vault lists it; opened from there, the page is the Vault's, and Max sells it all.
+    await openTab(page, "Vault");
+    const teslaRow = page.getByTestId("asset-row").and(page.locator("[data-ticker=STSLA]"));
+    await teslaRow.getByTestId("asset-row-link").click();
+    await page.waitForURL("**/dashboard/asset/STSLA");
+    await page.getByTestId("asset-detail").getByText("0.2264 STSLA", { exact: true }).waitFor();
+    check(
+      (await assetBack.getAttribute("href")) === "/dashboard" && /back to vault/i.test(await assetBack.innerText()),
+      "opened from the Vault's holdings, the asset's Back link returns to the Vault",
+    );
+    await page.getByRole("button", { name: "Sell", exact: true }).click();
+    await drawer.getByRole("button", { name: "Max" }).click();
+    await drawer.getByTestId("order-confirm").click();
+    await firstReceipt.waitFor();
+    check((await firstReceipt.innerText()).includes("Sold 0.2264 STSLA at $4,415.30."), "Max sells the whole STSLA position");
+    await drawer.getByRole("button", { name: "Done" }).click();
+    await drawer.waitFor({ state: "detached" });
+    await assetBack.click();
+    await page.waitForURL("**/dashboard");
+    await page.getByTestId("asset-list-empty").waitFor();
+    await openTab(page, "Account");
+    await page.getByTestId("vault-available").filter({ hasText: "15,000.00" }).waitFor();
+    check(true, "buying and selling all of it at the same price returns exactly the cash paid (15,000.00)");
 
     // Sign out.
     await page.getByRole("button", { name: /Sign out/ }).click();

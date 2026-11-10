@@ -82,13 +82,12 @@ what the module waits on. They do not change its scope.
     with the session's token, validated whole (`lib/market-data.ts`); the cash
     and the position come from the vault store. An unknown ticker shows "No
     such asset"; without live prices (503) the page says the market is not
-    open yet. Each holding in the vault's asset list opens its page.
+    open yet. Discover's rows and the holdings in the vault's asset list open
+    it, and it stays under the tab that opened it (Back returns there).
   - Prices are simulated until the pricing oracle, and served only with
     `MODO_DEMO`. Smoke e2e covers the page on both layouts.
-  - Left: a way to reach an asset before holding one (a catalog endpoint and
-    module 8; today a first buy needs the address, e.g.
-    `/dashboard/asset/AUG1`), and a market-data stream on the vault socket's
-    pattern (the quote is read once per visit).
+  - Left: a market-data stream on the vault socket's pattern (the quote is
+    read once per visit).
 - [x] **2. Order Execution Checkout** (Numpad, swipe-to-trade, zero-commission summary)
   - `components/markets/order-checkout-drawer.tsx`: numpad, $0.00 commission
     summary, Confirm Order, one idempotency key per order kept on retry.
@@ -115,7 +114,19 @@ what the module waits on. They do not change its scope.
 
 ## Phase 2: Discovery & Pro Analytics
 
-- [ ] **8. Market Explorer** (Predictive search, trending, top movers, collections)
+- [x] **8. Market Explorer** (Predictive search, trending, top movers, collections)
+  - The Discover tab (`app/dashboard/discover/page.tsx`), in the sidebar and
+    the phone's tab bar. The catalog comes from `GET /api/v1/market/assets`
+    (migration `0014` adds a synthetic Tesla share and CETES at 28 days),
+    validated whole and kept with the search in `store/market.ts`.
+  - Search by ticker, name or class, accents and case aside, ranked ticker
+    first (`lib/discover.ts`, unit tested). Without a query the list is
+    Trending: the most traded over 24 hours first. Rows open the asset's
+    page; the Vault's empty asset list points here. Smoke e2e covers it on
+    both layouts, with a first buy from Discover.
+  - Left: top movers and collections (curated lists), and predictive search
+    once the catalog outgrows a single page (a `q` parameter on the
+    endpoint).
 - [ ] **9. Asset Screener** (Cross-filtering technicals/fundamentals)
 - [ ] **10. Pro Charting** (TradingView wrapper, candlesticks, indicators, drawing tools)
   - TradingView's Charting Library needs a license; Lightweight Charts is open

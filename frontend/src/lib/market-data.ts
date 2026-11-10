@@ -1,7 +1,7 @@
 /**
- * Market data from the API (`types/market.ts`): runtime validation of a quote
- * and of an order receipt, and the small vault-side helpers the asset page
- * needs.
+ * Market data from the API (`types/market.ts`): runtime validation of the
+ * catalog, a quote and an order receipt, and the small vault-side helpers the
+ * asset page needs.
  *
  * Network data is validated before anything renders it (definition of done,
  * docs/FRONTEND_ROADMAP.md): a malformed payload is rejected whole, never
@@ -10,13 +10,23 @@
  */
 
 import { isDecimalString, isNonNegative, isOneOf, isPositive, isRecord, isText } from "./vault.ts";
-import type { MarketAsset, MarketQuote, OrderReceipt, OrderSide, PricePoint } from "../types/market.ts";
+import type {
+  MarketAsset,
+  MarketCatalog,
+  MarketListing,
+  MarketQuote,
+  OrderReceipt,
+  OrderSide,
+  PricePoint,
+} from "../types/market.ts";
 import type { DecimalString, Holding } from "../types/vault.ts";
 
 /** Like the backend's catalog (`mercado.activos.ticker`): a letter, then up to 11 letters or digits. */
 const TICKER_RE = /^[A-Z][A-Z0-9]{0,11}$/;
 /** A year of history is about 600 points; anything far beyond that is not a quote. */
 const MAX_HISTORY = 5_000;
+/** Far more assets than the bank lists; anything beyond that is not a catalog. */
+const MAX_CATALOG = 1_000;
 const SIDES: readonly OrderSide[] = ["buy", "sell"];
 const STATUSES = ["filled", "pending"] as const;
 const SOURCES = ["simulated", "oracle"] as const;
@@ -91,6 +101,23 @@ export function parseMarketQuote(value: unknown): MarketQuote | null {
     history.push(point);
   }
   return { asset, history, as_of, price_source };
+}
+
+/** `GET /api/v1/market/assets`; null if any listing is malformed or a ticker repeats. */
+export function parseMarketCatalog(value: unknown): MarketCatalog | null {
+  if (!isRecord(value)) return null;
+  const { assets, as_of } = value;
+  if (!isInstant(as_of) || !Array.isArray(assets) || assets.length > MAX_CATALOG) return null;
+  const listings: MarketListing[] = [];
+  const tickers = new Set<string>();
+  for (const raw of assets) {
+    const asset = parseMarketAsset(raw);
+    const source = isRecord(raw) ? raw.price_source : undefined;
+    if (!asset || !isOneOf(SOURCES, source) || tickers.has(asset.ticker)) return null;
+    tickers.add(asset.ticker);
+    listings.push({ ...asset, price_source: source });
+  }
+  return { assets: listings, as_of };
 }
 
 /** `POST /api/v1/market/order`; null if the receipt is malformed. */

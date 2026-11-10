@@ -1,11 +1,11 @@
 "use client";
 
-import { createContext, useCallback, useContext, useMemo, type ReactNode } from "react";
+import { createContext, useCallback, useContext, useEffect, useMemo, type ReactNode } from "react";
 import { usePathname, useRouter } from "next/navigation";
 
 import { DashboardHeader } from "@/components/dashboard/dashboard-header";
 import { KycBanner, isKycLocked } from "@/components/dashboard/kyc-status";
-import { Navigation, activeItem } from "@/components/layout/navigation";
+import { Navigation, activeItem, resetNavOrigin, useNavOrigin } from "@/components/layout/navigation";
 import { Alert, Button } from "@/components/ui/primitives";
 import { useDashboardData } from "@/hooks/use-dashboard-data";
 import { useSession } from "@/hooks/use-session";
@@ -16,11 +16,13 @@ import type { Cliente } from "@/lib/api/types";
 import { EXPIRED_LOGIN_PATH } from "@/lib/session";
 import { useAuthStore } from "@/store/auth";
 import { useDashboardStore } from "@/store/dashboard";
+import { useMarketStore } from "@/store/market";
 import { displayedRealtime, useVaultStore } from "@/store/vault";
 
 /*
- * The dashboard's frame, shared by every tab (Vault, Account, Invest,
- * Reserve): the navigation, the header, the load errors and the KYC banner.
+ * The dashboard's frame, shared by every tab (Vault, Discover, Account,
+ * Invest, Reserve) and the asset pages: the navigation, the header, the load
+ * errors and the KYC banner.
  *
  * It owns the data: the summary, the ledger and the vault load once here and
  * stay in their stores while the client moves between tabs, so switching
@@ -66,6 +68,17 @@ export function DashboardShell({ children }: { children: ReactNode }) {
   const loading = useDashboardStore((s) => s.loading);
   const error = useDashboardStore((s) => s.error);
   const lastUpdated = useDashboardStore((s) => s.lastUpdated);
+  const origin = useNavOrigin();
+
+  // Sign-out unmounts the dashboard: the next person in this tab starts from
+  // an empty search, and an asset page opened by address belongs to the Vault.
+  useEffect(
+    () => () => {
+      useMarketStore.getState().reset();
+      resetNavOrigin();
+    },
+    [],
+  );
 
   const refresh = useCallback(async () => {
     await Promise.all([refreshDashboard(), refreshVault()]);
@@ -86,7 +99,7 @@ export function DashboardShell({ children }: { children: ReactNode }) {
   );
 
   if (!context) return null;
-  const section = activeItem(pathname);
+  const section = activeItem(pathname, origin);
 
   return (
     <DashboardContext value={context}>

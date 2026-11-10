@@ -2,7 +2,14 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import { assetPath, isTicker, parseMarketQuote, parseOrderReceipt, positionFor } from "./market-data.ts";
+import {
+  assetPath,
+  isTicker,
+  parseMarketCatalog,
+  parseMarketQuote,
+  parseOrderReceipt,
+  positionFor,
+} from "./market-data.ts";
 import type { Holding } from "../types/vault.ts";
 
 /** The backend's answer for AUG1 (backend/tests/mercado.rs), with a short history. */
@@ -85,6 +92,39 @@ test("parseMarketQuote: a malformed quote is rejected whole", () => {
   ];
   for (const [motivo, valor] of malos) {
     assert.equal(parseMarketQuote(valor), null, motivo);
+  }
+});
+
+/** The backend's catalog (backend/tests/mercado.rs), two of its five listings. */
+function catalog(assets: unknown[] = [listing(), listing({ ticker: "STSLA", name: "Synthetic Tesla, 1 share" })]) {
+  return { assets, as_of: "2026-11-09T12:00:00.123Z" };
+}
+
+function listing(overrides: Record<string, unknown> = {}) {
+  return { ...quote().asset, price_source: "simulated", ...overrides };
+}
+
+test("parseMarketCatalog: the backend's catalog, as sent", () => {
+  assert.deepEqual(parseMarketCatalog(catalog()), catalog());
+  assert.deepEqual(parseMarketCatalog(catalog([])), catalog([]), "an empty catalog is still a catalog");
+  const live = parseMarketCatalog(catalog([listing({ price_source: "oracle" })]));
+  assert.equal(live?.assets[0]?.price_source, "oracle");
+});
+
+test("parseMarketCatalog: a malformed catalog is rejected whole", () => {
+  const malos: [string, unknown][] = [
+    ["not an object", []],
+    ["no assets", { as_of: "2026-11-09T12:00:00Z" }],
+    ["assets not a list", catalog("AUG1" as unknown as unknown[])],
+    ["unreadable as_of", { ...catalog(), as_of: "now" }],
+    ["a listing without its price source", catalog([listing({ price_source: undefined })])],
+    ["an unknown price source", catalog([listing({ price_source: "guess" })])],
+    ["a malformed asset among good ones", catalog([listing(), listing({ ticker: "stsla" })])],
+    ["a ticker listed twice", catalog([listing(), listing({ name: "Gold again" })])],
+    ["far too many listings", catalog(Array.from({ length: 1001 }, (_, i) => listing({ ticker: `A${i}` })))],
+  ];
+  for (const [motivo, valor] of malos) {
+    assert.equal(parseMarketCatalog(valor), null, motivo);
   }
 });
 

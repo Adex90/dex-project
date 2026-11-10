@@ -99,7 +99,7 @@ internet -> host 80/443 (UFW, fail2ban) -> nginx (edge network)
 | Staff authenticate with two factors; TOTP secrets never in clear | Same code on both: two-step verification (TOTP) is mandatory for `OPERADOR`, `AUDITOR` and `CUMPLIMIENTO` and re-checked on every request; secrets encrypted with `MFA_CLAVE_CIFRADO` (Secrets Manager) | Same; key in `secrets/mfa_encryption_key` | `tests/mfa.rs`, `tests/db/0010_auth_mfa.sql`, AML e2e (Appendix C) |
 | A client's reads return only that client's rows, even if the query is wrong | Same code on both: role `sc_cliente` (SELECT only) and RESTRICTIVE RLS policies keyed to `sc.cliente_actual` on users, accounts, movements, SPEI and SOFOM tables (migration `0011`) | Same | `tests/rls.rs`, `tests/db/0011_rls_por_cliente.sql` |
 | A client's live vault channel carries only that client's data, and only while the session is valid | Same code on both: the WebSocket handshake runs the same JWT and database checks as every route (token as a subprotocol entry, never echoed), requires `Origin` = `FRONTEND_ORIGIN`, sits in the `API` rate-limit group and is capped per client and per task; the session is re-checked every 60 s and at JWT expiry (close 4001); reads run as `sc_cliente` under RLS | Same, plus nginx's dedicated location (`limit_conn` 20 per IP) | `tests/boveda.rs`, `tests/db/0012_boveda_tiempo_real.sql` |
-| A market order moves exactly the cash it records, at the catalog's price, for a client allowed to trade | Same code on both: one transaction under `sc_mercado` (in the IFPE ledger it may write only its two movement types, and only `saldo_disponible` and the reserve). Each order is paired with its IFPE movement in the same transaction (deferred triggers). The database checks each order against the catalog price, the asset's increment, the maximal quantity, the cent-rounded amount, the position and the average cost; positions must replay their hash-chained ledger on commit. KYC is enforced by RLS. A buy is an AML channel with the freeze guard, and frozen clients cannot sell. Simulated prices trade only with `MODO_DEMO` | Same | `tests/mercado.rs`, `tests/db/0013_mercado_valores.sql` |
+| A market order moves exactly the cash it records, at the catalog's price, for a client allowed to trade | Same code on both: one transaction under `sc_mercado` (in the IFPE ledger it may write only its two movement types, and only `saldo_disponible` and the reserve). Each order is paired with its IFPE movement in the same transaction (deferred triggers). The database checks each order against the catalog price, the asset's increment, the maximal quantity, the cent-rounded amount, the position and the average cost; positions must replay their hash-chained ledger on commit. KYC is enforced by RLS. A buy is an AML channel with the freeze guard, and frozen clients cannot sell. Simulated prices are listed, quoted and traded only with `MODO_DEMO` | Same | `tests/mercado.rs`, `tests/db/0013_mercado_valores.sql` |
 | No request field outside the API contract is accepted | Same code on both: `deny_unknown_fields` on every body and query type (400 `VALIDACION`) | Same | `tests/entrada.rs` (source scan and HTTP) |
 | Least-privilege database identities | Service holds only `sc_app` (NOINHERIT, no owner rights); owner credentials only in the migrate task and with DBAs holding the `dba-tunnel` policy | Same, plus the schema owner is **not** a superuser (`deploy/postgres/10-schema-owner.sh`); the `postgres` superuser is break-glass only | `pg_authid` query in Appendix C |
 | Containers non-root, read-only, least capability, resource-limited | uid 65532, read-only rootfs, `drop ALL`, task CPU/memory | uid 65532 / 70 / 101, `read_only`, `cap_drop: ALL`, `no-new-privileges`, CPU/memory/PID limits | `docker inspect` in Appendix C |
@@ -1031,6 +1031,13 @@ following to operations.
     empty for existing rows, but the build scans the ledger and blocks its
     writes meanwhile, so on a large ledger create it first with
     `CONCURRENTLY` (the migration uses `IF NOT EXISTS`).
+- **Migration `0014`** (market catalog) only inserts two rows into
+  `mercado.activos` (`STSLA` and `CETES28`, with `SIMULADO` prices). Deploy
+  migrate, then the backend, which adds `GET /api/v1/market/assets`; the old
+  binary quotes the new rows like any other. Without `MODO_DEMO` they stay
+  hidden like every simulated price, so production lists nothing until the
+  pricing oracle writes live prices (the catalog answers 503
+  `MERCADO_NO_DISPONIBLE` meanwhile).
 
 ---
 
@@ -1300,6 +1307,25 @@ available, so Session Manager itself was not exercised. Everything around it was
     ran, it had read the announcer and failed: 3 of 4 times on one run.
 - **Backend:** rustfmt and clippy `-D warnings` clean; 314 tests passed, 0 failed.
   hadolint, actionlint and ShellCheck (with the CI settings) are clean.
+
+**Market Explorer** (migration `0014`, `GET /api/v1/market/assets`, the Discover tab):
+
+- **SQL suites:** all nine pass on a database migrated through `0014`. The
+  `0013` suite now checks its own three assets and compares what a client
+  sees with the whole catalog, instead of fixed counts.
+- **`backend/tests/mercado.rs`** (12 tests, three new):
+  - **Catalog:** the five assets by ticker, each entry equal to its quote's
+    `MarketAsset` plus `price_source`; the exact JSON for `STSLA` and
+    `CETES28`; staff can read it; 401 without a session.
+  - **Tradable:** 1,000 buys 0.2264 `STSLA` for 999.62 and 100 `CETES28` for
+    994.39, and the invariants hold (reserve cut replay included).
+  - **Production guard:** without `MODO_DEMO` and only simulated prices, 503
+    `MERCADO_NO_DISPONIBLE`; with one `ORACULO` price, only that asset.
+- **Frontend:** typecheck, lint, 188 unit tests (catalog validation, search
+  and ranking, the market store) and `next build`.
+- **End to end** on a fresh stack: smoke 128 checks (Discover on both
+  layouts, its search, a first buy from it sold back from the Vault, no
+  sideways scroll at 390 px) and AML console 123 checks.
 
 **Market engine** (migration `0013`, `GET /api/v1/market/quote/{ticker}` and
 `POST /api/v1/market/order`):
