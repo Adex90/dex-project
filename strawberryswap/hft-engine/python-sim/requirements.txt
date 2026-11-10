@@ -1,0 +1,4 @@
+# Tested with Python 3.13. yfinance is only needed to download bars (not for --csv, --synthetic or the tests).
+numpy==2.5.4
+pandas==3.1.1
+yfinance==1.8.0
