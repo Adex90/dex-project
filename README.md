@@ -671,9 +671,11 @@ cd frontend && npm audit --omit=dev --audit-level=moderate && npm audit --audit-
   <package>` or an `overrides` entry). Never relax the gate itself.
 - **Rust exceptions** go in `ignore` in `backend/.cargo/audit.toml`, each with
   its ticket: why it does not apply, who approved it, when it expires. Today
-  there is one, RUSTSEC-2023-0071 (`rsa`): it is in Cargo.lock only through
-  sqlx's optional MySQL driver and is never compiled. The backend build fails if
-  `rsa` ever enters the build graph.
+  there are two, and neither crate is ever compiled: RUSTSEC-2023-0071 (`rsa`),
+  in Cargo.lock only through sqlx's optional MySQL driver, and RUSTSEC-2026-0459
+  (`libsqlite3-sys`), only through its optional SQLite driver (fixed upstream in
+  sqlx 0.9; expires 2027-02-10). The backend build fails if either crate enters
+  the build graph.
 - **npm** has no exception file. A finding with no fixed version is pinned
   through `overrides` or removed.
 
