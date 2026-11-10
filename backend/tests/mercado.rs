@@ -38,6 +38,10 @@ impl Mercado {
         self.estado.jwt.emitir(cliente_id, RolUsuario::Cliente, false).unwrap().0
     }
 
+    async fn catalogo(&self, token: &str) -> (StatusCode, Value) {
+        llamar_json(&self.app, "GET", "/api/v1/market/assets", Some(token), None).await
+    }
+
     async fn cotizar(&self, token: &str, ticker: &str) -> (StatusCode, Value) {
         llamar_json(&self.app, "GET", &format!("/api/v1/market/quote/{ticker}"), Some(token), None).await
     }
@@ -72,6 +76,119 @@ async fn posicion(pool: &PgPool, cliente: Uuid, ticker: &str) -> Option<(Decimal
         .fetch_optional(pool)
         .await
         .unwrap()
+}
+
+// -----------------------------------------------------------------------------
+// Catálogo
+// -----------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "../migrations")]
+async fn catalogo_por_la_api(pool: PgPool) {
+    let cfg = preparar(&pool).await;
+    let m = Mercado::nuevo(&pool, cfg.clone());
+    let ana = cliente(&pool, &cfg, "Ana").await;
+    let token = m.token(ana.cliente.id);
+
+    let (s, c) = m.catalogo(&token).await;
+    assert_eq!(s, StatusCode::OK, "{c}");
+    assert!(chrono::DateTime::parse_from_rfc3339(c["as_of"].as_str().unwrap()).is_ok(), "{c}");
+    // Los activos de 0013 y 0014, por ticker (orden binario), todos simulados.
+    let activos = c["assets"].as_array().unwrap();
+    let tickers: Vec<&str> = activos.iter().map(|a| a["ticker"].as_str().unwrap()).collect();
+    assert_eq!(tickers, ["AGT1", "AUG1", "CETES28", "SCT28", "STSLA"]);
+
+    // Cada renglón es la ficha de su cotización (MarketAsset) y su fuente de
+    // precio: lo que el explorador lista se abre igual en la página del activo.
+    for activo in activos {
+        let ticker = activo["ticker"].as_str().unwrap();
+        let (s, q) = m.cotizar(&token, ticker).await;
+        assert_eq!(s, StatusCode::OK, "{ticker}: {q}");
+        let mut ficha = activo.clone();
+        let fuente = ficha.as_object_mut().unwrap().remove("price_source");
+        assert_eq!((&ficha, fuente.as_ref()), (&q["asset"], Some(&q["price_source"])), "{ticker}");
+    }
+
+    // Los dos de 0014: una acción sintética que baja y un CETES que paga.
+    assert_eq!(
+        activos[4],
+        json!({
+            "ticker": "STSLA",
+            "name": "Synthetic Tesla, 1 share",
+            "asset_class": "Equity",
+            "price": "4415.30000000",
+            "change_24h_pct": "-2.40",
+            "market_cap": "215000000.00",
+            "volume_24h": "96500000.00",
+            "yield_pct": null,
+            "quantity_decimals": 4,
+            "price_source": "simulated",
+        })
+    );
+    assert_eq!(
+        activos[2],
+        json!({
+            "ticker": "CETES28",
+            "name": "CETES, 28 days",
+            "asset_class": "Fixed income",
+            "price": "9.94390000",
+            "change_24h_pct": "0.02",
+            "market_cap": null,
+            "volume_24h": "18400000.00",
+            "yield_pct": "7.25",
+            "quantity_decimals": 0,
+            "price_source": "simulated",
+        })
+    );
+
+    let (s, _) = llamar_json(&m.app, "GET", "/api/v1/market/assets", None, None).await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED, "sin sesión");
+}
+
+#[sqlx::test(migrations = "../migrations")]
+async fn lo_que_lista_el_catalogo_se_opera(pool: PgPool) {
+    let cfg = preparar(&pool).await;
+    let m = Mercado::nuevo(&pool, cfg.clone());
+    let ana = con_efectivo(&pool, &cfg, "Ana", "10000").await;
+    let token = m.token(ana.cliente.id);
+
+    // Fracciones de una acción: 1 000 a 4 415.30 son 0.2264 por 999.62.
+    let (s, r) = m.ordenar(&token, orden("STSLA", "buy", "1000.00", "stsla")).await;
+    assert_eq!(s, StatusCode::CREATED, "{r}");
+    assert_eq!((&r["quantity"], &r["amount"]), (&json!("0.22640000"), &json!("999.62000000")), "{r}");
+    // CETES en títulos enteros: 1 000 a 9.9439 son 100 títulos por 994.39.
+    let (s, r) = m.ordenar(&token, orden("CETES28", "buy", "1000.00", "cetes")).await;
+    assert_eq!(s, StatusCode::CREATED, "{r}");
+    assert_eq!((&r["quantity"], &r["amount"]), (&json!("100.00000000"), &json!("994.39000000")), "{r}");
+    assert_eq!(saldo_ifpe(&pool, ana.cuenta_ifpe.id).await, (d("8005.99"), d("0")));
+    assert_eq!(posicion(&pool, ana.cliente.id, "CETES28").await, Some((d("100"), d("994.39"))));
+    verificar_invariantes(&pool).await;
+}
+
+#[sqlx::test(migrations = "../migrations")]
+async fn sin_modo_demo_el_catalogo_solo_lista_precios_reales(pool: PgPool) {
+    let mut cfg = preparar(&pool).await;
+    let ana = cliente(&pool, &cfg, "Ana").await;
+    cfg.modo_demo = false;
+    let m = Mercado::nuevo(&pool, cfg.clone());
+    let token = m.token(ana.cliente.id);
+
+    // Todo es simulado: el mercado no ha abierto, como en la cotización.
+    let (s, e) = m.catalogo(&token).await;
+    assert_eq!((s, &e["error"]["codigo"]), (StatusCode::SERVICE_UNAVAILABLE, &json!("MERCADO_NO_DISPONIBLE")), "{e}");
+
+    // Con el precio de un activo del oráculo, se lista ese y solo ese.
+    sqlx::query("UPDATE mercado.activos SET fuente_precio = 'ORACULO' WHERE ticker = 'CETES28'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let (s, c) = m.catalogo(&token).await;
+    assert_eq!(s, StatusCode::OK, "{c}");
+    let activos = c["assets"].as_array().unwrap();
+    assert_eq!(
+        (activos.len(), &activos[0]["ticker"], &activos[0]["price_source"]),
+        (1, &json!("CETES28"), &json!("oracle")),
+        "{c}"
+    );
 }
 
 // -----------------------------------------------------------------------------
@@ -414,6 +531,8 @@ async fn solo_un_cliente_con_kyc_coloca_ordenes(pool: PgPool) {
     assert_eq!((s, codigo.as_str()), (StatusCode::FORBIDDEN, "PROHIBIDO"));
     let (s, _) = m.cotizar(&token_operador, "AUG1").await;
     assert_eq!(s, StatusCode::OK);
+    let (s, _) = m.catalogo(&token_operador).await;
+    assert_eq!(s, StatusCode::OK, "el catálogo también");
     // … y la auditoría del ledger del mercado es del personal.
     let (s, a) = llamar_json(&m.app, "GET", "/api/v1/auditoria/ledger/mercado", Some(&token_operador), None).await;
     assert_eq!((s, &a["ledger"], &a["valido"]), (StatusCode::OK, &json!("MERCADO"), &json!(true)), "{a}");

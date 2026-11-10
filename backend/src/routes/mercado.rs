@@ -1,6 +1,6 @@
-//! Mercado de valores: cotizaciones y órdenes (`crate::mercado`).
+//! Mercado de valores: catálogo, cotizaciones y órdenes (`crate::mercado`).
 //!
-//! Las dos rutas están en el grupo `api` del límite por IP (limites.rs) y
+//! Las tres rutas están en el grupo `api` del límite por IP (limites.rs) y
 //! exigen sesión (el extractor [`Usuario`] valida el JWT y la sesión en la
 //! base de datos). Colocar una orden es solo del cliente.
 
@@ -17,13 +17,21 @@ use super::status_de;
 use crate::{
     auth::Usuario,
     error::AppResult,
-    mercado::{self, Cotizacion, Lado, Recibo, SolicitudOrden},
+    mercado::{self, Catalogo, Cotizacion, Lado, Recibo, SolicitudOrden},
     routes::extraccion::{Json, Path},
     state::AppState,
 };
 
 pub fn rutas() -> Router<AppState> {
-    Router::new().route("/market/quote/{ticker}", get(cotizacion)).route("/market/order", post(orden))
+    Router::new()
+        .route("/market/assets", get(catalogo))
+        .route("/market/quote/{ticker}", get(cotizacion))
+        .route("/market/order", post(orden))
+}
+
+/// El catálogo (`MarketCatalog`): lo que hoy se cotiza y se opera. Cualquier sesión válida.
+async fn catalogo(State(e): State<AppState>, _u: Usuario) -> AppResult<Json<Catalogo>> {
+    Ok(Json(mercado::catalogo(&e.pool, &e.config).await?))
 }
 
 /// El activo y su historial de precios (`MarketQuote`). Cualquier sesión válida.

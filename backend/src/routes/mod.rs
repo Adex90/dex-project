@@ -34,6 +34,7 @@
 //! | GET  | `/api/v1/reserva/prueba` | cliente |
 //! | POST | `/api/v1/reserva/cortes` | operador / auditor |
 //! | GET  | `/api/v1/auditoria/ledger/{ifpe,sofom,mercado}` | operador / auditor |
+//! | GET  | `/api/v1/market/assets` | cualquier sesión: el catálogo que hoy se cotiza y se opera |
 //! | GET  | `/api/v1/market/quote/{ticker}` | cualquier sesión: el activo y su historial de precios |
 //! | POST | `/api/v1/market/order` | cliente: orden de mercado (compra o venta), ejecutada al precio vigente |
 //! | GET  | `/api/v1/kyc/expediente` | cliente: estado, intentos, bloqueo y último resultado |

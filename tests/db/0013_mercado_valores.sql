@@ -169,9 +169,10 @@ SELECT pg_temp.exigir('rol sc_mercado NOLOGIN y esquema mercado sin PUBLIC', (
   SELECT NOT rolcanlogin FROM pg_roles WHERE rolname = 'sc_mercado')
   AND NOT has_schema_privilege('public', 'mercado', 'USAGE'));
 
+-- Solo el catálogo de esta migración: las siguientes (0014) le añaden activos.
 SELECT pg_temp.exigir('el catálogo inicial: AUG1, AGT1 y SCT28, todos con precio SIMULADO', (
   SELECT array_agg(ticker ORDER BY ticker) = ARRAY['AGT1', 'AUG1', 'SCT28'] AND bool_and(fuente_precio = 'SIMULADO')
-    FROM mercado.activos));
+    FROM mercado.activos WHERE ticker IN ('AGT1', 'AUG1', 'SCT28')));
 
 SELECT pg_temp.exigir('RLS en órdenes y posiciones, con la política RESTRICTIVE de sc_cliente (0011)', (
   SELECT count(*) = 2 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
@@ -486,6 +487,8 @@ SELECT pg_temp.exigir('Beto: 1 SCT28 por 9.92, sin decimales (incremento de 1 un
   pg_temp.posicion('b0000000-0000-0000-0000-00000000000b', 'SCT28') = '1.00000000 / 9.92000000'
   AND pg_temp.saldo('1b000000-0000-0000-0000-00000000001b') = 90.08);
 
+-- El catálogo completo, contado como dueño, para compararlo con lo que ve el cliente.
+SELECT count(*) AS catalogo FROM mercado.activos \gset
 SELECT pg_temp.exigir('como Ana, sc_cliente ve sus tres órdenes, su posición y el catálogo completo', (
   SELECT set_config('sc.cliente_actual', 'a0000000-0000-0000-0000-00000000000a', true) IS NOT NULL));
 SET LOCAL ROLE sc_cliente;
@@ -493,7 +496,7 @@ SELECT pg_temp.exigir('… sus órdenes, ninguna de Beto', (
   SELECT count(*) = 3 AND bool_and(cliente_id = 'a0000000-0000-0000-0000-00000000000a') FROM mercado.ordenes));
 SELECT pg_temp.exigir('… su posición, ninguna de Beto', (
   SELECT count(*) = 1 AND bool_and(cliente_id = 'a0000000-0000-0000-0000-00000000000a') FROM mercado.posiciones));
-SELECT pg_temp.exigir('… y el catálogo completo', (SELECT count(*) = 3 FROM mercado.activos));
+SELECT pg_temp.exigir('… y el catálogo completo', (SELECT count(*) = :catalogo AND :catalogo >= 3 FROM mercado.activos));
 SELECT pg_temp.exigir('… aunque pida las de Beto por id', (
   SELECT count(*) = 0 FROM mercado.ordenes WHERE cliente_id = 'b0000000-0000-0000-0000-00000000000b'));
 RESET ROLE;

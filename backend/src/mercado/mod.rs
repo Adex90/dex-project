@@ -1,5 +1,8 @@
-//! Mercado de valores (migración 0013): cotizaciones y órdenes de mercado.
+//! Mercado de valores (migraciones 0013 y 0014): catálogo, cotizaciones y
+//! órdenes de mercado.
 //!
+//! - [`catalogo`]: los activos que hoy se cotizan y se operan
+//!   (`GET /api/v1/market/assets`), el explorador del frontend.
 //! - [`cotizar`]: el activo del catálogo y su historial de precios
 //!   (`GET /api/v1/market/quote/{ticker}`).
 //! - [`colocar`]: una orden de compra o venta que se ejecuta completa al
@@ -58,16 +61,43 @@ async fn leer_activo(tx: &mut Tx, ticker: &str) -> AppResult<Activo> {
         .ok_or_else(|| no_existe(ticker))
 }
 
-/// Un precio simulado solo se cotiza y se opera con MODO_DEMO.
+/// Un precio simulado solo se cotiza, se lista y se opera con MODO_DEMO.
+fn se_ofrece(activo: &Activo, config: &Config) -> bool {
+    activo.fuente_precio != FuentePrecio::Simulado || config.modo_demo
+}
+
+fn mercado_no_disponible() -> AppError {
+    AppError::peticion(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "MERCADO_NO_DISPONIBLE",
+        "el mercado abre cuando se conecte el oráculo de precios; hoy los precios son simulados",
+    )
+}
+
 fn exigir_precio_real_o_demo(activo: &Activo, config: &Config) -> AppResult<()> {
-    if activo.fuente_precio == FuentePrecio::Simulado && !config.modo_demo {
-        return Err(AppError::peticion(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "MERCADO_NO_DISPONIBLE",
-            "el mercado abre cuando se conecte el oráculo de precios; hoy los precios son simulados",
-        ));
+    if se_ofrece(activo, config) {
+        Ok(())
+    } else {
+        Err(mercado_no_disponible())
     }
-    Ok(())
+}
+
+/// El catálogo del explorador: cada activo que hoy se cotiza y se opera, por
+/// ticker. Lee la tabla de la que cotizan y ejecutan las órdenes, así que todo
+/// lo listado se puede abrir y comprar. Sin MODO_DEMO lista solo los precios
+/// reales; si ninguno lo es, el mercado no ha abierto (503
+/// `MERCADO_NO_DISPONIBLE`, como la cotización).
+pub async fn catalogo(pool: &PgPool, config: &Config) -> AppResult<Catalogo> {
+    let mut tx = db::begin_lectura(pool, Rol::Mercado).await?;
+    let activos: Vec<Activo> =
+        sqlx::query_as("SELECT * FROM mercado.activos ORDER BY ticker COLLATE \"C\"").fetch_all(&mut *tx).await?;
+    tx.commit().await?;
+    let listados: Vec<ActivoCatalogo> =
+        activos.iter().filter(|a| se_ofrece(a, config)).map(ActivoCatalogo::from).collect();
+    if listados.is_empty() && !config.modo_demo {
+        return Err(mercado_no_disponible());
+    }
+    Ok(Catalogo { activos: listados, al: Utc::now() })
 }
 
 /// La cotización de un activo: su ficha, su historial y la hora del precio.

@@ -175,6 +175,32 @@ impl From<&Activo> for ActivoMercado {
     }
 }
 
+/// Un activo del catálogo (`MarketListing`): su ficha y de dónde viene su precio.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ActivoCatalogo {
+    #[serde(flatten)]
+    pub activo: ActivoMercado,
+    #[serde(rename = "price_source")]
+    pub fuente: &'static str,
+}
+
+impl From<&Activo> for ActivoCatalogo {
+    fn from(a: &Activo) -> Self {
+        Self { activo: ActivoMercado::from(a), fuente: a.fuente_precio.etiqueta() }
+    }
+}
+
+/// `GET /api/v1/market/assets` (`MarketCatalog`): lo que hoy se cotiza y se
+/// opera, por ticker.
+#[derive(Debug, Clone, Serialize)]
+pub struct Catalogo {
+    #[serde(rename = "assets")]
+    pub activos: Vec<ActivoCatalogo>,
+    /// Cuándo se leyeron los precios.
+    #[serde(rename = "as_of")]
+    pub al: DateTime<Utc>,
+}
+
 /// `GET /api/v1/market/quote/{ticker}` (`MarketQuote`).
 #[derive(Debug, Clone, Serialize)]
 pub struct Cotizacion {
