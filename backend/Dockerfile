@@ -91,15 +91,19 @@ RUN --mount=type=secret,id=extra_ca,required=false \
     cargo fetch --locked --target "$(rustc --print host-tuple)"; \
     rm -f /tmp/ca-bundle.crt
 
-# backend/.cargo/audit.toml ignores RUSTSEC-2023-0071 (rsa) only because rsa is never
-# built: it is in Cargo.lock through sqlx's optional MySQL driver. Fail if that changes.
-# (cargo tree prints nothing for a crate outside the graph; any error fails the step.)
+# backend/.cargo/audit.toml ignores two advisories only because their crates are never
+# built. Both are in Cargo.lock through sqlx's optional drivers: rsa (RUSTSEC-2023-0071)
+# through MySQL, libsqlite3-sys (RUSTSEC-2026-0459) through SQLite. Fail if either enters
+# the build graph. (cargo tree prints nothing for a crate outside the graph; any error,
+# including a crate that has left Cargo.lock and made its exception stale, fails the step.)
 RUN set -eu; \
-    construido="$(cargo tree --frozen -i rsa -e normal,build)"; \
-    if [ -n "$construido" ]; then \
-        echo "rsa is now built: RUSTSEC-2023-0071 applies, drop its exception in backend/.cargo/audit.toml" >&2; \
-        exit 1; \
-    fi
+    for crate in rsa libsqlite3-sys; do \
+        construido="$(cargo tree --frozen -i "$crate" -e normal,build)"; \
+        if [ -n "$construido" ]; then \
+            echo "$crate is now built: its advisory applies, drop its exception in backend/.cargo/audit.toml" >&2; \
+            exit 1; \
+        fi; \
+    done
 
 RUN cargo build --release --frozen --bin synthetic-capital
 

@@ -16,6 +16,15 @@ ignore = [
     # graph, which would make this exception stale. Approved with the dependency-audit
     # change; review when sqlx moves to 0.9.
     "RUSTSEC-2023-0071",
+    # RUSTSEC-2026-0459, libsqlite3-sys 0.30.1 (bundled SQLite C library, CVE-2026-119375;
+    # fixed in 0.39.0). libsqlite3-sys is in Cargo.lock only through sqlx's optional SQLite
+    # driver (sqlx-sqlite), which this crate never enables: `cargo tree -i libsqlite3-sys`
+    # is empty on every target, so SQLite is never compiled or linked. No fix within
+    # sqlx 0.8: sqlx-sqlite 0.8.6 requires libsqlite3-sys ^0.30.1, and 0.39.0 comes with
+    # sqlx 0.9. backend/Dockerfile fails the build if libsqlite3-sys ever enters the build
+    # graph. Approved by the repository owner (Adex90) on 2026-11-10; expires on 2027-02-10
+    # or when sqlx moves to 0.9, whichever comes first.
+    "RUSTSEC-2026-0459",
 ]
 
 [output]
