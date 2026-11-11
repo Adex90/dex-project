@@ -1,0 +1,40 @@
+[package]
+name = "hft-engine-rust"
+version = "0.1.0"
+edition = "2024"
+# The toolchain CI and the backend build with. It also steers Cargo's MSRV-aware resolver: an older value would make
+# it prefer older dependency releases.
+rust-version = "1.97"
+description = "StrawberrySwap HFT execution engine: Avellaneda–Stoikov quoting on a 100 ms tokio loop"
+publish = false
+
+[[bin]]
+name = "hft-engine"
+path = "src/main.rs"
+
+[dependencies]
+# HTTP JSON-RPC provider (rustls, no OpenSSL), sol!-generated contract bindings and the RPC types, for the live reads
+# that replace the mocks. On-chain fixed-point types (U256, I256) and unit conversions come from alloy-primitives.
+# No local signer: signing will go through the threshold vault (mpc/tss-vault), never a private key in this process.
+alloy = { version = "2.5.0", default-features = false, features = [
+    "std",
+    "contract",
+    "provider-http",
+    "reqwest-rustls-tls",
+    "rpc-types",
+] }
+# One task on a current-thread runtime: the tick loop never crosses threads, so its state needs no locks.
+tokio = { version = "1.54.1", features = ["rt", "macros", "time", "signal"] }
+# Reads the `engine` block of the Python lab's calibration.json. float_roundtrip: serde_json's default float parser
+# is approximate (it reads the lab's σ² 0.00039623631218582077 one ulp off); with it, every number is correctly rounded,
+# so a calibration loads bit for bit as the lab wrote it.
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = { version = "1.0.154", features = ["float_roundtrip"] }
+
+[dev-dependencies]
+# Paused virtual time: the loop tests run hours of 100 ms ticks in milliseconds, deterministically.
+tokio = { version = "1.54.1", features = ["rt", "macros", "time", "signal", "test-util"] }
+
+[profile.release]
+# Integer overflow panics in release too: a wrapped amount must never reach a quote.
+overflow-checks = true
