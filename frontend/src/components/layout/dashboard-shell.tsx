@@ -15,6 +15,7 @@ import { describeError } from "@/lib/api/client";
 import type { Cliente } from "@/lib/api/types";
 import { EXPIRED_LOGIN_PATH } from "@/lib/session";
 import { useAuthStore } from "@/store/auth";
+import { useCardStore } from "@/store/card";
 import { useDashboardStore } from "@/store/dashboard";
 import { useMarketStore } from "@/store/market";
 import { useOrdersStore } from "@/store/orders";
@@ -72,11 +73,13 @@ export function DashboardShell({ children }: { children: ReactNode }) {
   const origin = useNavOrigin();
 
   // Sign-out unmounts the dashboard: the next person in this tab starts from
-  // an empty search, and an asset page opened by address belongs to the Vault.
+  // an empty search and the card's defaults, and an asset page opened by
+  // address belongs to the Vault.
   useEffect(
     () => () => {
       useMarketStore.getState().reset();
       useOrdersStore.getState().reset();
+      useCardStore.getState().reset();
       resetNavOrigin();
     },
     [],

@@ -11,7 +11,8 @@
  *
  * First pass: landing -> sign-up -> KYC-locked dashboard -> full onboarding
  * (personal data, INE photos and details, biometric consent + liveness) ->
- * VERIFICADO -> deposit, fixed-term investment, Proof of Reserve, ledger,
+ * VERIFICADO -> deposit, fixed-term investment, the Account tab's previews
+ * (the Sovereign Yield counter, the debit card), Proof of Reserve, ledger,
  * moving between the dashboard's tabs (Vault, Discover, Account, Invest,
  * Reserve). It ends on asset pages opened by their address (AUG1, an unknown
  * ticker, an address that is not a ticker, a market without live prices) and
@@ -42,6 +43,8 @@ import { mkdirSync } from "node:fs";
 import { sampleIdentity, SAMPLE_IDENTITY_SPACE, todayInMexicoCity } from "../src/lib/kyc.ts";
 // And the allocation's exact math, to know what the Vault must show for the figures the API gives.
 import { allocation, formatShare } from "../src/lib/allocation.ts";
+// And the Sovereign Yield preview's, to check the Account tab's live counter against it.
+import { SOVEREIGN_YIELD_PCT, accrued, formatTruncated, monthWindow } from "../src/lib/wealth.ts";
 
 // createRequire honors NODE_PATH (ESM imports do not), so a global install works.
 const { chromium } = createRequire(import.meta.url)("playwright");
@@ -486,6 +489,14 @@ try {
       await page.getByTestId("vault-total").filter({ hasText: "26,234" }).waitFor();
       await page.getByTestId("portfolio-line").waitFor();
       await shot(page, "vault-mobile");
+      await openTab(page, "Account");
+      await page.getByTestId("cash-yield-counter").waitFor();
+      await page.getByTestId("card-face").waitFor();
+      check(
+        await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth),
+        "on a phone the Account tab fits the width: the yield, the card and the account stack",
+      );
+      await shot(page, "account-mobile");
       await openTab(page, "Reserve");
       await page.getByRole("button", { name: "Verify My Merkle Proof" }).click();
       await page.getByTestId("proof-verdict").waitFor({ timeout: 15_000 });
@@ -927,6 +938,77 @@ try {
     await openTab(page, "Account");
     await page.getByTestId("vault-available").filter({ hasText: "15,000.00" }).waitFor();
     check(true, "bridge moves 10,000 from the vault into a mutuum contract");
+
+    // Sovereign Yield: a preview, ticking up live on the 15,000.00 available. What it shows
+    // is the exact accrual (lib/wealth.ts) at the instant it is read, to within a second.
+    const reading = async () => Number((await page.getByTestId("cash-yield-counter").innerText()).replace(/[^\d.]/g, ""));
+    const expectedAt = (at) =>
+      Number(formatTruncated(accrued("15000.00", SOVEREIGN_YIELD_PCT, at - monthWindow(at).start), 6).replace(/,/g, ""));
+    const readFrom = Date.now();
+    const firstReading = await reading();
+    const readTo = Date.now();
+    await page.waitForTimeout(1_200);
+    const secondReading = await reading();
+    check(
+      /preview · 7\.25% a year/i.test(await page.getByTestId("cash-yield-preview").innerText()) &&
+        (await page.getByTestId("cash-yield-available").innerText()) === "$15,000.00" &&
+        (await page.getByTestId("cash-yield-per-day").innerText()) === "$3.02" &&
+        firstReading >= expectedAt(readFrom - 1_000) &&
+        firstReading <= expectedAt(readTo + 1_000) &&
+        secondReading > firstReading,
+      `Sovereign Yield, a preview at 7.25 %, ticks up live on the 15,000.00 available ($${firstReading} → $${secondReading}, $3.02 a day)`,
+    );
+
+    // The debit card, a preview: freeze (kept across tabs), the PIN's place, settings, saveback.
+    const cardFace = page.getByTestId("card-face");
+    check(
+      /^[A-Z][A-Z .'-]+$/.test(await page.getByTestId("card-holder").innerText()) &&
+        (await page.getByTestId("card-number").innerText()).includes("•••• •••• •••• ••••"),
+      "the card carries the holder's name in capitals, and no number until it is issued",
+    );
+    await page.getByTestId("card-freeze").click();
+    await cardFace.and(page.locator("[data-frozen=true]")).waitFor();
+    check(
+      (await page.getByTestId("card-freeze").getAttribute("aria-pressed")) === "true" &&
+        (await page.getByTestId("card-status").innerText()).startsWith("Frozen"),
+      "Freeze frosts the card over, keeps its button pressed and says payments are declined",
+    );
+    await openTab(page, "Vault");
+    await openTab(page, "Account");
+    await cardFace.and(page.locator("[data-frozen=true]")).waitFor();
+    check(true, "the card is still frozen back from another tab");
+    await page.getByTestId("card-freeze").click();
+    await cardFace.and(page.locator("[data-frozen=false]")).waitFor();
+    await page.getByTestId("card-pin").click();
+    const pinPanel = page.getByTestId("card-pin-panel");
+    await pinPanel.waitFor();
+    check(
+      (await page.getByTestId("card-pin").getAttribute("aria-expanded")) === "true" &&
+        (await pinPanel.innerText()).includes("No PIN yet"),
+      "Show PIN opens the PIN's place, which says the preview card has none yet",
+    );
+    await pinPanel.waitFor({ state: "detached", timeout: 12_000 });
+    check(
+      (await page.getByTestId("card-pin").getAttribute("aria-expanded")) === "false",
+      "the PIN's place closes by itself after 10 seconds",
+    );
+    await page.getByTestId("card-settings").click();
+    const abroad = page.getByTestId("card-use").and(page.locator("[data-use=abroad]"));
+    const abroadBefore = await abroad.getAttribute("aria-checked");
+    await abroad.click();
+    check(
+      (await page.getByTestId("card-use").count()) === 4 &&
+        abroadBefore === "false" &&
+        (await abroad.getAttribute("aria-checked")) === "true",
+      "Settings lists four uses as switches, and Payments abroad turns on",
+    );
+    check(
+      /^\$[\d,]+\.\d{2}$/.test(await page.getByTestId("saveback-earned").innerText()) &&
+        (await page.getByTestId("saveback").innerText()).includes("of $300.00"),
+      "the saveback tracker shows this month's simulated saveback toward its $300.00 cap",
+    );
+    await page.mouse.move(0, 0);
+    await shot(page, "account-wealth-desktop");
 
     // Proof of Reserve.
     await openTab(page, "Reserve");

@@ -31,8 +31,10 @@ what the module waits on. They do not change its scope.
   - Trading, options and margin (modules 1 to 7, 19 and 29) need a securities
     intermediary: a casa de bolsa license or a partner broker.
   - The Ley Fintech bars an IFPE from paying interest on e-money balances. In
-    the current design yield comes only from SOFOM contracts, which module 13
-    must respect.
+    the current design yield comes only from SOFOM contracts. Module 13's
+    counter is a labelled preview on IFPE cash: before anything is paid, the
+    yield needs a structure the licence allows (a SOFOM contract the client
+    opts into, a fund, or a banking licence).
   - Margin (modules 19 and 29) is credit. The app's 100% reserve promise says
     vault money is "never lent", so this is also a product decision.
 - **Navigation.**
@@ -216,13 +218,41 @@ what the module waits on. They do not change its scope.
 
 ## Phase 3: Wealth & Liquidity
 
-- [ ] **13. Cash/Yield Tab** (Uninvested balance and live interest counter)
-  - Foundation: the Vault and Account tabs. The counter shows SOFOM contract
-    accrual, not interest on IFPE cash (see the licensing scope above).
-- [ ] **14. Card Management** (Virtual card UI, freeze, PIN, Apple/Google Wallet)
-  - Waits on a card issuing processor. Adding a card to Apple or Google
-    Wallet from inside the app needs native apps; a web app cannot do it.
+- [x] **13. Cash/Yield Tab** (Uninvested balance and live interest counter)
+  - On the Account tab (`components/wealth/cash-yield-section.tsx`), above
+    the account: the uninvested cash (`available_cash` from `useVaultStore`)
+    and a live "Earned this month" counter at a mocked 7.25 % Sovereign Yield
+    (ACT/360, exact to 10^-8 and rounded down, `lib/wealth.ts`, unit
+    tested). It ticks on every animation frame without re-rendering React
+    (once a second with reduced motion), shows enough decimals for the last
+    one to move, and adds the month so far, a day's yield and the month's
+    projection.
+  - A preview, labelled as such: simulated on today's available cash since
+    the 1st, and nothing is paid (see the licensing scope above). Smoke e2e
+    checks the counter against the exact accrual at the instant it is read,
+    and that it ticks up.
+  - Left: the payout, through a structure the licence allows, and then the
+    counter on real accrual (time-weighted from the ledger, not today's
+    balance), with the SOFOM contracts' accrual beside it.
+- [x] **14. Card Management** (Virtual card UI, freeze, PIN, Apple/Google Wallet)
+  - On the Account tab (`components/wealth/card-management.tsx`): the card
+    face (pure black and square, the gold mark, a minimal chip, the number
+    masked until issued, the holder's name as a card carries it). Freeze is
+    a toggle that frosts the card and stays gold while on; Show PIN opens
+    the PIN's place for 10 seconds (a preview card has none yet); Settings
+    turns the card's uses on and off (online, contactless, ATM, abroad). A
+    Saveback tracker shows 1 % of card payments toward a $300.00 monthly
+    cap, on simulated spending. State in `store/card.ts`, reset on sign-out.
+  - A preview, labelled as such: no card is issued and nothing is sent.
+    Smoke e2e covers freeze (kept across tabs), the PIN's place closing by
+    itself, the settings and the phone layout.
+  - Left: a card issuing processor (the number, the PIN, freezing and the
+    uses through its API). Adding a card to Apple or Google Wallet from
+    inside the app needs native apps; a web app cannot do it.
 - [ ] **15. Round-up & Saveback** (Cashback tracking and spare change investing)
+  - Previewed on the card (module 14): a saveback tracker on simulated
+    spending. Left: card payments to compute it from, round-ups, and where
+    the money goes (cash, or a savings plan once module 4 is live).
 - [ ] **16. Linked Accounts & Withdrawals** (Whitelisting CLABE and fiat off-ramp)
   - The backend already sends withdrawals to an own external CLABE
     (`POST /api/v1/ifpe/retiros`). CLABE check-digit validation exists in

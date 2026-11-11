@@ -1059,6 +1059,38 @@ labels use floating point.
     Vault's allocation against the shares the vault's own figures give,
     following a deposit and a buy live.
 
+## Account: Sovereign Yield and the debit card (previews)
+
+The Account tab (`frontend/src/app/dashboard/account/page.tsx`) holds the
+liquidity and banking tools around the IFPE account. Two of them are previews,
+labelled as such on screen: no yield is paid and no card is issued yet, and
+nothing they show is sent to the backend.
+
+- **Sovereign Yield** (`frontend/src/components/wealth/cash-yield-section.tsx`):
+  the uninvested cash (`available_cash` from the vault store) and a live
+  "Earned this month" counter at a mocked 7.25 % a year.
+  - The math (`frontend/src/lib/wealth.ts`): actual time over a 360-day year
+    (ACT/360, the SOFOM's convention), in BigInt units of 10^-8 rounded down,
+    on today's available cash since the 1st of the month in Mexico City. With
+    it, a day's yield and the whole month's projection.
+  - The counter writes its digits on each animation frame without re-rendering
+    React, with as many decimals as the last one needs to move (four to
+    eight); once a second with reduced motion.
+  - Licensing: the Ley Fintech bars an IFPE from paying interest on e-money,
+    so paying this yield needs a structure the licence allows first
+    (`docs/FRONTEND_ROADMAP.md`, "Licensing scope").
+- **Debit card** (`frontend/src/components/wealth/card-management.tsx`): the
+  card face (pure black, square, the number masked until issued), Freeze, Show
+  PIN (a 10-second window; a preview card has no PIN yet), Settings (online,
+  contactless, ATM, abroad) and a Saveback tracker (1 % of card payments up to
+  $300.00 a month, on simulated spending). The state lives in
+  `frontend/src/store/card.ts` and resets on sign-out.
+- Tests: `frontend/src/lib/wealth.test.ts` (the month in Mexico City, the
+  accrual, the counter's decimals, saveback, the name on the card) and
+  `frontend/src/store/card.test.ts`; `frontend/e2e/smoke.mjs` checks the
+  counter against the exact accrual as it ticks, the card's states, and the tab
+  on a phone.
+
 ## Layout
 
 ```
