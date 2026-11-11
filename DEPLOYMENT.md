@@ -1335,6 +1335,23 @@ available, so Session Manager itself was not exercised. Everything around it was
 - **Backend:** rustfmt and clippy `-D warnings` clean; 314 tests passed, 0 failed.
   hadolint, actionlint and ShellCheck (with the CI settings) are clean.
 
+**Discover: top movers, collections and the asset screener** (frontend only, no migration):
+
+- **Frontend:** typecheck, lint, 245 unit tests (9 new: the screener's
+  classes, directions, cross-filter counts, toggles and their summary,
+  collections as presets with their equal-weight change, the top movers and
+  their ties; and the filters kept in the market store) and `next build`.
+- **End to end** on a fresh stack: smoke 174 checks and AML console 123
+  checks. The new smoke checks cover:
+  - the top movers (gold up 0.84 %, the synthetic Tesla down 2.40 %) and the
+    collections with their assets and equal-weight change;
+  - a collection presetting the screener, a toggle narrowing it, the counts,
+    and a toggle that would leave nothing disabled;
+  - the empty state of a search the filters exclude, and its way out;
+  - the screener kept on the way back from an asset, no request beyond the
+    catalog, and the rows that swipe on a phone without sideways scroll.
+- **Backend:** unchanged (373 tests).
+
 **Pro chart and portfolio allocation** (frontend only, no migration):
 
 - **Frontend:** typecheck, lint, 236 unit tests (22 new: candles from the
