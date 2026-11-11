@@ -1335,6 +1335,24 @@ available, so Session Manager itself was not exercised. Everything around it was
 - **Backend:** rustfmt and clippy `-D warnings` clean; 314 tests passed, 0 failed.
   hadolint, actionlint and ShellCheck (with the CI settings) are clean.
 
+**Account: the Sovereign Yield counter and the debit card, as previews** (frontend only, no migration):
+
+- **Frontend:** typecheck, lint, 256 unit tests (11 new: the Mexico City month,
+  the ACT/360 accrual exact to 10^-8, the counter's decimals, the saveback and
+  its cap, the name on the card, and the card store) and `next build`.
+- **End to end** on a fresh stack: smoke 186 checks and AML console 123
+  checks. The new smoke checks cover:
+  - the counter against the exact accrual at the instant it is read, ticking
+    up, with a day's yield and the uninvested cash;
+  - the card: the holder's name, no number before it is issued, Lock (kept
+    across tabs), the PIN's place closing by itself, the settings' switches
+    and the saveback tracker;
+  - the Account tab on a phone, without sideways scroll.
+- The first AML run failed two checks: the card's "Freeze" control used a
+  word an AML hold must never show a client (`e2e/aml.mjs` TIP_OFF). The
+  control became Lock / Unlock, and the AML suite passed again in full.
+- **Backend:** unchanged (373 tests).
+
 **Discover: top movers, collections and the asset screener** (frontend only, no migration):
 
 - **Frontend:** typecheck, lint, 245 unit tests (9 new: the screener's
