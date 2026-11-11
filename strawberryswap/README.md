@@ -56,6 +56,7 @@ strawberryswap/
 │   ├── hft-engine-rust/            # A-S execution engine: 100 ms tokio loop, alloy (iteration 0: mock chain)
 │   ├── searcher-rust/              # (reserved) production RPC / signer adapters
 │   └── inventory-cpp/              # Searcher core: LOB signals, Avellaneda–Stoikov, curve planner (C++20)
+├── vaults/threshold-signer/        # signer daemon for the HFT engine: Unix socket, strict policy (iteration 0: mock key)
 ├── mpc/tss-vault/                  # (Phase 4) threshold-ECDSA/EdDSA corporate vault coordinator
 ├── infra/
 │   ├── terraform/{modules/{network,ec2-bots,rds,s3-ipfs-pin},envs/prod}
@@ -236,6 +237,22 @@ quotes into the curve planner and `SearcherExecutor.rebalance`, as in `bots/inve
 
 ```bash
 cd bots/hft-engine-rust && cargo test && cargo run --release -- --ticks 50
+```
+
+## Threshold signer (Rust), iteration 0
+
+`vaults/threshold-signer/` is the daemon that signs for the HFT engine, so that the engine never holds a key.
+
+* **The exchange.** The engine sends an unsigned EIP-1559 transaction over a local Unix socket. The vault decodes it,
+  checks it and returns the signature and the signed transaction.
+* **Access control.** The socket sits in a private directory, and the kernel checks the caller's uid (`SO_PEERCRED`).
+* **The policy.** Only `SearcherExecutor.rebalance`, on one chain, with bounded amounts, gas and fees, no ether, and
+  never `sweep`.
+* **What is mocked.** The key, held in memory behind `alloy_signer::Signer`, and the chain-aware rules. The crate's
+  README explains the separation, the threat model and the path to t-of-n threshold ECDSA.
+
+```bash
+cd vaults/threshold-signer && cargo test && cargo run --release -- --chain-id 31337 --executor 0x<SearcherExecutor>
 ```
 
 ## Known limitations (read before Phase 2)
