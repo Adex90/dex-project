@@ -53,6 +53,7 @@ strawberryswap/
 │   └── src/{app/{,trade},components,hooks,lib,styles}
 ├── bots/
 │   ├── automator/                  # Go relayer: intents → batch → proof → settleBatch; Tor-only metadata layer
+│   ├── hft-engine-rust/            # A-S execution engine: 100 ms tokio loop, alloy (iteration 0: mock chain)
 │   ├── searcher-rust/              # (reserved) production RPC / signer adapters
 │   └── inventory-cpp/              # Searcher core: LOB signals, Avellaneda–Stoikov, curve planner (C++20)
 ├── mpc/tss-vault/                  # (Phase 4) threshold-ECDSA/EdDSA corporate vault coordinator
@@ -219,6 +220,23 @@ A mobile-first rebuild of the UI (presentation only: every hook, ABI, `lib/` and
 * **Accessible.** Text meets WCAG AA on every surface (button fills use deeper brand shades for white labels), token pickers
   are native `<select>`s, tabs are ARIA tablists, and motion stops under `prefers-reduced-motion`. Skeletons are sized like
   the data they stand in for, so content fades in without layout shift.
+
+## HFT execution engine (Rust), iteration 0
+
+`bots/hft-engine-rust/` ports the Python lab's Avellaneda–Stoikov closed forms (`hft-engine/python-sim/as_sim/model.py`)
+to Rust, on a 100 ms tokio loop. The parameters are the `engine` block of the lab's `calibration.json`.
+
+* **Mock data only.** It reads mock data sources shaped like the live calls: the zk oracle's `(price, updatedAt)` and
+  the executor's token0 balance. Nothing touches a chain.
+* **Matches the lab.** Golden vectors from the lab's own code agree to within 1 ulp, bit-identical in all but one case.
+* **Safe and clean.** `forbid(unsafe_code)`; valgrind memcheck is clean.
+
+The crate's README covers the guards, the verification and the wiring plan (oracle and balance reads through alloy;
+quotes into the curve planner and `SearcherExecutor.rebalance`, as in `bots/inventory-cpp`).
+
+```bash
+cd bots/hft-engine-rust && cargo test && cargo run --release -- --ticks 50
+```
 
 ## Known limitations (read before Phase 2)
 
