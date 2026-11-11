@@ -240,6 +240,8 @@ jobs:
             expect: "tests/db/0012_boveda_tiempo_real.sql: todas las pruebas pasaron (ROLLBACK)"
           - suite: 0013_mercado_valores
             expect: "tests/db/0013_mercado_valores.sql: todas las pruebas pasaron (ROLLBACK)"
+          - suite: 0015_ordenes_avanzadas
+            expect: "tests/db/0015_ordenes_avanzadas.sql: todas las pruebas pasaron (ROLLBACK)"
     services:
       postgres:
         image: postgres:16

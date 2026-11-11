@@ -5,17 +5,20 @@
 //!    orden global (encabezado de [`crate::ledger`]). Toda orden del cliente
 //!    lo toma, así que su posición no cambia hasta el COMMIT.
 //! 2. Idempotencia, ya con el candado: la repetición de una orden espera a la
-//!    primera y devuelve su recibo; una clave usada para otra cosa es 409.
+//!    primera y devuelve su recibo; una clave usada para otra cosa (también
+//!    una orden límite o stop) es 409.
 //! 3. Reglas: KYC operable, el activo abierto y con precio real (o MODO_DEMO);
-//!    compra: saldo disponible para el monto; venta: la posición.
+//!    compra: saldo disponible para el monto; venta: los títulos libres (los
+//!    comprometidos en ventas límite o stop pendientes no se venden a mercado).
 //! 4. Compra: PLD antes de cualquier escritura, en el canal COMPRA_MERCADO
 //!    (como la inversión en mutuo); un BLOQUEAR confirma solo la evaluación.
 //!    Venta: no se evalúa (dinero del cliente que regresa, como un mutuo
 //!    vencido), pero un cliente congelado no vende.
-//! 5. Reserva en custodia, saldos y el movimiento IFPE (COMPRA_MERCADO o
-//!    VENTA_MERCADO); luego la orden, que la base de datos revisa contra el
-//!    catálogo y la posición, encadena y aplica a la posición. Ambos hashes
-//!    se recalculan aquí.
+//! 5. [`escribir_orden`]: reserva en custodia, saldos y el movimiento IFPE
+//!    (COMPRA_MERCADO o VENTA_MERCADO); luego la orden, que la base de datos
+//!    revisa contra el catálogo y la posición, encadena y aplica a la
+//!    posición. Ambos hashes se recalculan aquí. La ejecución de una orden
+//!    límite o stop ([`super::pendiente`]) escribe con la misma función.
 //!
 //! El cambio de saldo sube la versión de la cuenta en esta transacción: al
 //! confirmar, `sc_boveda` avisa y el WebSocket envía la bóveda nueva.
@@ -25,8 +28,8 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use super::{
-    calculo::{self, Rechazo},
-    exigir_precio_real_o_demo, leer_activo, ticker_valido, Activo, Lado, Orden, Recibo,
+    calculo::{self, Ejecucion, Rechazo},
+    exigir_precio_real_o_demo, leer_activo, pendiente, ticker_valido, Activo, Lado, Orden, Recibo,
 };
 use crate::{
     aml::{self, Canal, Contraparte, Decision, Operacion},
@@ -64,7 +67,8 @@ fn maximo() -> Decimal {
     Decimal::new(99_999_999_999, 2)
 }
 
-fn validar_monto(monto: Decimal) -> AppResult<Decimal> {
+/// Pesos con centavos, de 0.01 al máximo de una orden (también las límite y stop).
+pub(super) fn validar_monto(monto: Decimal) -> AppResult<Decimal> {
     let monto = dinero::validar_monto(monto)?;
     if monto.normalize().scale() > 2 {
         return Err(AppError::validacion("el monto admite como máximo 2 decimales (centavos)"));
@@ -105,7 +109,9 @@ async fn colocar_tx(pool: &PgPool, config: &Config, s: &SolicitudOrden, monto: D
         tx.commit().await?;
         return Ok(ResultadoOrden { recibo, idempotente: true });
     }
-    if ledger::buscar_por_clave(&mut tx, &s.clave_idempotencia).await?.is_some() {
+    if ledger::buscar_por_clave(&mut tx, &s.clave_idempotencia).await?.is_some()
+        || pendiente::por_clave(&mut tx, &s.clave_idempotencia).await?.is_some()
+    {
         return Err(clave_reutilizada());
     }
 
@@ -114,7 +120,7 @@ async fn colocar_tx(pool: &PgPool, config: &Config, s: &SolicitudOrden, monto: D
     let activo = leer_activo(&mut tx, &s.ticker).await?;
     exigir_precio_real_o_demo(&activo, config)?;
     if !activo.operable {
-        return Err(AppError::negocio("MERCADO_CERRADO", format!("{} no opera en este momento", activo.ticker)));
+        return Err(mercado_cerrado(&activo));
     }
 
     let orden_id = Uuid::new_v4();
@@ -147,48 +153,89 @@ async fn colocar_tx(pool: &PgPool, config: &Config, s: &SolicitudOrden, monto: D
             // Congelado (preventivo u operador) o cerrada: no vende. El
             // preventivo responde el error constante, sin aviso.
             ledger::exigir_debitable(&cuenta)?;
-            let (tenido, costo) = posicion(&mut tx, s.cliente_id, &activo.ticker).await?;
-            calculo::venta(monto, activo.precio, activo.decimales(), tenido, costo).map_err(|r| rechazo(r, &activo))?
+            let t = tenencia(&mut tx, s.cliente_id, &activo.ticker).await?;
+            calculo::venta(monto, activo.precio, activo.decimales(), t.libre(), t.cantidad, t.costo)
+                .map_err(|r| rechazo(r, &activo))?
         }
     };
 
-    // 5. Reserva, saldos y movimiento IFPE: el efectivo sale de la custodia a
-    // liquidar la compra, o regresa con la venta. El pasivo y la reserva se
-    // mueven juntos (SC_RESERVA_100).
-    let reserva = ledger::bloquear_reserva(&mut tx).await?;
-    let (sql_cuenta, sql_reserva, tipo, concepto, origen, destino) = match s.lado {
+    // 5. Reserva, saldos, movimiento IFPE y la orden.
+    let orden = escribir_orden(
+        &mut tx,
+        NuevaOrden {
+            id: orden_id,
+            tx_ifpe_id,
+            cliente_id: s.cliente_id,
+            cuenta_id: cuenta.id,
+            activo: &activo,
+            lado: s.lado,
+            monto_solicitado: monto,
+            ejecucion,
+            clave: &s.clave_idempotencia,
+        },
+    )
+    .await?;
+    tx.commit().await?;
+    tracing::info!(orden = %orden.id, ticker = %orden.ticker, lado = orden.lado.as_str(), "orden de mercado ejecutada");
+    Ok(ResultadoOrden { recibo: Recibo::from(&orden), idempotente: false })
+}
+
+/// Lo que escribe la ejecución de una orden, ya decidida (cantidad, importe y
+/// costo) y ya evaluada en PLD si compra.
+pub(super) struct NuevaOrden<'a> {
+    pub id: Uuid,
+    pub tx_ifpe_id: Uuid,
+    pub cliente_id: Uuid,
+    pub cuenta_id: Uuid,
+    pub activo: &'a Activo,
+    pub lado: Lado,
+    /// El monto que pidió el cliente (el de la orden pendiente, si ejecuta una).
+    pub monto_solicitado: Decimal,
+    pub ejecucion: Ejecucion,
+    /// La clave de la orden y de su movimiento IFPE (la del cliente, o
+    /// `ord:<pendiente>:ejecucion`).
+    pub clave: &'a str,
+}
+
+/// Reserva, saldo, movimiento IFPE y orden: el efectivo sale de la custodia a
+/// liquidar la compra, o regresa con la venta. El pasivo y la reserva se
+/// mueven juntos (SC_RESERVA_100). La cuenta del cliente debe estar bloqueada
+/// por el llamador (primer candado); aquí se toma la reserva.
+pub(super) async fn escribir_orden(tx: &mut Tx, n: NuevaOrden<'_>) -> AppResult<Orden> {
+    let reserva = ledger::bloquear_reserva(tx).await?;
+    let (sql_cuenta, sql_reserva, tipo, concepto, origen, destino) = match n.lado {
         Lado::Compra => (
             "UPDATE ifpe.cuentas SET saldo_disponible = saldo_disponible - $1 WHERE id = $2",
             "UPDATE ifpe.reserva_custodia SET saldo = saldo - $1 WHERE id = $2",
             TipoTxIfpe::CompraMercado,
-            format!("Compra de {}", activo.ticker),
-            Some(cuenta.id),
+            format!("Compra de {}", n.activo.ticker),
+            Some(n.cuenta_id),
             None,
         ),
         Lado::Venta => (
             "UPDATE ifpe.cuentas SET saldo_disponible = saldo_disponible + $1 WHERE id = $2",
             "UPDATE ifpe.reserva_custodia SET saldo = saldo + $1 WHERE id = $2",
             TipoTxIfpe::VentaMercado,
-            format!("Venta de {}", activo.ticker),
+            format!("Venta de {}", n.activo.ticker),
             None,
-            Some(cuenta.id),
+            Some(n.cuenta_id),
         ),
     };
-    sqlx::query(sql_cuenta).bind(ejecucion.monto).bind(cuenta.id).execute(&mut *tx).await?;
-    sqlx::query(sql_reserva).bind(ejecucion.monto).bind(reserva.id).execute(&mut *tx).await?;
+    sqlx::query(sql_cuenta).bind(n.ejecucion.monto).bind(n.cuenta_id).execute(&mut **tx).await?;
+    sqlx::query(sql_reserva).bind(n.ejecucion.monto).bind(reserva.id).execute(&mut **tx).await?;
     let movimiento = ledger::insertar_tx_ifpe(
-        &mut tx,
+        tx,
         NuevaTxIfpe {
-            id: tx_ifpe_id,
+            id: n.tx_ifpe_id,
             tipo,
             origen,
             destino,
             reserva: Some(reserva.id),
-            monto: ejecucion.monto,
+            monto: n.ejecucion.monto,
             concepto: Some(&concepto),
             referencia_externa: None,
-            clave: &s.clave_idempotencia,
-            espejo: Some(orden_id),
+            clave: n.clave,
+            espejo: Some(n.id),
         },
     )
     .await?;
@@ -200,20 +247,20 @@ async fn colocar_tx(pool: &PgPool, config: &Config, s: &SolicitudOrden, monto: D
           fuente_precio, tx_ifpe_id, clave_idempotencia) \
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) RETURNING *",
     )
-    .bind(orden_id)
-    .bind(s.cliente_id)
-    .bind(cuenta.id)
-    .bind(&activo.ticker)
-    .bind(s.lado)
-    .bind(monto)
-    .bind(ejecucion.cantidad)
-    .bind(activo.precio)
-    .bind(ejecucion.monto)
-    .bind(ejecucion.costo_liberado)
-    .bind(activo.fuente_precio)
+    .bind(n.id)
+    .bind(n.cliente_id)
+    .bind(n.cuenta_id)
+    .bind(&n.activo.ticker)
+    .bind(n.lado)
+    .bind(n.monto_solicitado)
+    .bind(n.ejecucion.cantidad)
+    .bind(n.activo.precio)
+    .bind(n.ejecucion.monto)
+    .bind(n.ejecucion.costo_liberado)
+    .bind(n.activo.fuente_precio)
     .bind(movimiento.id)
-    .bind(&s.clave_idempotencia)
-    .fetch_one(&mut *tx)
+    .bind(n.clave)
+    .fetch_one(&mut **tx)
     .await?;
     let recalculado = hash::hash_mercado(&orden);
     if recalculado != orden.tx_hash {
@@ -222,44 +269,62 @@ async fn colocar_tx(pool: &PgPool, config: &Config, s: &SolicitudOrden, monto: D
             orden.secuencia, orden.tx_hash, recalculado
         )));
     }
-    tx.commit().await?;
-    tracing::info!(orden = %orden.id, ticker = %orden.ticker, lado = orden.lado.as_str(), "orden de mercado ejecutada");
-    Ok(ResultadoOrden { recibo: Recibo::from(&orden), idempotente: false })
+    Ok(orden)
 }
 
-async fn orden_por_clave(tx: &mut Tx, clave: &str) -> AppResult<Option<Orden>> {
+pub(super) async fn orden_por_clave(tx: &mut Tx, clave: &str) -> AppResult<Option<Orden>> {
     Ok(sqlx::query_as("SELECT * FROM mercado.ordenes WHERE clave_idempotencia = $1")
         .bind(clave)
         .fetch_optional(&mut **tx)
         .await?)
 }
 
-/// Cantidad y costo de la posición del cliente en el activo (0, 0 si no
-/// tiene). Sin candado propio: toda orden del cliente toma antes su fila IFPE,
-/// que esta transacción ya tiene.
-async fn posicion(tx: &mut Tx, cliente_id: Uuid, ticker: &str) -> AppResult<(Decimal, Decimal)> {
-    let fila: Option<(Decimal, Decimal)> =
-        sqlx::query_as("SELECT cantidad, costo FROM mercado.posiciones WHERE cliente_id = $1 AND ticker = $2")
-            .bind(cliente_id)
-            .bind(ticker)
-            .fetch_optional(&mut **tx)
-            .await?;
-    Ok(fila.unwrap_or((Decimal::ZERO, Decimal::ZERO)))
+/// La posición del cliente en un activo: todos sus títulos, los comprometidos
+/// en ventas pendientes y su costo (ceros si no tiene).
+#[derive(Debug, Clone, Copy, Default, sqlx::FromRow)]
+pub(super) struct Tenencia {
+    pub cantidad: Decimal,
+    pub cantidad_comprometida: Decimal,
+    pub costo: Decimal,
 }
 
-fn clave_reutilizada() -> AppError {
+impl Tenencia {
+    /// Los títulos que una venta de mercado (o una venta pendiente nueva) puede usar.
+    pub fn libre(&self) -> Decimal {
+        self.cantidad - self.cantidad_comprometida
+    }
+}
+
+/// Sin candado propio: toda orden del cliente toma antes su fila IFPE, que
+/// esta transacción ya tiene.
+pub(super) async fn tenencia(tx: &mut Tx, cliente_id: Uuid, ticker: &str) -> AppResult<Tenencia> {
+    let fila: Option<Tenencia> = sqlx::query_as(
+        "SELECT cantidad, cantidad_comprometida, costo FROM mercado.posiciones WHERE cliente_id = $1 AND ticker = $2",
+    )
+    .bind(cliente_id)
+    .bind(ticker)
+    .fetch_optional(&mut **tx)
+    .await?;
+    Ok(fila.unwrap_or_default())
+}
+
+pub(super) fn clave_reutilizada() -> AppError {
     AppError::conflicto(
         "CLAVE_IDEMPOTENCIA_REUTILIZADA",
         "la clave de idempotencia ya se usó para una operación distinta",
     )
 }
 
-fn rechazo(r: Rechazo, activo: &Activo) -> AppError {
+pub(super) fn mercado_cerrado(activo: &Activo) -> AppError {
+    AppError::negocio("MERCADO_CERRADO", format!("{} no opera en este momento", activo.ticker))
+}
+
+pub(super) fn rechazo(r: Rechazo, activo: &Activo) -> AppError {
     match r {
         Rechazo::MontoInsuficiente => AppError::negocio(
             "MONTO_INSUFICIENTE",
             format!(
-                "el monto no alcanza para el incremento mínimo de {} ({} al precio vigente)",
+                "el monto no alcanza para el incremento mínimo de {} ({} al precio de la orden)",
                 activo.ticker,
                 Decimal::new(1, activo.decimales())
             ),
@@ -267,9 +332,13 @@ fn rechazo(r: Rechazo, activo: &Activo) -> AppError {
         Rechazo::SinPosicion => {
             AppError::negocio("POSICION_INSUFICIENTE", format!("no tienes {} que vender", activo.ticker))
         }
+        Rechazo::TitulosComprometidos => AppError::negocio(
+            "POSICION_INSUFICIENTE",
+            format!("tus títulos de {} están comprometidos en órdenes pendientes", activo.ticker),
+        ),
         Rechazo::PosicionInsuficiente => AppError::negocio(
             "POSICION_INSUFICIENTE",
-            format!("el monto excede lo que vale tu posición en {}", activo.ticker),
+            format!("el monto excede lo que valen tus títulos libres de {}", activo.ticker),
         ),
         Rechazo::FueraDeRango => AppError::validacion("el monto está fuera del rango permitido"),
     }

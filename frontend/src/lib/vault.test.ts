@@ -23,6 +23,7 @@ function snapshot(): VaultSnapshot {
     balance: {
       total_mxn: "128450.75",
       available_cash: "18450.75",
+      held_cash: "0",
       invested_assets: "110000.00",
       unrealized_pnl_percentage: "4.25",
     },
@@ -32,6 +33,7 @@ function snapshot(): VaultSnapshot {
         ticker: "NVDA",
         name: "NVIDIA Corp.",
         shares: "12.5",
+        held_shares: "0",
         current_price: "3200.00",
         total_value: "40000.00",
         daily_change_pct: "-1.40",
@@ -40,6 +42,7 @@ function snapshot(): VaultSnapshot {
         ticker: "CETES28",
         name: "CETES 28 días",
         shares: "7000",
+        held_shares: "0",
         current_price: "10.00",
         total_value: "70000.00",
         daily_change_pct: "0.03",
@@ -142,6 +145,29 @@ test("an unknown reserve status or a non-hex root is refused", () => {
 test("one malformed holding rejects the whole snapshot", () => {
   const holdings = [...snapshot().holdings, { ticker: "AAPL", name: "Apple", shares: "-1" }];
   assert.equal(parseVaultSnapshot({ ...snapshot(), holdings }), null);
+});
+
+test("held cash and held shares (0015): absent means 0, present must be sound", () => {
+  // A backend before 0015 sends neither: nothing is held.
+  const antiguo: Record<string, unknown> = { ...snapshot(), balance: { ...snapshot().balance } };
+  delete (antiguo.balance as Record<string, unknown>).held_cash;
+  antiguo.holdings = snapshot().holdings.map((h) => {
+    const sinRetenidos: Record<string, unknown> = { ...h };
+    delete sinRetenidos.held_shares;
+    return sinRetenidos;
+  });
+  assert.deepEqual(parseVaultSnapshot(antiguo), snapshot());
+  // Cash held for a limit buy, units held for a limit sell.
+  const con = {
+    ...snapshot(),
+    balance: { ...snapshot().balance, held_cash: "1250.00" },
+    holdings: snapshot().holdings.map((h) => (h.ticker === "NVDA" ? { ...h, held_shares: "2.5" } : h)),
+  };
+  assert.deepEqual(parseVaultSnapshot(con), con);
+  // Negative, or more units held than the holding has: refused.
+  assert.equal(parseVaultSnapshot({ ...snapshot(), balance: { ...snapshot().balance, held_cash: "-1" } }), null);
+  const demasiados = snapshot().holdings.map((h) => (h.ticker === "NVDA" ? { ...h, held_shares: "12.50000001" } : h));
+  assert.equal(parseVaultSnapshot({ ...snapshot(), holdings: demasiados }), null);
 });
 
 test("a ticker listed twice is refused: it would be double-counted", () => {

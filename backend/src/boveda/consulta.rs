@@ -36,6 +36,7 @@ struct FilaCuenta {
     clabe: String,
     saldo_disponible: Decimal,
     saldo_bloqueado: Decimal,
+    saldo_comprometido: Decimal,
     seq: i64,
 }
 
@@ -44,6 +45,7 @@ struct FilaPosicion {
     ticker: String,
     nombre: String,
     cantidad: Decimal,
+    cantidad_comprometida: Decimal,
     costo: Decimal,
     precio: Decimal,
     precio_cierre_previo: Decimal,
@@ -55,7 +57,7 @@ struct FilaPosicion {
 pub async fn leer(pool: &PgPool, config: &Config, cliente_id: Uuid) -> AppResult<Lectura> {
     let mut tx = db::begin_lectura_instantanea_cliente(pool, cliente_id).await?;
     let cuenta: Option<FilaCuenta> = sqlx::query_as(
-        "SELECT id, clabe, saldo_disponible, saldo_bloqueado, seq \
+        "SELECT id, clabe, saldo_disponible, saldo_bloqueado, saldo_comprometido, seq \
          FROM ifpe.cuentas WHERE cliente_id = $1 AND moneda = 'MXN'",
     )
     .bind(cliente_id)
@@ -72,7 +74,7 @@ pub async fn leer(pool: &PgPool, config: &Config, cliente_id: Uuid) -> AppResult
     .await?;
     // Las posiciones del mercado de valores (0013) al precio vigente del catálogo.
     let filas: Vec<FilaPosicion> = sqlx::query_as(
-        "SELECT p.ticker, a.nombre, p.cantidad, p.costo, a.precio, a.precio_cierre_previo \
+        "SELECT p.ticker, a.nombre, p.cantidad, p.cantidad_comprometida, p.costo, a.precio, a.precio_cierre_previo \
            FROM mercado.posiciones p JOIN mercado.activos a ON a.ticker = p.ticker \
           WHERE p.cliente_id = $1 AND p.cantidad > 0 ORDER BY p.ticker",
     )
@@ -89,6 +91,7 @@ pub async fn leer(pool: &PgPool, config: &Config, cliente_id: Uuid) -> AppResult
             ticker: p.ticker.clone(),
             nombre: p.nombre.clone(),
             titulos: dinero::con_escala(p.cantidad),
+            titulos_comprometidos: dinero::con_escala(p.cantidad_comprometida),
             precio: dinero::con_escala(p.precio),
             valor: calculo::valor(p.cantidad, p.precio),
             cambio_diario: calculo::cambio_pct(p.precio, p.precio_cierre_previo),
@@ -108,9 +111,13 @@ pub async fn leer(pool: &PgPool, config: &Config, cliente_id: Uuid) -> AppResult
     };
     let invertido = invertido + en_mercado;
     // Escala 8, como todo importe de la API (sin mutuos, la suma es un 0 sin decimales).
+    // El efectivo comprometido en órdenes pendientes sigue siendo del cliente.
     let saldo = SaldoBoveda {
-        total: dinero::con_escala(cuenta.saldo_disponible + cuenta.saldo_bloqueado + invertido),
+        total: dinero::con_escala(
+            cuenta.saldo_disponible + cuenta.saldo_comprometido + cuenta.saldo_bloqueado + invertido,
+        ),
         disponible: dinero::con_escala(cuenta.saldo_disponible),
+        comprometido: dinero::con_escala(cuenta.saldo_comprometido),
         invertido: dinero::con_escala(invertido),
         rendimiento_no_realizado,
     };

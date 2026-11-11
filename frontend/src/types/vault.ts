@@ -23,12 +23,19 @@ export type DecimalString = string;
 /** The vault's totals, in MXN. */
 export interface VaultBalance {
   /**
-   * Net worth: cash (available and on hold) plus `invested_assets`. With funds
-   * on hold, `available_cash` + `invested_assets` is less than the total.
+   * Net worth: cash (available, held for open orders and on hold) plus
+   * `invested_assets`. With funds on hold, `available_cash` + `held_cash` +
+   * `invested_assets` is less than the total.
    */
   total_mxn: DecimalString;
   /** Settled cash, free to withdraw or invest right now. */
   available_cash: DecimalString;
+  /**
+   * Cash committed to pending limit and stop buys (migration 0015): still the
+   * client's and in custody, but not spendable until the order fills or is
+   * cancelled. "0" from a backend that predates it.
+   */
+  held_cash: DecimalString;
   /** Market value of every holding at its current price. */
   invested_assets: DecimalString;
   /** Unrealized profit or loss on the invested assets, in percent: "4.25" is +4.25 %. */
@@ -58,8 +65,13 @@ export interface Holding {
   /** Exchange symbol, unique within the portfolio: "NVDA", "CETES28". */
   ticker: string;
   name: string;
-  /** Units held; fractional shares allowed. */
+  /** Units held, those committed to pending sells included; fractional shares allowed. */
   shares: DecimalString;
+  /**
+   * Units committed to pending limit and stop sells: a market sale only sells
+   * `shares` − `held_shares`. "0" from a backend that predates it.
+   */
+  held_shares: DecimalString;
   /** Last price per share, MXN. */
   current_price: DecimalString;
   /** `shares` × `current_price`, computed by the backend, MXN. */

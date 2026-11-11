@@ -12,13 +12,20 @@ beforeEach(() => vault().reset());
 /* Fixtures */
 
 function balance(total: string, cash = "0.00"): VaultBalance {
-  return { total_mxn: total, available_cash: cash, invested_assets: "110000.00", unrealized_pnl_percentage: "4.25" };
+  return {
+    total_mxn: total,
+    available_cash: cash,
+    held_cash: "0",
+    invested_assets: "110000.00",
+    unrealized_pnl_percentage: "4.25",
+  };
 }
 
 const NVDA: Holding = {
   ticker: "NVDA",
   name: "NVIDIA Corp.",
   shares: "12.5",
+  held_shares: "0",
   current_price: "3200.00",
   total_value: "40000.00",
   daily_change_pct: "-1.40",
@@ -28,6 +35,7 @@ const CETES: Holding = {
   ticker: "CETES28",
   name: "CETES 28 días",
   shares: "7000",
+  held_shares: "0",
   current_price: "10.00",
   total_value: "70000.00",
   daily_change_pct: "0.03",

@@ -1,4 +1,4 @@
-//! Filas del esquema `mercado` (migración 0013) y lo que viaja al navegador.
+//! Filas del esquema `mercado` (migraciones 0013 y 0015) y lo que viaja al navegador.
 //!
 //! Lo que se serializa lleva los nombres del contrato
 //! (`frontend/src/types/market.ts`), en inglés; los importes son decimales
@@ -216,19 +216,23 @@ pub struct Cotizacion {
     pub fuente: &'static str,
 }
 
-/// Estado de una orden. Una orden de mercado se ejecuta completa al colocarse;
-/// `pending` queda para las órdenes límite (módulo 3 de la hoja de ruta).
+/// Estado de una orden de mercado: se ejecuta completa al colocarse. Las
+/// órdenes límite y stop esperan ([`EstadoPendiente`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum EstadoOrden {
     #[serde(rename = "filled")]
     Ejecutada,
 }
 
-/// `POST /api/v1/market/order` (`OrderReceipt`).
+/// `POST /api/v1/market/order` de una orden de mercado (`OrderReceipt`).
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Recibo {
     #[serde(rename = "order_id")]
     pub orden_id: Uuid,
+    /// Siempre `market`: distingue el recibo de una orden límite o stop
+    /// ([`VistaPendiente`]) en la misma respuesta.
+    #[serde(rename = "order_type")]
+    pub tipo: &'static str,
     pub status: EstadoOrden,
     pub ticker: String,
     #[serde(rename = "side")]
@@ -252,6 +256,7 @@ impl From<&Orden> for Recibo {
     fn from(o: &Orden) -> Self {
         Self {
             orden_id: o.id,
+            tipo: "market",
             status: EstadoOrden::Ejecutada,
             ticker: o.ticker.clone(),
             lado: o.lado,
@@ -262,4 +267,221 @@ impl From<&Orden> for Recibo {
             ejecutada_en: o.creado_en,
         }
     }
+}
+
+// -----------------------------------------------------------------------------
+// Órdenes límite y stop (migración 0015)
+// -----------------------------------------------------------------------------
+
+/// Tipo de una orden que espera a su precio (`mercado.ordenes_pendientes.tipo`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, sqlx::Type)]
+#[sqlx(type_name = "text")]
+pub enum TipoPendiente {
+    /// Compra a su precio límite o menos; vende a su precio límite o más.
+    #[sqlx(rename = "LIMITE")]
+    #[serde(rename = "limit")]
+    Limite,
+    /// Se dispara cuando el precio alcanza su stop: una compra al subir a él,
+    /// una venta al bajar a él. Se ejecuta al precio vigente.
+    #[sqlx(rename = "STOP")]
+    #[serde(rename = "stop")]
+    Stop,
+}
+
+impl TipoPendiente {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            TipoPendiente::Limite => "LIMITE",
+            TipoPendiente::Stop => "STOP",
+        }
+    }
+}
+
+/// Estado de una orden límite o stop: solo avanza (de PENDIENTE a uno de los otros tres).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, sqlx::Type)]
+#[sqlx(type_name = "text")]
+pub enum EstadoPendiente {
+    #[sqlx(rename = "PENDIENTE")]
+    #[serde(rename = "pending")]
+    Pendiente,
+    #[sqlx(rename = "EJECUTADA")]
+    #[serde(rename = "filled")]
+    Ejecutada,
+    #[sqlx(rename = "CANCELADA")]
+    #[serde(rename = "cancelled")]
+    Cancelada,
+    #[sqlx(rename = "RECHAZADA")]
+    #[serde(rename = "rejected")]
+    Rechazada,
+}
+
+impl EstadoPendiente {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            EstadoPendiente::Pendiente => "PENDIENTE",
+            EstadoPendiente::Ejecutada => "EJECUTADA",
+            EstadoPendiente::Cancelada => "CANCELADA",
+            EstadoPendiente::Rechazada => "RECHAZADA",
+        }
+    }
+}
+
+/// `mercado.ordenes_pendientes`: una orden límite o stop. Sus términos no
+/// cambian; al cerrarse guarda cómo (y, si se ejecutó, con qué orden).
+#[derive(Debug, Clone, FromRow)]
+pub struct OrdenPendiente {
+    pub id: Uuid,
+    pub cliente_id: Uuid,
+    pub cuenta_ifpe_id: Uuid,
+    pub ticker: String,
+    pub lado: Lado,
+    pub tipo: TipoPendiente,
+    /// Pesos con centavos: cuánto invertir (compra) o cuánto vender.
+    pub monto: Decimal,
+    pub precio_limite: Option<Decimal>,
+    pub precio_stop: Option<Decimal>,
+    /// Compra: todo el monto, comprometido en la cuenta IFPE.
+    pub efectivo_comprometido: Decimal,
+    /// Venta: los títulos que el monto vende al precio de la orden.
+    pub titulos_comprometidos: Decimal,
+    pub estado: EstadoPendiente,
+    /// Código de la regla que la rechazó al dispararse.
+    pub motivo: Option<String>,
+    pub tx_compromiso_id: Option<Uuid>,
+    pub tx_liberacion_id: Option<Uuid>,
+    /// La orden del ledger del mercado que la ejecutó.
+    pub orden_ejecutada_id: Option<Uuid>,
+    pub clave_idempotencia: String,
+    pub creado_en: DateTime<Utc>,
+    pub cerrado_en: Option<DateTime<Utc>>,
+}
+
+impl OrdenPendiente {
+    /// Su precio límite o su precio stop (la base de datos exige el que corresponde).
+    pub fn precio(&self) -> Decimal {
+        match self.tipo {
+            TipoPendiente::Limite => self.precio_limite,
+            TipoPendiente::Stop => self.precio_stop,
+        }
+        .unwrap_or_default()
+    }
+
+    /// ¿Se ejecuta a `precio`? Una límite, a su precio o mejor; una stop, ya
+    /// alcanzado su precio. La base de datos aplica la misma regla a la orden
+    /// que la ejecuta (`mercado.fn_validar_orden`, 0015).
+    pub fn disparada(&self, precio: Decimal) -> bool {
+        disparada(self.tipo, self.lado, self.precio(), precio)
+    }
+}
+
+/// [`OrdenPendiente::disparada`] con los términos sueltos.
+pub fn disparada(tipo: TipoPendiente, lado: Lado, precio_orden: Decimal, precio: Decimal) -> bool {
+    match (tipo, lado) {
+        (TipoPendiente::Limite, Lado::Compra) => precio <= precio_orden,
+        (TipoPendiente::Limite, Lado::Venta) => precio >= precio_orden,
+        (TipoPendiente::Stop, Lado::Compra) => precio >= precio_orden,
+        (TipoPendiente::Stop, Lado::Venta) => precio <= precio_orden,
+    }
+}
+
+/// La ejecución de una orden límite o stop (`OrderExecution`): la orden del
+/// ledger del mercado que la cumplió.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct EjecucionPendiente {
+    /// Id de la orden ejecutada en `mercado.ordenes`.
+    #[serde(rename = "order_id")]
+    pub orden_id: Uuid,
+    #[serde(rename = "quantity")]
+    pub cantidad: Decimal,
+    #[serde(rename = "price")]
+    pub precio: Decimal,
+    /// Lo que se cargó o abonó a la bóveda: `quantity × price` al centavo.
+    #[serde(rename = "amount")]
+    pub monto: Decimal,
+    #[serde(rename = "commission")]
+    pub comision: Decimal,
+    #[serde(rename = "executed_at")]
+    pub ejecutada_en: DateTime<Utc>,
+}
+
+impl From<&Orden> for EjecucionPendiente {
+    fn from(o: &Orden) -> Self {
+        Self {
+            orden_id: o.id,
+            cantidad: dinero::con_escala(o.cantidad),
+            precio: dinero::con_escala(o.precio),
+            monto: dinero::con_escala(o.monto),
+            comision: dinero::con_escala(o.comision),
+            ejecutada_en: o.creado_en,
+        }
+    }
+}
+
+/// Una orden límite o stop como la lee el frontend (`PendingOrder`): la
+/// respuesta de colocarla o cancelarla y cada renglón de
+/// `GET /api/v1/market/orders/pending`.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct VistaPendiente {
+    #[serde(rename = "order_id")]
+    pub id: Uuid,
+    #[serde(rename = "order_type")]
+    pub tipo: TipoPendiente,
+    pub status: EstadoPendiente,
+    pub ticker: String,
+    #[serde(rename = "side")]
+    pub lado: Lado,
+    /// Lo que pidió el cliente, en MXN.
+    #[serde(rename = "amount")]
+    pub monto: Decimal,
+    #[serde(rename = "limit_price")]
+    pub precio_limite: Option<Decimal>,
+    #[serde(rename = "stop_price")]
+    pub precio_stop: Option<Decimal>,
+    /// Efectivo comprometido ahora (compras pendientes; 0 al cerrarse).
+    #[serde(rename = "held_cash")]
+    pub efectivo_comprometido: Decimal,
+    /// Títulos comprometidos ahora (ventas pendientes; 0 al cerrarse).
+    #[serde(rename = "held_quantity")]
+    pub titulos_comprometidos: Decimal,
+    #[serde(rename = "created_at")]
+    pub creada_en: DateTime<Utc>,
+    #[serde(rename = "closed_at")]
+    pub cerrada_en: Option<DateTime<Utc>>,
+    /// Código de la regla que la rechazó (`rejected`).
+    #[serde(rename = "reject_reason")]
+    pub motivo: Option<String>,
+    /// La orden que la ejecutó (`filled`).
+    #[serde(rename = "execution")]
+    pub ejecucion: Option<EjecucionPendiente>,
+}
+
+impl VistaPendiente {
+    pub fn de(p: &OrdenPendiente, ejecucion: Option<&Orden>) -> Self {
+        let abierta = p.estado == EstadoPendiente::Pendiente;
+        let ahora = |d: Decimal| dinero::con_escala(if abierta { d } else { Decimal::ZERO });
+        Self {
+            id: p.id,
+            tipo: p.tipo,
+            status: p.estado,
+            ticker: p.ticker.clone(),
+            lado: p.lado,
+            monto: dinero::con_escala(p.monto),
+            precio_limite: p.precio_limite.map(dinero::con_escala),
+            precio_stop: p.precio_stop.map(dinero::con_escala),
+            efectivo_comprometido: ahora(p.efectivo_comprometido),
+            titulos_comprometidos: ahora(p.titulos_comprometidos),
+            creada_en: p.creado_en,
+            cerrada_en: p.cerrado_en,
+            motivo: p.motivo.clone(),
+            ejecucion: ejecucion.map(EjecucionPendiente::from),
+        }
+    }
+}
+
+/// `GET /api/v1/market/orders/pending` (`PendingOrders`): las órdenes que
+/// esperan, de la más nueva a la más antigua.
+#[derive(Debug, Clone, Serialize)]
+pub struct OrdenesPendientes {
+    #[serde(rename = "orders")]
+    pub ordenes: Vec<VistaPendiente>,
 }

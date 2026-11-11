@@ -1,7 +1,7 @@
 import { ArrowDownRight, ArrowUpRight, Minus, type LucideIcon } from "lucide-react";
 
 import { cx } from "@/components/ui/primitives";
-import { formatMoney } from "@/lib/decimal";
+import { formatMoney, isZero } from "@/lib/decimal";
 import { moneyParts, shortHash, signedPercent, type Trend } from "@/lib/vault";
 import type { DecimalString, ReserveProof, ReserveProofStatus, VaultBalance } from "@/types/vault";
 
@@ -77,6 +77,12 @@ export function SovereignBalance({ balance, reserveProof, className }: Sovereign
         <BalanceStat label="Cash" value={balance.available_cash} />
         <BalanceStat label="Invested" value={balance.invested_assets} />
       </dl>
+      {/* Still the client's and in custody: counted in the total, not in Cash. */}
+      {!isZero(balance.held_cash) ? (
+        <p className="mt-3 text-xs text-muted tabular-nums" data-testid="vault-held-cash">
+          {formatMoney(balance.held_cash)} MXN held for open orders
+        </p>
+      ) : null}
 
       <p className="mt-5 flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-muted">
         <span className="font-medium tracking-[0.14em] uppercase">ZK reserve root</span>

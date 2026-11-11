@@ -12,7 +12,7 @@ import { MarketNotice, NoticeLink } from "@/components/markets/market-notice";
 import { Alert, Button } from "@/components/ui/primitives";
 import { ApiError, describeError } from "@/lib/api/client";
 import { api } from "@/lib/api/endpoints";
-import { isTicker, parseMarketQuote, parseOrderReceipt, positionFor } from "@/lib/market-data";
+import { isTicker, parseMarketQuote, parseOrderReceipt, positionFor, sellableFor } from "@/lib/market-data";
 import { EXPIRED_LOGIN_PATH } from "@/lib/session";
 import { useAuthStore } from "@/store/auth";
 import { useVaultStore } from "@/store/vault";
@@ -190,6 +190,7 @@ export default function AssetPage() {
           now={Date.parse(quote.quote.as_of)}
           availableCash={balance.available_cash}
           position={positionFor(holdings, quote.quote.asset.ticker)}
+          sellable={sellableFor(holdings, quote.quote.asset.ticker)}
           onPlaceOrder={placeOrder}
         />
       )}

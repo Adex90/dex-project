@@ -101,9 +101,9 @@ export const api = {
   /**
    * A market order, filled at the current price. 201 for a new order, 200 with
    * the same receipt when the idempotency key repeats one already filled.
-   * Market orders only, sent without `order_type`: the endpoint predates the
-   * other types and rejects unknown fields. Untyped on purpose:
-   * `parseOrderReceipt` validates the receipt.
+   * Sent without `order_type`, which the endpoint reads as market (limit and
+   * stop orders reach the checkout through `LIVE_ORDER_TYPES`). Untyped on
+   * purpose: `parseOrderReceipt` validates the receipt.
    */
   placeOrder: (token: string, order: MarketOrderRequest) =>
     request<unknown>("/api/v1/market/order", {
@@ -111,6 +111,22 @@ export const api = {
       token,
       body: { ticker: order.ticker, side: order.side, amount: order.amount, idempotency_key: order.idempotency_key },
     }),
+
+  /**
+   * The client's limit and stop orders still waiting for their price, newest
+   * first. Untyped on purpose: `parsePendingOrders` validates the list.
+   */
+  pendingOrders: (token: string, signal?: AbortSignal) =>
+    request<unknown>("/api/v1/market/orders/pending", { token, signal }),
+
+  /**
+   * Cancels a pending limit or stop order: its cash or units are released.
+   * Repeating it answers the same cancelled order; one that already filled or
+   * was rejected is 409 `ORDEN_NO_PENDIENTE`. Untyped on purpose:
+   * `parsePendingOrder` validates the answer.
+   */
+  cancelOrder: (token: string, orderId: string) =>
+    request<unknown>(`/api/v1/market/orders/${encodeURIComponent(orderId)}/cancel`, { method: "POST", token }),
 
   movements: (token: string, params: { limit?: number; before?: number } = {}, signal?: AbortSignal) =>
     request<TransaccionIfpe[]>("/api/v1/ifpe/movimientos", {

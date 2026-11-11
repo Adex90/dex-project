@@ -51,6 +51,11 @@ export interface AssetDetailProps {
   availableCash: DecimalString;
   /** Units held; "0" for none. */
   position: DecimalString;
+  /**
+   * Units a market sale can sell: the position minus units held by pending
+   * limit and stop sells. Defaults to the whole position.
+   */
+  sellable?: DecimalString;
   /** The price streams in as it trades (shows "Live"). */
   live?: boolean;
   /** Places an order: resolves with the receipt, or rejects with the error to show. */
@@ -64,6 +69,7 @@ export function AssetDetail({
   now,
   availableCash,
   position,
+  sellable = position,
   live = false,
   onPlaceOrder,
   className,
@@ -82,6 +88,8 @@ export function AssetDetail({
   const trend = TREND[change.trend];
   const holds = toUnits(position) > 0n;
   const worth = holds ? positionValue(position, asset.price) : "0";
+  // Units held by pending sell orders are not for sale at market.
+  const canSell = toUnits(sellable) > 0n;
 
   return (
     <article aria-labelledby={titleId} className={className} data-testid="asset-detail">
@@ -205,8 +213,14 @@ export function AssetDetail({
           <button
             type="button"
             onClick={() => setCheckout("sell")}
-            disabled={!holds}
-            title={holds ? undefined : `You don't hold any ${asset.ticker}.`}
+            disabled={!canSell}
+            title={
+              canSell
+                ? undefined
+                : holds
+                  ? `Your ${asset.ticker} is held by pending sell orders.`
+                  : `You don't hold any ${asset.ticker}.`
+            }
             className={cx(
               "h-14 border border-border-strong bg-surface-2 text-base font-bold tracking-[0.24em] text-white uppercase transition-colors sm:h-16",
               "hover:bg-surface-hover focus-visible:ring-2 focus-visible:ring-synthetic-yellow focus-visible:ring-offset-2 focus-visible:ring-offset-bg focus-visible:outline-none",
@@ -236,7 +250,7 @@ export function AssetDetail({
         onClose={() => setCheckout(null)}
         asset={asset}
         cash={availableCash}
-        held={position}
+        held={sellable}
         onConfirm={onPlaceOrder}
       />
     </article>

@@ -336,6 +336,8 @@ pub async fn verificar_cadena_ifpe(pool: &PgPool) -> AppResult<ResultadoVerifica
 
     let mut v = VerificadorCadena::default();
     let mut cuentas = Reproduccion::default();
+    // El efectivo comprometido en órdenes pendientes (0015), el tercer saldo de la cuenta.
+    let mut comprometidos = Reproduccion::default();
     let mut reservas = Reproduccion::default();
     let mut anclas_ok = 0_u64;
     let mut discrepancias = Vec::new();
@@ -380,6 +382,14 @@ pub async fn verificar_cadena_ifpe(pool: &PgPool) -> AppResult<ResultadoVerifica
                 }
                 TipoTxIfpe::Retencion => cuentas.mover(t.cuenta_origen_id, -m, m),
                 TipoTxIfpe::LiberacionRetencion => cuentas.mover(t.cuenta_origen_id, m, -m),
+                TipoTxIfpe::CompromisoOrden => {
+                    cuentas.mover(t.cuenta_origen_id, -m, cero);
+                    comprometidos.mover(t.cuenta_origen_id, m, cero);
+                }
+                TipoTxIfpe::LiberacionOrden => {
+                    cuentas.mover(t.cuenta_origen_id, m, cero);
+                    comprometidos.mover(t.cuenta_origen_id, -m, cero);
+                }
             }
         }
     }
@@ -419,6 +429,14 @@ pub async fn verificar_cadena_ifpe(pool: &PgPool) -> AppResult<ResultadoVerifica
                 .fetch_all(&mut *tx)
                 .await?;
         cuentas.conciliar("sombra de cuenta IFPE", &sombra, &mut r);
+        let vivos: Vec<(Uuid, Decimal, Decimal)> =
+            sqlx::query_as("SELECT id, saldo_comprometido, 0::numeric FROM ifpe.cuentas").fetch_all(&mut *tx).await?;
+        comprometidos.conciliar("efectivo comprometido de cuenta IFPE", &vivos, &mut r);
+        let sombra: Vec<(Uuid, Decimal, Decimal)> =
+            sqlx::query_as("SELECT cuenta_id, comprometido, 0::numeric FROM ifpe.saldos_ledger")
+                .fetch_all(&mut *tx)
+                .await?;
+        comprometidos.conciliar("sombra del efectivo comprometido", &sombra, &mut r);
         let reserva: Vec<(Uuid, Decimal, Decimal)> =
             sqlx::query_as("SELECT id, saldo, 0::numeric FROM ifpe.reserva_custodia").fetch_all(&mut *tx).await?;
         reservas.conciliar("reserva en custodia", &reserva, &mut r);
@@ -546,7 +564,8 @@ async fn verificar_espejos(pool: &PgPool) -> AppResult<Vec<String>> {
 
 /// Recorre todo el ledger del mercado (foto consistente): cadena de hashes,
 /// reproducción de cada posición (cantidad y costo), el costo promedio que
-/// liberó cada venta y el par de cada orden con su movimiento IFPE.
+/// liberó cada venta, el par de cada orden con su movimiento IFPE y lo
+/// comprometido en órdenes límite y stop pendientes.
 pub async fn verificar_cadena_mercado(pool: &PgPool) -> AppResult<ResultadoVerificacion> {
     let mut tx = db::begin_lectura_instantanea(pool, Rol::Mercado).await?;
     let cabeza: LedgerCabeza =
@@ -636,6 +655,38 @@ pub async fn verificar_cadena_mercado(pool: &PgPool) -> AppResult<ResultadoVerif
         for (id,) in sin_orden {
             r.discrepancias.push(format!("el movimiento IFPE {id} es del mercado y no tiene su orden"));
         }
+
+        // Órdenes límite y stop (0015): lo comprometido es lo de las órdenes
+        // pendientes (efectivo de cada cuenta = sus compras; títulos de cada
+        // posición = sus ventas) y cada compromiso o liberación del ledger
+        // IFPE es el de su orden, por su monto.
+        let descuadres: Vec<(String,)> = sqlx::query_as(
+            "SELECT format('la cuenta %s tiene %s comprometido; sus compras pendientes suman %s', \
+                           c.id, c.saldo_comprometido, coalesce(p.s, 0)) \
+               FROM ifpe.cuentas c \
+               LEFT JOIN (SELECT cuenta_ifpe_id, sum(efectivo_comprometido) AS s FROM mercado.ordenes_pendientes \
+                           WHERE estado = 'PENDIENTE' GROUP BY cuenta_ifpe_id) p ON p.cuenta_ifpe_id = c.id \
+              WHERE c.saldo_comprometido <> coalesce(p.s, 0) \
+             UNION ALL \
+             SELECT format('la posición de %s en %s tiene %s títulos comprometidos; sus ventas pendientes suman %s', \
+                           x.cliente_id, x.ticker, x.cantidad_comprometida, coalesce(p.s, 0)) \
+               FROM mercado.posiciones x \
+               LEFT JOIN (SELECT cliente_id, ticker, sum(titulos_comprometidos) AS s FROM mercado.ordenes_pendientes \
+                           WHERE estado = 'PENDIENTE' GROUP BY cliente_id, ticker) p USING (cliente_id, ticker) \
+              WHERE x.cantidad_comprometida <> coalesce(p.s, 0) \
+             UNION ALL \
+             SELECT format('el movimiento IFPE %s (%s) no corresponde a su orden pendiente', t.id, t.tipo) \
+               FROM ifpe.transacciones t LEFT JOIN mercado.ordenes_pendientes p ON p.id = t.ref_movimiento_espejo \
+              WHERE t.tipo IN ('COMPROMISO_ORDEN', 'LIBERACION_ORDEN') \
+                AND (p.id IS NULL OR p.lado <> 'COMPRA' OR p.efectivo_comprometido <> t.monto \
+                     OR p.cuenta_ifpe_id IS DISTINCT FROM t.cuenta_origen_id \
+                     OR NOT ((t.tipo = 'COMPROMISO_ORDEN' AND p.tx_compromiso_id = t.id) \
+                          OR (t.tipo = 'LIBERACION_ORDEN' AND p.tx_liberacion_id = t.id))) \
+             LIMIT 100",
+        )
+        .fetch_all(&mut *tx)
+        .await?;
+        r.discrepancias.extend(descuadres.into_iter().map(|(d,)| d));
     }
     tx.commit().await?;
     Ok(r.cerrar())

@@ -836,11 +836,11 @@ three routes in the `API` rate-limit group, all behind the JWT extractor:
     - a sale can take what the position is worth at the order's price;
     - an amount too small for one unit is refused before it is sent.
   - The contract is `OrderRequest` in `frontend/src/types/market.ts`, a union
-    on `order_type` with `limit_price`, `stop_price` and `frequency`. Only
-    market orders are live (`LIVE_ORDER_TYPES`). The others can be set up and
-    previewed, but their button stays disabled with a note saying why, and
-    `api.placeOrder` sends market orders only, in today's wire format. A limit
-    order can never reach the market endpoint and fill at the current price.
+    on `order_type` with `limit_price`, `stop_price` and `frequency`. The
+    backend executes limit and stop orders (next section), but the checkout
+    still sends market orders only (`LIVE_ORDER_TYPES`): the other types can
+    be set up and previewed, their button stays disabled with a note saying
+    why, and `api.placeOrder` sends a market order without `order_type`.
 - **Audit:** `GET /api/v1/auditoria/ledger/mercado` (operator / auditor)
   re-verifies the chain, replays every position and every sale's average
   cost, and checks each order against its IFPE movement.
@@ -856,6 +856,112 @@ three routes in the `API` rate-limit group, all behind the JWT extractor:
     Vault; a buy on another device appears live; a buy whose answer is lost
     fills once; refusals show their reason; "Max" sells everything on a
     phone; the ledger lists the legs; a new reserve cut still succeeds.
+
+## Limit and stop orders (migration `0015`)
+
+A limit or stop order waits for its price with what it would use **held**,
+so nothing spends it twice, and the trigger engine fills it at the current
+price when the price reaches it. The backend is
+`backend/src/mercado/pendiente.rs`; the contract, `PendingOrder` in
+`frontend/src/types/market.ts`.
+
+- **`POST /api/v1/market/order`** takes `order_type` (`market` when absent,
+  the original contract) and the order's price:
+  `{"ticker", "side", "amount", "idempotency_key", "order_type": "limit", "limit_price": "1600.0000"}`
+  or `"order_type": "stop", "stop_price"`. A market order answers its
+  `OrderReceipt` (now with `"order_type": "market"`); a limit or stop order
+  answers a `PendingOrder`: its terms, `status` (`pending`, `filled`,
+  `cancelled`, `rejected`), `held_cash` / `held_quantity`, and its
+  `execution` once filled. 201 for a new order; 200 when the key repeats the
+  same order (as it stands now); 409 `CLAVE_IDEMPOTENCIA_REUTILIZADA` when
+  the key was used for another order, market or pending.
+  `"order_type": "savings_plan"` is 422 `TIPO_ORDEN_NO_DISPONIBLE` until the
+  plans' scheduler exists.
+- **`GET /api/v1/market/orders/pending`** (client): `{"orders": [...]}`, the
+  client's orders still waiting, newest first.
+- **`POST /api/v1/market/orders/{id}/cancel`** (client): the cancelled order,
+  its cash or units released. Repeating it answers the same order; one that
+  already filled or was rejected is 409 `ORDEN_NO_PENDIENTE`; another
+  client's order does not exist (404). Cancelling works on a frozen account:
+  giving back what is held is always allowed.
+- **What a pending order holds:**
+  - A **buy** holds its whole amount: a third balance of the IFPE account,
+    `saldo_comprometido`, moved from `saldo_disponible` by a new
+    hash-chained IFPE movement, `COMPROMISO_ORDEN`, and back by
+    `LIBERACION_ORDEN` when the order closes. Both stay inside the account
+    and never touch the custody reserve: the liabilities, the 100 % reserve,
+    the shadow balances and the Merkle leaves all count held cash (it is the
+    client's and in custody), and `saldo_disponible` keeps meaning
+    "spendable", so withdrawals, transfers, investments and AML holds are
+    unchanged. The amount must buy at least one increment at the order's
+    price.
+  - A **sell** holds the units its amount sells at the order's price, from
+    the free units (`mercado.posiciones.cantidad_comprometida`). From then
+    on a market sale sells only free units (422 `POSICION_INSUFICIENTE`
+    otherwise), and the vault's "Max" is the free units' value.
+- **Rules at placement:** verified KYC, an active account (a preventive AML
+  freeze answers the constant `OPERACION_NO_DISPONIBLE`), an asset that
+  trades and is offered (real price, or simulated with `MODO_DEMO`), a stop
+  the price has not reached yet (a buy stop above the price, a sell stop
+  below; 422 `PRECIO_STOP_INVALIDO`), the cash or the free units, and at
+  most 50 open orders per client (422 `LIMITE_ORDENES_PENDIENTES`).
+- **Execution.** The trigger engine (`MERCADO_DISPARO_INTERVALO_SEG`,
+  default 5 s, 0 disables it) fills, oldest first, every pending order whose
+  asset trades and whose price the current one reaches: a limit at its price
+  or better, a stop once its price is touched. A limit already reachable when
+  placed (buy at 1,700 or less with the price at 1,612.40) fills at once, in
+  the same request, through the same code.
+  - A **buy** closes `filled`, releases its cash and buys with all of it at
+    the current price, exactly as a market buy (AML evaluated before any
+    write); the rest stays available.
+  - A **sell** closes `filled`, releasing its units, and sells exactly those
+    units at the current price.
+  - The fill is a row of the market ledger with the key
+    `ord:<order>:ejecucion`, and the database checks it against the pending
+    order's terms: never worse than a limit, never before a stop, the same
+    amount, exactly the held units.
+  - A rule that no longer holds (KYC revoked, an account frozen by the
+    operator or by AML, an amount that no longer buys one increment after a
+    stop gapped up) closes it `rejected` with the error code in
+    `reject_reason`, and what it held is released. A suspended asset or a
+    transient error leaves it pending for the next pass. Concurrent engines
+    (several replicas) and a cancel racing a fill are serialized by the
+    account and order locks: an order closes once.
+- **What the database guarantees** (`mercado.ordenes_pendientes` and deferred
+  checks at COMMIT): an order is born pending; its terms never change; its
+  state only moves forward; each account's held cash equals its pending buys
+  and each position's held units its pending sells
+  (`SC_COMPROMISO_DESCUADRE`); every hold and release is paired with its
+  order in the same transaction (`SC_COMPROMISO_SIN_ORDEN`,
+  `SC_ORDEN_SIN_COMPROMISO`); held cash is replayed from the ledger like the
+  other balances (`SC_SALDO_SIN_LEDGER`); a closed account holds nothing.
+  `sc_mercado` may only close an order (state, reason and links), never edit
+  its terms; `sc_cliente` reads only its own orders (RLS).
+- **The vault** (`GET /api/v1/vault` and the WebSocket): `balance.held_cash`
+  (counted in `total_mxn`, not in `available_cash`) and each holding's
+  `held_shares`. Placing, cancelling, filling or rejecting an order raises
+  the vault's `seq`, a sell order included (it moves no cash: the account's
+  order version does), so every change is pushed live. The ledger feed shows
+  "Held for order" and "Order hold released"; the Account tab shows the cash
+  held for open orders.
+- **Audit:** `GET /api/v1/auditoria/ledger/ifpe` replays the held cash with
+  the other balances; `/mercado` also reconciles held cash and units against
+  the pending orders and every hold or release against its order.
+- **Frontend:** the contract (`PendingOrder`, `parsePendingOrder`,
+  `api.pendingOrders`, `api.cancelOrder`) and the vault's held fields are in
+  place; the checkout still sends market orders only (previous section).
+- Tests:
+  - `tests/db/0015_ordenes_avanzadas.sql`: holds, pairing, immutability,
+    validation of each fill against its order, the free-unit rule and the
+    global invariants, in one transaction (the numbers of the Rust tests).
+  - `backend/tests/ordenes_avanzadas.rs`: the API and the engine (holds and
+    the reserve cut, idempotency, the list, cancelling, fills at each price,
+    a limit filled at once, rules, rejections that release, the AML freeze,
+    a cancel racing a fill, tamper detection).
+  - `backend/tests/boveda.rs`: placing, cancelling and filling, pushed over
+    the WebSocket.
+  - `frontend/e2e/smoke.mjs`: a limit buy from another device shows its held
+    cash and ledger hold live, and cancelling releases them.
 
 ## Layout
 
@@ -911,6 +1017,7 @@ psql "$EMPTY_DATABASE_URL" -f tests/db/0010_auth_mfa.sql
 psql "$EMPTY_DATABASE_URL" -f tests/db/0011_rls_por_cliente.sql
 psql "$EMPTY_DATABASE_URL" -f tests/db/0012_boveda_tiempo_real.sql
 psql "$EMPTY_DATABASE_URL" -f tests/db/0013_mercado_valores.sql
+psql "$EMPTY_DATABASE_URL" -f tests/db/0015_ordenes_avanzadas.sql
 cd frontend && npm test && npm run build
 FRONTEND_URL=http://localhost:3000 node e2e/smoke.mjs   # needs backend (MODO_DEMO=true) + next start
 # AML/PLD console against the real stack (structuring -> freeze -> four-eyes unfreeze, roles, no tipping off):
@@ -1090,7 +1197,9 @@ the password is hashed, so a parallel burst cannot test more than 5 passwords.
 | GET | `/api/v1/vault/ws` | client: Sovereign Vault real-time channel (WebSocket, subprotocol `sc.vault.v1`) |
 | GET | `/api/v1/market/assets` | any session: the catalog that can be quoted and traded now (`MarketCatalog`) |
 | GET | `/api/v1/market/quote/{ticker}` | any session: the asset and its price history (`MarketQuote`) |
-| POST | `/api/v1/market/order` | client: market order by amount (`OrderRequest` → `OrderReceipt`), filled at the current price |
+| POST | `/api/v1/market/order` | client: order by amount (`OrderRequest`): market (`OrderReceipt`, filled at the current price), limit or stop (`PendingOrder`, its cash or units held until it fills) |
+| GET | `/api/v1/market/orders/pending` | client: its limit and stop orders still waiting (`PendingOrders`) |
+| POST | `/api/v1/market/orders/{id}/cancel` | client: cancels a pending order and releases what it held |
 | GET | `/api/v1/ifpe/cuenta`, `/api/v1/ifpe/movimientos` | client |
 | POST | `/api/v1/ifpe/transferencias` | client: internal transfer |
 | POST | `/api/v1/ifpe/retiros` | client: withdrawal to own external CLABE (an outgoing SPEI) |

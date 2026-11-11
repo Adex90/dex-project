@@ -106,18 +106,26 @@ what the module waits on. They do not change its scope.
     whose price is typed on the same numpad as the amount, with their
     estimates and rules (`assessOrder` in `lib/market.ts`, unit tested; smoke
     e2e). Contract: `LimitOrderRequest` and `StopOrderRequest` in
-    `types/market.ts` (`limit_price`, `stop_price`); a pending order's receipt
-    has `status: "pending"`.
-  - Not live: the button stays disabled until the backend executes these
-    types (`LIVE_ORDER_TYPES`). Left: the backend (accept `order_type`,
-    reserve the cash or units, trigger on the price), then trailing stops and
-    time in force (Day/GTC), and a list of open orders with cancel.
+    `types/market.ts` (`limit_price`, `stop_price`).
+  - Backend built (migration 0015, README "Limit and stop orders"): the
+    order endpoint takes `order_type`; a pending order holds its cash
+    (`held_cash`) or units (`held_shares`) with the 100 % reserve intact; the
+    trigger engine fills it at its price (a reachable limit fills when
+    placed) or rejects it and releases what it held; `GET
+    /api/v1/market/orders/pending` lists open orders and `POST
+    /api/v1/market/orders/{id}/cancel` cancels one. The answer is a
+    `PendingOrder` (`parsePendingOrder`, `api.pendingOrders`,
+    `api.cancelOrder`); the vault shows the cash held for open orders and the
+    ledger shows each hold and release.
+  - Left: turn it on in the checkout (`LIVE_ORDER_TYPES`, send the type and
+    price, show a `PendingOrder` receipt), a screen of open orders with
+    cancel, then trailing stops and time in force (Day/GTC).
 - [ ] **4. Savings Plans / DCA** (Automated fractional recurring buys)
   - Frontend built: Savings plan in the same toggle (buys only), with the
     amount per purchase, the frequency (weekly, every 2 weeks, monthly), the
     quantity at today's price and the monthly equivalent. Contract:
     `SavingsPlanRequest` (`frequency`).
-  - Not live, like module 3. Left: the backend schedule (execution day,
+  - Not live: the backend answers 422 `TIPO_ORDEN_NO_DISPONIBLE`. Left: the backend schedule (execution day,
     business days, what happens without cash), the plan's own response
     (next purchase date), and a screen to pause, edit or cancel plans.
 - [ ] **5. Options & Derivatives Chain** (Calls/Puts, Greeks, Expirations)

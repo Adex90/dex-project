@@ -99,7 +99,8 @@ internet -> host 80/443 (UFW, fail2ban) -> nginx (edge network)
 | Staff authenticate with two factors; TOTP secrets never in clear | Same code on both: two-step verification (TOTP) is mandatory for `OPERADOR`, `AUDITOR` and `CUMPLIMIENTO` and re-checked on every request; secrets encrypted with `MFA_CLAVE_CIFRADO` (Secrets Manager) | Same; key in `secrets/mfa_encryption_key` | `tests/mfa.rs`, `tests/db/0010_auth_mfa.sql`, AML e2e (Appendix C) |
 | A client's reads return only that client's rows, even if the query is wrong | Same code on both: role `sc_cliente` (SELECT only) and RESTRICTIVE RLS policies keyed to `sc.cliente_actual` on users, accounts, movements, SPEI and SOFOM tables (migration `0011`) | Same | `tests/rls.rs`, `tests/db/0011_rls_por_cliente.sql` |
 | A client's live vault channel carries only that client's data, and only while the session is valid | Same code on both: the WebSocket handshake runs the same JWT and database checks as every route (token as a subprotocol entry, never echoed), requires `Origin` = `FRONTEND_ORIGIN`, sits in the `API` rate-limit group and is capped per client and per task; the session is re-checked every 60 s and at JWT expiry (close 4001); reads run as `sc_cliente` under RLS | Same, plus nginx's dedicated location (`limit_conn` 20 per IP) | `tests/boveda.rs`, `tests/db/0012_boveda_tiempo_real.sql` |
-| A market order moves exactly the cash it records, at the catalog's price, for a client allowed to trade | Same code on both: one transaction under `sc_mercado` (in the IFPE ledger it may write only its two movement types, and only `saldo_disponible` and the reserve). Each order is paired with its IFPE movement in the same transaction (deferred triggers). The database checks each order against the catalog price, the asset's increment, the maximal quantity, the cent-rounded amount, the position and the average cost; positions must replay their hash-chained ledger on commit. KYC is enforced by RLS. A buy is an AML channel with the freeze guard, and frozen clients cannot sell. Simulated prices are listed, quoted and traded only with `MODO_DEMO` | Same | `tests/mercado.rs`, `tests/db/0013_mercado_valores.sql` |
+| A market order moves exactly the cash it records, at the catalog's price, for a client allowed to trade | Same code on both: one transaction under `sc_mercado` (in the IFPE ledger it may write only the market's four movement types, and only `saldo_disponible`, `saldo_comprometido` and the reserve). Each order is paired with its IFPE movement in the same transaction (deferred triggers). The database checks each order against the catalog price, the asset's increment, the maximal quantity, the cent-rounded amount, the position and the average cost; positions must replay their hash-chained ledger on commit. KYC is enforced by RLS. A buy is an AML channel with the freeze guard, and frozen clients cannot sell. Simulated prices are listed, quoted and traded only with `MODO_DEMO` | Same | `tests/mercado.rs`, `tests/db/0013_mercado_valores.sql` |
+| A pending limit or stop order's cash or units cannot be spent twice, and holding them never breaks the 100 % reserve | Same code on both: a buy's cash moves to `saldo_comprometido` by a hash-chained IFPE movement (`COMPROMISO_ORDEN`, back by `LIBERACION_ORDEN`) inside the account, never out of custody; a sell's units to `cantidad_comprometida`, which market sales cannot sell. At COMMIT the database requires held cash and units to equal the pending orders, every hold and release to be paired with its order, held cash to replay from the ledger, and each fill to meet its order's limit or stop and sell exactly its held units. Liabilities, Merkle leaves and the reserve cut count held cash. Terms are immutable; `sc_mercado` may only close an order | Same | `tests/ordenes_avanzadas.rs`, `tests/db/0015_ordenes_avanzadas.sql` |
 | No request field outside the API contract is accepted | Same code on both: `deny_unknown_fields` on every body and query type (400 `VALIDACION`) | Same | `tests/entrada.rs` (source scan and HTTP) |
 | Least-privilege database identities | Service holds only `sc_app` (NOINHERIT, no owner rights); owner credentials only in the migrate task and with DBAs holding the `dba-tunnel` policy | Same, plus the schema owner is **not** a superuser (`deploy/postgres/10-schema-owner.sh`); the `postgres` superuser is break-glass only | `pg_authid` query in Appendix C |
 | Containers non-root, read-only, least capability, resource-limited | uid 65532, read-only rootfs, `drop ALL`, task CPU/memory | uid 65532 / 70 / 101, `read_only`, `cap_drop: ALL`, `no-new-privileges`, CPU/memory/PID limits | `docker inspect` in Appendix C |
@@ -1038,6 +1039,32 @@ following to operations.
   hidden like every simulated price, so production lists nothing until the
   pricing oracle writes live prices (the catalog answers 503
   `MERCADO_NO_DISPONIBLE` meanwhile).
+- **Migration `0015`** (limit and stop orders) is additive: deploy migrate,
+  then the backend. The old binary keeps working on a migrated database: it
+  never creates pending orders, so nothing is held, its market sales sell
+  free units (all of them), and its reads ignore the new columns. What the
+  migration does:
+  - adds `saldo_comprometido` and `version_ordenes` to `ifpe.cuentas`, a
+    `comprometido` shadow column and `cantidad_comprometida` to
+    `mercado.posiciones`, all defaulting to 0 (no rewrite). Their checks, and
+    the closed-account check now covering held cash, scan `ifpe.cuentas` and
+    `mercado.posiciones` once under the table's lock;
+  - widens the IFPE ledger's type and shape checks with `NOT VALID` (no
+    scan) and recreates the market's two RLS policies on it;
+  - replaces the liabilities trigger, the Merkle leaf view, the vault version
+    trigger, the shadow-balance function, the KYC gate and the market order
+    validator (same signatures);
+  - creates `mercado.ordenes_pendientes` (empty) with its triggers, deferred
+    checks, grants and RLS.
+
+  Finish the rollout before clients place limit or stop orders: an old task
+  would leave held cash out of the vault's total, and its reserve-cut replay
+  does not know the new movements, so its cut fails closed (`SC_` integrity
+  error, nothing published) until the task is replaced. The trigger engine
+  runs in every backend task every `MERCADO_DISPARO_INTERVALO_SEG` seconds
+  (default 5, 0 disables it); concurrent tasks are safe (account and order
+  locks). The frontend reads the vault's new fields as 0 when an older
+  backend omits them.
 
 ---
 
@@ -1307,6 +1334,61 @@ available, so Session Manager itself was not exercised. Everything around it was
     ran, it had read the announcer and failed: 3 of 4 times on one run.
 - **Backend:** rustfmt and clippy `-D warnings` clean; 314 tests passed, 0 failed.
   hadolint, actionlint and ShellCheck (with the CI settings) are clean.
+
+**Limit and stop orders** (migration `0015`, the polymorphic `POST /api/v1/market/order`,
+`GET /api/v1/market/orders/pending`, `POST /api/v1/market/orders/{id}/cancel`, the trigger engine):
+
+- **SQL suites:** all ten pass on a freshly migrated database, as a role that is
+  not a superuser: the earlier nine unchanged (39, 47, 17, 40, 409, 32, 17, 24
+  and 66 checks; two `0013` checks now count only their own tables, and its
+  truncate check uses `CASCADE`, now that pending orders reference executed
+  ones) and the new `tests/db/0015_ordenes_avanzadas.sql` with 101 checks:
+  - **Holds:** a buy's cash moves from available to held by a chained
+    `COMPROMISO_ORDEN` (shadow, liabilities, Merkle leaf and reserve
+    unchanged); a sell's units are held in the position.
+  - **Pairing at COMMIT**, each deferred check tested on its own (`SET
+    CONSTRAINTS <name> IMMEDIATE`): a hold without its order, an order
+    without its hold, a hold for another amount, held cash without a ledger
+    movement, a release of an order still pending, held cash or units that
+    differ from the pending orders.
+  - **Placement rules:** KYC, another client's account, a frozen account, a
+    suspended asset, a stop already reached on either side, prices by type,
+    cents, units beyond the free ones or off the increment.
+  - **Lifecycle:** terms immutable (even for the owner), closing only once,
+    no delete or truncate; a frozen account still gets its cash back.
+  - **Fills:** a limit never above its price, a stop never before its price,
+    the order's amount, exactly the held units; market sales only of free
+    units, with average cost over all units held. The numbers match the Rust
+    tests: 1,250 at 1,590 buys 0.7861 g for 1,249.90; 0.2941 g sell at 1,710
+    for 502.91.
+- **Backend:** rustfmt and clippy `-D warnings` clean; 373 tests passed, 0
+  failed (22 binaries). New:
+  - `tests/ordenes_avanzadas.rs` (11): a limit buy holds its cash (exact JSON,
+    the vault's `held_cash`, the pending list, idempotency, keys shared with
+    market orders refused, a reserve cut and the client's Merkle proof
+    counting held cash); the engine fills each order at its price
+    (limit buy, limit sell, stop buy, stop sell) with the SQL suite's numbers;
+    a reachable limit fills when placed; 21 validation cases and the cap of
+    50 open orders; cancelling (idempotent, another client's 404, a filled
+    one 409, staff 403, a frozen account still released); market sales of
+    free units only; rejections that release (stop gapped past the amount,
+    KYC revoked, operator freeze) and a suspended asset that keeps the order
+    pending; an AML preventive freeze (constant error, fill rejected, cash
+    released); two orders racing for the same cash and a cancel racing a
+    fill (one close only); the auditor's verifier catching held cash without
+    an order.
+  - `tests/boveda.rs`: placing, cancelling and filling, each pushed over the
+    WebSocket, a sell order included.
+  - The invariants every money-path test checks now include held cash
+    (liabilities, ledger replay, held = pending orders); the AML source scan
+    registers the fill's evaluation.
+- **Frontend:** typecheck, lint, 201 unit tests (held fields, the pending
+  order parser, free units for the checkout's Max, hold movements in the cash
+  history) and `next build`.
+- **End to end** on a fresh stack: smoke 142 checks (a limit buy from
+  another device shows its held cash and ledger hold live; cancelling
+  releases both; a reserve cut afterwards succeeds) and AML console 123
+  checks.
 
 **Market Explorer** (migration `0014`, `GET /api/v1/market/assets`, the Discover tab):
 

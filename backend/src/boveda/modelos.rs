@@ -30,13 +30,19 @@ pub struct Boveda {
 /// Los totales, en MXN.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct SaldoBoveda {
-    /// Patrimonio: efectivo (disponible y retenido) más lo invertido. Con una
-    /// retención, `available_cash` + `invested_assets` es menor que el total.
+    /// Patrimonio: efectivo (disponible, comprometido en órdenes y retenido)
+    /// más lo invertido. Con una retención PLD, `available_cash` + `held_cash`
+    /// + `invested_assets` es menor que el total.
     #[serde(rename = "total_mxn")]
     pub total: Decimal,
     /// Libre disposición: `saldo_disponible` de la cuenta IFPE.
     #[serde(rename = "available_cash")]
     pub disponible: Decimal,
+    /// Comprometido en compras límite y stop pendientes (`saldo_comprometido`,
+    /// migración 0015): sigue siendo del cliente, pero no se puede gastar
+    /// hasta que la orden se ejecute o se cancele.
+    #[serde(rename = "held_cash")]
+    pub comprometido: Decimal,
     /// Principal en mutuos SOFOM vigentes (o vencidos y aún por liquidar) más
     /// el valor de las posiciones del mercado al precio vigente.
     #[serde(rename = "invested_assets")]
@@ -78,8 +84,13 @@ pub struct Posicion {
     pub ticker: String,
     #[serde(rename = "name")]
     pub nombre: String,
+    /// Todos los títulos del cliente, comprometidos incluidos.
     #[serde(rename = "shares")]
     pub titulos: Decimal,
+    /// Los comprometidos en ventas límite y stop pendientes (0015): una venta
+    /// de mercado solo vende `shares` − `held_shares`.
+    #[serde(rename = "held_shares")]
+    pub titulos_comprometidos: Decimal,
     #[serde(rename = "current_price")]
     pub precio: Decimal,
     #[serde(rename = "total_value")]

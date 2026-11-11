@@ -178,12 +178,13 @@ SELECT pg_temp.exigir('RLS en órdenes y posiciones, con la política RESTRICTIV
   SELECT count(*) = 2 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
    WHERE n.nspname = 'mercado' AND c.relname IN ('ordenes', 'posiciones') AND c.relrowsecurity)
   AND (SELECT count(*) = 2 FROM pg_policies
-        WHERE schemaname = 'mercado' AND policyname = 'solo_del_cliente' AND permissive = 'RESTRICTIVE'
-          AND cmd = 'ALL' AND roles = '{sc_cliente}'));
+        WHERE schemaname = 'mercado' AND tablename IN ('ordenes', 'posiciones') AND policyname = 'solo_del_cliente'
+          AND permissive = 'RESTRICTIVE' AND cmd = 'ALL' AND roles = '{sc_cliente}'));
 
 SELECT pg_temp.exigir('sc_cliente solo lee el mercado: SELECT en activos, órdenes y posiciones', (
   SELECT count(*) FILTER (WHERE privilege_type = 'SELECT') = 3 AND count(*) FILTER (WHERE privilege_type <> 'SELECT') = 0
-    FROM information_schema.role_table_grants WHERE grantee = 'sc_cliente' AND table_schema = 'mercado'));
+    FROM information_schema.role_table_grants
+   WHERE grantee = 'sc_cliente' AND table_schema = 'mercado' AND table_name IN ('activos', 'ordenes', 'posiciones')));
 
 SELECT pg_temp.exigir('oro tokenizado: 1 612.40 MXN en incrementos de 0.0001', (
   SELECT precio = 1612.40 AND decimales_cantidad = 4 AND operable FROM mercado.activos WHERE ticker = 'AUG1'));
@@ -468,8 +469,9 @@ SELECT pg_temp.debe_fallar('una orden no se modifica (ni el dueño)', ARRAY[
 SELECT pg_temp.debe_fallar('una orden no se borra', ARRAY[
   $q$DELETE FROM mercado.ordenes WHERE id = '0d000000-0000-0000-0000-000000000001'$q$
 ], 'SC_LEDGER_INMUTABLE');
+-- CASCADE: también lo que lo referencia (las órdenes pendientes de 0015), y aun así no.
 SELECT pg_temp.debe_fallar('el ledger del mercado no se trunca', ARRAY[
-  'TRUNCATE mercado.ordenes'
+  'TRUNCATE mercado.ordenes CASCADE'
 ], 'SC_LEDGER_INMUTABLE');
 SELECT pg_temp.debe_fallar('una posición que el ledger no justifica (el dueño la edita)', ARRAY[
   $q$UPDATE mercado.posiciones SET cantidad = 10, costo = 1 WHERE cliente_id = 'a0000000-0000-0000-0000-00000000000a'$q$

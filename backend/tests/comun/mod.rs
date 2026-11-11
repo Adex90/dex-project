@@ -365,11 +365,13 @@ pub async fn verificar_invariantes(pool: &PgPool) {
             .fetch_one(pool)
             .await
             .unwrap();
-    let suma_cuentas: Decimal =
-        sqlx::query_scalar("SELECT coalesce(sum(saldo_disponible + saldo_bloqueado), 0) FROM ifpe.cuentas")
-            .fetch_one(pool)
-            .await
-            .unwrap();
+    // El efectivo comprometido en órdenes pendientes (0015) sigue siendo del cliente.
+    let suma_cuentas: Decimal = sqlx::query_scalar(
+        "SELECT coalesce(sum(saldo_disponible + saldo_bloqueado + saldo_comprometido), 0) FROM ifpe.cuentas",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap();
     let suma_custodia: Decimal =
         sqlx::query_scalar("SELECT coalesce(sum(saldo), 0) FROM ifpe.reserva_custodia").fetch_one(pool).await.unwrap();
     assert_eq!(pasivo, activo, "pasivo IFPE != reserva");
@@ -377,18 +379,22 @@ pub async fn verificar_invariantes(pool: &PgPool) {
     assert_eq!(activo, suma_custodia, "estado_reserva.activo no cuadra con la custodia");
 
     // Los saldos de cada cuenta IFPE se pueden reconstruir solo con el ledger.
+    // Las retenciones y los compromisos de órdenes mueven dinero dentro de una
+    // cuenta: no cambian su total.
     let descuadres: i64 = sqlx::query_scalar(
         "WITH efectos AS ( \
            SELECT cuenta_destino_id AS cuenta, \
-                  CASE WHEN tipo IN ('RETENCION','LIBERACION_RETENCION') THEN 0 ELSE monto END AS delta \
+                  CASE WHEN tipo IN ('RETENCION','LIBERACION_RETENCION','COMPROMISO_ORDEN','LIBERACION_ORDEN') \
+                       THEN 0 ELSE monto END AS delta \
              FROM ifpe.transacciones WHERE cuenta_destino_id IS NOT NULL \
            UNION ALL \
            SELECT cuenta_origen_id, \
-                  CASE WHEN tipo IN ('RETENCION','LIBERACION_RETENCION') THEN 0 ELSE -monto END \
+                  CASE WHEN tipo IN ('RETENCION','LIBERACION_RETENCION','COMPROMISO_ORDEN','LIBERACION_ORDEN') \
+                       THEN 0 ELSE -monto END \
              FROM ifpe.transacciones WHERE cuenta_origen_id IS NOT NULL) \
          SELECT count(*) FROM ifpe.cuentas c \
           LEFT JOIN (SELECT cuenta, sum(delta) AS total FROM efectos GROUP BY cuenta) e ON e.cuenta = c.id \
-         WHERE coalesce(e.total, 0) <> c.saldo_disponible + c.saldo_bloqueado",
+         WHERE coalesce(e.total, 0) <> c.saldo_disponible + c.saldo_bloqueado + c.saldo_comprometido",
     )
     .fetch_one(pool)
     .await
@@ -399,6 +405,18 @@ pub async fn verificar_invariantes(pool: &PgPool) {
     let mut conexion = pool.acquire().await.unwrap();
     let sin_ledger = reserva::saldos_sin_ledger(&mut conexion).await.unwrap();
     assert_eq!(sin_ledger, 0, "el corte de reserva no reproduce desde el ledger {sin_ledger} saldos");
+    // Lo comprometido es exactamente lo de las órdenes pendientes (0015).
+    let (efectivo, compras, titulos, ventas): (Decimal, Decimal, Decimal, Decimal) = sqlx::query_as(
+        "SELECT (SELECT coalesce(sum(saldo_comprometido), 0) FROM ifpe.cuentas), \
+                (SELECT coalesce(sum(efectivo_comprometido), 0) FROM mercado.ordenes_pendientes WHERE estado = 'PENDIENTE'), \
+                (SELECT coalesce(sum(cantidad_comprometida), 0) FROM mercado.posiciones), \
+                (SELECT coalesce(sum(titulos_comprometidos), 0) FROM mercado.ordenes_pendientes WHERE estado = 'PENDIENTE')",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(efectivo, compras, "efectivo comprometido != compras pendientes");
+    assert_eq!(titulos, ventas, "títulos comprometidos != ventas pendientes");
 
     // Regla 2: el saldo bloqueado SOFOM es exactamente el principal de los mutuos vigentes,
     // y ningún mutuo está sobreasignado.

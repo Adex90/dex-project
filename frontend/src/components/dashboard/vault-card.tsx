@@ -63,6 +63,11 @@ export function VaultCard({
               <p className="mt-1 text-3xl font-semibold tracking-tight sm:text-4xl" data-testid="vault-available">
                 <Money value={account.saldo_disponible} currencyClassName="text-base" />
               </p>
+              {account.saldo_comprometido && !isZero(account.saldo_comprometido) ? (
+                <p className="mt-1 text-xs text-muted" data-testid="vault-held-for-orders">
+                  {formatMoney(account.saldo_comprometido)} MXN held for open orders
+                </p>
+              ) : null}
               {/* Neutral wording: a hold must never disclose why it exists (no tipping off). */}
               {!isZero(account.saldo_bloqueado) ? (
                 <p className="mt-1 text-xs text-warning">
@@ -79,7 +84,11 @@ export function VaultCard({
               />
               <Stat
                 label="Held for you"
-                value={<Money value={addUnits(account.saldo_disponible, account.saldo_bloqueado)} />}
+                value={
+                  <Money
+                    value={addUnits(account.saldo_disponible, account.saldo_bloqueado, account.saldo_comprometido ?? "0")}
+                  />
+                }
                 hint="Matched 1:1 by cash in custody"
               />
             </dl>

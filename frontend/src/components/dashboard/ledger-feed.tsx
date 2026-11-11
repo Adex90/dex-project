@@ -46,6 +46,9 @@ function describe(tx: TransaccionIfpe, accountId: string | null): Kind {
     // The cash side of a market order; the asset itself is in the vault's holdings.
     COMPRA_MERCADO: { label: "Market buy", icon: Coins, tone: "accent", direction: "out" },
     VENTA_MERCADO: { label: "Market sale", icon: Banknote, tone: "verified", direction: "in" },
+    // A limit or stop buy holds its cash inside the account until it fills or is cancelled.
+    COMPROMISO_ORDEN: { label: "Held for order", icon: Lock, tone: "info", direction: "internal" },
+    LIBERACION_ORDEN: { label: "Order hold released", icon: Unlock, tone: "info", direction: "internal" },
   };
   // A kind this build does not know yet: a plain movement, never a broken feed.
   return (

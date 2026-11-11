@@ -300,6 +300,7 @@ async fn compra_y_venta_por_la_api(pool: PgPool) {
         r,
         json!({
             "order_id": orden_id,
+            "order_type": "market",
             "status": "filled",
             "ticker": "AUG1",
             "side": "buy",
@@ -339,6 +340,7 @@ async fn compra_y_venta_por_la_api(pool: PgPool) {
         json!({
             "total_mxn": "20000.00248000",
             "available_cash": "18750.07000000",
+            "held_cash": "0.00000000",
             "invested_assets": "1249.93248000",
             "unrealized_pnl_percentage": "0.00",
         })
@@ -349,6 +351,7 @@ async fn compra_y_venta_por_la_api(pool: PgPool) {
             "ticker": "AUG1",
             "name": "Tokenized gold, 1 g",
             "shares": "0.77520000",
+            "held_shares": "0.00000000",
             "current_price": "1612.40000000",
             "total_value": "1249.93248000",
             "daily_change_pct": "0.84",

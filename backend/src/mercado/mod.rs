@@ -1,5 +1,5 @@
-//! Mercado de valores (migraciones 0013 y 0014): catálogo, cotizaciones y
-//! órdenes de mercado.
+//! Mercado de valores (migraciones 0013 a 0015): catálogo, cotizaciones,
+//! órdenes de mercado y órdenes límite y stop.
 //!
 //! - [`catalogo`]: los activos que hoy se cotizan y se operan
 //!   (`GET /api/v1/market/assets`), el explorador del frontend.
@@ -7,6 +7,9 @@
 //!   (`GET /api/v1/market/quote/{ticker}`).
 //! - [`colocar`]: una orden de compra o venta que se ejecuta completa al
 //!   precio vigente (`POST /api/v1/market/order`); ver [`orden`].
+//! - [`pendiente`]: órdenes límite y stop (el mismo `POST` con `order_type`),
+//!   que esperan a su precio con su efectivo o sus títulos comprometidos;
+//!   su lista y su cancelación, y el motor de disparo que las ejecuta.
 //!
 //! El mercado es una entidad aparte de la IFPE y la SOFOM: su propio esquema,
 //! su rol (`sc_mercado`) y su ledger encadenado (`mercado.ordenes`). El
@@ -25,6 +28,7 @@ pub mod calculo;
 pub mod historial;
 pub mod modelos;
 mod orden;
+pub mod pendiente;
 
 use axum::http::StatusCode;
 use chrono::Utc;

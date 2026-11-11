@@ -48,6 +48,9 @@ test("cashDelta: credits, debits, transfers by side, and holds that change nothi
   assert.equal(cashDelta(tx("TRANSFERENCIA", "1", 0, OTHER), ACCOUNT), 100_000_000n, "received");
   assert.equal(cashDelta(tx("RETENCION", "1", 0, ACCOUNT), ACCOUNT), 0n);
   assert.equal(cashDelta(tx("LIBERACION_RETENCION", "1", 0, ACCOUNT), ACCOUNT), 0n);
+  // An order's hold and its release move cash inside the account (0015).
+  assert.equal(cashDelta(tx("COMPROMISO_ORDEN", "1250", 0, ACCOUNT), ACCOUNT), 0n);
+  assert.equal(cashDelta(tx("LIBERACION_ORDEN", "1250", 0, ACCOUNT), ACCOUNT), 0n);
   // Market orders: a buy pays from the vault's cash, a sale pays into it.
   assert.equal(cashDelta(tx("COMPRA_MERCADO", "1249.93", 0, ACCOUNT), ACCOUNT), -124_993_000_000n);
   assert.equal(cashDelta(tx("VENTA_MERCADO", "499.84", 0), ACCOUNT), 49_984_000_000n);

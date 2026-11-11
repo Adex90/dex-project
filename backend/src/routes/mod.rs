@@ -36,7 +36,9 @@
 //! | GET  | `/api/v1/auditoria/ledger/{ifpe,sofom,mercado}` | operador / auditor |
 //! | GET  | `/api/v1/market/assets` | cualquier sesión: el catálogo que hoy se cotiza y se opera |
 //! | GET  | `/api/v1/market/quote/{ticker}` | cualquier sesión: el activo y su historial de precios |
-//! | POST | `/api/v1/market/order` | cliente: orden de mercado (compra o venta), ejecutada al precio vigente |
+//! | POST | `/api/v1/market/order` | cliente: orden de mercado (ejecutada al precio vigente), límite o stop (pendiente, con su efectivo o sus títulos comprometidos) |
+//! | GET  | `/api/v1/market/orders/pending` | cliente: sus órdenes límite y stop que esperan |
+//! | POST | `/api/v1/market/orders/{id}/cancel` | cliente: cancela una orden pendiente y devuelve lo comprometido |
 //! | GET  | `/api/v1/kyc/expediente` | cliente: estado, intentos, bloqueo y último resultado |
 //! | POST | `/api/v1/kyc/perfil` | cliente: datos personales y domicilio |
 //! | POST | `/api/v1/kyc/verificar` | cliente: INE + selfie (hasta 12 MB) |

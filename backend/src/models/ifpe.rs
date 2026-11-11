@@ -17,6 +17,9 @@ pub struct CuentaIfpe {
     pub moneda: String,
     pub saldo_disponible: Decimal,
     pub saldo_bloqueado: Decimal,
+    /// Efectivo comprometido en compras límite y stop pendientes (migración
+    /// 0015): del cliente y en custodia, pero no disponible.
+    pub saldo_comprometido: Decimal,
     pub estado: EstadoCuenta,
     pub creado_en: DateTime<Utc>,
     pub actualizado_en: DateTime<Utc>,
@@ -84,6 +87,17 @@ pub enum TipoTxIfpe {
     #[sqlx(rename = "VENTA_MERCADO")]
     #[serde(rename = "VENTA_MERCADO")]
     VentaMercado,
+    /// Una compra límite o stop compromete su efectivo: de disponible a
+    /// comprometido, dentro de la cuenta y sin tocar la reserva (migración
+    /// 0015). Su orden está en `mercado.ordenes_pendientes`.
+    #[sqlx(rename = "COMPROMISO_ORDEN")]
+    #[serde(rename = "COMPROMISO_ORDEN")]
+    CompromisoOrden,
+    /// La orden se cerró (ejecutada, cancelada o rechazada): el efectivo
+    /// comprometido regresa al disponible.
+    #[sqlx(rename = "LIBERACION_ORDEN")]
+    #[serde(rename = "LIBERACION_ORDEN")]
+    LiberacionOrden,
 }
 
 impl TipoTxIfpe {
@@ -98,6 +112,8 @@ impl TipoTxIfpe {
             TipoTxIfpe::LiberacionRetencion => "LIBERACION_RETENCION",
             TipoTxIfpe::CompraMercado => "COMPRA_MERCADO",
             TipoTxIfpe::VentaMercado => "VENTA_MERCADO",
+            TipoTxIfpe::CompromisoOrden => "COMPROMISO_ORDEN",
+            TipoTxIfpe::LiberacionOrden => "LIBERACION_ORDEN",
         }
     }
 }

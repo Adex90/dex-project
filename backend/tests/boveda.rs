@@ -350,6 +350,7 @@ async fn la_boveda_por_rest(pool: PgPool) {
             "balance": {
                 "total_mxn": "1000.00000000",
                 "available_cash": "1000.00000000",
+                "held_cash": "0.00000000",
                 "invested_assets": "0.00000000",
                 "unrealized_pnl_percentage": "0.00",
             },
@@ -381,6 +382,7 @@ async fn la_boveda_por_rest(pool: PgPool) {
         json!({
             "total_mxn": "1000.00000000",
             "available_cash": "600.00000000",
+            "held_cash": "0.00000000",
             "invested_assets": "400.00000000",
             "unrealized_pnl_percentage": "0.00",
         })
@@ -846,6 +848,7 @@ async fn una_orden_de_mercado_llega_por_el_socket(pool: PgPool) {
         json!({
             "total_mxn": "20000.00248000",
             "available_cash": "18750.07000000",
+            "held_cash": "0.00000000",
             "invested_assets": "1249.93248000",
             "unrealized_pnl_percentage": "0.00",
         })
@@ -856,6 +859,7 @@ async fn una_orden_de_mercado_llega_por_el_socket(pool: PgPool) {
             "ticker": "AUG1",
             "name": "Tokenized gold, 1 g",
             "shares": "0.77520000",
+            "held_shares": "0.00000000",
             "current_price": "1612.40000000",
             "total_value": "1249.93248000",
             "daily_change_pct": "0.84",
@@ -875,5 +879,87 @@ async fn una_orden_de_mercado_llega_por_el_socket(pool: PgPool) {
     assert_eq!((m["type"].as_str(), m["seq"].as_i64()), (Some("vault.snapshot"), Some(3)), "{m}");
     assert_eq!(m["vault"]["balance"]["available_cash"], "20000.00000000");
     assert_eq!(m["vault"]["holdings"], json!([]));
+    oyente.abort();
+}
+
+/// Las órdenes límite y stop (0015) también avisan: comprometer, cancelar y
+/// ejecutar cambian la bóveda que ve el cliente, aunque una venta pendiente
+/// no mueva efectivo (la versión de órdenes de la cuenta sube la `seq`).
+#[sqlx::test(migrations = "../migrations")]
+async fn las_ordenes_pendientes_llegan_por_el_socket(pool: PgPool) {
+    let cfg = preparar(&pool).await;
+    let srv = arrancar(AppState::nuevo(pool.clone(), cfg.clone())).await;
+    let ana = cliente(&pool, &cfg, "Ana").await;
+    let cuenta = ana.cuenta_ifpe.id;
+    depositar(&pool, &cfg, cuenta, "20000").await;
+    let token = token_cliente(&srv.estado, ana.cliente.id);
+    let api = routes::router(srv.estado.clone());
+    let ordenar = |cuerpo: Value| {
+        let (api, token) = (api.clone(), token.clone());
+        async move { llamar_json(&api, "POST", "/api/v1/market/order", Some(&token), Some(cuerpo)).await }
+    };
+
+    let mut ws = abrir(srv.dir, &token).await.unwrap();
+    assert_eq!(recibir(&mut ws).await["seq"], 1);
+    let oyente = tokio::spawn(central::escuchar(srv.estado.boveda.clone()));
+    assert_eq!(recibir(&mut ws).await["seq"], 1, "la foto al empezar a escuchar");
+
+    // Una compra límite compromete 1 000: disponible 19 000, comprometido 1 000.
+    let (s, compra) = ordenar(json!({ "ticker": "AUG1", "side": "buy", "amount": "1000.00",
+        "idempotency_key": "limite-por-socket", "order_type": "limit", "limit_price": "1500" }))
+    .await;
+    assert_eq!(s, StatusCode::CREATED, "{compra}");
+    let m = recibir(&mut ws).await;
+    assert_eq!((m["type"].as_str(), m["seq"].as_i64()), (Some("vault.snapshot"), Some(2)), "{m}");
+    assert_eq!(
+        (
+            &m["vault"]["balance"]["available_cash"],
+            &m["vault"]["balance"]["held_cash"],
+            &m["vault"]["balance"]["total_mxn"]
+        ),
+        (&json!("19000.00000000"), &json!("1000.00000000"), &json!("20000.00000000"))
+    );
+
+    // Cancelarla lo devuelve, en la versión siguiente.
+    let ruta = format!("/api/v1/market/orders/{}/cancel", compra["order_id"].as_str().unwrap());
+    let (s, _) = llamar_json(&api, "POST", &ruta, Some(&token), None).await;
+    assert_eq!(s, StatusCode::OK);
+    let m = recibir(&mut ws).await;
+    assert_eq!(m["seq"], 3, "{m}");
+    assert_eq!(m["vault"]["balance"]["held_cash"], "0.00000000");
+
+    // Una venta límite no mueve efectivo, pero sí cambia la bóveda: sus títulos se comprometen.
+    let (s, _) = ordenar(json!({ "ticker": "AUG1", "side": "buy", "amount": "1250.00",
+        "idempotency_key": "compra-por-socket" }))
+    .await;
+    assert_eq!(s, StatusCode::CREATED);
+    assert_eq!(recibir(&mut ws).await["seq"], 4);
+    let antes = seq(&pool, cuenta).await;
+    let (s, venta) = ordenar(json!({ "ticker": "AUG1", "side": "sell", "amount": "500.00",
+        "idempotency_key": "venta-por-socket", "order_type": "limit", "limit_price": "1700" }))
+    .await;
+    assert_eq!(s, StatusCode::CREATED, "{venta}");
+    subio_una(&pool, cuenta, antes).await;
+    let m = recibir(&mut ws).await;
+    assert_eq!(m["seq"], 5, "{m}");
+    assert_eq!(
+        (&m["vault"]["holdings"][0]["shares"], &m["vault"]["holdings"][0]["held_shares"]),
+        (&json!("0.77520000"), &json!("0.29410000"))
+    );
+    assert_eq!(m["vault"]["balance"]["available_cash"], "18750.07000000");
+
+    // El oráculo sube el precio y el motor la ejecuta: títulos vendidos, efectivo de vuelta.
+    sqlx::query("UPDATE mercado.activos SET precio = 1710 WHERE ticker = 'AUG1'").execute(&pool).await.unwrap();
+    let r = synthetic_capital::mercado::pendiente::disparar(&pool, &cfg).await.unwrap();
+    assert_eq!((r.ejecutadas, r.errores), (1, 0));
+    let m = recibir(&mut ws).await;
+    assert_eq!(m["seq"], 6, "{m}");
+    // 0.2941 g a 1 710 son 502.91.
+    assert_eq!(m["vault"]["balance"]["available_cash"], "19252.98000000");
+    assert_eq!(
+        (&m["vault"]["holdings"][0]["shares"], &m["vault"]["holdings"][0]["held_shares"]),
+        (&json!("0.48110000"), &json!("0.00000000"))
+    );
+    nada_mas(&mut ws, Duration::from_millis(300)).await;
     oyente.abort();
 }

@@ -95,6 +95,11 @@ export interface CuentaIfpe {
   moneda: string;
   saldo_disponible: Decimal;
   saldo_bloqueado: Decimal;
+  /**
+   * Cash committed to pending limit and stop buys (migration 0015): the
+   * client's, not spendable. Absent from a backend that predates it.
+   */
+  saldo_comprometido?: Decimal;
   estado: EstadoCuenta;
   creado_en: IsoDateTime;
   actualizado_en: IsoDateTime;
@@ -166,7 +171,11 @@ export type TipoTxIfpe =
   | "LIBERACION_RETENCION"
   // The cash legs of market orders (migration 0013): a buy pays from the vault, a sale pays into it.
   | "COMPRA_MERCADO"
-  | "VENTA_MERCADO";
+  | "VENTA_MERCADO"
+  // A pending limit or stop buy holds its cash, and releases it when it closes (migration 0015):
+  // both move money inside the account, from available to held and back.
+  | "COMPROMISO_ORDEN"
+  | "LIBERACION_ORDEN";
 
 export interface TransaccionIfpe {
   id: Uuid;

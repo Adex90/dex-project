@@ -134,18 +134,22 @@ async fn bloqueante<T: Send + 'static>(f: impl FnOnce() -> AppResult<T> + Send +
 /// Cada tipo de movimiento se nombra con su efecto, como en
 /// `ifpe.fn_aplicar_tx_a_sombras`: abonan al cliente y a la reserva DEPOSITO,
 /// RETORNO_DE_SOFOM y VENTA_MERCADO; cargan a ambos RETIRO, TRASPASO_A_SOFOM y
-/// COMPRA_MERCADO (0013); TRANSFERENCIA mueve entre cuentas y las retenciones,
-/// dentro de una. Un tipo que no esté aquí no mueve nada en la reproducción, y
-/// el saldo que sí movió aparece como descuadre.
+/// COMPRA_MERCADO (0013); TRANSFERENCIA mueve entre cuentas, las retenciones
+/// entre el disponible y el bloqueado de una, y COMPROMISO_ORDEN /
+/// LIBERACION_ORDEN (0015) entre su disponible y su comprometido. Un tipo que
+/// no esté aquí no mueve nada en la reproducción, y el saldo que sí movió
+/// aparece como descuadre.
 const SQL_SALDOS_SIN_LEDGER: &str = "\
     WITH mov AS ( \
-        SELECT cuenta_destino_id AS id, monto AS d, 0::numeric AS b FROM ifpe.transacciones \
+        SELECT cuenta_destino_id AS id, monto AS d, 0::numeric AS b, 0::numeric AS k FROM ifpe.transacciones \
          WHERE tipo IN ('DEPOSITO', 'RETORNO_DE_SOFOM', 'VENTA_MERCADO', 'TRANSFERENCIA') \
-        UNION ALL SELECT cuenta_origen_id, -monto, 0 FROM ifpe.transacciones \
+        UNION ALL SELECT cuenta_origen_id, -monto, 0, 0 FROM ifpe.transacciones \
          WHERE tipo IN ('RETIRO', 'TRASPASO_A_SOFOM', 'COMPRA_MERCADO', 'TRANSFERENCIA') \
-        UNION ALL SELECT cuenta_origen_id, -monto, monto FROM ifpe.transacciones WHERE tipo = 'RETENCION' \
-        UNION ALL SELECT cuenta_origen_id, monto, -monto FROM ifpe.transacciones WHERE tipo = 'LIBERACION_RETENCION' \
-    ), cuentas AS (SELECT id, sum(d) AS d, sum(b) AS b FROM mov GROUP BY id), \
+        UNION ALL SELECT cuenta_origen_id, -monto, monto, 0 FROM ifpe.transacciones WHERE tipo = 'RETENCION' \
+        UNION ALL SELECT cuenta_origen_id, monto, -monto, 0 FROM ifpe.transacciones WHERE tipo = 'LIBERACION_RETENCION' \
+        UNION ALL SELECT cuenta_origen_id, -monto, 0, monto FROM ifpe.transacciones WHERE tipo = 'COMPROMISO_ORDEN' \
+        UNION ALL SELECT cuenta_origen_id, monto, 0, -monto FROM ifpe.transacciones WHERE tipo = 'LIBERACION_ORDEN' \
+    ), cuentas AS (SELECT id, sum(d) AS d, sum(b) AS b, sum(k) AS k FROM mov GROUP BY id), \
     reservas AS ( \
         SELECT reserva_id AS id, \
                sum(CASE WHEN tipo IN ('DEPOSITO', 'RETORNO_DE_SOFOM', 'VENTA_MERCADO') THEN monto \
@@ -154,7 +158,8 @@ const SQL_SALDOS_SIN_LEDGER: &str = "\
     ) \
     SELECT (SELECT count(*) FROM ifpe.cuentas c FULL JOIN cuentas r ON r.id = c.id \
              WHERE coalesce(c.saldo_disponible, 0) <> coalesce(r.d, 0) \
-                OR coalesce(c.saldo_bloqueado, 0) <> coalesce(r.b, 0)) \
+                OR coalesce(c.saldo_bloqueado, 0) <> coalesce(r.b, 0) \
+                OR coalesce(c.saldo_comprometido, 0) <> coalesce(r.k, 0)) \
          + (SELECT count(*) FROM ifpe.reserva_custodia c FULL JOIN reservas r ON r.id = c.id \
              WHERE coalesce(c.saldo, 0) <> coalesce(r.s, 0))";
 
@@ -528,7 +533,8 @@ async fn prueba_en_ultimo_corte(
 ) -> AppResult<Option<PruebaReserva>> {
     let mut tx = db::begin_lectura_instantanea(pool, Rol::Auditor).await?;
     let cuenta: Option<(Uuid, Decimal)> = sqlx::query_as(
-        "SELECT id, saldo_disponible + saldo_bloqueado FROM ifpe.cuentas WHERE cliente_id = $1 AND moneda = 'MXN'",
+        "SELECT id, saldo_disponible + saldo_bloqueado + saldo_comprometido FROM ifpe.cuentas \
+         WHERE cliente_id = $1 AND moneda = 'MXN'",
     )
     .bind(cliente_id)
     .fetch_optional(&mut *tx)

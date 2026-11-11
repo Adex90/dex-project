@@ -138,18 +138,29 @@ export function isPositive(value: unknown): value is DecimalString {
   return isDecimalString(value) && toUnits(value) > 0n;
 }
 
+/**
+ * A field a newer backend adds: absent means "0" (a backend that predates
+ * it); present, it must be a non-negative decimal.
+ */
+function nonNegativeOrZero(value: unknown): DecimalString | null {
+  if (value === undefined) return "0";
+  return isNonNegative(value) ? value : null;
+}
+
 export function parseVaultBalance(value: unknown): VaultBalance | null {
   if (!isRecord(value)) return null;
   const { total_mxn, available_cash, invested_assets, unrealized_pnl_percentage } = value;
+  const held_cash = nonNegativeOrZero(value.held_cash);
   if (
     !isDecimalString(total_mxn) ||
     !isDecimalString(available_cash) ||
+    held_cash === null ||
     !isNonNegative(invested_assets) ||
     !isDecimalString(unrealized_pnl_percentage)
   ) {
     return null;
   }
-  return { total_mxn, available_cash, invested_assets, unrealized_pnl_percentage };
+  return { total_mxn, available_cash, held_cash, invested_assets, unrealized_pnl_percentage };
 }
 
 export function parseReserveProof(value: unknown): ReserveProof | null {
@@ -164,17 +175,21 @@ export function parseReserveProof(value: unknown): ReserveProof | null {
 export function parseHolding(value: unknown): Holding | null {
   if (!isRecord(value)) return null;
   const { ticker, name, shares, current_price, total_value, daily_change_pct } = value;
+  const held_shares = nonNegativeOrZero(value.held_shares);
   if (
     !isText(ticker, 32) ||
     !isText(name) ||
     !isNonNegative(shares) ||
+    held_shares === null ||
     !isNonNegative(current_price) ||
     !isNonNegative(total_value) ||
     !isDecimalString(daily_change_pct)
   ) {
     return null;
   }
-  return { ticker, name, shares, current_price, total_value, daily_change_pct };
+  // Committed units are part of the holding, never more than all of it.
+  if (toUnits(held_shares) > toUnits(shares)) return null;
+  return { ticker, name, shares, held_shares, current_price, total_value, daily_change_pct };
 }
 
 export function parseVaultSnapshot(value: unknown): VaultSnapshot | null {

@@ -178,6 +178,9 @@ fn es_invariante(codigo: &str) -> bool {
             | "ORDEN_SIN_MOVIMIENTO"
             | "ORDEN_INCOHERENTE"
             | "POSICION_SIN_LEDGER"
+            | "COMPROMISO_DESCUADRE"
+            | "COMPROMISO_SIN_ORDEN"
+            | "ORDEN_SIN_COMPROMISO"
             | "MUTUO_TITULAR"
             | "AML_ESPEJO"
             | "AML_AISLAMIENTO"
@@ -233,6 +236,8 @@ fn traducir_error_bd(codigo_sql: &str, mensaje: &str, restriccion: &str) -> Opti
         match codigo {
             "AML_NO_AUTORIZADO" => return Some(AppError::Prohibido),
             "AML_NO_ENCONTRADO" => return Some(AppError::no_encontrado(detalle)),
+            // Otra petición (o el motor de disparo) cerró la orden primero.
+            "ORDEN_NO_PENDIENTE" => return Some(AppError::conflicto("ORDEN_NO_PENDIENTE", detalle)),
             c if es_conflicto_aml(c) => return Some(AppError::conflicto(c, detalle)),
             _ => {}
         }

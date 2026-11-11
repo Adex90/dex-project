@@ -3650,6 +3650,9 @@ fn fuente_intercepta_toda_salida() {
         ("ledger/mod.rs", 2),
         // La compra en el mercado (0013); la venta no se evalúa.
         ("mercado/orden.rs", 1),
+        // La compra que ejecuta una orden límite o stop (0015), al dispararse;
+        // comprometer su efectivo no es una salida.
+        ("mercado/pendiente.rs", 1),
         ("sofom/credito.rs", 2),
         ("sofom/puente.rs", 1),
         ("spei/inbound.rs", 1),

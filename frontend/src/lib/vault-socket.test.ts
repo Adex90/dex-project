@@ -209,6 +209,7 @@ test("a SPEI deposit updates total_mxn at once; a reserve proof and a holding fo
     ticker: "AUG1",
     name: "Tokenized gold, 1 g",
     shares: "1.00000000",
+    held_shares: "0.00000000",
     current_price: "1612.40000000",
     total_value: "1612.40000000",
     daily_change_pct: "0.84",

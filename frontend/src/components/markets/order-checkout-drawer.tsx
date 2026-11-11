@@ -645,19 +645,16 @@ function Receipt({
   doneRef: RefObject<HTMLButtonElement | null>;
   onDone: () => void;
 }) {
-  const filled = receipt.status === "filled";
   return (
     <div className="px-5 pt-8 pb-[calc(1.25rem+env(safe-area-inset-bottom))] text-center" data-testid="order-receipt">
       <span aria-hidden className="mx-auto grid size-12 place-items-center bg-synthetic-yellow text-black">
         <Check className="size-6" strokeWidth={2.5} />
       </span>
       <p role="status" className="mt-4 text-lg font-semibold tracking-tight">
-        {filled ? "Order filled" : "Order received"}
+        Order filled
       </p>
       <p className="mt-1 text-sm text-muted">
-        {filled
-          ? `${buying ? "Bought" : "Sold"} ${formatShares(receipt.quantity, decimals)} ${ticker} at ${formatMoney(receipt.price)}.`
-          : "It fills at the next available price."}
+        {`${buying ? "Bought" : "Sold"} ${formatShares(receipt.quantity, decimals)} ${ticker} at ${formatMoney(receipt.price)}.`}
       </p>
       <dl className="mt-6 space-y-2.5 border-y border-border py-4 text-left text-sm">
         <SummaryRow label="Amount" value={formatMoney(receipt.amount)} />

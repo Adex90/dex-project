@@ -45,6 +45,8 @@ export function cashDelta(tx: Pick<LedgerEntry, "tipo" | "monto" | "cuenta_orige
       return tx.cuenta_origen_id === accountId ? -amount : amount;
     case "RETENCION":
     case "LIBERACION_RETENCION":
+    case "COMPROMISO_ORDEN":
+    case "LIBERACION_ORDEN":
       return 0n;
     default:
       // A kind this build does not know yet: leave the line flat rather than guess.

@@ -470,6 +470,38 @@ try {
           (await page.getByText("Market sale", { exact: true }).count()) === 2,
         "the ledger lists three market buys and two market sales",
       );
+      // A limit buy from another device (the checkout sends market orders
+      // only, for now): it waits below the price with its cash held, and
+      // cancelling it releases the cash. Both legs reach this tab live.
+      const limitBuy = await apiOrder(otherDevice, {
+        ticker: "AUG1",
+        side: "buy",
+        amount: "100.00",
+        order_type: "limit",
+        limit_price: "1500.0000",
+      });
+      check(
+        limitBuy.status === 201 && limitBuy.receipt.status === "pending" && limitBuy.receipt.held_cash === "100.00000000",
+        `a limit buy of 100.00 at 1,500 waits with its cash held (${limitBuy.status} ${limitBuy.receipt.status})`,
+      );
+      await page
+        .getByTestId("vault-held-for-orders")
+        .filter({ hasText: "100.00 MXN held for open orders" })
+        .waitFor({ timeout: 5_000 });
+      await page.getByText("Held for order", { exact: true }).waitFor();
+      check(true, "the Account tab shows the cash held for the order, and the hold in the ledger");
+      const cancelled = await fetch(`${API}/api/v1/market/orders/${limitBuy.receipt.order_id}/cancel`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${otherDevice}` },
+      });
+      const cancelledOrder = await cancelled.json();
+      check(
+        cancelled.status === 200 && cancelledOrder.status === "cancelled" && cancelledOrder.held_cash === "0.00000000",
+        "cancelling the limit buy releases its cash",
+      );
+      await page.getByText("Order hold released", { exact: true }).waitFor({ timeout: 5_000 });
+      await page.getByTestId("vault-held-for-orders").waitFor({ state: "detached" });
+      check(true, "the release reaches the ledger and nothing stays held");
       // A new Proof of Reserve cut still rebuilds every balance from the
       // ledger, the orders' legs included: a new account's first proof makes
       // the server cut again, over every account.

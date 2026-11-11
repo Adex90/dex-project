@@ -42,7 +42,8 @@ export default function VaultPage() {
   // history rebuilt backwards from that balance is exact.
   const history = useMemo(() => {
     if (!cashAccount || lastUpdated === null) return null;
-    const cash = addUnits(cashAccount.saldo_disponible, cashAccount.saldo_bloqueado);
+    // All the account's cash: available, on hold and held for open orders.
+    const cash = addUnits(cashAccount.saldo_disponible, cashAccount.saldo_bloqueado, cashAccount.saldo_comprometido ?? "0");
     return cashBalanceHistory(movements, cashAccount.id, cash, lastUpdated);
   }, [cashAccount, movements, lastUpdated]);
 

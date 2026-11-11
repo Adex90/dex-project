@@ -47,6 +47,8 @@ pub struct Config {
     pub corte_min_intervalo_seg: u64,
     /// Periodicidad de liquidación automática de mutuos vencidos (0 = desactivado).
     pub liquidacion_intervalo_seg: u64,
+    /// Periodicidad del motor de disparo de órdenes límite y stop (0 = desactivado).
+    pub mercado_disparo_intervalo_seg: u64,
     pub reserva_institucion: String,
     pub reserva_cuenta: String,
     pub caja_institucion: String,
@@ -505,6 +507,7 @@ impl Config {
             corte_intervalo_seg: var_o("CORTE_INTERVALO_SEG", 300)?,
             corte_min_intervalo_seg: var_o("CORTE_MIN_INTERVALO_SEG", 60)?,
             liquidacion_intervalo_seg: var_o("LIQUIDACION_INTERVALO_SEG", 3600)?,
+            mercado_disparo_intervalo_seg: var_o("MERCADO_DISPARO_INTERVALO_SEG", 5)?,
             reserva_institucion: var("RESERVA_INSTITUCION")?.unwrap_or_else(|| "Banco de México".into()),
             reserva_cuenta: var("RESERVA_CUENTA")?.unwrap_or_else(|| "SC-IFPE-RESERVA-001".into()),
             caja_institucion: var("CAJA_INSTITUCION")?.unwrap_or_else(|| "Banco Custodio SOFOM".into()),
@@ -631,6 +634,7 @@ impl Config {
             corte_intervalo_seg: 0,
             corte_min_intervalo_seg: 0,
             liquidacion_intervalo_seg: 0,
+            mercado_disparo_intervalo_seg: 0,
             reserva_institucion: "Banco de México".into(),
             reserva_cuenta: "SC-IFPE-RESERVA-001".into(),
             caja_institucion: "Banco Custodio SOFOM".into(),

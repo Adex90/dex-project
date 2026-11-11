@@ -11,14 +11,18 @@
 //!   (10^-decimales): `cantidad = piso(monto / precio)`. Se cobra
 //!   `cantidad × precio` al centavo (mitad hacia arriba), que nunca excede el
 //!   monto; el resto se queda en efectivo.
-//! - **Venta**: un monto que excede, al centavo hacia arriba, lo que vale la
-//!   posición se rechaza. Uno que llega, al centavo hacia abajo, a lo que vale
-//!   la vende completa (el botón «Max» del frontend, sin residuos). Si no, la
-//!   cantidad que cubre el monto, como en la compra. Se abona
-//!   `cantidad × precio` al centavo.
+//! - **Venta**: solo de los títulos libres (los comprometidos en ventas
+//!   límite o stop pendientes, migración 0015, no se venden a mercado). Un
+//!   monto que excede, al centavo hacia arriba, lo que valen se rechaza. Uno
+//!   que llega, al centavo hacia abajo, a lo que valen los vende todos (el
+//!   botón «Max» del frontend, sin residuos). Si no, la cantidad que cubre el
+//!   monto, como en la compra. Se abona `cantidad × precio` al centavo.
+//! - **Venta de una orden pendiente**: exactamente los títulos que comprometió,
+//!   al precio de su ejecución.
 //! - **Costo**: la compra suma su importe al costo de la posición; la venta
-//!   libera `costo × vendido / tenido` (costo promedio) al 10^-8, mitad hacia
-//!   arriba, o todo el costo si vende todo.
+//!   libera `costo × vendido / tenido` (costo promedio sobre todos los títulos
+//!   que tiene, comprometidos incluidos) al 10^-8, mitad hacia arriba, o todo
+//!   el costo si vende todo.
 
 use rust_decimal::Decimal;
 
@@ -51,6 +55,8 @@ pub enum Rechazo {
     MontoInsuficiente,
     /// El cliente no tiene ese activo.
     SinPosicion,
+    /// Todos sus títulos de ese activo están comprometidos en ventas pendientes.
+    TitulosComprometidos,
     /// El monto excede lo que vale la posición.
     PosicionInsuficiente,
     /// Un número fuera de `NUMERIC(18, 8)` (no debería llegar aquí: los montos
@@ -131,29 +137,36 @@ pub fn compra(monto: Decimal, precio: Decimal, decimales: u32) -> Result<Ejecuci
     Ok(Ejecucion { cantidad: decimal(cantidad)?, monto: decimal(cobro)?, costo_liberado: None })
 }
 
-/// Venta de `monto` pesos de una posición de `tenido` unidades que costó `costo`.
+/// Venta de `monto` pesos de los `libre` títulos libres de una posición de
+/// `tenido` títulos que costó `costo` (sin órdenes pendientes, `libre` =
+/// `tenido`).
 pub fn venta(
     monto: Decimal,
     precio: Decimal,
     decimales: u32,
+    libre: Decimal,
     tenido: Decimal,
     costo: Decimal,
 ) -> Result<Ejecucion, Rechazo> {
-    let (m, p, t, c) = (centavos_exactos(monto)?, unidades(precio)?, unidades(tenido)?, unidades(costo)?);
-    if p <= 0 || t < 0 || c < 0 {
+    let (m, p, l, t, c) =
+        (centavos_exactos(monto)?, unidades(precio)?, unidades(libre)?, unidades(tenido)?, unidades(costo)?);
+    if p <= 0 || l < 0 || t < l || c < 0 {
         return Err(Rechazo::FueraDeRango);
     }
     if t == 0 {
         return Err(Rechazo::SinPosicion);
     }
-    let valor = por(t, p)?; // 10^-16
+    if l == 0 {
+        return Err(Rechazo::TitulosComprometidos);
+    }
+    let valor = por(l, p)?; // 10^-16
     let piso = valor / CENTAVO_16;
     let techo = (valor + CENTAVO_16 - 1) / CENTAVO_16;
     let pedido = m / CENTAVO_8; // centavos exactos
     if pedido > techo {
         return Err(Rechazo::PosicionInsuficiente);
     }
-    let cantidad = if pedido >= piso { t } else { cantidad_que_cubre(m, p, decimales)? };
+    let cantidad = if pedido >= piso { l } else { cantidad_que_cubre(m, p, decimales)? };
     if cantidad == 0 {
         return Err(Rechazo::MontoInsuficiente);
     }
@@ -163,6 +176,27 @@ pub fn venta(
         return Err(Rechazo::MontoInsuficiente);
     }
     Ok(Ejecucion { cantidad: decimal(cantidad)?, monto: decimal(abono)?, costo_liberado: Some(decimal(liberado)?) })
+}
+
+/// Venta de exactamente `cantidad` títulos a `precio`, de una posición de
+/// `tenido` que costó `costo`: la ejecución de una venta límite o stop, que
+/// vende los títulos que comprometió.
+pub fn venta_de_titulos(
+    cantidad: Decimal,
+    precio: Decimal,
+    tenido: Decimal,
+    costo: Decimal,
+) -> Result<Ejecucion, Rechazo> {
+    let (q, p, t, c) = (unidades(cantidad)?, unidades(precio)?, unidades(tenido)?, unidades(costo)?);
+    if p <= 0 || q <= 0 || c < 0 {
+        return Err(Rechazo::FueraDeRango);
+    }
+    let liberado = costo_liberado(c, q, t)?;
+    let abono = importe(q, p)?;
+    if abono == 0 {
+        return Err(Rechazo::MontoInsuficiente);
+    }
+    Ok(Ejecucion { cantidad: decimal(q)?, monto: decimal(abono)?, costo_liberado: Some(decimal(liberado)?) })
 }
 
 /// Costo promedio de `vendido` unidades de una posición de `tenido` que costó
@@ -248,7 +282,7 @@ mod pruebas {
     fn venta_parcial_libera_el_costo_promedio() {
         // Posición de la compra de 1 250: 0.7752 que costaron 1 249.93.
         assert_eq!(
-            venta(d("500"), d(ORO), 4, d("0.7752"), d("1249.93")),
+            venta(d("500"), d(ORO), 4, d("0.7752"), d("0.7752"), d("1249.93")),
             Ok(ejecucion("0.3100", "499.84", Some("499.84300826")))
         );
     }
@@ -257,10 +291,10 @@ mod pruebas {
     fn lo_que_vale_la_posicion_la_vende_completa() {
         // Quedan 0.4652 (costo 750.08699174), que valen 750.088480.
         let todo = ejecucion("0.4652", "750.09", Some("750.08699174"));
-        assert_eq!(venta(d("750.08"), d(ORO), 4, d("0.4652"), d("750.08699174")), Ok(todo), "piso");
-        assert_eq!(venta(d("750.09"), d(ORO), 4, d("0.4652"), d("750.08699174")), Ok(todo), "techo");
+        assert_eq!(venta(d("750.08"), d(ORO), 4, d("0.4652"), d("0.4652"), d("750.08699174")), Ok(todo), "piso");
+        assert_eq!(venta(d("750.09"), d(ORO), 4, d("0.4652"), d("0.4652"), d("750.08699174")), Ok(todo), "techo");
         assert_eq!(
-            venta(d("750.10"), d(ORO), 4, d("0.4652"), d("750.08699174")),
+            venta(d("750.10"), d(ORO), 4, d("0.4652"), d("0.4652"), d("750.08699174")),
             Err(Rechazo::PosicionInsuficiente),
             "un centavo de más"
         );
@@ -280,8 +314,11 @@ mod pruebas {
 
     #[test]
     fn sin_posicion_o_monto_minimo() {
-        assert_eq!(venta(d("100"), d(ORO), 4, d("0"), d("0")), Err(Rechazo::SinPosicion));
-        assert_eq!(venta(d("0.10"), d(ORO), 4, d("0.7752"), d("1249.93")), Err(Rechazo::MontoInsuficiente));
+        assert_eq!(venta(d("100"), d(ORO), 4, d("0"), d("0"), d("0")), Err(Rechazo::SinPosicion));
+        assert_eq!(
+            venta(d("0.10"), d(ORO), 4, d("0.7752"), d("0.7752"), d("1249.93")),
+            Err(Rechazo::MontoInsuficiente)
+        );
     }
 
     #[test]
@@ -289,7 +326,8 @@ mod pruebas {
         // Un monto con fracciones de centavo no es un monto de orden.
         assert_eq!(compra(d("1.001"), d(ORO), 4), Err(Rechazo::FueraDeRango));
         assert_eq!(compra(d("1.123456789"), d(ORO), 4), Err(Rechazo::FueraDeRango));
-        assert_eq!(venta(d("1.001"), d(ORO), 4, d("1"), d("1")), Err(Rechazo::FueraDeRango));
+        assert_eq!(venta(d("1.001"), d(ORO), 4, d("1"), d("1"), d("1")), Err(Rechazo::FueraDeRango));
+        assert_eq!(venta(d("1"), d(ORO), 4, d("2"), d("1"), d("1")), Err(Rechazo::FueraDeRango), "libre > tenido");
         assert_eq!(compra(d("0"), d(ORO), 4), Err(Rechazo::FueraDeRango));
         assert_eq!(compra(d("10"), d("0"), 4), Err(Rechazo::FueraDeRango));
         assert_eq!(compra(d("10"), d(ORO), 9), Err(Rechazo::FueraDeRango));
@@ -297,6 +335,45 @@ mod pruebas {
         assert_eq!(compra(d("999999999.99"), d("0.00000001"), 8), Err(Rechazo::FueraDeRango));
         // El máximo de una orden con 8 decimales de cantidad: los productos caben en i128.
         assert!(compra(d("999999999.99"), d(ORO), 8).is_ok());
+    }
+
+    // Los mismos números que tests/db/0015_ordenes_avanzadas.sql: 0.4231 de
+    // los 0.7752 g comprometidos en ventas pendientes, 0.3521 libres.
+    #[test]
+    fn una_venta_de_mercado_solo_vende_los_titulos_libres() {
+        let (libre, tenido, costo) = (d("0.3521"), d("0.7752"), d("1249.93"));
+        // El costo promedio es sobre todo lo que tiene, comprometido incluido.
+        assert_eq!(
+            venta(d("100"), d(ORO), 4, libre, tenido, costo),
+            Ok(ejecucion("0.0620", "99.97", Some("99.96860165")))
+        );
+        // Los libres valen 567.726040: 567.72 o 567.73 los venden todos, y nada más.
+        let libres = ejecucion("0.3521", "567.73", Some("567.72491357"));
+        assert_eq!(venta(d("567.72"), d(ORO), 4, libre, tenido, costo), Ok(libres), "piso");
+        assert_eq!(venta(d("567.73"), d(ORO), 4, libre, tenido, costo), Ok(libres), "techo");
+        assert_eq!(venta(d("600"), d(ORO), 4, libre, tenido, costo), Err(Rechazo::PosicionInsuficiente));
+        assert_eq!(venta(d("100"), d(ORO), 4, d("0"), tenido, costo), Err(Rechazo::TitulosComprometidos));
+    }
+
+    #[test]
+    fn la_venta_de_una_pendiente_vende_exactamente_sus_titulos() {
+        // 0.2941 g a 1 710 de una posición de 1.4993 g que costó 2 399.86139835.
+        assert_eq!(
+            venta_de_titulos(d("0.2941"), d("1710"), d("1.4993"), d("2399.86139835")),
+            Ok(ejecucion("0.2941", "502.91", Some("470.75250934")))
+        );
+        // Todos sus títulos: todo el costo.
+        assert_eq!(
+            venta_de_titulos(d("0.1290"), d("1540"), d("0.1290"), d("207.13")),
+            Ok(ejecucion("0.1290", "198.66", Some("207.13")))
+        );
+        assert_eq!(
+            venta_de_titulos(d("0.5"), d(ORO), d("0.4"), d("1")),
+            Err(Rechazo::PosicionInsuficiente),
+            "más de lo que tiene"
+        );
+        // Un importe de 0.00 no se puede registrar.
+        assert_eq!(venta_de_titulos(d("0.0001"), d("1"), d("1"), d("1")), Err(Rechazo::MontoInsuficiente));
     }
 
     #[test]

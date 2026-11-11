@@ -7,10 +7,12 @@
 //! - Monitoreo PLD por lotes ([`aml::monitoreo`]): reglas de 7 y 30 días y de
 //!   redes entre clientes, reevaluación de marcas diferidas, plazos de
 //!   cumplimiento, sellado de la bitácora y entrega de notificaciones.
+//! - Motor de disparo del mercado ([`mercado::pendiente::disparar`]): ejecuta
+//!   las órdenes límite y stop que el precio vigente alcanzó.
 
 use std::time::Duration;
 
-use crate::{aml, reserva, sofom, spei, state::AppState};
+use crate::{aml, mercado, reserva, sofom, spei, state::AppState};
 
 pub fn lanzar(estado: AppState) {
     let (corte_seg, liquidacion_seg) = (estado.config.corte_intervalo_seg, estado.config.liquidacion_intervalo_seg);
@@ -66,6 +68,32 @@ pub fn lanzar(estado: AppState) {
                     Ok(_) => {}
                     Err(err) => {
                         tracing::error!(target: "aml", codigo = err.codigo(), error = %err.detalle(), "falló el ciclo de monitoreo AML")
+                    }
+                }
+            }
+        });
+    }
+    let disparo_seg = estado.config.mercado_disparo_intervalo_seg;
+    if disparo_seg > 0 {
+        let e = estado.clone();
+        tokio::spawn(async move {
+            let mut intervalo = tokio::time::interval(Duration::from_secs(disparo_seg));
+            intervalo.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                intervalo.tick().await;
+                match mercado::pendiente::disparar(&e.pool, &e.config).await {
+                    Ok(r) if r.ejecutadas + r.rechazadas + r.errores > 0 => {
+                        tracing::info!(
+                            revisadas = r.revisadas,
+                            ejecutadas = r.ejecutadas,
+                            rechazadas = r.rechazadas,
+                            errores = r.errores,
+                            "motor de disparo del mercado"
+                        )
+                    }
+                    Ok(_) => {}
+                    Err(err) => {
+                        tracing::error!(codigo = err.codigo(), error = %err.detalle(), "falló el motor de disparo del mercado")
                     }
                 }
             }
