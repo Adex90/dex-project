@@ -1335,6 +1335,23 @@ available, so Session Manager itself was not exercised. Everything around it was
 - **Backend:** rustfmt and clippy `-D warnings` clean; 314 tests passed, 0 failed.
   hadolint, actionlint and ShellCheck (with the CI settings) are clean.
 
+**Pro chart and portfolio allocation** (frontend only, no migration):
+
+- **Frontend:** typecheck, lint, 236 unit tests (22 new: candles from the
+  quote's history, simulated wicks and volume, exact grouping, each range's
+  window and time axis, run in six time zones; the allocation's parts, Other,
+  and shares that add up to 100.00 %) and `next build`.
+- **End to end** on a fresh stack: smoke 165 checks and AML console 123
+  checks. The new smoke checks cover:
+  - the asset chart as a line and as candles, the crosshair's price matching
+    the headline and the candle's prices in the legend;
+  - keyboard reading, the candle period of each range, and the chart type
+    remembered on the next asset's page;
+  - the Vault's allocation against the shares the vault's own figures give,
+    following a deposit and a buy live;
+  - the chart on a phone, without sideways scroll.
+- **Backend:** unchanged (373 tests).
+
 **Open orders and limit and stop orders in the checkout** (frontend only, no migration):
 
 - **Frontend:** typecheck, lint, 214 unit tests (13 new: how an order is
