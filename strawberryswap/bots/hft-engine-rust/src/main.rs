@@ -696,8 +696,8 @@ nothing is read from or sent to any chain.
   --calibration PATH  the Python lab's calibration.json (its `engine` block); default: mock parameters
   --ticks N           stop after N ticks (default: run until Ctrl-C)
   --mid PRICE         starting mid of the mock oracle (default: 2)
-  --lot TOKENS        quote size in token0; the cap is ten lots (default: 100). γ is per token0, so use
-                      the lot the calibration was run with (the lab's --lot, 1 by default)
+  --lot TOKENS        quote size in token0; the cap is ten lots (default: 1, as in the lab). γ is per
+                      token0, so this must be the lot the calibration was run with (the lab's --lot)
   --seed N            seed of the mock oracle and venue (default: 7)";
 
 struct Args {
@@ -715,7 +715,7 @@ impl Args {
             calibration: None,
             ticks: None,
             mid: 2.0,
-            lot: wad("100"),
+            lot: wad("1"),
             seed: 7,
         };
         while let Some(flag) = it.next() {

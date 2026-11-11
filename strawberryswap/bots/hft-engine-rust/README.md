@@ -8,7 +8,7 @@ contracts.
 ```bash
 cargo test                                  # 19 tests, offline
 cargo run --release -- --ticks 50           # 5 s of quoting against the mocks
-cargo run --release -- --calibration ../../hft-engine/python-sim/results/<run>/calibration.json --mid 100 --lot 1
+cargo run --release -- --calibration ../../hft-engine/python-sim/results/<run>/calibration.json --mid 100
 ```
 
 | flag | meaning |
@@ -16,7 +16,7 @@ cargo run --release -- --calibration ../../hft-engine/python-sim/results/<run>/c
 | `--calibration PATH` | the `engine` block of a `calibration.json` written by the lab's `run_sim.py`; default: mock parameters |
 | `--ticks N` | stop after N ticks (default: run until Ctrl-C) |
 | `--mid PRICE` | starting mid of the mock oracle (default 2) |
-| `--lot TOKENS` | quote size in token0, the cap is ten lots (default 100) |
+| `--lot TOKENS` | quote size in token0, the cap is ten lots (default 1, the lab's default) |
 | `--seed N` | seed of the mocks (default 7); a run is reproducible for a seed |
 
 ## Model
@@ -37,8 +37,9 @@ quotes                 bid = min(r − δ/2, s),  ask = max(r + δ/2, s),  round
 | κ | 1 / price | `kappa` |
 
 γ is per token0 of inventory, as the lab's simulator applies it. Run the engine with the lot the calibration was made
-with (the lab's `--lot`, 1 by default). A 100-token lot with a γ calibrated on 1-token lots skews r a hundred times
-harder per fill.
+with: the lab's `--lot`, which defaults to 1, as the engine's `--lot` does. A 100-token lot with a γ calibrated on
+1-token lots skews r a hundred times harder per fill. A γ also belongs to the σ², κ and τ of its own calibration run
+(γ* = 1/(κσ²τ̄)), so it is loaded with them from the same `calibration.json`, never on its own.
 
 ## One tick
 
