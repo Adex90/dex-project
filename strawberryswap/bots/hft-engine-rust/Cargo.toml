@@ -5,7 +5,7 @@ edition = "2024"
 # The toolchain CI and the backend build with. It also steers Cargo's MSRV-aware resolver: an older value would make
 # it prefer older dependency releases.
 rust-version = "1.97"
-description = "StrawberrySwap HFT execution engine: Avellaneda–Stoikov quoting on a 100 ms tokio loop"
+description = "StrawberrySwap HFT execution engine: Avellaneda–Stoikov on a 100 ms tokio loop, rebalancing DarkPool through transactions the threshold vault signs"
 publish = false
 
 [[bin]]
@@ -15,16 +15,22 @@ path = "src/main.rs"
 [dependencies]
 # HTTP JSON-RPC provider (rustls, no OpenSSL), sol!-generated contract bindings and the RPC types, for the live reads
 # that replace the mocks. On-chain fixed-point types (U256, I256) and unit conversions come from alloy-primitives.
-# No local signer: signing will go through the threshold vault (mpc/tss-vault), never a private key in this process.
+# consensus and eips: the EIP-1559 transaction, its signing payload, and the decoding of the signed transaction the
+# vault returns; k256: signature recovery, to check that reply. No signer crate (alloy's signer-local, keystore and
+# mnemonic features stay off): signing goes through the threshold vault (vaults/threshold-signer), never a key here.
 alloy = { version = "2.5.0", default-features = false, features = [
     "std",
+    "consensus",
     "contract",
+    "eips",
+    "k256",
     "provider-http",
     "reqwest-rustls-tls",
     "rpc-types",
 ] }
-# One task on a current-thread runtime: the tick loop never crosses threads, so its state needs no locks.
-tokio = { version = "1.54.1", features = ["rt", "macros", "time", "signal"] }
+# One task on a current-thread runtime: the tick loop never crosses threads, so its state needs no locks. net and
+# io-util: the vault's Unix socket.
+tokio = { version = "1.54.1", features = ["rt", "macros", "time", "signal", "net", "io-util"] }
 # Reads the `engine` block of the Python lab's calibration.json. float_roundtrip: serde_json's default float parser
 # is approximate (it reads the lab's σ² 0.00039623631218582077 one ulp off); with it, every number is correctly rounded,
 # so a calibration loads bit for bit as the lab wrote it.
@@ -33,7 +39,13 @@ serde_json = { version = "1.0.154", features = ["float_roundtrip"] }
 
 [dev-dependencies]
 # Paused virtual time: the loop tests run hours of 100 ms ticks in milliseconds, deterministically.
-tokio = { version = "1.54.1", features = ["rt", "macros", "time", "signal", "test-util"] }
+tokio = { version = "1.54.1", features = ["rt", "macros", "time", "signal", "net", "io-util", "test-util"] }
+# The loop tests' stand-in for the vault: it signs in process with the end-to-end tests' public key. Tests only (a
+# dev-dependency is never linked into the engine binary), and no new crate: alloy already brings k256 0.13 for the
+# signature recovery.
+k256 = { version = "0.13.4", default-features = false, features = ["ecdsa"] }
+# The end-to-end test's memory scan (tests/vault_e2e.rs). Already in the graph (through serde_json and hyper).
+memchr = "2.8.3"
 
 [profile.release]
 # Integer overflow panics in release too: a wrapped amount must never reach a quote.

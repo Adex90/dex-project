@@ -164,6 +164,7 @@ dependencies = [
  "alloy-primitives",
  "alloy-rlp",
  "borsh",
+ "k256",
  "serde",
  "thiserror",
 ]
@@ -1998,6 +1999,8 @@ name = "hft-engine-rust"
 version = "0.1.0"
 dependencies = [
  "alloy",
+ "k256",
+ "memchr",
  "serde",
  "serde_json",
  "tokio",
