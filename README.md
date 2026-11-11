@@ -1080,8 +1080,10 @@ nothing they show is sent to the backend.
     so paying this yield needs a structure the licence allows first
     (`docs/FRONTEND_ROADMAP.md`, "Licensing scope").
 - **Debit card** (`frontend/src/components/wealth/card-management.tsx`): the
-  card face (pure black, square, the number masked until issued), Freeze, Show
-  PIN (a 10-second window; a preview card has no PIN yet), Settings (online,
+  card face (pure black, square, the number masked until issued), Lock (never
+  "freeze": client screens must not use the words of an AML hold, which
+  `frontend/e2e/aml.mjs` checks), Show PIN (a 10-second window; a preview card
+  has no PIN yet), Settings (online,
   contactless, ATM, abroad) and a Saveback tracker (1 % of card payments up to
   $300.00 a month, on simulated spending). The state lives in
   `frontend/src/store/card.ts` and resets on sign-out.

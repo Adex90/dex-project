@@ -237,16 +237,17 @@ what the module waits on. They do not change its scope.
 - [x] **14. Card Management** (Virtual card UI, freeze, PIN, Apple/Google Wallet)
   - On the Account tab (`components/wealth/card-management.tsx`): the card
     face (pure black and square, the gold mark, a minimal chip, the number
-    masked until issued, the holder's name as a card carries it). Freeze is
-    a toggle that frosts the card and stays gold while on; Show PIN opens
+    masked until issued, the holder's name as a card carries it). Lock is a
+    toggle that frosts the card and stays gold while on ("lock", never
+    "freeze": client screens must not use AML hold words); Show PIN opens
     the PIN's place for 10 seconds (a preview card has none yet); Settings
     turns the card's uses on and off (online, contactless, ATM, abroad). A
     Saveback tracker shows 1 % of card payments toward a $300.00 monthly
     cap, on simulated spending. State in `store/card.ts`, reset on sign-out.
   - A preview, labelled as such: no card is issued and nothing is sent.
-    Smoke e2e covers freeze (kept across tabs), the PIN's place closing by
+    Smoke e2e covers the lock (kept across tabs), the PIN's place closing by
     itself, the settings and the phone layout.
-  - Left: a card issuing processor (the number, the PIN, freezing and the
+  - Left: a card issuing processor (the number, the PIN, locking and the
     uses through its API). Adding a card to Apple or Google Wallet from
     inside the app needs native apps; a web app cannot do it.
 - [ ] **15. Round-up & Saveback** (Cashback tracking and spare change investing)

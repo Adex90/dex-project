@@ -9,7 +9,7 @@ const card = () => useCardStore.getState();
 beforeEach(() => card().reset());
 
 test("the card starts active, online, contactless and ATM on, abroad off", () => {
-  assert.equal(card().frozen, false);
+  assert.equal(card().locked, false);
   assert.deepEqual(card().uses, { online: true, contactless: true, atm: true, abroad: false });
   assert.deepEqual(
     CARD_USES.map((use) => use.key),
@@ -17,16 +17,16 @@ test("the card starts active, online, contactless and ATM on, abroad off", () =>
   );
 });
 
-test("freeze toggles; uses change one at a time; reset brings the defaults back", () => {
-  card().toggleFrozen();
-  assert.equal(card().frozen, true);
+test("lock toggles; uses change one at a time; reset brings the defaults back", () => {
+  card().toggleLocked();
+  assert.equal(card().locked, true);
   card().setUse("abroad", true);
   card().setUse("atm", false);
   assert.deepEqual(card().uses, { online: true, contactless: true, atm: false, abroad: true });
-  card().toggleFrozen();
-  assert.equal(card().frozen, false);
-  card().toggleFrozen();
+  card().toggleLocked();
+  assert.equal(card().locked, false);
+  card().toggleLocked();
   card().reset();
-  assert.equal(card().frozen, false);
+  assert.equal(card().locked, false);
   assert.deepEqual(card().uses, { online: true, contactless: true, atm: true, abroad: false });
 });

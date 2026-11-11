@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useId, useState, type ComponentType } from "react";
-import { KeyRound, Nfc, Settings2, Snowflake } from "lucide-react";
+import { KeyRound, Lock, LockOpen, Nfc, Settings2 } from "lucide-react";
 
 import { BrandMark } from "@/components/brand";
 import { useDashboard } from "@/components/layout/dashboard-shell";
@@ -19,9 +19,10 @@ import { CARD_USES, useCardStore, type CardUse } from "@/store/card";
  * - The card face: pure black and square, the mark and wordmark in gold, a
  *   minimal chip, the contactless sign, the number masked, and the holder's
  *   name as a card carries it (`cardholderName`).
- * - Freeze: a toggle. A frozen card is frosted over and says so, and the
- *   button stays gold (pressed) until it is unfrozen. Screen readers hear the
- *   new state.
+ * - Lock: a toggle. A locked card is frosted over and says so, and the
+ *   button stays gold (pressed) until it is unlocked. Screen readers hear the
+ *   new state. "Lock", never "freeze": the client's screens must not use the
+ *   words of an AML hold, which is never disclosed (store/card.ts).
  * - Show PIN: opens the PIN's place for 10 seconds, the time a PIN shows
  *   for; a preview card has none yet, and says so.
  * - Settings: what the card may be used for (online, contactless, ATM,
@@ -41,8 +42,8 @@ export function CardManagement({ className }: { className?: string }) {
   const pinId = useId();
   const settingsId = useId();
   const { client } = useDashboard();
-  const frozen = useCardStore((s) => s.frozen);
-  const toggleFrozen = useCardStore((s) => s.toggleFrozen);
+  const locked = useCardStore((s) => s.locked);
+  const toggleLocked = useCardStore((s) => s.toggleLocked);
   const [pinOpen, setPinOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   // Stable, so the PIN's countdown is not restarted by a render of this section.
@@ -70,26 +71,26 @@ export function CardManagement({ className }: { className?: string }) {
 
       <div className="mt-5 flex flex-col gap-6 @2xl:flex-row @2xl:items-start">
         <div className="w-full max-w-sm shrink-0 @2xl:w-80">
-          <CardFace holder={holder} frozen={frozen} />
+          <CardFace holder={holder} locked={locked} />
           <p
             role="status"
-            className={cx("mt-3 flex items-center gap-2 text-xs", frozen ? "text-ink" : "text-muted")}
+            className={cx("mt-3 flex items-center gap-2 text-xs", locked ? "text-ink" : "text-muted")}
             data-testid="card-status"
           >
-            <span aria-hidden className={cx("size-2", frozen ? "bg-info" : "bg-gain")} />
-            {frozen ? "Frozen: payments are declined until you unfreeze it." : "Active: payments allowed."}
+            <span aria-hidden className={cx("size-2", locked ? "bg-ink-2" : "bg-gain")} />
+            {locked ? "Locked: payments are declined until you unlock it." : "Active: payments allowed."}
           </p>
         </div>
 
         <div className="min-w-0 flex-1 space-y-4">
           <div className="grid grid-cols-3 gap-2">
             <Action
-              icon={Snowflake}
-              label={frozen ? "Unfreeze" : "Freeze"}
-              on={frozen}
-              aria={{ "aria-pressed": frozen }}
-              onClick={toggleFrozen}
-              testId="card-freeze"
+              icon={locked ? LockOpen : Lock}
+              label={locked ? "Unlock" : "Lock"}
+              on={locked}
+              aria={{ "aria-pressed": locked }}
+              onClick={toggleLocked}
+              testId="card-lock"
             />
             <Action
               icon={KeyRound}
@@ -120,16 +121,16 @@ export function CardManagement({ className }: { className?: string }) {
 /* ------------------------------------------------------------------------ */
 
 /** The card itself: pure black, square, ID-1 proportions (85.60 × 53.98 mm). */
-function CardFace({ holder, frozen }: { holder: string; frozen: boolean }) {
+function CardFace({ holder, locked }: { holder: string; locked: boolean }) {
   return (
     <div
       className={cx(
         "@container relative aspect-[1.586] w-full overflow-hidden border border-border-strong/50 bg-black select-none",
         "transition-[filter] duration-500",
-        frozen && "grayscale",
+        locked && "grayscale",
       )}
       data-testid="card-face"
-      data-frozen={frozen}
+      data-locked={locked}
     >
       {/* A gold hairline along the top edge, as on the vault's balance. */}
       <span
@@ -164,11 +165,11 @@ function CardFace({ holder, frozen }: { holder: string; frozen: boolean }) {
           </p>
         </div>
       </div>
-      {frozen ? (
+      {locked ? (
         <div className="absolute inset-0 grid place-items-center bg-black/55 backdrop-blur-[2px]">
           <span className="inline-flex items-center gap-2 border border-ink/40 bg-black/70 px-3 py-1.5 text-xs font-semibold tracking-[0.24em] text-ink uppercase">
-            <Snowflake className="size-4" aria-hidden />
-            Frozen
+            <Lock className="size-4" aria-hidden />
+            Locked
           </span>
         </div>
       ) : null}

@@ -2,8 +2,12 @@
 
 /**
  * Card store: the state of the Synthetic Capital debit card on the Account
- * tab (components/wealth/card-management.tsx), frozen or not, and what it
+ * tab (components/wealth/card-management.tsx), locked or not, and what it
  * may be used for.
+ *
+ * "Lock", never "freeze": the client's screens must not use the words of an
+ * AML hold (a preventive freeze is never disclosed: e2e/aml.mjs checks every
+ * client page for them).
  *
  * A preview: no card issuer is connected, so nothing here is sent anywhere.
  * The choices outlive the page (back from another tab they are as they were
@@ -24,21 +28,21 @@ export const CARD_USES: readonly { key: CardUse; label: string; detail: string }
 ];
 
 export interface CardFields {
-  frozen: boolean;
+  locked: boolean;
   uses: Readonly<Record<CardUse, boolean>>;
 }
 
 export interface CardActions {
-  toggleFrozen: () => void;
+  toggleLocked: () => void;
   setUse: (use: CardUse, on: boolean) => void;
   reset: () => void;
 }
 
-const INITIAL: CardFields = { frozen: false, uses: { online: true, contactless: true, atm: true, abroad: false } };
+const INITIAL: CardFields = { locked: false, uses: { online: true, contactless: true, atm: true, abroad: false } };
 
 export const useCardStore = create<CardFields & CardActions>()((set) => ({
   ...INITIAL,
-  toggleFrozen: () => set((state) => ({ frozen: !state.frozen })),
+  toggleLocked: () => set((state) => ({ locked: !state.locked })),
   setUse: (use, on) => set((state) => ({ uses: { ...state.uses, [use]: on } })),
   reset: () => set({ ...INITIAL }),
 }));

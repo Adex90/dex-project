@@ -959,26 +959,26 @@ try {
       `Sovereign Yield, a preview at 7.25 %, ticks up live on the 15,000.00 available ($${firstReading} → $${secondReading}, $3.02 a day)`,
     );
 
-    // The debit card, a preview: freeze (kept across tabs), the PIN's place, settings, saveback.
+    // The debit card, a preview: lock (kept across tabs), the PIN's place, settings, saveback.
     const cardFace = page.getByTestId("card-face");
     check(
       /^[A-Z][A-Z .'-]+$/.test(await page.getByTestId("card-holder").innerText()) &&
         (await page.getByTestId("card-number").innerText()).includes("•••• •••• •••• ••••"),
       "the card carries the holder's name in capitals, and no number until it is issued",
     );
-    await page.getByTestId("card-freeze").click();
-    await cardFace.and(page.locator("[data-frozen=true]")).waitFor();
+    await page.getByTestId("card-lock").click();
+    await cardFace.and(page.locator("[data-locked=true]")).waitFor();
     check(
-      (await page.getByTestId("card-freeze").getAttribute("aria-pressed")) === "true" &&
-        (await page.getByTestId("card-status").innerText()).startsWith("Frozen"),
-      "Freeze frosts the card over, keeps its button pressed and says payments are declined",
+      (await page.getByTestId("card-lock").getAttribute("aria-pressed")) === "true" &&
+        (await page.getByTestId("card-status").innerText()).startsWith("Locked"),
+      "Lock frosts the card over, keeps its button pressed and says payments are declined",
     );
     await openTab(page, "Vault");
     await openTab(page, "Account");
-    await cardFace.and(page.locator("[data-frozen=true]")).waitFor();
-    check(true, "the card is still frozen back from another tab");
-    await page.getByTestId("card-freeze").click();
-    await cardFace.and(page.locator("[data-frozen=false]")).waitFor();
+    await cardFace.and(page.locator("[data-locked=true]")).waitFor();
+    check(true, "the card is still locked back from another tab");
+    await page.getByTestId("card-lock").click();
+    await cardFace.and(page.locator("[data-locked=false]")).waitFor();
     await page.getByTestId("card-pin").click();
     const pinPanel = page.getByTestId("card-pin-panel");
     await pinPanel.waitFor();
