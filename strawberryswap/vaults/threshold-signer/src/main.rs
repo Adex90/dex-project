@@ -14,6 +14,13 @@
 
 #![forbid(unsafe_code)]
 
+// The insecure-test-key feature lets the end-to-end tests give the vault a key they know, so that they can look for it
+// in process memory. It must never reach a deployable binary, so optimized builds refuse to compile with it.
+#[cfg(all(feature = "insecure-test-key", not(debug_assertions)))]
+compile_error!(
+    "the insecure-test-key feature loads the key from a file: it is for the end-to-end tests and is refused in optimized builds"
+);
+
 use std::fmt;
 use std::fs;
 use std::future::Future;
@@ -376,6 +383,30 @@ impl Vault {
 // The socket
 // ---------------------------------------------------------------------------------------------------------------------
 
+/// Reads a test key: 32 bytes as 64 hex digits (an optional 0x prefix), from a file only its owner can read.
+#[cfg(feature = "insecure-test-key")]
+fn load_test_key(path: &Path) -> io::Result<PrivateKeySigner> {
+    let meta = fs::metadata(path)?;
+    if meta.mode() & 0o077 != 0 {
+        return Err(invalid(format!(
+            "{}: a key file must be readable by its owner only (0600)",
+            path.display()
+        )));
+    }
+    let text = fs::read_to_string(path)?;
+    let digits = text.trim();
+    let digits = digits.strip_prefix("0x").unwrap_or(digits);
+    let bytes: B256 = digits
+        .parse()
+        .map_err(|_| invalid(format!("{}: expected 64 hex digits", path.display())))?;
+    PrivateKeySigner::from_bytes(&bytes).map_err(|e| {
+        invalid(format!(
+            "{}: not a valid secp256k1 key: {e}",
+            path.display()
+        ))
+    })
+}
+
 /// The uid this process runs as. /proc/self is owned by it (Linux; no libc call, so no unsafe code).
 fn own_uid() -> io::Result<u32> {
     Ok(fs::metadata("/proc/self")?.uid())
@@ -593,6 +624,8 @@ struct Args {
     max_gas: u64,
     max_fee_gwei: u64,
     signs_per_sec: u32,
+    #[cfg(feature = "insecure-test-key")]
+    test_key_file: Option<PathBuf>,
 }
 
 impl Args {
@@ -611,6 +644,8 @@ impl Args {
             max_gas: 1_000_000,
             max_fee_gwei: 500,
             signs_per_sec: 20,
+            #[cfg(feature = "insecure-test-key")]
+            test_key_file: None,
         };
         while let Some(flag) = it.next() {
             if flag == "-h" || flag == "--help" {
@@ -637,6 +672,8 @@ impl Args {
                 "--max-gas" => args.max_gas = number(&flag, &value)?,
                 "--max-fee-gwei" => args.max_fee_gwei = number(&flag, &value)?,
                 "--max-signs-per-sec" => args.signs_per_sec = number(&flag, &value)?,
+                #[cfg(feature = "insecure-test-key")]
+                "--insecure-test-key-file" => args.test_key_file = Some(PathBuf::from(value)),
                 other => return Err(Some(format!("unknown argument {other}"))),
             }
         }
@@ -660,6 +697,10 @@ async fn main() -> ExitCode {
         Ok(args) => args,
         Err(None) => {
             println!("{USAGE}");
+            #[cfg(feature = "insecure-test-key")]
+            println!(
+                "  --insecure-test-key-file PATH  INSECURE: the key from PATH (0600); end-to-end tests only"
+            );
             return ExitCode::SUCCESS;
         }
         Err(Some(message)) => {
@@ -687,7 +728,30 @@ async fn main() -> ExitCode {
     };
 
     // MOCK key: generated here, held only by the signer (k256 zeroizes it on drop), never logged or stored.
-    let signer = PrivateKeySigner::random();
+    const MOCK_KEY: &str = "MOCK key, generated in memory at start and never stored";
+    #[cfg(not(feature = "insecure-test-key"))]
+    let (signer, key_origin) = (PrivateKeySigner::random(), MOCK_KEY.to_string());
+    #[cfg(feature = "insecure-test-key")]
+    let (signer, key_origin) = match args.test_key_file.as_deref() {
+        None => (PrivateKeySigner::random(), MOCK_KEY.to_string()),
+        Some(path) => match load_test_key(path) {
+            Ok(signer) => {
+                eprintln!(
+                    "WARNING: INSECURE TEST KEY loaded from {}: end-to-end tests only, never a deployment",
+                    path.display()
+                );
+                let origin = format!(
+                    "INSECURE TEST KEY from {} (end-to-end tests only)",
+                    path.display()
+                );
+                (signer, origin)
+            }
+            Err(e) => {
+                eprintln!("error: {e}");
+                return ExitCode::FAILURE;
+            }
+        },
+    };
     let address = signer.address();
     let vault = Arc::new(Vault::new(
         policy.clone(),
@@ -703,9 +767,7 @@ async fn main() -> ExitCode {
         }
     };
 
-    println!(
-        "threshold-signer: MOCK key, generated in memory at start and never stored; signer {address}"
-    );
+    println!("threshold-signer: {key_origin}; signer {address}");
     println!(
         "policy: chain {} · to {} · {REBALANCE} [{}] only, never sweep · gas ≤ {} · max fee ≤ {} gwei · ≤ {} signatures/s",
         policy.chain_id,
@@ -1214,6 +1276,32 @@ mod tests {
             vault.handle(request.to_string().as_bytes()).await["error"]["code"],
             "rate_limited"
         );
+    }
+
+    #[cfg(feature = "insecure-test-key")]
+    #[test]
+    fn a_test_key_file_must_be_private_and_well_formed() {
+        let dir = TempDir::new("testkey");
+        fs::create_dir_all(&dir.0).unwrap();
+        let path = dir.0.join("key");
+        // The end-to-end tests' key: keccak256 of a public phrase, so no key literal is stored anywhere. Its address
+        // was computed independently with viem (privateKeyToAccount).
+        let key = keccak256("strawberryswap insecure test key: end-to-end tests only");
+        fs::write(&path, format!("{key}\n")).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(
+            load_test_key(&path)
+                .unwrap_err()
+                .to_string()
+                .contains("0600")
+        );
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(
+            load_test_key(&path).unwrap().address(),
+            address!("0xf8e44d4517A0de6610113165659DaAd8cF9327B2")
+        );
+        fs::write(&path, "not hex").unwrap();
+        assert!(load_test_key(&path).is_err());
     }
 
     #[test]
