@@ -215,11 +215,14 @@ jobs:
 
   # ---------------------------------------------------------------------------
   # StrawberrySwap's market-making engine (strawberryswap/bots/hft-engine-rust):
-  # the Avellaneda–Stoikov closed forms against the Python lab's golden vectors
-  # and the 100 ms tokio loop on paused virtual time, then 30 real ticks of the
-  # release binary against its mock data sources (no network, no keys).
+  # the Avellaneda–Stoikov closed forms against the Python lab's golden vectors,
+  # the curve planner against the C++ engine's, the 100 ms loop on paused
+  # virtual time, and end to end against the real threshold signer on a
+  # temporary socket: every broadcast transaction must recover to the vault, and
+  # the engine's memory is scanned for the vault's (test) key. Then 30 ticks of
+  # the release binary with no vault: it must withdraw, never send.
   hft-engine:
-    name: HFT engine (Rust; fmt, clippy, tests, run)
+    name: HFT engine (Rust; fmt, clippy, tests, end to end with the vault, run)
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     defaults:
@@ -241,7 +244,9 @@ jobs:
       - name: Restore the Cargo cache
         uses: Swatinem/rust-cache@v2
         with:
-          workspaces: strawberryswap/bots/hft-engine-rust -> target
+          workspaces: |
+            strawberryswap/bots/hft-engine-rust -> target
+            strawberryswap/vaults/threshold-signer -> target
 
       # fmt, clippy, tests and the run are independent: one failure does not hide the others.
       - name: cargo fmt --check
@@ -252,13 +257,25 @@ jobs:
         if: ${{ !cancelled() && steps.rust.outcome == 'success' }}
         run: cargo clippy --all-targets --locked -- -D warnings
 
-      - name: cargo test
+      # The end-to-end tests run this binary (tests/vault_e2e.rs; without the variable they build it themselves).
+      # The feature gives the vault a key the tests know, so that they can look for it in memory; it is debug-only.
+      - name: Build the threshold signer for the end-to-end tests (debug, insecure-test-key)
         if: ${{ !cancelled() && steps.rust.outcome == 'success' }}
-        run: cargo test --locked --no-fail-fast
+        working-directory: strawberryswap/vaults/threshold-signer
+        run: |
+          cargo build --locked --features insecure-test-key
+          echo "THRESHOLD_SIGNER_BIN=$PWD/target/debug/threshold-signer" >> "$GITHUB_ENV"
 
-      - name: Run the engine for 30 ticks (mock data sources)
+      - name: cargo test (unit, and end to end with the vault)
         if: ${{ !cancelled() && steps.rust.outcome == 'success' }}
-        run: cargo run --release --locked -- --ticks 30
+        run: cargo test --locked --no-fail-fast -- --nocapture
+
+      - name: Run the release engine for 30 ticks with no vault (it must withdraw, never send)
+        if: ${{ !cancelled() && steps.rust.outcome == 'success' }}
+        run: |
+          cargo run --release --locked -- --ticks 30 --vault-socket "$RUNNER_TEMP/no-vault/vault.sock" > engine.log
+          cat engine.log
+          grep -Eq '^summary ticks=30 .* sent=0 ' engine.log
 
   # ---------------------------------------------------------------------------
   # The signer daemon (strawberryswap/vaults/threshold-signer): the transaction
@@ -296,11 +313,25 @@ jobs:
 
       - name: cargo clippy
         if: ${{ !cancelled() && steps.rust.outcome == 'success' }}
-        run: cargo clippy --all-targets --locked -- -D warnings
+        run: |
+          cargo clippy --all-targets --locked -- -D warnings
+          cargo clippy --all-targets --locked --features insecure-test-key -- -D warnings
 
       - name: cargo test
         if: ${{ !cancelled() && steps.rust.outcome == 'success' }}
-        run: cargo test --locked --no-fail-fast
+        run: |
+          cargo test --locked --no-fail-fast
+          cargo test --locked --no-fail-fast --features insecure-test-key
+
+      # The test-key feature must never reach a deployable binary: an optimized build with it must fail to compile.
+      - name: insecure-test-key is refused in optimized builds
+        if: ${{ !cancelled() && steps.rust.outcome == 'success' }}
+        run: |
+          if cargo check --release --locked --features insecure-test-key 2> refused.log; then
+            echo "::error::an optimized build with insecure-test-key compiled"
+            exit 1
+          fi
+          grep -q 'refused in optimized builds' refused.log
 
   # ---------------------------------------------------------------------------
   sql-suites:

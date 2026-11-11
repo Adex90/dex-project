@@ -53,7 +53,7 @@ strawberryswap/
 │   └── src/{app/{,trade},components,hooks,lib,styles}
 ├── bots/
 │   ├── automator/                  # Go relayer: intents → batch → proof → settleBatch; Tor-only metadata layer
-│   ├── hft-engine-rust/            # A-S execution engine: 100 ms tokio loop, alloy (iteration 0: mock chain)
+│   ├── hft-engine-rust/            # A-S execution engine: 100 ms loop, curve planner, vault-signed txs (iteration 1: mock chain)
 │   ├── searcher-rust/              # (reserved) production RPC / signer adapters
 │   └── inventory-cpp/              # Searcher core: LOB signals, Avellaneda–Stoikov, curve planner (C++20)
 ├── vaults/threshold-signer/        # signer daemon for the HFT engine: Unix socket, strict policy (iteration 0: mock key)
@@ -222,26 +222,34 @@ A mobile-first rebuild of the UI (presentation only: every hook, ABI, `lib/` and
   are native `<select>`s, tabs are ARIA tablists, and motion stops under `prefers-reduced-motion`. Skeletons are sized like
   the data they stand in for, so content fades in without layout shift.
 
-## HFT execution engine (Rust), iteration 0
+## HFT execution engine (Rust), iteration 1
 
-`bots/hft-engine-rust/` ports the Python lab's Avellaneda–Stoikov closed forms (`hft-engine/python-sim/as_sim/model.py`)
-to Rust, on a 100 ms tokio loop. The parameters are the `engine` block of the lab's `calibration.json`.
+`bots/hft-engine-rust/` runs the market-making loop end to end, every 100 ms:
 
-* **Mock data only.** It reads mock data sources shaped like the live calls: the zk oracle's `(price, updatedAt)` and
-  the executor's token0 balance. Nothing touches a chain.
-* **Matches the lab.** Golden vectors from the lab's own code agree to within 1 ulp, bit-identical in all but one case.
-* **Safe and clean.** `forbid(unsafe_code)`; valgrind memcheck is clean.
+1. Quote with the Python lab's Avellaneda–Stoikov closed forms, using the `engine` block of `calibration.json`.
+2. Size a DarkPool rebalance with the C++ engine's curve planner, ported bit for bit.
+3. Build the unsigned EIP-1559 `SearcherExecutor.rebalance` transaction.
+4. Have it signed by the threshold signer over its Unix socket, within a deadline.
+5. Check the signed transaction and broadcast it.
 
-The crate's README covers the guards, the verification and the wiring plan (oracle and balance reads through alloy;
-quotes into the curve planner and `SearcherExecutor.rebalance`, as in `bots/inventory-cpp`).
+* **No key in the engine.** A late, refused or mismatched signature withdraws the rebalance. End-to-end tests run the
+  engine against the real vault. They recover every broadcast transaction to the vault's address and scan the
+  engine's memory for the vault's test key: it is not there, while the same scan finds it in the vault.
+* **The chain is a mock.** It is the C++ SimChain behind a real transaction boundary: signed EIP-1559 only, the sender
+  recovered, the nonce consumed and the operator enforced.
+* **Matches the references.**
+  * Planner: bit-identical to the C++ on 311 golden cases.
+  * A-S: within 1 ulp of the lab.
+* **Safe and clean.** `forbid(unsafe_code)`; valgrind memcheck shows no errors.
 
 ```bash
-cd bots/hft-engine-rust && cargo test && cargo run --release -- --ticks 50
+cd bots/hft-engine-rust && cargo test     # unit tests, plus end to end with the vault binary
 ```
 
 ## Threshold signer (Rust), iteration 0
 
-`vaults/threshold-signer/` is the daemon that signs for the HFT engine, so that the engine never holds a key.
+`vaults/threshold-signer/` is the daemon that signs for the HFT engine, so that the engine never holds a key. The
+engine routes every rebalance through it.
 
 * **The exchange.** The engine sends an unsigned EIP-1559 transaction over a local Unix socket. The vault decodes it,
   checks it and returns the signature and the signed transaction.

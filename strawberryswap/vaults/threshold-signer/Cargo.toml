@@ -29,6 +29,12 @@ tokio = { version = "1.54.1", features = ["rt", "macros", "net", "io-util", "tim
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 
+[features]
+# For the end-to-end tests only: --insecure-test-key-file gives the vault a key the test knows, so that the test can
+# look for it in the memory of the vault (positive control) and of the engine (it must not be there). Debug builds
+# only: an optimized build with this feature does not compile.
+insecure-test-key = []
+
 [profile.release]
 # Integer overflow panics in release too.
 overflow-checks = true

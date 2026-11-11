@@ -2,10 +2,12 @@
 
 The vault daemon that signs StrawberrySwap's market-making transactions for the HFT engine (`bots/hft-engine-rust`).
 This is **iteration 0**. The process boundary, the socket's access control and the transaction policy are real. The
-key and the chain-aware parts of the policy are mocked.
+key and the chain-aware parts of the policy are mocked. The engine routes every rebalance through this socket, and
+its end-to-end tests run this binary.
 
 ```bash
 cargo test                                                     # 12 tests, offline
+cargo test --features insecure-test-key                        # 13: also the test-key loader
 cargo run --release -- --chain-id 31337 --executor 0x<SearcherExecutor address>
 ```
 
@@ -108,10 +110,32 @@ One JSON object per line, in each direction.
     with their reason.
   * User `nobody` could not reach the socket (permission denied on the directory).
   * With `--allow-uid 65534`, a root connection was refused by the kernel uid check.
+* **With the engine** (`bots/hft-engine-rust/tests/vault_e2e.rs`, the engine's CI job):
+  * The real engine and this binary run on a temporary socket.
+  * Every transaction the engine broadcasts recovers to this vault's address and is in its audit log.
+  * A policy refusal withdraws the rebalance.
+  * The test key is found in this process's memory, and nowhere in the engine's.
 * **Code checks:**
-  * `#![forbid(unsafe_code)]`, and clippy with `-D warnings`.
+  * `#![forbid(unsafe_code)]`, and clippy with `-D warnings`, with and without the test-key feature.
   * valgrind memcheck on the whole test suite: 0 errors, 0 bytes definitely or indirectly lost.
-  * The CI job "Threshold signer (Rust)" runs fmt, clippy and the tests.
+  * The CI job "Threshold signer (Rust)" runs fmt, clippy and the tests, both ways. It also checks that an optimized
+    build with `insecure-test-key` fails to compile.
+
+## The `insecure-test-key` feature (end-to-end tests only)
+
+The engine's end-to-end tests must show that the vault's key never reaches the engine's memory. For that they need to
+know the key, so they can look for it. With this feature the vault takes `--insecure-test-key-file PATH` and loads the
+key from that file. The file must be readable by its owner only (0600) and hold 64 hex digits.
+
+The tests use keccak256 of a public phrase, `"strawberryswap insecure test key: end-to-end tests only"`. Its address
+is `0xf8e44d4517A0de6610113165659DaAd8cF9327B2`, so no key literal is stored anywhere. The banner and stderr announce
+`INSECURE TEST KEY` when the feature is in use.
+
+Three guards keep this feature away from deployments:
+
+* It is off by default.
+* `compile_error!` rejects it in any optimized build.
+* CI checks that the release build fails.
 
 ## Mocked in this iteration
 
@@ -129,7 +153,9 @@ One JSON object per line, in each direction.
 * **Policy at every co-signer.** Each co-signer enforces the policy independently, so one compromised host cannot sign
   alone. Each also adds chain-aware rules: nonce sequencing, notional limits per window, and a price sanity check
   against the oracle.
-* **Deployment.** Run the engine and the vault as separate users, under systemd hardening:
+* **Deployment.** Run the engine and the vault as separate users. Then the engine cannot read the vault's memory
+  either: `/proc/<pid>/mem` needs the same uid, or CAP_SYS_PTRACE. (The end-to-end test can read it only because it is
+  the vault's parent and runs as the same user.) Add systemd hardening:
   * `PrivateNetwork=yes`, `NoNewPrivileges=yes`, `ProtectSystem=strict`, `MemoryDenyWriteExecute=yes`;
   * `LimitCORE=0`, and no swap or encrypted swap;
   * `RuntimeDirectory=strawberryswap-vault` with `RuntimeDirectoryMode=0750` and a group shared with the engine.
