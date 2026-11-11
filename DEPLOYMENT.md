@@ -1335,6 +1335,20 @@ available, so Session Manager itself was not exercised. Everything around it was
 - **Backend:** rustfmt and clippy `-D warnings` clean; 314 tests passed, 0 failed.
   hadolint, actionlint and ShellCheck (with the CI settings) are clean.
 
+**Open orders and limit and stop orders in the checkout** (frontend only, no migration):
+
+- **Frontend:** typecheck, lint, 214 unit tests (13 new: how an order is
+  described, and the open orders store: validated loads, optimistic cancel,
+  its rollback, the 409 and a stale load) and `next build`.
+- **End to end** on a fresh stack: smoke 152 checks and AML console 123
+  checks. The new smoke checks cover:
+  - a limit buy placed in the checkout, with what it holds before and after;
+  - the order listed on the Vault above the assets, with the cash it holds;
+  - a stop-loss placed on another device appearing there live, newest first;
+  - both cancelled from the list, the cash coming back through the WebSocket;
+  - the rows on a phone, without sideways scroll.
+- **Backend:** unchanged (373 tests).
+
 **Limit and stop orders** (migration `0015`, the polymorphic `POST /api/v1/market/order`,
 `GET /api/v1/market/orders/pending`, `POST /api/v1/market/orders/{id}/cancel`, the trigger engine):
 
