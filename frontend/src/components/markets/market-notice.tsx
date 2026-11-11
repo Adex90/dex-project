@@ -7,7 +7,8 @@ import { cx } from "@/components/ui/primitives";
 /*
  * A full-width state in place of market content: an asset that does not
  * exist, the market not open yet, a search with no match. Square charcoal
- * card, a dashed yellow icon, and at most one way forward (`children`).
+ * card, a dashed yellow icon, and a way forward (`children`): one gold
+ * action, and at most a second one outlined.
  */
 
 export function MarketNotice({
@@ -43,6 +44,13 @@ export function MarketNotice({
 export const NOTICE_ACTION = cx(
   "inline-flex h-11 items-center justify-center bg-synthetic-yellow px-5 text-xs font-bold tracking-[0.2em] text-black uppercase transition-colors",
   "hover:bg-synthetic-yellow-hover active:bg-synthetic-yellow-pressed",
+  "focus-visible:ring-2 focus-visible:ring-synthetic-yellow focus-visible:ring-offset-2 focus-visible:ring-offset-surface focus-visible:outline-none",
+);
+
+/** A second way forward beside the gold one: outlined, as the Sell button is beside Buy. */
+export const NOTICE_SECONDARY = cx(
+  "inline-flex h-11 items-center justify-center border border-border-strong bg-surface-2 px-5 text-xs font-bold tracking-[0.2em] text-ink uppercase transition-colors",
+  "hover:bg-surface-hover",
   "focus-visible:ring-2 focus-visible:ring-synthetic-yellow focus-visible:ring-offset-2 focus-visible:ring-offset-surface focus-visible:outline-none",
 );
 

@@ -111,3 +111,11 @@ test("setQuery keeps what is typed; reset clears it and cancels a load", async (
     { catalog: null, status: "idle", error: null, query: "" },
   );
 });
+
+test("setFilters keeps the screener's choices across visits; a refresh keeps them; reset clears them", async () => {
+  market().setFilters({ classes: ["Commodity"], directions: ["up"] });
+  await market().load(async () => catalog("AUG1", "AGT1"));
+  assert.deepEqual(market().filters, { classes: ["Commodity"], directions: ["up"] }, "new prices keep the filters");
+  market().reset();
+  assert.deepEqual(market().filters, { classes: [], directions: [] });
+});

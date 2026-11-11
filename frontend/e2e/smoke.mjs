@@ -15,8 +15,9 @@
  * moving between the dashboard's tabs (Vault, Discover, Account, Invest,
  * Reserve). It ends on asset pages opened by their address (AUG1, an unknown
  * ticker, an address that is not a ticker, a market without live prices) and
- * on Discover: the catalog, its search, and a first buy from it (a fraction
- * of STSLA), sold back from the Vault with "Max". On AUG1 the pro chart is
+ * on Discover: the catalog, its top movers and collections, its search and
+ * its screener (a collection presets it, toggles narrow it), and a first buy
+ * from it (a fraction of STSLA), sold back from the Vault with "Max". On AUG1 the pro chart is
  * read as a line and as candles (crosshair, legend, keyboard, ranges), and the
  * chart type it was left in is remembered on STSLA's page.
  * Second pass: signing in again lands directly on the Vault, which is live
@@ -475,6 +476,11 @@ try {
       check(
         await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth),
         "Discover fits a phone's width: long names truncate, nothing scrolls sideways",
+      );
+      check(
+        (await page.getByTestId("top-movers").locator("ul").evaluate((row) => row.scrollWidth > row.clientWidth)) &&
+          (await page.getByTestId("collections").locator("ul").evaluate((row) => row.scrollWidth > row.clientWidth + 200)),
+        "on a phone the top movers and the collections are rows that swipe sideways, inside the page",
       );
       await openTab(page, "Vault");
       await page.getByTestId("vault-total").filter({ hasText: "26,234" }).waitFor();
@@ -1119,6 +1125,26 @@ try {
         (await page.getByTestId("discover-simulated").isVisible()),
       "the Discover tab is titled, its list is Trending, and it says the prices are simulated",
     );
+    // The day's top movers and the collections, from the catalog alone.
+    const quotesBefore = quoteCalls.length;
+    const mover = (kind) => page.getByTestId("top-mover").and(page.locator(`[data-kind=${kind}]`));
+    check(
+      (await mover("gainer").getAttribute("data-ticker")) === "AUG1" &&
+        (await mover("gainer").getByTestId("top-mover-change").innerText()) === "+0.84%" &&
+        (await mover("gainer").getAttribute("href")) === "/dashboard/asset/AUG1" &&
+        (await mover("loser").getAttribute("data-ticker")) === "STSLA" &&
+        (await mover("loser").getByTestId("top-mover-change").innerText()) === "−2.40%",
+      "Top movers: gold leads the day (+0.84%), the synthetic Tesla trails it (−2.40%); each opens its asset",
+    );
+    const collection = (id) => page.getByTestId("collection").and(page.locator(`[data-collection=${id}]`));
+    check(
+      (await collection("hard-assets").getByTestId("collection-tickers").innerText()) === "AUG1 · AGT1" &&
+        (await collection("hard-assets").getByTestId("collection-change").innerText()) === "+0.16%" &&
+        (await collection("synthetic-equities").getByTestId("collection-tickers").innerText()) === "STSLA" &&
+        (await collection("fixed-income").getByTestId("collection-tickers").innerText()) === "CETES28 · SCT28" &&
+        (await collection("fixed-income").getByTestId("collection-change").innerText()) === "+0.01%",
+      "Collections list their assets, most traded first, and their equal-weight change (Hard Assets +0.16%, Fixed Income +0.01%)",
+    );
     await page.mouse.move(0, 0);
     await shot(page, "discover-desktop");
 
@@ -1132,7 +1158,10 @@ try {
       await search.fill(query);
       await listing(tickers);
     }
-    check(true, "the search finds assets by name, ticker or class, whatever the case");
+    check(
+      (await page.getByTestId("top-movers").count()) === 0 && (await page.getByTestId("collections").count()) === 0,
+      "the search finds assets by name, ticker or class, whatever the case; the highlights step aside meanwhile",
+    );
     await search.fill("bitcoin");
     await page.getByTestId("discover-no-match").waitFor();
     check(
@@ -1145,6 +1174,60 @@ try {
       await search.evaluate((field) => field === document.activeElement && field.value === ""),
       "Clear search empties the field and leaves the focus in it",
     );
+
+    // The screener: a collection presets the asset class, the toggles narrow further,
+    // and each toggle shows what it would leave (the search and the other row included).
+    const option = (value) => page.getByTestId("screener-option").and(page.locator(`[data-value="${value}"]`));
+    const leaves = (value) => option(value).getByTestId("screener-option-count").innerText();
+    const shownOf = async () => flat(await page.getByTestId("screener-count").innerText());
+    await collection("hard-assets").click();
+    await listing(["AUG1", "AGT1"]);
+    check(
+      (await collection("hard-assets").getAttribute("aria-pressed")) === "true" &&
+        (await option("Commodity").getAttribute("aria-pressed")) === "true" &&
+        (await shownOf()) === "2 of 5 assets" &&
+        (await page.getByTestId("market-list").getByRole("heading", { name: "Screener" }).count()) === 1 &&
+        (await leaves("up")) === "1" &&
+        (await leaves("down")) === "1",
+      "Hard Assets sets the screener to Commodities: gold and silver, one rising and one falling",
+    );
+    await option("up").click();
+    await listing(["AUG1"]);
+    await page.getByTestId("discover-status").filter({ hasText: "1 asset matches these filters" }).waitFor();
+    check(
+      (await shownOf()) === "1 of 5 assets" &&
+        flat(await page.getByTestId("market-list-summary").innerText()) ===
+          "Commodities · Positive 24h · most traded first" &&
+        (await option("Equity").isDisabled()) &&
+        (await leaves("Equity")) === "0",
+      "Positive narrows Hard Assets to gold; Equities, all falling, would leave nothing and waits disabled",
+    );
+    await page.mouse.move(0, 0);
+    await shot(page, "discover-screener-desktop");
+    await collection("fixed-income").click();
+    await listing(["CETES28"]);
+    check(
+      (await collection("hard-assets").getAttribute("aria-pressed")) === "false" &&
+        (await collection("fixed-income").getAttribute("aria-pressed")) === "true" &&
+        (await option("up").getAttribute("aria-pressed")) === "true",
+      "Fixed Income replaces Hard Assets and keeps Positive: CETES rose; the flat T-bill (0.00%) stays out",
+    );
+    await search.fill("tesla");
+    await page.getByTestId("discover-no-match").waitFor();
+    check(
+      (await page.getByTestId("discover-status").textContent()) === "No assets match tesla with these filters",
+      "a search the filters exclude says so, on screen and to screen readers",
+    );
+    await page.getByTestId("discover-no-match").getByRole("button", { name: "Clear filters" }).click();
+    await listing(["STSLA"]);
+    check(
+      (await page.getByTestId("market-list").getByRole("heading", { name: "Results" }).count()) === 1 &&
+        (await page.getByTestId("screener-clear").count()) === 0,
+      "Clear filters keeps the search: the Tesla share",
+    );
+    await option("Equity").click();
+    await listing(["STSLA"]);
+    check(quoteCalls.length === quotesBefore, "movers, collections and the screener need no request beyond the catalog");
 
     // A first buy, from Discover: a fraction of a synthetic Tesla share.
     await search.fill("tesla");
@@ -1289,7 +1372,11 @@ try {
     await assetBack.click();
     await page.waitForURL("**/dashboard/discover");
     await listing(["STSLA"]);
-    check((await search.inputValue()) === "tesla", "back on Discover, the search and its results are as they were left");
+    check(
+      (await search.inputValue()) === "tesla" && (await option("Equity").getAttribute("aria-pressed")) === "true",
+      "back on Discover, the search, the screener and their results are as they were left",
+    );
+    await page.getByTestId("screener-clear").click();
     await page.getByTestId("market-search-clear").click();
     await listing(TRENDING);
 

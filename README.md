@@ -807,6 +807,17 @@ three routes in the `API` rate-limit group, all behind the JWT extractor:
     Trending: the most traded over the last 24 hours first.
   - Every row opens the asset's page, where a first buy happens. The Vault's
     empty asset list points here.
+  - Above the list, the day's top movers (the largest 24-hour rise and fall
+    in the whole catalog) and three collections (Hard Assets, Synthetic
+    Equities, Fixed Income) with their assets and equal-weight 24-hour
+    change (`frontend/src/components/markets/discover-highlights.tsx`). On a
+    phone each is a row that swipes; both step aside while a search is typed.
+  - The screener (`frontend/src/components/markets/asset-screener.tsx`)
+    narrows the list by asset class and by the direction of the 24-hour
+    change. Choices add up within a row and narrow across rows, combine with
+    the search, and show what each would leave; a collection presets the
+    asset class. All of it is computed from the catalog
+    (`frontend/src/lib/screener.ts`): no other request.
 - **Frontend: the asset's page** (`/dashboard/asset/[ticker]`, inside the
   dashboard shell):
   - It belongs to the tab that opened it: from Discover, Discover stays

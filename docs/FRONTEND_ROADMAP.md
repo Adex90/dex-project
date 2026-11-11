@@ -145,10 +145,35 @@ what the module waits on. They do not change its scope.
     Trending: the most traded over 24 hours first. Rows open the asset's
     page; the Vault's empty asset list points here. Smoke e2e covers it on
     both layouts, with a first buy from Discover.
-  - Left: top movers and collections (curated lists), and predictive search
-    once the catalog outgrows a single page (a `q` parameter on the
-    endpoint).
-- [ ] **9. Asset Screener** (Cross-filtering technicals/fundamentals)
+  - Above the list, the day's top movers and the collections
+    (`components/markets/discover-highlights.tsx`): one row that swipes on a
+    phone, a grid from `sm`. Top movers: the largest 24-hour rise (green) and
+    fall (red) in the whole catalog, compared exactly, each opening its
+    asset. Collections (Hard Assets, Synthetic Equities, Fixed Income) list
+    their assets and their equal-weight 24-hour change; picking one presets
+    the screener's asset class (module 9). Both step aside while a search is
+    typed, and everything comes from the catalog (`lib/screener.ts`, unit
+    tested): no new endpoint.
+  - Left: predictive search once the catalog outgrows a single page (a `q`
+    parameter on the endpoint), and curated collections beyond asset classes
+    (themes chosen by hand, which need a catalog field or an endpoint).
+- [x] **9. Asset Screener** (Cross-filtering technicals/fundamentals)
+  - `components/markets/asset-screener.tsx`, an inline panel above the list:
+    toggles for the asset class (Equities, Commodities, Fixed income) and the
+    24-hour performance (Positive, Negative), solid Synthetic Gold when on.
+    Choices add up within a row and narrow across rows, and combine with the
+    search; the list updates as each one changes. Each toggle shows what it
+    would leave given the search and the other row (cross-filtering), and one
+    that would leave nothing is disabled. A direction is the one the list
+    prints (0.00 % is neither), so a filter never disagrees with a color.
+  - Client-side over `GET /api/v1/market/assets` (`lib/screener.ts`, unit
+    tested); the filters live in `store/market.ts` with the search, so they
+    survive a visit to an asset. The list, its summary and the screen reader
+    status say what is shown; a search the filters exclude offers to clear
+    either. Smoke e2e: collections, toggles, counts, the disabled toggle, the
+    empty state and the return from an asset.
+  - Left: sorting (by change, price, yield), ranges on the figures (market
+    cap, volume, yield), and technical screens once there is a candle feed.
 - [x] **10. Pro Charting** (TradingView wrapper, candlesticks, indicators, drawing tools)
   - `components/charts/pro-candlestick-chart.tsx` on the asset page, in native
     SVG: no charting library, so nothing to license and no change to the CSP.
