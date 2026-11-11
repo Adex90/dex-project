@@ -261,6 +261,48 @@ jobs:
         run: cargo run --release --locked -- --ticks 30
 
   # ---------------------------------------------------------------------------
+  # The signer daemon (strawberryswap/vaults/threshold-signer): the transaction
+  # policy, signatures that recover to the vault, and the Unix socket's access
+  # control (private directory, SO_PEERCRED), all on a local socket.
+  threshold-signer:
+    name: Threshold signer (Rust; fmt, clippy, tests)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: strawberryswap/vaults/threshold-signer
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install Rust ${{ env.RUST_TOOLCHAIN }}
+        id: rust
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --component rustfmt,clippy --no-self-update
+          rustup default "$RUST_TOOLCHAIN"
+          rustc --version
+          cargo --version
+
+      - name: Restore the Cargo cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: strawberryswap/vaults/threshold-signer -> target
+
+      # fmt, clippy and tests are independent: one failure does not hide the others.
+      - name: cargo fmt --check
+        if: ${{ !cancelled() && steps.rust.outcome == 'success' }}
+        run: cargo fmt --check
+
+      - name: cargo clippy
+        if: ${{ !cancelled() && steps.rust.outcome == 'success' }}
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: cargo test
+        if: ${{ !cancelled() && steps.rust.outcome == 'success' }}
+        run: cargo test --locked --no-fail-fast
+
+  # ---------------------------------------------------------------------------
   sql-suites:
     name: SQL suite ${{ matrix.suite }}
     runs-on: ubuntu-24.04
@@ -760,7 +802,7 @@ jobs:
   ci-ok:
     name: CI result
     if: ${{ always() }}
-    needs: [frontend, backend, hft-engine, sql-suites, e2e, docker, iac-and-scripts]
+    needs: [frontend, backend, hft-engine, threshold-signer, sql-suites, e2e, docker, iac-and-scripts]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
