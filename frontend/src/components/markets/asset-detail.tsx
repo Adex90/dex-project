@@ -18,7 +18,7 @@ import {
   type ChartRangeId,
 } from "@/lib/portfolio";
 import { formatShares, moneyParts, signedPercent, type Trend } from "@/lib/vault";
-import type { MarketAsset, OrderReceipt, OrderRequest, OrderSide } from "@/types/market";
+import type { MarketAsset, OrderRequest, OrderSide, PlacedOrder } from "@/types/market";
 import type { DecimalString } from "@/types/vault";
 
 /*
@@ -59,7 +59,7 @@ export interface AssetDetailProps {
   /** The price streams in as it trades (shows "Live"). */
   live?: boolean;
   /** Places an order: resolves with the receipt, or rejects with the error to show. */
-  onPlaceOrder: (order: OrderRequest) => Promise<OrderReceipt>;
+  onPlaceOrder: (order: OrderRequest) => Promise<PlacedOrder>;
   className?: string;
 }
 

@@ -5,6 +5,7 @@ import Link from "next/link";
 import { Lock } from "lucide-react";
 
 import { useDashboard } from "@/components/layout/dashboard-shell";
+import { OpenOrdersList } from "@/components/markets/open-orders-list";
 import { Alert, Button } from "@/components/ui/primitives";
 import { AssetList, AssetListSkeleton } from "@/components/vault/asset-list";
 import { PortfolioChart } from "@/components/vault/portfolio-chart";
@@ -20,14 +21,17 @@ import { useVaultStore } from "@/store/vault";
  * Vault: the dashboard's home. The Sovereign Vault snapshot
  * (GET /api/v1/vault) feeds the balance, the reserve seal, the assets and
  * the deposit details; the chart redraws the cash balance from the IFPE
- * ledger the shell already loads.
+ * ledger the shell already loads. Open limit and stop orders sit at the top
+ * of the holdings, with what they hold (components/markets/open-orders-list.tsx);
+ * the section is absent when there are none.
  *
- * Layout: one column on phones (balance, trend, deposit, assets); from xl,
- * the balance (two thirds) beside the deposit card, both the same height,
- * then the trend and the assets across the full width.
+ * Layout: one column on phones (balance, trend, deposit, open orders,
+ * assets); from xl, the balance (two thirds) beside the deposit card, both
+ * the same height, then the trend, the open orders and the assets across the
+ * full width.
  */
 export default function VaultPage() {
-  const { client, kycLocked, refresh } = useDashboard();
+  const { token, client, kycLocked, refresh } = useDashboard();
   const balance = useVaultStore((s) => s.balance);
   const reserveProof = useVaultStore((s) => s.reserveProof);
   const holdings = useVaultStore((s) => s.holdings);
@@ -95,6 +99,9 @@ export default function VaultPage() {
             <SpeiDepositCard clabe={account.clabe} bankName={account.bank_name} className="h-full" />
           )}
         </div>
+
+        {/* Its own grid item, or nothing: no empty row (and no extra gap) without open orders. */}
+        <OpenOrdersList token={token} className="min-w-0 xl:col-span-3" />
 
         <div className="min-w-0 xl:col-span-3">
           {loaded ? <AssetList holdings={holdings} /> : <AssetListSkeleton />}

@@ -1,11 +1,11 @@
 "use client";
 
 import { useEffect, useId, useRef, useState, type ChangeEvent, type FormEvent, type RefObject } from "react";
-import { Check, Clock, Delete, Loader2, X } from "lucide-react";
+import { Check, CircleSlash, Clock, Delete, Loader2, X } from "lucide-react";
 
 import { SegmentedControl } from "@/components/ui/segmented-control";
 import { cx } from "@/components/ui/primitives";
-import { describeError } from "@/lib/api/client";
+import { describeError, messageForCode } from "@/lib/api/client";
 import { newIdempotencyKey } from "@/lib/api/endpoints";
 import { formatMoney } from "@/lib/decimal";
 import {
@@ -29,8 +29,9 @@ import {
   type OrderAssessment,
   type OrderDraft,
 } from "@/lib/market";
+import { heldLabel, orderKind, triggerPhrase } from "@/lib/orders";
 import { formatShares } from "@/lib/vault";
-import type { MarketAsset, OrderReceipt, OrderRequest, OrderSide, OrderType, PlanFrequency } from "@/types/market";
+import type { MarketAsset, OrderRequest, OrderSide, OrderType, PlacedOrder, PlanFrequency } from "@/types/market";
 import type { DecimalString } from "@/types/vault";
 
 /*
@@ -42,10 +43,17 @@ import type { DecimalString } from "@/types/vault";
  *   limit or stop adds its price, typed on the same numpad as the amount
  *   (the field it types into is underlined in gold). A savings plan asks how
  *   often instead, and shows what it adds up to in a month.
- * - Only `liveTypes` can be placed (today, market orders: lib/market.ts).
- *   The others can be set up and previewed, estimates included; their button
- *   stays disabled and a note says why, so nothing is ever sent for a type
- *   the backend does not execute.
+ * - `liveTypes` can be placed: market, limit and stop orders
+ *   (lib/market.ts). A limit or stop order holds what it would use (a buy,
+ *   its amount from the cash; a sell, its units) until it fills or is
+ *   cancelled, and the summary says so before it is placed. A savings plan
+ *   can be set up and previewed, estimates included, but its button stays
+ *   disabled and a note says why: nothing is sent for a type the backend
+ *   does not execute.
+ * - The receipt follows the answer: a fill (a market order, or a limit
+ *   already reachable, which fills at once), an order waiting for its price
+ *   (what it waits for and what it holds; it is listed in the Vault's Open
+ *   orders), or an order the bank could not fill.
  * - A native <dialog> opened as a modal: focus stays inside, the page behind
  *   is inert, Escape closes, and closing returns focus to the button that
  *   opened it.
@@ -72,8 +80,8 @@ export interface OrderCheckoutDrawerProps {
   held: DecimalString;
   /** The types that can be placed; the others can only be previewed. */
   liveTypes?: readonly OrderType[];
-  /** Places a live order: resolves with the receipt, or rejects with the error to show. */
-  onConfirm: (order: OrderRequest) => Promise<OrderReceipt>;
+  /** Places a live order: resolves with the fill or the waiting order, or rejects with the error to show. */
+  onConfirm: (order: OrderRequest) => Promise<PlacedOrder>;
 }
 
 export function OrderCheckoutDrawer(props: OrderCheckoutDrawerProps) {
@@ -96,7 +104,7 @@ const TYPE_LABELS: Record<OrderType, string> = {
   savings_plan: "Savings plan",
 };
 
-/** In a sentence: "Limit orders are not live yet." */
+/** In a sentence: "Savings plans are not live yet." */
 const TYPE_PLURALS: Record<OrderType, string> = {
   market: "Market orders",
   limit: "Limit orders",
@@ -145,7 +153,7 @@ function CheckoutDialog({
   const [active, setActive] = useState<Field>("amount");
   const [phase, setPhase] = useState<Phase>("entry");
   const [error, setError] = useState<unknown>(null);
-  const [receipt, setReceipt] = useState<OrderReceipt | null>(null);
+  const [receipt, setReceipt] = useState<PlacedOrder | null>(null);
 
   const buying = side === "buy";
   const verb = buying ? "Buy" : "Sell";
@@ -282,7 +290,7 @@ function CheckoutDialog({
 
       {phase === "done" && receipt ? (
         <Receipt
-          receipt={receipt}
+          placed={receipt}
           ticker={asset.ticker}
           buying={buying}
           decimals={asset.quantity_decimals}
@@ -498,6 +506,13 @@ function CheckoutDialog({
                   value={order.price === null ? "—" : formatPrice(order.price)}
                 />
                 <SummaryRow label={type === "limit" ? "Quantity (at the limit)" : "Quantity (estimate)"} value={quantity} />
+                {priced ? (
+                  <SummaryRow
+                    label="Held until it fills"
+                    value={buying ? formatMoney(amountForApi(amount)) : quantity}
+                    testId="order-held"
+                  />
+                ) : null}
                 <SummaryRow label="Commission" value="$0.00" strong />
                 <div className="border-t border-border pt-2.5">
                   <SummaryRow label="Total" value={formatMoney(amountForApi(amount))} strong />
@@ -594,6 +609,13 @@ function priceHint(type: OrderType, buying: boolean): string {
   return buying ? "Triggers when the price rises to it." : "Triggers when the price falls to it.";
 }
 
+/** What a limit or stop order holds while it waits. */
+function holdSentence(buying: boolean): string {
+  return buying
+    ? "Its amount is held from your cash until it fills or you cancel it."
+    : "The units it sells are held until it fills or you cancel it.";
+}
+
 /** What the order will do, under the button. */
 function footnote(
   draft: OrderDraft,
@@ -607,13 +629,13 @@ function footnote(
       return "Market order: it fills at the next available price, which may differ slightly from the estimate.";
     case "limit":
       if (order.marketable) {
-        return `The price is already at your limit: it would fill at once, at ${formatPrice(asset.price)} or better.`;
+        return `The price is already at your limit: it fills at once, at ${formatPrice(asset.price)} or better.`;
       }
-      return `Limit order: it fills only at ${at ?? "your price"} or ${buying ? "lower" : "higher"}, and may never fill.`;
+      return `Limit order: it fills only at ${at ?? "your price"} or ${buying ? "lower" : "higher"}, and may never fill. ${holdSentence(buying)}`;
     case "stop":
       return buying
-        ? `Stop order: when the price rises to ${at ?? "your stop"}, it becomes a market order and fills at the next available price.`
-        : `Stop-loss: when the price falls to ${at ?? "your stop"}, it becomes a market order and fills at the next available price, which may be lower.`;
+        ? `Stop order: when the price rises to ${at ?? "your stop"}, it becomes a market order and fills at the next available price. ${holdSentence(buying)}`
+        : `Stop-loss: when the price falls to ${at ?? "your stop"}, it becomes a market order and fills at the next available price, which may be lower. ${holdSentence(buying)}`;
     case "savings_plan": {
       const each = order.amountProblem === "empty" ? "your amount" : formatMoney(amountForApi(draft.amount));
       return `Savings plan: buys ${each} of ${asset.ticker} ${FREQUENCY_PHRASES[draft.frequency]} at the price of the day, from your vault's cash, with no commission.`;
@@ -621,9 +643,19 @@ function footnote(
   }
 }
 
-function SummaryRow({ label, value, strong = false }: { label: string; value: string; strong?: boolean }) {
+function SummaryRow({
+  label,
+  value,
+  strong = false,
+  testId,
+}: {
+  label: string;
+  value: string;
+  strong?: boolean;
+  testId?: string;
+}) {
   return (
-    <div className="flex items-baseline justify-between gap-4">
+    <div className="flex items-baseline justify-between gap-4" data-testid={testId}>
       <dt className="text-muted">{label}</dt>
       <dd className={cx("text-right tabular-nums", strong ? "font-semibold text-ink" : "text-ink-2")}>{value}</dd>
     </div>
@@ -631,36 +663,89 @@ function SummaryRow({ label, value, strong = false }: { label: string; value: st
 }
 
 function Receipt({
-  receipt,
+  placed,
   ticker,
   buying,
   decimals,
   doneRef,
   onDone,
 }: {
-  receipt: OrderReceipt;
+  placed: PlacedOrder;
   ticker: string;
   buying: boolean;
   decimals: number;
   doneRef: RefObject<HTMLButtonElement | null>;
   onDone: () => void;
 }) {
+  // A market order fills at once, and so does a limit already reachable.
+  const fill = placed.order_type === "market" ? placed : placed.execution;
+  const waiting = placed.order_type !== "market" && placed.status === "pending" ? placed : null;
+  const notFilled = placed.order_type !== "market" && fill === null && waiting === null ? placed : null;
   return (
-    <div className="px-5 pt-8 pb-[calc(1.25rem+env(safe-area-inset-bottom))] text-center" data-testid="order-receipt">
-      <span aria-hidden className="mx-auto grid size-12 place-items-center bg-synthetic-yellow text-black">
-        <Check className="size-6" strokeWidth={2.5} />
+    <div
+      className="px-5 pt-8 pb-[calc(1.25rem+env(safe-area-inset-bottom))] text-center"
+      data-testid="order-receipt"
+      data-outcome={fill ? "filled" : waiting ? "pending" : "not-filled"}
+    >
+      <span
+        aria-hidden
+        className={cx(
+          "mx-auto grid size-12 place-items-center",
+          fill
+            ? "bg-synthetic-yellow text-black"
+            : waiting
+              ? "border border-synthetic-yellow/60 text-synthetic-yellow"
+              : "border border-border-strong text-muted",
+        )}
+      >
+        {fill ? <Check className="size-6" strokeWidth={2.5} /> : waiting ? <Clock className="size-6" /> : <CircleSlash className="size-6" />}
       </span>
-      <p role="status" className="mt-4 text-lg font-semibold tracking-tight">
-        Order filled
-      </p>
-      <p className="mt-1 text-sm text-muted">
-        {`${buying ? "Bought" : "Sold"} ${formatShares(receipt.quantity, decimals)} ${ticker} at ${formatMoney(receipt.price)}.`}
-      </p>
-      <dl className="mt-6 space-y-2.5 border-y border-border py-4 text-left text-sm">
-        <SummaryRow label="Amount" value={formatMoney(receipt.amount)} />
-        <SummaryRow label="Commission" value={formatMoney(receipt.commission)} strong />
-        <SummaryRow label="Order" value={receipt.order_id} />
-      </dl>
+      {fill ? (
+        <>
+          <p role="status" className="mt-4 text-lg font-semibold tracking-tight">
+            Order filled
+          </p>
+          <p className="mt-1 text-sm text-muted">
+            {`${buying ? "Bought" : "Sold"} ${formatShares(fill.quantity, decimals)} ${ticker} at ${formatMoney(fill.price)}.`}
+          </p>
+          <dl className="mt-6 space-y-2.5 border-y border-border py-4 text-left text-sm">
+            <SummaryRow label="Amount" value={formatMoney(fill.amount)} />
+            <SummaryRow label="Commission" value={formatMoney(fill.commission)} strong />
+            <SummaryRow label="Order" value={placed.order_id} />
+          </dl>
+        </>
+      ) : null}
+      {waiting ? (
+        <>
+          <p role="status" className="mt-4 text-lg font-semibold tracking-tight">
+            {orderKind(waiting)} placed
+          </p>
+          <p className="mt-1 text-sm text-muted">{`${buying ? "Buys" : "Sells"} ${ticker} ${triggerPhrase(waiting)}.`}</p>
+          <dl className="mt-6 space-y-2.5 border-y border-border py-4 text-left text-sm">
+            <SummaryRow label="Amount" value={formatMoney(waiting.amount)} />
+            <SummaryRow label="Held until it fills" value={heldLabel(waiting)} strong testId="receipt-held" />
+            <SummaryRow label="Order" value={waiting.order_id} />
+          </dl>
+          <p className="mt-4 text-xs leading-relaxed text-muted">
+            It stays open until it fills or you cancel it, in Open orders on your Vault.
+          </p>
+        </>
+      ) : null}
+      {notFilled ? (
+        <>
+          <p role="status" className="mt-4 text-lg font-semibold tracking-tight">
+            Order not filled
+          </p>
+          <p className="mt-1 text-sm text-muted">
+            {(notFilled.reject_reason ? messageForCode(notFilled.reject_reason) : undefined) ?? "The bank could not fill it."}
+          </p>
+          <dl className="mt-6 space-y-2.5 border-y border-border py-4 text-left text-sm">
+            <SummaryRow label="Amount" value={formatMoney(notFilled.amount)} />
+            <SummaryRow label="Order" value={notFilled.order_id} />
+          </dl>
+          <p className="mt-4 text-xs leading-relaxed text-muted">Nothing was charged, and nothing stays held.</p>
+        </>
+      ) : null}
       <button
         ref={doneRef}
         type="button"

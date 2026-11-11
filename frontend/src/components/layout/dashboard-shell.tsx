@@ -17,6 +17,7 @@ import { EXPIRED_LOGIN_PATH } from "@/lib/session";
 import { useAuthStore } from "@/store/auth";
 import { useDashboardStore } from "@/store/dashboard";
 import { useMarketStore } from "@/store/market";
+import { useOrdersStore } from "@/store/orders";
 import { displayedRealtime, useVaultStore } from "@/store/vault";
 
 /*
@@ -75,6 +76,7 @@ export function DashboardShell({ children }: { children: ReactNode }) {
   useEffect(
     () => () => {
       useMarketStore.getState().reset();
+      useOrdersStore.getState().reset();
       resetNavOrigin();
     },
     [],

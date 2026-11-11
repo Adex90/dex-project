@@ -470,9 +470,12 @@ try {
           (await page.getByText("Market sale", { exact: true }).count()) === 2,
         "the ledger lists three market buys and two market sales",
       );
-      // A limit buy from another device (the checkout sends market orders
-      // only, for now): it waits below the price with its cash held, and
-      // cancelling it releases the cash. Both legs reach this tab live.
+      // A limit buy from another device: it waits below the price with its
+      // cash held, and cancelling it releases the cash. Both legs reach this
+      // tab live (after the holds of the other pass's orders, if it ran first).
+      const holdRows = page.getByText("Held for order", { exact: true });
+      const releaseRows = page.getByText("Order hold released", { exact: true });
+      const [holdsBefore, releasesBefore] = [await holdRows.count(), await releaseRows.count()];
       const limitBuy = await apiOrder(otherDevice, {
         ticker: "AUG1",
         side: "buy",
@@ -488,7 +491,7 @@ try {
         .getByTestId("vault-held-for-orders")
         .filter({ hasText: "100.00 MXN held for open orders" })
         .waitFor({ timeout: 5_000 });
-      await page.getByText("Held for order", { exact: true }).waitFor();
+      await holdRows.nth(holdsBefore).waitFor({ timeout: 5_000 });
       check(true, "the Account tab shows the cash held for the order, and the hold in the ledger");
       const cancelled = await fetch(`${API}/api/v1/market/orders/${limitBuy.receipt.order_id}/cancel`, {
         method: "POST",
@@ -499,7 +502,7 @@ try {
         cancelled.status === 200 && cancelledOrder.status === "cancelled" && cancelledOrder.held_cash === "0.00000000",
         "cancelling the limit buy releases its cash",
       );
-      await page.getByText("Order hold released", { exact: true }).waitFor({ timeout: 5_000 });
+      await releaseRows.nth(releasesBefore).waitFor({ timeout: 5_000 });
       await page.getByTestId("vault-held-for-orders").waitFor({ state: "detached" });
       check(true, "the release reaches the ledger and nothing stays held");
       // A new Proof of Reserve cut still rebuilds every balance from the
@@ -1023,8 +1026,8 @@ try {
       "an asset opened from Discover stays under Discover, and its Back link returns there",
     );
     // The order types first. A limit or a stop takes its price on the same
-    // numpad, a savings plan its frequency; only market orders are live, so
-    // none of the others is ever sent.
+    // numpad, a savings plan its frequency. Market, limit and stop orders are
+    // live; a savings plan is previewed but never sent.
     let ordersSent = 0;
     page.on("request", (r) => {
       if (r.method() === "POST" && r.url().endsWith("/api/v1/market/order")) ordersSent += 1;
@@ -1071,10 +1074,12 @@ try {
     );
     check(
       (await buttonText()) === "place limit order" &&
-        (await confirmButton.isDisabled()) &&
-        /not live yet/.test(await drawer.getByTestId("order-not-live").innerText()) &&
-        (await footnote.innerText()).includes("only at $4,200.00 or lower"),
-      "Place Limit Order stays disabled, and a note says limit orders are not live yet",
+        (await confirmButton.isEnabled()) &&
+        (await drawer.getByTestId("order-not-live").count()) === 0 &&
+        (await drawer.getByTestId("order-held").innerText()).includes("$1,000.00") &&
+        (await footnote.innerText()).includes("only at $4,200.00 or lower") &&
+        (await footnote.innerText()).includes("held from your cash until it fills or you cancel it"),
+      "Place Limit Order is live, and the summary says the 1,000.00 stays held until it fills",
     );
 
     await chooseType("Stop");
@@ -1083,8 +1088,10 @@ try {
     for (let i = 0; i < 4; i++) await drawer.getByRole("button", { name: "Delete last digit" }).click();
     await typeKeys(["4", "6", "0", "0"]);
     check(
-      (await footnote.innerText()).includes("when the price rises to $4,600.00") && (await buttonText()) === "place stop order",
-      "a stop to buy above the price says when it triggers",
+      (await footnote.innerText()).includes("when the price rises to $4,600.00") &&
+        (await buttonText()) === "place stop order" &&
+        (await confirmButton.isEnabled()),
+      "a stop to buy above the price says when it triggers, and can be placed",
     );
 
     await chooseType("Savings plan");
@@ -1093,18 +1100,44 @@ try {
       (await priceField.count()) === 0 &&
         (await buttonText()) === "create savings plan" &&
         (await confirmButton.isDisabled()) &&
+        /Savings plans are not live yet/.test(await drawer.getByTestId("order-not-live").innerText()) &&
         (await summary.innerText()).includes("$2,166.67"),
-      "a savings plan asks how often: 1,000.00 every 2 weeks is about $2,166.67 a month",
+      "a savings plan asks how often (1,000.00 every 2 weeks is about $2,166.67 a month), and is not live yet",
     );
     await shot(page, "checkout-plan-desktop");
 
-    await chooseType("Market");
-    check(
-      (await buttonText()) === "confirm order" && (await confirmButton.isEnabled()) && ordersSent === 0,
-      "back on Market the order can be placed, and nothing was sent for the other types",
-    );
-    await drawer.getByTestId("order-confirm").click();
+    // A limit buy below the price waits, its 1,000.00 held.
+    await chooseType("Limit");
+    for (let i = 0; i < 4; i++) await drawer.getByRole("button", { name: "Delete last digit" }).click();
+    await typeKeys(["4", "2", "0", "0"]);
+    check(ordersSent === 0, "nothing is sent while the order is set up");
+    await confirmButton.click();
     const firstReceipt = drawer.getByTestId("order-receipt");
+    await firstReceipt.waitFor();
+    const placedLimit = await firstReceipt.innerText();
+    check(
+      (await firstReceipt.getAttribute("data-outcome")) === "pending" &&
+        placedLimit.includes("Limit buy placed") &&
+        placedLimit.includes("Buys STSLA at $4,200.00 or lower.") &&
+        (await drawer.getByTestId("receipt-held").innerText()).includes("$1,000.00") &&
+        placedLimit.includes("Open orders on your Vault") &&
+        ordersSent === 1,
+      "Place Limit Order: the limit buy waits below the price with its 1,000.00 held",
+    );
+    await shot(page, "checkout-limit-placed-desktop");
+    await drawer.getByRole("button", { name: "Done" }).click();
+    await drawer.waitFor({ state: "detached" });
+
+    // Then a market buy of 1,000.00, from the 14,000.00 left available (the
+    // vault's WebSocket brings the new available cash).
+    await page.getByTestId("asset-buy").click();
+    await drawer.getByText("Available: $14,000.00").waitFor({ timeout: 5_000 });
+    await typeKeys(["1", "0", "0", "0"]);
+    check(
+      (await buttonText()) === "confirm order" && (await drawer.getByTestId("order-amount").inputValue()) === "1,000",
+      "a new order starts as a market order, and the cash held by the limit is not available",
+    );
+    await confirmButton.click();
     await firstReceipt.waitFor();
     check(
       (await firstReceipt.innerText()).includes("Bought 0.2264 STSLA at $4,415.30."),
@@ -1120,8 +1153,84 @@ try {
     await page.getByTestId("market-search-clear").click();
     await listing(TRENDING);
 
-    // The Vault lists it; opened from there, the page is the Vault's, and Max sells it all.
+    // The Vault: the open limit buy sits above the assets, with the cash it holds.
     await openTab(page, "Vault");
+    const openOrders = page.getByTestId("open-orders");
+    const openRows = openOrders.getByTestId("open-order");
+    const limitRow = openRows.filter({ hasText: "Limit buy" });
+    await limitRow.waitFor({ timeout: 5_000 });
+    check(
+      (await openRows.count()) === 1 &&
+        (await limitRow.getAttribute("data-ticker")) === "STSLA" &&
+        (await limitRow.getByTestId("open-order-trigger").innerText()) === "at $4,200.00 or lower" &&
+        (await limitRow.innerText()).includes("≈ 0.238 STSLA") &&
+        (await limitRow.getByTestId("open-order-held").innerText()).includes("$1,000.00"),
+      "the Vault lists the open limit buy: STSLA, at $4,200.00 or lower, about 0.238 STSLA, 1,000.00 held",
+    );
+    const assetList = page.getByTestId("asset-list");
+    check(
+      (await openOrders.boundingBox()).y < (await assetList.boundingBox()).y &&
+        (await openOrders.getByTestId("open-orders-held").innerText()).includes("$1,000.00") &&
+        (await page.getByTestId("vault-held-cash").innerText()).includes("1,000.00 MXN held for open orders"),
+      "open orders come before the assets, and the balance says what they hold",
+    );
+
+    // A stop-loss placed on another device appears live, newest first, with the units it holds.
+    const elsewhere = await apiLogin(email, password);
+    const stopLoss = await apiOrder(elsewhere, {
+      ticker: "STSLA",
+      side: "sell",
+      amount: "500.00",
+      order_type: "stop",
+      stop_price: "4000.0000",
+    });
+    check(
+      stopLoss.status === 201 && stopLoss.receipt.status === "pending" && stopLoss.receipt.held_quantity === "0.12500000",
+      `a stop-loss of 500.00 at 4,000.00 placed on another device holds 0.125 STSLA (${stopLoss.status})`,
+    );
+    const stopRow = openOrders.locator(`[data-order-id="${stopLoss.receipt.order_id}"]`);
+    await stopRow.waitFor({ timeout: 5_000 });
+    check(
+      (await openRows.count()) === 2 &&
+        (await openRows.first().getAttribute("data-order-id")) === stopLoss.receipt.order_id &&
+        (await stopRow.innerText()).includes("Stop-loss") &&
+        (await stopRow.getByTestId("open-order-trigger").innerText()) === "when the price falls to $4,000.00" &&
+        (await stopRow.getByTestId("open-order-held").innerText()).includes("0.125 STSLA"),
+      "the stop-loss appears live, newest first, holding 0.125 STSLA",
+    );
+    await page.mouse.move(0, 0);
+    await shot(page, "open-orders-desktop");
+
+    // On a phone the rows fit the screen: the amount and what is held move under the order.
+    await page.setViewportSize({ width: 390, height: 844 });
+    await openOrders.scrollIntoViewIfNeeded();
+    check(
+      (await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)) &&
+        (await stopRow.getByTestId("open-order-cancel").isVisible()) &&
+        (await stopRow.innerText()).includes("Held 0.125 STSLA"),
+      "on a phone the open orders fit the width, Cancel included, and still say what each one holds",
+    );
+    await shot(page, "open-orders-mobile");
+    await page.setViewportSize({ width: 1440, height: 1000 });
+
+    // Cancel: the row leaves at once, and the WebSocket brings back what it held.
+    const notice = openOrders.getByTestId("open-orders-notice");
+    await stopRow.getByTestId("open-order-cancel").click();
+    await stopRow.waitFor({ state: "detached", timeout: 2_000 });
+    await notice.filter({ hasText: "Stop-loss of STSLA cancelled" }).waitFor();
+    check(
+      (await notice.innerText()).includes("Your 0.125 STSLA are free to sell again.") && (await openRows.count()) === 1,
+      "Cancel removes the stop-loss at once and says its units are free again",
+    );
+    await limitRow.getByTestId("open-order-cancel").click();
+    await limitRow.waitFor({ state: "detached", timeout: 2_000 });
+    await notice.filter({ hasText: "Limit buy of STSLA cancelled. $1,000.00 is back in your cash." }).waitFor();
+    await page.getByTestId("vault-held-cash").waitFor({ state: "detached", timeout: 5_000 });
+    check(true, "cancelling the limit buy returns its 1,000.00: the balance no longer shows cash held for orders");
+    await openOrders.waitFor({ state: "detached", timeout: 10_000 });
+    check(true, "with nothing open, the Open orders section leaves the Vault once its notice is read");
+
+    // The Vault lists STSLA; opened from there, the page is the Vault's, and Max sells it all.
     const teslaRow = page.getByTestId("asset-row").and(page.locator("[data-ticker=STSLA]"));
     await teslaRow.getByTestId("asset-row-link").click();
     await page.waitForURL("**/dashboard/asset/STSLA");
@@ -1142,8 +1251,9 @@ try {
     check(
       (await drawer.getByTestId("order-amount").inputValue()) === "905.6" &&
         (await buttonText()) === "place stop-loss" &&
-        (await confirmButton.isDisabled()),
-      "a stop-loss at 4,000.00 sells at most what the position is worth there (905.60); Place Stop-Loss stays disabled",
+        (await confirmButton.isEnabled()) &&
+        (await drawer.getByTestId("order-held").innerText()).includes("0.2264 STSLA"),
+      "a stop-loss at 4,000.00 sells at most what the position is worth there (905.60), and would hold all 0.2264 STSLA",
     );
     await chooseType("Market");
     await drawer.getByRole("button", { name: "Max" }).click();

@@ -137,7 +137,13 @@ const MESSAGES: Record<string, string> = {
   MERCADO_NO_DISPONIBLE: "The market opens once live prices are connected. No order was placed.",
   MERCADO_CERRADO: "This asset is not trading right now. No order was placed.",
   MONTO_INSUFICIENTE: "That amount is too small to buy the smallest unit of this asset.",
-  POSICION_INSUFICIENTE: "That is more than your position is worth.",
+  POSICION_INSUFICIENTE: "That is more than the units you can sell are worth. Units held by open orders cannot be sold.",
+  // Limit and stop orders (migration 0015).
+  PRECIO_STOP_INVALIDO:
+    "The price has already reached that stop. A buy stop goes above the current price, a sell stop below it.",
+  LIMITE_ORDENES_PENDIENTES: "You have the maximum of 50 open orders. Cancel one to place another.",
+  ORDEN_NO_PENDIENTE: "This order is no longer open: it has already filled or was rejected.",
+  TIPO_ORDEN_NO_DISPONIBLE: "Savings plans are not available yet. Nothing was scheduled.",
   // A client whose account is restricted gets this one neutral message whatever
   // the cause (no tipping off): it must not mention compliance, alerts or freezes.
   OPERACION_NO_DISPONIBLE: GENERIC_UNAVAILABLE_MESSAGE,
@@ -165,6 +171,11 @@ const MESSAGES: Record<string, string> = {
  * most KYC_* codes, whose `mensaje` depends on the case) are translated from
  * the backend's Spanish when recognized (see `kycMessageInEnglish`).
  */
+/** The English message for an API error code, if there is one ("MONTO_INSUFICIENTE"). */
+export function messageForCode(code: string): string | undefined {
+  return MESSAGES[code];
+}
+
 export function describeError(error: unknown): string {
   if (error instanceof ApiError) {
     return MESSAGES[error.code] ?? kycMessageInEnglish(error.message) ?? error.message;

@@ -101,25 +101,23 @@ what the module waits on. They do not change its scope.
     fills once; "Max" sells the whole position on a phone.
   - Left: swipe-to-trade. Confirm Order is the keyboard-accessible path a
     swipe would need anyway.
-- [ ] **3. Advanced Order Engine** (Limit, Stop-Loss, Trailing, Day/GTC)
-  - Frontend built: the checkout's order-type toggle offers Limit and Stop,
-    whose price is typed on the same numpad as the amount, with their
-    estimates and rules (`assessOrder` in `lib/market.ts`, unit tested; smoke
-    e2e). Contract: `LimitOrderRequest` and `StopOrderRequest` in
-    `types/market.ts` (`limit_price`, `stop_price`).
-  - Backend built (migration 0015, README "Limit and stop orders"): the
-    order endpoint takes `order_type`; a pending order holds its cash
-    (`held_cash`) or units (`held_shares`) with the 100 % reserve intact; the
-    trigger engine fills it at its price (a reachable limit fills when
-    placed) or rejects it and releases what it held; `GET
-    /api/v1/market/orders/pending` lists open orders and `POST
-    /api/v1/market/orders/{id}/cancel` cancels one. The answer is a
-    `PendingOrder` (`parsePendingOrder`, `api.pendingOrders`,
-    `api.cancelOrder`); the vault shows the cash held for open orders and the
-    ledger shows each hold and release.
-  - Left: turn it on in the checkout (`LIVE_ORDER_TYPES`, send the type and
-    price, show a `PendingOrder` receipt), a screen of open orders with
-    cancel, then trailing stops and time in force (Day/GTC).
+- [x] **3. Advanced Order Engine** (Limit, Stop-Loss, Trailing, Day/GTC)
+  - Live: the checkout places limit and stop orders (`LIVE_ORDER_TYPES`),
+    their price typed on the same numpad as the amount, with their estimates
+    and rules (`assessOrder` in `lib/market.ts`) and what stays held until
+    they fill. The receipt says what the order waits for and what it holds,
+    or that a reachable limit filled at once.
+  - Backend (migration 0015, README "Limit and stop orders"): the held cash
+    or units keep the 100 % reserve intact; the trigger engine fills each
+    order at its price or rejects it and releases what it held.
+  - Open orders on the Vault, above the assets
+    (`components/markets/open-orders-list.tsx`): what each order waits for,
+    its amount and what it holds, with an optimistic Cancel
+    (`store/orders.ts`); the list follows the vault's WebSocket. Unit tests
+    and smoke e2e (placed in the checkout, a stop-loss from another device
+    appearing live, both cancelled, phone layout).
+  - Left: trailing stops, time in force (Day/GTC) and a history of closed
+    orders (filled, cancelled, rejected).
 - [ ] **4. Savings Plans / DCA** (Automated fractional recurring buys)
   - Frontend built: Savings plan in the same toggle (buys only), with the
     amount per purchase, the frequency (weekly, every 2 weeks, monthly), the

@@ -836,11 +836,11 @@ three routes in the `API` rate-limit group, all behind the JWT extractor:
     - a sale can take what the position is worth at the order's price;
     - an amount too small for one unit is refused before it is sent.
   - The contract is `OrderRequest` in `frontend/src/types/market.ts`, a union
-    on `order_type` with `limit_price`, `stop_price` and `frequency`. The
-    backend executes limit and stop orders (next section), but the checkout
-    still sends market orders only (`LIVE_ORDER_TYPES`): the other types can
-    be set up and previewed, their button stays disabled with a note saying
-    why, and `api.placeOrder` sends a market order without `order_type`.
+    on `order_type` with `limit_price`, `stop_price` and `frequency`. Market,
+    limit and stop orders are live (`LIVE_ORDER_TYPES`; next section); a
+    savings plan can be set up and previewed, but its button stays disabled
+    with a note saying why. `api.placeOrder` sends a market order without
+    `order_type` and a limit or stop order with its type and price.
 - **Audit:** `GET /api/v1/auditoria/ledger/mercado` (operator / auditor)
   re-verifies the chain, replays every position and every sale's average
   cost, and checks each order against its IFPE movement.
@@ -947,9 +947,32 @@ price when the price reaches it. The backend is
 - **Audit:** `GET /api/v1/auditoria/ledger/ifpe` replays the held cash with
   the other balances; `/mercado` also reconciles held cash and units against
   the pending orders and every hold or release against its order.
-- **Frontend:** the contract (`PendingOrder`, `parsePendingOrder`,
-  `api.pendingOrders`, `api.cancelOrder`) and the vault's held fields are in
-  place; the checkout still sends market orders only (previous section).
+- **Frontend: placing them.** The checkout drawer places limit and stop
+  orders through the same endpoint. Before confirming, its summary says what
+  stays held until the order fills (the amount for a buy, the units for a
+  sell). The receipt follows the answer: "Limit buy placed" with what fills
+  it and what it holds, "Order filled" when a limit was already reachable,
+  or "Order not filled" with the reason. The asset page validates the
+  answer (`parsePendingOrder`) and refreshes the open orders.
+- **Frontend: Open orders** (`frontend/src/components/markets/open-orders-list.tsx`,
+  on the Vault above the assets, absent when there are none):
+  - One row per order: the ticker (it opens the asset's page), the kind
+    ("Limit buy", "Stop-loss") and what fills it ("at $4,200.00 or lower",
+    "when the price falls to $4,000.00"), its amount with what it trades (an
+    estimate for a buy, at its own price and in the asset's increment;
+    exactly the units a sell holds), and what it holds, with a lock. The
+    header adds up the cash held, from the vault; the balance card links to
+    the list from its "held for open orders" line.
+  - Cancel is optimistic (`frontend/src/store/orders.ts`): the row leaves at
+    once and `POST /api/v1/market/orders/{id}/cancel` goes out. A failure
+    brings it back and says why; an order that filled or was rejected
+    meanwhile (409) is gone anyway; a load that started before can never
+    bring a cancelled order back. The released cash or units come back
+    through the vault's WebSocket, never through arithmetic in the page.
+  - The list reloads whenever the vault moves (the WebSocket's new version),
+    so an order placed on another device appears and a filled one goes.
+  - On a phone the amount and what is held move under the order, and the
+    rows fit the width, Cancel included.
 - Tests:
   - `tests/db/0015_ordenes_avanzadas.sql`: holds, pairing, immutability,
     validation of each fill against its order, the free-unit rule and the
@@ -960,8 +983,15 @@ price when the price reaches it. The backend is
     a cancel racing a fill, tamper detection).
   - `backend/tests/boveda.rs`: placing, cancelling and filling, pushed over
     the WebSocket.
-  - `frontend/e2e/smoke.mjs`: a limit buy from another device shows its held
-    cash and ledger hold live, and cancelling releases them.
+  - `frontend/src/lib/orders.test.ts` and `frontend/src/store/orders.test.ts`:
+    how an order is described, and the open orders store (validated loads,
+    optimistic cancel, its rollback and the 409, a stale load).
+  - `frontend/e2e/smoke.mjs`: a limit buy placed in the checkout (its held
+    amount before and after), listed on the Vault above the assets; a
+    stop-loss placed on another device appears there live; both cancelled
+    from the list, the cash back through the WebSocket; the rows on a phone.
+    Also a limit buy from another device shows its hold in the Account
+    tab's ledger, and cancelling releases it.
 
 ## Layout
 

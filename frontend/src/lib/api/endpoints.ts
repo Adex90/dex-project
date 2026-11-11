@@ -1,4 +1,4 @@
-import type { MarketOrderRequest } from "@/types/market";
+import type { LimitOrderRequest, MarketOrderRequest, StopOrderRequest } from "@/types/market";
 
 import { request } from "./client";
 import type {
@@ -99,18 +99,16 @@ export const api = {
     request<unknown>(`/api/v1/market/quote/${encodeURIComponent(ticker)}`, { token, signal }),
 
   /**
-   * A market order, filled at the current price. 201 for a new order, 200 with
-   * the same receipt when the idempotency key repeats one already filled.
-   * Sent without `order_type`, which the endpoint reads as market (limit and
-   * stop orders reach the checkout through `LIVE_ORDER_TYPES`). Untyped on
-   * purpose: `parseOrderReceipt` validates the receipt.
+   * Places an order. A market order is sent without `order_type` (what the
+   * endpoint reads as market) and answers an `OrderReceipt`, filled at the
+   * current price; a limit or stop order carries its type and price and
+   * answers a `PendingOrder`, waiting with its cash or units held (or filled
+   * at once, when a limit is already reachable). 201 for a new order, 200 when
+   * the idempotency key repeats the same one. Untyped on purpose:
+   * `parseOrderReceipt` and `parsePendingOrder` validate the answer.
    */
-  placeOrder: (token: string, order: MarketOrderRequest) =>
-    request<unknown>("/api/v1/market/order", {
-      method: "POST",
-      token,
-      body: { ticker: order.ticker, side: order.side, amount: order.amount, idempotency_key: order.idempotency_key },
-    }),
+  placeOrder: (token: string, order: MarketOrderRequest | LimitOrderRequest | StopOrderRequest) =>
+    request<unknown>("/api/v1/market/order", { method: "POST", token, body: orderBody(order) }),
 
   /**
    * The client's limit and stop orders still waiting for their price, newest
@@ -309,4 +307,17 @@ export function newIdempotencyKey(): string {
   b[8] = (b[8]! & 0x3f) | 0x80;
   const h = Array.from(b, (x) => x.toString(16).padStart(2, "0")).join("");
   return `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20)}`;
+}
+
+/** The body of `POST /api/v1/market/order`: exactly the fields the backend reads for each type. */
+export function orderBody(order: MarketOrderRequest | LimitOrderRequest | StopOrderRequest): Record<string, string> {
+  const base = { ticker: order.ticker, side: order.side, amount: order.amount, idempotency_key: order.idempotency_key };
+  switch (order.order_type) {
+    case "market":
+      return base;
+    case "limit":
+      return { ...base, order_type: "limit", limit_price: order.limit_price };
+    case "stop":
+      return { ...base, order_type: "stop", stop_price: order.stop_price };
+  }
 }

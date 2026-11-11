@@ -77,10 +77,16 @@ export function SovereignBalance({ balance, reserveProof, className }: Sovereign
         <BalanceStat label="Cash" value={balance.available_cash} />
         <BalanceStat label="Invested" value={balance.invested_assets} />
       </dl>
-      {/* Still the client's and in custody: counted in the total, not in Cash. */}
+      {/* Still the client's and in custody: counted in the total, not in Cash. The link jumps to the orders. */}
       {!isZero(balance.held_cash) ? (
         <p className="mt-3 text-xs text-muted tabular-nums" data-testid="vault-held-cash">
-          {formatMoney(balance.held_cash)} MXN held for open orders
+          {formatMoney(balance.held_cash)} MXN held for{" "}
+          <a
+            href="#open-orders"
+            className="font-medium text-synthetic-yellow underline-offset-2 hover:underline focus-visible:ring-2 focus-visible:ring-synthetic-yellow focus-visible:outline-none"
+          >
+            open orders
+          </a>
         </p>
       ) : null}
 
