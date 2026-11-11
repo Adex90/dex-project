@@ -74,8 +74,8 @@ what the module waits on. They do not change its scope.
 ## Phase 1: Core Trading & Execution
 
 - [x] **1. Asset Detail View** (Chart, Key Stats, Sticky Buy/Sell)
-  - `components/markets/asset-detail.tsx`, with the price chart on the shared
-    `components/charts/trend-chart.tsx` (the vault's balance chart uses it too).
+  - `components/markets/asset-detail.tsx`, with the pro chart (module 10);
+    the vault's balance chart stays on `components/charts/trend-chart.tsx`.
   - Mounted at `/dashboard/asset/[ticker]`, inside the dashboard shell (the
     Vault tab stays current; a "Back to vault" link returns). The quote comes
     from `GET /api/v1/market/quote/{ticker}` (`MarketQuote`, migration `0013`)
@@ -149,12 +149,44 @@ what the module waits on. They do not change its scope.
     once the catalog outgrows a single page (a `q` parameter on the
     endpoint).
 - [ ] **9. Asset Screener** (Cross-filtering technicals/fundamentals)
-- [ ] **10. Pro Charting** (TradingView wrapper, candlesticks, indicators, drawing tools)
-  - TradingView's Charting Library needs a license; Lightweight Charts is open
-    source. Either way, self-host it: the CSP allows only the app's own scripts.
-- [ ] **11. Portfolio Analytics** (Donut charts, sector/geo distribution, dividend tracker)
-  - Foundation: the Vault tab's asset list (`components/vault/asset-list.tsx`)
-    and the cash chart.
+- [x] **10. Pro Charting** (TradingView wrapper, candlesticks, indicators, drawing tools)
+  - `components/charts/pro-candlestick-chart.tsx` on the asset page, in native
+    SVG: no charting library, so nothing to license and no change to the CSP.
+    A gold line or candlesticks (rising: hollow green; falling: solid red),
+    switched by a toggle beside the ranges and remembered on the device. Both
+    modes share the window and the axes. The candle period fits the range: 30
+    minutes over a day, 4 hours over a week, a day over a month, a week over a
+    year.
+  - The crosshair snaps to the nearest point or candle. Its exact price is
+    tagged on the price axis and shown in the headline; its date and time on
+    the time axis. The legend reads the candle's open, high, low, close,
+    change and volume. The volume is a pane of its own under the price (no
+    second scale), and the keyboard reads every point or candle aloud.
+  - Candles come from the quote's history (`lib/candles.ts`, unit tested):
+    each point opens at the one before, and grouping is exact (first open,
+    highest high, lowest low, last close, summed volume). Simulated prices get
+    simulated wicks and volume, seeded so a quote always draws the same, with
+    the last 24 hours adding up to the quote's 24-hour volume. Live prices
+    never get invented ones. Smoke e2e: line, candles, crosshair, keyboard,
+    ranges, the remembered type and the phone width.
+  - Left: candles and volume served by the price oracle, indicators (moving
+    averages, RSI), drawing tools and a live price stream.
+- [x] **11. Portfolio Analytics** (Donut charts, sector/geo distribution, dividend tracker)
+  - `components/vault/portfolio-analytics.tsx` on the Vault, under the balance.
+    It shows the invested and cash shares and a segmented bar: cash in gold,
+    then each investment, largest first, on a four-step zinc scale checked
+    against the charcoal surface. Beside the bar, the list of parts with value
+    and share; a holding's row opens its asset. Pointing at a block or a row
+    lights up both.
+  - Exact (`lib/allocation.ts`, unit tested). Cash is the total minus what is
+    invested: available, held for orders and on hold. Fixed term is what is
+    invested beyond the holdings. Shares are basis points that add up to
+    100.00 % (largest remainder), and past four investments the smallest fold
+    into Other. Live from `useVaultStore`. Smoke e2e checks the shares against
+    the vault's own figures, and that they follow a deposit and a buy live.
+  - Left: sector and geography (the catalog has no such fields yet),
+    dividends and yield income, and performance over time (time-weighted
+    return).
 - [ ] **12. Corporate Events Calendar** (Earnings, ex-dividend dates)
 
 ## Phase 3: Wealth & Liquidity

@@ -993,6 +993,61 @@ price when the price reaches it. The backend is
     Also a limit buy from another device shows its hold in the Account
     tab's ledger, and cancelling releases it.
 
+## Pro chart and portfolio allocation (frontend)
+
+Two analytics views in the Sovereign Gold identity, in native SVG and HTML (no
+charting library, nothing new for the CSP). Money stays exact: decimal strings
+and BigInt (`frontend/src/lib/decimal.ts`); only pixel positions and axis
+labels use floating point.
+
+- **Pro chart** (`frontend/src/components/charts/pro-candlestick-chart.tsx`,
+  on the asset page):
+  - A gold line or candlesticks. A rising candle (close at or above its open)
+    is hollow green, a falling one solid red, so direction never rests on
+    color alone. The toggle sits beside the ranges, and the device remembers
+    the choice (`localStorage`, a convenience only).
+  - Both modes share one window and one set of axes (`priceView`): whole
+    candle periods from the one the range starts in to the one forming now.
+    The period fits the range: 30 minutes over a day, 4 hours over a week, a
+    day over a month, a week over a year.
+  - The crosshair snaps to the nearest point or candle. Its exact price is
+    tagged on the price axis and in the headline, and its date and time on
+    the time axis. The legend reads the candle's open, high, low, close,
+    change and volume, or the line's high, low and change over the range.
+    The volume is its own pane under the price, on the same time axis. The
+    keyboard (arrows, Home, End, Escape) reads each point or candle aloud.
+- **Candles until the oracle serves them** (`frontend/src/lib/candles.ts`):
+  - One candle per point of the quote's history: it opens at the point
+    before and closes at its own price. Grouping into periods is exact.
+  - For simulated prices (`price_source`, demo mode) the candles also get
+    simulated wicks and volume. They are seeded with the ticker and the
+    instant, so a quote always draws the same candles, and the last 24 hours
+    of volume add up to the quote's `volume_24h` exactly. Live prices never
+    get invented wicks or volume.
+- **Allocation** (`frontend/src/components/vault/portfolio-analytics.tsx`, on
+  the Vault under the balance):
+  - The invested and cash shares, then a segmented bar: cash in gold, the
+    investments largest first on a zinc scale. Beside it, the list of parts
+    with value and share; holdings open their asset's page.
+  - The math (`frontend/src/lib/allocation.ts`): cash is the total minus what
+    is invested (available, held for open orders, on hold); each holding at
+    its market value; fixed term is what is invested beyond the holdings
+    (SOFOM contracts). Shares are basis points that add up to exactly 100.00 %
+    (largest remainder). At most five parts: past four investments the
+    smallest fold into Other, because four zinc steps are all that stay apart
+    on the charcoal surface.
+  - It follows `useVaultStore`, so the vault's WebSocket keeps it live.
+- Tests:
+  - `frontend/src/lib/candles.test.ts`: candles from the history, simulated
+    wicks and volume, exact grouping, each range's window, the time axis, in
+    any time zone.
+  - `frontend/src/lib/allocation.test.ts`: the parts, Other, and shares that
+    add up to 100.00 %.
+  - `frontend/e2e/smoke.mjs`: the chart as a line and as candles (crosshair,
+    legend, keyboard, ranges, the remembered type, the phone width). The
+    Vault's allocation against the shares the vault's own figures give,
+    following a deposit and a buy live.
+
 ## Layout
 
 ```

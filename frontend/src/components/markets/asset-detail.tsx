@@ -3,22 +3,16 @@
 import { useEffect, useId, useMemo, useRef, useState } from "react";
 import { ArrowDownRight, ArrowUpRight, Minus, type LucideIcon } from "lucide-react";
 
+import { ChartModeToggle, ProCandlestickChart, type ChartMode } from "@/components/charts/pro-candlestick-chart";
 import { RangePicker } from "@/components/charts/range-picker";
-import { TrendChart } from "@/components/charts/trend-chart";
 import { OrderCheckoutDrawer } from "@/components/markets/order-checkout-drawer";
 import { cx } from "@/components/ui/primitives";
+import { candleTime, historyCandles, priceView, type PriceView } from "@/lib/candles";
 import { compareAmounts, formatAmount, formatMoney, toUnits } from "@/lib/decimal";
 import { positionValue } from "@/lib/market";
-import {
-  compactMoney,
-  drawable,
-  pointsInRange,
-  readoutDate,
-  type BalancePoint,
-  type ChartRangeId,
-} from "@/lib/portfolio";
+import { compactMoney, readoutDate, type BalancePoint, type ChartRangeId } from "@/lib/portfolio";
 import { formatShares, moneyParts, signedPercent, type Trend } from "@/lib/vault";
-import type { MarketAsset, OrderRequest, OrderSide, PlacedOrder } from "@/types/market";
+import type { MarketAsset, OrderRequest, OrderSide, PlacedOrder, PriceSource } from "@/types/market";
 import type { DecimalString } from "@/types/vault";
 
 /*
@@ -26,8 +20,13 @@ import type { DecimalString } from "@/types/vault";
  *
  * - Header: the ticker as a gold-edged block, the full name, and the price,
  *   large. A new price flashes green or red for a moment as it ticks.
- * - Chart: the shared TrendChart, a gold line over 1D to All. Reading a point
- *   (pointer or keyboard) moves the headline to that point's price and date.
+ * - Chart: the Pro Chart (components/charts/pro-candlestick-chart.tsx) over
+ *   1D to All, as a gold line or as candlesticks (the toggle beside the
+ *   ranges, remembered on this device), with a crosshair and the volume.
+ *   Reading a point or a candle (pointer or keyboard) moves the headline to
+ *   its price (a candle's close) and its date. Until the price oracle serves
+ *   candles they come from the quote's history (lib/candles.ts); simulated
+ *   prices get simulated wicks and volume, live ones never do.
  * - Key stats: market cap, 24-hour volume, yield, on a hairline grid.
  * - A sticky action bar: Sell (charcoal) and Buy (solid gold), massive, held
  *   above the phone's tab bar and at the bottom of the terminal on desktop.
@@ -40,6 +39,17 @@ import type { DecimalString } from "@/types/vault";
 
 /** The ranges a price is read over. */
 const PRICE_RANGES: readonly ChartRangeId[] = ["1D", "1W", "1M", "1Y", "ALL"];
+
+/** Where this device remembers the chart type (a convenience: nothing breaks without it). */
+const CHART_MODE_KEY = "synthetic-capital.chart-mode";
+
+function storedChartMode(): ChartMode {
+  try {
+    return window.localStorage.getItem(CHART_MODE_KEY) === "candles" ? "candles" : "line";
+  } catch {
+    return "line";
+  }
+}
 
 export interface AssetDetailProps {
   asset: MarketAsset;
@@ -58,6 +68,12 @@ export interface AssetDetailProps {
   sellable?: DecimalString;
   /** The price streams in as it trades (shows "Live"). */
   live?: boolean;
+  /**
+   * Where the price comes from. Only "simulated" prices (demo mode) get
+   * simulated wicks and volume on their candles; the default draws the
+   * history as it is.
+   */
+  priceSource?: PriceSource;
   /** Places an order: resolves with the receipt, or rejects with the error to show. */
   onPlaceOrder: (order: OrderRequest) => Promise<PlacedOrder>;
   className?: string;
@@ -71,19 +87,26 @@ export function AssetDetail({
   position,
   sellable = position,
   live = false,
+  priceSource = "oracle",
   onPlaceOrder,
   className,
 }: AssetDetailProps) {
   const titleId = useId();
   const statsId = useId();
   const [range, setRange] = useState<ChartRangeId>("1M");
+  const [mode, setMode] = useState<ChartMode>(storedChartMode);
   const [active, setActive] = useState<number | null>(null);
   const [checkout, setCheckout] = useState<OrderSide | null>(null);
   const tick = usePriceTick(asset.price);
 
-  const shown = useMemo(() => drawable(pointsInRange(history, range, now)), [history, range, now]);
-  const focus = active !== null ? (shown[active] ?? null) : null;
-  const headline = moneyParts(focus ? focus.value : asset.price);
+  const candles = useMemo(
+    () =>
+      historyCandles(history, priceSource === "simulated" ? { seed: asset.ticker, volume24h: asset.volume_24h } : null),
+    [history, priceSource, asset.ticker, asset.volume_24h],
+  );
+  const view = useMemo(() => priceView(history, candles, range, now), [history, candles, range, now]);
+  const focus = view && active !== null ? readFocus(view, mode, active) : null;
+  const headline = moneyParts(focus ? focus.price : asset.price);
   const change = signedPercent(asset.change_24h_pct);
   const trend = TREND[change.trend];
   const holds = toUnits(position) > 0n;
@@ -135,7 +158,9 @@ export function AssetDetail({
               <span className="text-[0.5em] text-muted">.{headline.fraction}</span>
             </p>
             {focus ? (
-              <p className="mt-2 text-sm text-muted tabular-nums">{readoutDate(focus.at)}</p>
+              <p className="mt-2 text-sm text-muted tabular-nums" data-testid="asset-focus-date">
+                {focus.date}
+              </p>
             ) : (
               <p className={cx("mt-2 inline-flex items-center gap-1.5 text-sm font-semibold tabular-nums", trend.className)}>
                 <trend.Icon className="size-4" aria-hidden />
@@ -146,7 +171,19 @@ export function AssetDetail({
           </div>
         </header>
 
-        <div className="mt-6 flex justify-end">
+        <div className="mt-6 flex flex-wrap items-center justify-between gap-3">
+          <ChartModeToggle
+            value={mode}
+            onChange={(next) => {
+              setMode(next);
+              setActive(null);
+              try {
+                window.localStorage.setItem(CHART_MODE_KEY, next);
+              } catch {
+                // Private mode or storage off: the choice holds for this page only.
+              }
+            }}
+          />
           <RangePicker
             ranges={PRICE_RANGES}
             value={range}
@@ -156,16 +193,18 @@ export function AssetDetail({
             }}
           />
         </div>
-        <TrendChart
+        <ProCandlestickChart
           className="mt-4"
-          points={shown}
-          curve="linear"
-          label={`${asset.name} price chart. Use the arrow keys to read each point.`}
+          view={view}
+          mode={mode}
+          label={
+            mode === "line" || !view
+              ? `${asset.name} price chart, line. Use the arrow keys to read each point.`
+              : `${asset.name} price chart, ${view.interval.name.toLowerCase()} candles. Use the arrow keys to read each candle.`
+          }
           active={active}
           onActiveChange={setActive}
-          describe={(point) => `${formatMoney(point.value)} MXN, ${readoutDate(point.at)}`}
-          emptyText={{ title: "No price history yet", body: "The line starts with the first trade." }}
-          heightClassName="h-60 sm:h-80"
+          emptyText={{ title: "No price history yet", body: "The chart starts with the first trade." }}
           lineTestId="asset-line"
         />
       </section>
@@ -259,6 +298,16 @@ export function AssetDetail({
 
 /* ------------------------------------------------------------------------ */
 
+/** What the headline reads while a point or a candle is in focus: its price (a candle's close) and its date. */
+function readFocus(view: PriceView, mode: ChartMode, index: number): { price: DecimalString; date: string } | null {
+  if (mode === "line") {
+    const point = view.line[index];
+    return point ? { price: point.value, date: readoutDate(point.at) } : null;
+  }
+  const candle = view.candles[index];
+  return candle ? { price: candle.close, date: candleTime(candle, view.interval) } : null;
+}
+
 const TREND: Record<Trend, { Icon: LucideIcon; className: string }> = {
   up: { Icon: ArrowUpRight, className: "text-gain" },
   down: { Icon: ArrowDownRight, className: "text-loss" },
@@ -317,8 +366,13 @@ export function AssetDetailSkeleton({ className }: { className?: string }) {
           <div className="mt-4 h-7 w-56 bg-surface-2" />
           <div className="mt-6 h-14 w-64 bg-surface-2 sm:h-16" />
           <div className="mt-3 h-4 w-24 bg-surface-2" />
-          <div className="mt-6 ml-auto h-9 w-60 bg-surface-2" />
-          <div className="mt-4 h-60 bg-surface-2 sm:h-80" />
+          <div className="mt-6 flex justify-between gap-3">
+            <div className="h-9 w-20 bg-surface-2 sm:w-44" />
+            <div className="h-9 w-52 bg-surface-2" />
+          </div>
+          <div className="mt-4 h-9 w-72 max-w-full bg-surface-2 sm:h-5" />
+          <div className="mt-3 h-60 bg-surface-2 sm:h-80" />
+          <div className="mt-1 h-12 bg-surface-2 sm:h-14" />
         </div>
         <div className="mt-4 grid grid-cols-1 gap-px border border-border bg-border sm:mt-6 sm:grid-cols-3">
           {[0, 1, 2].map((i) => (

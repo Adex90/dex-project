@@ -8,6 +8,7 @@ import { useDashboard } from "@/components/layout/dashboard-shell";
 import { OpenOrdersList } from "@/components/markets/open-orders-list";
 import { Alert, Button } from "@/components/ui/primitives";
 import { AssetList, AssetListSkeleton } from "@/components/vault/asset-list";
+import { PortfolioAnalytics, PortfolioAnalyticsSkeleton } from "@/components/vault/portfolio-analytics";
 import { PortfolioChart } from "@/components/vault/portfolio-chart";
 import { SovereignBalance, SovereignBalanceSkeleton } from "@/components/vault/sovereign-balance";
 import { SpeiDepositCard, SpeiDepositCardSkeleton } from "@/components/vault/spei-deposit-card";
@@ -19,16 +20,19 @@ import { useVaultStore } from "@/store/vault";
 
 /*
  * Vault: the dashboard's home. The Sovereign Vault snapshot
- * (GET /api/v1/vault) feeds the balance, the reserve seal, the assets and
- * the deposit details; the chart redraws the cash balance from the IFPE
- * ledger the shell already loads. Open limit and stop orders sit at the top
- * of the holdings, with what they hold (components/markets/open-orders-list.tsx);
- * the section is absent when there are none.
+ * (GET /api/v1/vault) feeds the balance, the reserve seal, the allocation,
+ * the assets and the deposit details; the chart redraws the cash balance from
+ * the IFPE ledger the shell already loads. The allocation
+ * (components/vault/portfolio-analytics.tsx) splits the total between cash,
+ * each holding and fixed term, live from the same store. Open limit and stop
+ * orders sit at the top of the holdings, with what they hold
+ * (components/markets/open-orders-list.tsx); the section is absent when there
+ * are none.
  *
- * Layout: one column on phones (balance, trend, deposit, open orders,
- * assets); from xl, the balance (two thirds) beside the deposit card, both
- * the same height, then the trend, the open orders and the assets across the
- * full width.
+ * Layout: one column on phones (balance, allocation, trend, deposit, open
+ * orders, assets); from xl, the balance (two thirds) beside the deposit card,
+ * both the same height, then the allocation, the trend, the open orders and
+ * the assets across the full width.
  */
 export default function VaultPage() {
   const { token, client, kycLocked, refresh } = useDashboard();
@@ -77,6 +81,10 @@ export default function VaultPage() {
         </div>
 
         <div className="min-w-0 xl:col-span-3 xl:row-start-2">
+          {loaded ? <PortfolioAnalytics balance={balance} holdings={holdings} /> : <PortfolioAnalyticsSkeleton />}
+        </div>
+
+        <div className="min-w-0 xl:col-span-3 xl:row-start-3">
           {history ? (
             <PortfolioChart
               points={history}

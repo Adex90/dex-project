@@ -214,6 +214,7 @@ export default function AssetPage() {
           availableCash={balance.available_cash}
           position={positionFor(holdings, quote.quote.asset.ticker)}
           sellable={sellableFor(holdings, quote.quote.asset.ticker)}
+          priceSource={quote.quote.price_source}
           onPlaceOrder={placeOrder}
         />
       )}

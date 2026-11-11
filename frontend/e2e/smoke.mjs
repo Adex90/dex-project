@@ -16,11 +16,15 @@
  * Reserve). It ends on asset pages opened by their address (AUG1, an unknown
  * ticker, an address that is not a ticker, a market without live prices) and
  * on Discover: the catalog, its search, and a first buy from it (a fraction
- * of STSLA), sold back from the Vault with "Max".
+ * of STSLA), sold back from the Vault with "Max". On AUG1 the pro chart is
+ * read as a line and as candles (crosshair, legend, keyboard, ranges), and the
+ * chart type it was left in is remembered on STSLA's page.
  * Second pass: signing in again lands directly on the Vault, which is live
  * over its WebSocket: a deposit made outside the browser reaches the screen
  * with REST blocked, a server restart (1001) reconnects, and a session the
- * server ends (4001) returns to sign-in. In between, trading with REST for
+ * server ends (4001) returns to sign-in. The Vault's allocation shows the
+ * shares its own figures give, exactly, and follows the deposit and the gold
+ * buy live. In between, trading with REST for
  * the vault blocked: a gold buy on another device appears in the asset list,
  * its row opens the asset's page, a buy whose answer is lost is retried with
  * the same idempotency key and fills once, refusals show their reason; then,
@@ -35,6 +39,8 @@ import { mkdirSync } from "node:fs";
 // Node >= 22.18 strips TypeScript types, so the app's own (framework-free)
 // KYC library builds an identity that passes every frontend and backend check.
 import { sampleIdentity, SAMPLE_IDENTITY_SPACE, todayInMexicoCity } from "../src/lib/kyc.ts";
+// And the allocation's exact math, to know what the Vault must show for the figures the API gives.
+import { allocation, formatShare } from "../src/lib/allocation.ts";
 
 // createRequire honors NODE_PATH (ESM imports do not), so a global install works.
 const { chromium } = createRequire(import.meta.url)("playwright");
@@ -107,6 +113,42 @@ async function apiOrder(token, order) {
     body: JSON.stringify({ ...order, idempotency_key: crypto.randomUUID() }),
   });
   return { status: response.status, receipt: await response.json() };
+}
+
+/** Collapses the whitespace `innerText` puts between a component's pieces. */
+const flat = (text) => text.replace(/\s+/g, " ").trim();
+
+/**
+ * The vault's allocation from its own figures (GET /api/v1/vault), through
+ * the app's exact math (lib/allocation.ts): each part's key and share, and
+ * the bar's blocks in basis points. What the Vault must show.
+ */
+async function expectedAllocation(token) {
+  const response = await fetch(`${API}/api/v1/vault`, { headers: { authorization: `Bearer ${token}` } });
+  const vault = await response.json();
+  const split = allocation(vault.balance, vault.holdings);
+  return {
+    parts: split.parts.map((part) => [part.key, formatShare(part.basisPoints, part.value)]),
+    bar: split.parts.filter((part) => part.basisPoints > 0).map((part) => part.basisPoints),
+  };
+}
+
+/** Waits until the Vault's allocation reads exactly `expected` (`expectedAllocation`), in the list and in the bar. */
+async function allocationShows(page, expected, timeout = 5_000) {
+  await page.waitForFunction(
+    (want) =>
+      JSON.stringify({
+        parts: [...document.querySelectorAll("[data-testid=allocation-part]")].map((row) => [
+          row.getAttribute("data-key"),
+          row.querySelector("[data-testid=allocation-share]")?.textContent ?? null,
+        ]),
+        bar: [...document.querySelectorAll("[data-testid=allocation-segment]")].map((block) =>
+          Number(block.getAttribute("data-share")),
+        ),
+      }) === want,
+    JSON.stringify(expected),
+    { timeout },
+  );
 }
 
 /**
@@ -243,6 +285,16 @@ try {
       );
       await page.getByTestId("kyc-header-badge").and(page.locator("[data-status=VERIFICADO]")).waitFor();
       check((await page.getByTestId("kyc-banner").count()) === 0, "second pass: no KYC banner for the verified client");
+      // The allocation: cash and the fixed-term contract, nothing in the market yet, in the
+      // exact shares the vault's own figures give (they add up to 100.00 %).
+      let split = await expectedAllocation(await apiLogin(email, password));
+      await allocationShows(page, split);
+      check(
+        JSON.stringify(split.parts.map(([key]) => key)) === JSON.stringify(["cash", "fixed-term"]) &&
+          split.bar.reduce((sum, share) => sum + share, 0) === 10_000 &&
+          (await page.getByTestId("allocation-split").innerText()).includes(split.parts[0][1]),
+        `the Vault's allocation splits it exactly: cash ${split.parts[0][1]}, fixed term ${split.parts[1][1]}`,
+      );
       await streamStatus(page, "live");
       check(frames[0]?.type === "vault.snapshot", "the vault stream opens with a snapshot");
       await shot(page, "vault-desktop");
@@ -262,6 +314,9 @@ try {
       // The rest of the dashboard follows: the chart's cash reads the new balance.
       await page.getByTestId("portfolio-chart").filter({ hasText: "16,234.56" }).waitFor({ timeout: 5_000 });
       check(true, "the cash chart follows the deposit");
+      split = await expectedAllocation(otherDevice);
+      await allocationShows(page, split);
+      check(true, `the allocation follows the deposit live: cash ${split.parts[0][1]}, fixed term ${split.parts[1][1]}`);
       await page.unroute("**/api/v1/vault");
 
       // A deploy: the server closes with 1001; the dashboard reconnects and catches up.
@@ -295,6 +350,21 @@ try {
       const goldRow = page.getByTestId("asset-row").and(page.locator("[data-ticker=AUG1]"));
       await goldRow.waitFor({ timeout: 5_000 });
       check((await goldRow.innerText()).includes("Tokenized gold"), "the holding appears in the asset list live");
+      split = await expectedAllocation(otherDevice);
+      await allocationShows(page, split);
+      const goldPart = page.getByTestId("allocation-part").and(page.locator("[data-key=AUG1]"));
+      check(
+        JSON.stringify(split.parts.map(([key]) => key)) === JSON.stringify(["cash", "fixed-term", "AUG1"]) &&
+          split.bar.reduce((sum, share) => sum + share, 0) === 10_000 &&
+          (await goldPart.getByRole("link").getAttribute("href")) === "/dashboard/asset/AUG1",
+        `the allocation gains AUG1 live (${split.parts[2][1]}), still adding up to 100.00 %; its row opens the asset`,
+      );
+      await page.getByTestId("allocation-segment").and(page.locator("[data-key=AUG1]")).hover();
+      check(
+        /^AUG1 ?Tokenized gold, 1 g/.test(flat(await page.getByTestId("allocation-readout").innerText())),
+        "pointing at AUG1's block of the bar reads its name, value and share under it",
+      );
+      await page.mouse.move(0, 0);
 
       // A click anywhere on the row (here, its value) opens the asset's page inside the dashboard.
       await goldRow.locator("td").last().click();
@@ -431,6 +501,14 @@ try {
       await page.waitForURL("**/dashboard/asset/AUG1");
       await detail.getByText("1.5504 AUG1").waitFor();
       await shot(page, "asset-mobile");
+      await page.getByTestId("chart-mode").getByRole("button", { name: "Candles" }).click();
+      await page.getByTestId("pro-chart").and(page.locator("[data-mode=candles]")).waitFor();
+      check(
+        await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth),
+        "on a phone the chart fits the width, as a line and as candles",
+      );
+      await shot(page, "asset-candles-mobile");
+      await page.getByTestId("chart-mode").getByRole("button", { name: "Line" }).click();
       await page.getByRole("button", { name: "Sell", exact: true }).click();
       await checkout.getByTestId("order-type").getByText("Limit", { exact: true }).click();
       await checkout.getByTestId("order-price").waitFor();
@@ -938,6 +1016,63 @@ try {
     );
     check(await page.getByRole("button", { name: "Sell", exact: true }).isDisabled(), "Sell is disabled without a position");
     await shot(page, "asset-desktop");
+
+    // The pro chart: a gold line over the month by default; candles on demand, over the same window and axes.
+    const chart = page.getByTestId("pro-chart");
+    const legend = page.getByTestId("chart-legend");
+    check(
+      (await chart.getAttribute("data-mode")) === "line" &&
+        (await page.getByTestId("asset-line").count()) === 1 &&
+        (await page.getByTestId("chart-volume").isVisible()) &&
+        (await page.getByTestId("chart-last-price").innerText()) === "$1,612.40" &&
+        /^High \$[\d,.]+ Low \$[\d,.]+ Range [+−]?[\d.]+%$/.test(flat(await legend.innerText())),
+      "the chart opens as a gold line over the month: high, low and change above, volume below, $1,612.40 tagged",
+    );
+    await page.getByTestId("chart-mode").getByRole("button", { name: "Candles" }).click();
+    await chart.and(page.locator("[data-mode=candles]")).waitFor();
+    const days = await page.getByTestId("candle").count();
+    check(
+      (await chart.getAttribute("data-interval")) === "1d" &&
+        days >= 30 &&
+        days <= 32 &&
+        (await page.getByTestId("asset-line").count()) === 0 &&
+        /^DAILY O \$[\d,.]+ H \$[\d,.]+ L \$[\d,.]+ C \$1,612\.40 /.test(flat(await legend.innerText())),
+      `Candles draws the month as ${days} daily candles; the legend reads the forming one, closing at $1,612.40`,
+    );
+    const plot = page.getByTestId("chart-plot");
+    const plotBox = await plot.boundingBox();
+    await page.mouse.move(plotBox.x + plotBox.width * 0.5, plotBox.y + plotBox.height * 0.4);
+    await page.getByTestId("chart-crosshair").waitFor();
+    const tagged = await page.getByTestId("chart-price-tag").innerText();
+    check(
+      /^\$[\d,]+\.\d{2}$/.test(tagged) &&
+        tagged === (await page.getByTestId("asset-price").innerText()) &&
+        (await page.getByTestId("chart-time-tag").innerText()) === (await page.getByTestId("asset-focus-date").innerText()) &&
+        flat(await legend.innerText()).includes(`C ${tagged} `),
+      `the crosshair snaps to a candle: its close (${tagged}) on the price axis and in the headline, its day on both, its prices in the legend`,
+    );
+    await shot(page, "asset-candles-desktop");
+    await page.mouse.move(0, 0);
+    await page.getByTestId("chart-crosshair").waitFor({ state: "detached" });
+    await plot.focus();
+    await page.keyboard.press("End");
+    await chart.locator("p[aria-live]").filter({ hasText: "daily candle: opened" }).filter({ hasText: "closed $1,612.40" }).waitFor();
+    await page.keyboard.press("Escape");
+    check(true, "the keyboard reads the candles too: End announces the forming one, which closes at $1,612.40");
+    for (const [range, interval, low, high, chip] of [
+      ["the last day", "30m", 48, 49, "30 MIN"],
+      ["the last week", "4h", 42, 43, "4 HOURS"],
+      ["the last year", "1w", 52, 54, "WEEKLY"],
+    ]) {
+      await page.getByRole("button", { name: `Show ${range}` }).click();
+      await chart.and(page.locator(`[data-interval="${interval}"]`)).waitFor();
+      const count = await page.getByTestId("candle").count();
+      check(
+        count >= low && count <= high && flat(await legend.innerText()).startsWith(`${chip} O `),
+        `over ${range} the candles last ${chip.toLowerCase()} (${count} of them)`,
+      );
+    }
+    await page.getByRole("button", { name: "Show the last month" }).click();
     await page.getByTestId("asset-back").click();
     await page.waitForURL("**/dashboard");
     check(true, "Back to vault returns to the Vault");
@@ -1025,6 +1160,11 @@ try {
         /back to discover/i.test(await assetBack.innerText()),
       "an asset opened from Discover stays under Discover, and its Back link returns there",
     );
+    // AUG1's page was left in candles: this device remembers it.
+    await page.getByTestId("pro-chart").and(page.locator("[data-mode=candles]")).waitFor();
+    check(true, "the chart type is remembered on this device: STSLA opens as candles, as AUG1 was left");
+    await page.getByTestId("chart-mode").getByRole("button", { name: "Line" }).click();
+    await page.getByTestId("asset-line").waitFor();
     // The order types first. A limit or a stop takes its price on the same
     // numpad, a savings plan its frequency. Market, limit and stop orders are
     // live; a savings plan is previewed but never sent.

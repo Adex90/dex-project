@@ -108,9 +108,23 @@ const DAY_MS = 86_400_000;
  * first point; "ALL" is everything.
  */
 export function pointsInRange(points: readonly BalancePoint[], range: ChartRangeId, now: number): BalancePoint[] {
-  const days = CHART_RANGES.find((r) => r.id === range)?.days ?? null;
+  const days = rangeDays(range);
   if (days === null || points.length === 0) return [...points];
-  const start = now - days * DAY_MS;
+  return pointsSince(points, now - days * DAY_MS, now);
+}
+
+/** How many days a range spans; null for "ALL". */
+export function rangeDays(range: ChartRangeId): number | null {
+  return CHART_RANGES.find((r) => r.id === range)?.days ?? null;
+}
+
+/**
+ * The points from `start` to `now`: those after `start`, preceded by the one
+ * in force at `start` (the last at or before it), so the line spans the whole
+ * window. A history that begins after `start` starts at its first point.
+ */
+export function pointsSince(points: readonly BalancePoint[], start: number, now: number): BalancePoint[] {
+  if (points.length === 0) return [];
   const firstInside = points.findIndex((p) => p.at > start);
   if (firstInside === -1) {
     // Nothing moved inside the range: the last balance held all along.
