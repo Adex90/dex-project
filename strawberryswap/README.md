@@ -57,6 +57,7 @@ strawberryswap/
 │   ├── searcher-rust/              # (reserved) production RPC / signer adapters
 │   └── inventory-cpp/              # Searcher core: LOB signals, Avellaneda–Stoikov, curve planner (C++20)
 ├── vaults/threshold-signer/        # signer daemon for the HFT engine: Unix socket, strict policy (iteration 0: mock key)
+├── oracle/                         # price-proof pipeline: ETHUSD endpoint, KMS notary, ~15 s relayer → ZkPriceFeed
 ├── mpc/tss-vault/                  # (Phase 4) threshold-ECDSA/EdDSA corporate vault coordinator
 ├── infra/
 │   ├── terraform/{modules/{network,ec2-bots,rds,s3-ipfs-pin},envs/prod}
@@ -183,11 +184,11 @@ Test totals: Foundry 134, circuits 89 witness tests, Go all packages, wallet 17,
 
 ### Mainnet blockers (not solved by this phase)
 1. **Trusted setup.** Every verifier is built from single-party DEV keys; a public multi-party ceremony is required.
-2. **No production price source yet.** `ZkPriceFeed` (Phase 1, `docs/ORACLE.md`) now implements `IZKOracle`: it
-   keeps the newest zk-DECO-attested price, with strict ordering and freshness rules. Nothing feeds it yet: the relayer,
-   notary and endpoint come in Phase 2. Testnet then runs a **trusted bootstrap**: we operate the endpoint and the notary,
-   and this is disclosed. Mainnet needs independent providers and a decentralized notary (or in-circuit TLS). Batches
-   and rebalances depend on the price being fresh (≤ 60 s).
+2. **No production price source yet.** `ZkPriceFeed` (Phase 1, `docs/ORACLE.md`) implements `IZKOracle`: it keeps the
+   newest zk-DECO-attested price, with strict ordering and freshness rules. The pipeline that feeds it (Phase 2,
+   `oracle/`) is built and tested end to end on anvil. Testnet runs it as a **trusted bootstrap**: we operate the
+   endpoint and the notary, and this is disclosed. Mainnet needs independent providers and a decentralized notary (or
+   in-circuit TLS). Batches and rebalances depend on the price being fresh (≤ 60 s).
 3. **No external audit.** The Phase-8 review is internal; open items are listed in `docs/AUDIT_PHASE8.md` §7
    (operator sandwich residual, oracle-relative slippage, anonymity floor on-chain, deadline window, intent relaying,
    searcher RPC architecture, among others).
@@ -264,6 +265,27 @@ engine routes every rebalance through it.
 
 ```bash
 cd vaults/threshold-signer && cargo test && cargo run --release -- --chain-id 31337 --executor 0x<SearcherExecutor>
+```
+
+## Price-proof pipeline (Rust), testnet Phase 2
+
+`oracle/` keeps `ZkPriceFeed` fresh. Three services, one crate (`docs/ORACLE.md` has the design and the trust model):
+
+* **`price-endpoint`** serves `GET /v1/ETHUSD`: the circuit's canonical body of the median of Coinbase, Kraken and
+  Bitstamp. It needs two quotes within 1 % of each other and no older than 10 s; otherwise it answers 503 (fail
+  closed).
+* **`notary`** fetches that body itself over HTTPS and checks it byte for byte. It then has **AWS KMS** sign
+  `ZkDecoOracle`'s digest of its commitment, and checks that the signature recovers to it before handing it out.
+* **`relayer`** runs every ~15 s. It checks the attestation as the contract will and proves it (Groth16, the committed
+  DEV keys in `oracle/zk/`). It preflights `submit`, then pushes an EIP-1559 transaction signed by its own KMS key,
+  with capped fees.
+
+No process holds key material: both keys are KMS keys (interim custody until the MPC vault). The tests run the
+production KMS signer against a stand-in that speaks KMS's protocol, and real proofs throughout. CI's end-to-end
+test runs the three binaries against `ZkPriceFeed` on anvil while the market moves.
+
+```bash
+cd oracle && cargo test     # needs `npm ci` in circuits/ (snarkjs); the anvil end to end runs in CI (--ignored)
 ```
 
 ## Known limitations (read before Phase 2)

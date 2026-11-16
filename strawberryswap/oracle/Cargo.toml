@@ -1,0 +1,61 @@
+[package]
+name = "zk-oracle"
+version = "0.1.0"
+edition = "2024"
+# The toolchain CI and the other Rust crates build with (it also steers Cargo's MSRV-aware resolver).
+rust-version = "1.97"
+description = "StrawberrySwap's price-proof pipeline: the ETHUSD price endpoint, the KMS-backed notary and the ~15 s relayer that keeps ZkPriceFeed fresh"
+publish = false
+
+[[bin]]
+name = "price-endpoint"
+path = "src/bin/price_endpoint.rs"
+
+[[bin]]
+name = "notary"
+path = "src/bin/notary.rs"
+
+[[bin]]
+name = "relayer"
+path = "src/bin/relayer.rs"
+
+[dependencies]
+# EIP-1559 transactions, contract bindings, the HTTP provider (rustls) and the AWS KMS signer: the notary's and the
+# relayer's keys never leave KMS (no local signer feature).
+alloy = { version = "2.5.0", default-features = false, features = [
+    "std",
+    "consensus",
+    "contract",
+    "eips",
+    "k256",
+    "network",
+    "provider-http",
+    "reqwest-rustls-tls",
+    "rpc-types",
+    "signer-aws",
+    "sol-types",
+] }
+# The KMS client the signer runs on. Credentials and region come from the standard AWS chain (on EC2, the instance
+# role); no SSO or credential-process providers. alloy-signer-aws pins aws-smithy-types to =1.6.1, so these are the
+# newest releases that build against it (aws-sdk-kms 1.114, aws-config 1.10).
+aws-config = { version = "1.10", default-features = false, features = ["behavior-version-latest", "default-https-client", "rt-tokio"] }
+aws-sdk-kms = { version = "1.114", default-features = false, features = ["default-https-client", "rt-tokio"] }
+# The endpoint's and the notary's HTTP APIs.
+axum = { version = "0.8.9", default-features = false, features = ["http1", "json", "tokio"] }
+# Poseidon over BN254 with circomlib's parameters: the body and query commitments the circuit recomputes.
+light-poseidon = "0.5.0"
+ark-bn254 = "0.6.0"
+ark-ff = "0.6.0"
+# Upstream price sources and the notary's fetch of the endpoint (rustls, certificate checks on).
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+tokio = { version = "1.54.1", features = ["rt", "rt-multi-thread", "macros", "time", "signal", "net", "process", "io-util", "sync"] }
+
+[dev-dependencies]
+# The tests' stand-in for AWS KMS signs with a local key (tests only: never linked into the binaries).
+k256 = { version = "0.13.4", features = ["ecdsa", "pkcs8"] }
+base64 = "0.22"
+
+[profile.release]
+overflow-checks = true
