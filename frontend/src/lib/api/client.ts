@@ -146,6 +146,8 @@ const MESSAGES: Record<string, string> = {
   TIPO_ORDEN_NO_DISPONIBLE: "Savings plans are not available yet. Nothing was scheduled.",
   // Withdrawals (migration 0016): only to a bank account linked in the client's own name.
   CUENTA_NO_VINCULADA: "Withdrawals go only to a bank account linked in your name. Nothing was sent.",
+  TRANSFERENCIAS_TERCEROS_NO_DISPONIBLES:
+    "Payments to other people's accounts are not available. Withdrawals go to a bank account in your name.",
   // A client whose account is restricted gets this one neutral message whatever
   // the cause (no tipping off): it must not mention compliance, alerts or freezes.
   OPERACION_NO_DISPONIBLE: GENERIC_UNAVAILABLE_MESSAGE,

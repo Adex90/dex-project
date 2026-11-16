@@ -335,10 +335,21 @@ async fn la_lista_blanca_en_las_dos_rutas_de_retiro(pool: PgPool) {
     assert_eq!(s, StatusCode::CREATED, "{r}");
     assert_eq!(r["orden"]["cuenta_vinculada_id"], cuenta_a["id"]);
 
-    // Un pago a un tercero (/spei/transfer) no es un retiro: no lleva cuenta vinculada.
+    // Un pago a un tercero (/spei/transfer) no es un retiro. Por omisión no hay
+    // (422, antes de tocar dinero); encendido, no lleva cuenta vinculada.
     let pago = json!({ "clabe_destino": externa(1), "beneficiario_nombre": "Proveedor Externo", "monto": "10.00",
                        "clave_idempotencia": clave_api() });
-    let (s, p) = llamar_json(&api.app, "POST", "/api/v1/spei/transfer", Some(&ta), Some(pago)).await;
+    let (s, e) = llamar_json(&api.app, "POST", "/api/v1/spei/transfer", Some(&ta), Some(pago.clone())).await;
+    assert_eq!(
+        (s, e["error"]["codigo"].as_str()),
+        (StatusCode::UNPROCESSABLE_ENTITY, Some("TRANSFERENCIAS_TERCEROS_NO_DISPONIBLES")),
+        "{e}"
+    );
+    assert_eq!(saldos(&pool, ana.cuenta_ifpe.id).await.0, d("4990"));
+    let mut con_terceros = cfg.clone();
+    con_terceros.spei.transferencias_terceros = true;
+    let api_terceros = Api::nueva(&pool, con_terceros);
+    let (s, p) = llamar_json(&api_terceros.app, "POST", "/api/v1/spei/transfer", Some(&ta), Some(pago)).await;
     assert_eq!(s, StatusCode::CREATED, "{p}");
     assert_eq!(p["orden"]["cuenta_vinculada_id"], Value::Null);
     // Los rechazos no tocaron el saldo: salieron solo el retiro y el pago.

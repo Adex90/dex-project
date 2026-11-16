@@ -46,6 +46,9 @@ MFA_CLAVE_CIFRADO=$(openssl rand -hex 32)
 # backend/tests/limites.rs covers the per-IP limits.
 HTTP_LIMITE_IP=false
 SPEI_WEBHOOK_SECRETO=$(openssl rand -hex 32)
+# Off by default (own-name withdrawals only); the AML console suite sends third-party SPEI
+# to trigger its rules, so this stack turns them on.
+SPEI_TRANSFERENCIAS_TERCEROS=true
 BOOTSTRAP_CUMPLIMIENTO_EMAILS=oficial1@cumplimiento.mx,oficial2@cumplimiento.mx
 BOOTSTRAP_CUMPLIMIENTO_PASSWORD=cumplimiento-e2e-2026
 BOOTSTRAP_OPERADOR_EMAIL=operador@synthetic.mx

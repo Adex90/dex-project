@@ -53,7 +53,7 @@
 //! | POST | `/api/v1/operaciones/creditos/{id}/pagos` | operador |
 //! | POST | `/api/v1/operaciones/capital` | operador |
 //! | POST | `/api/v1/spei/webhook/inbound`, `/api/v1/spei/webhook/estado` | proveedor SPEI (firma HMAC) |
-//! | POST | `/api/v1/spei/transfer` | cliente: SPEI saliente |
+//! | POST | `/api/v1/spei/transfer` | cliente: SPEI a un tercero, solo con `SPEI_TRANSFERENCIAS_TERCEROS` (apagado por omisión) |
 //! | GET  | `/api/v1/spei/transferencias`, `/api/v1/spei/recibidos` | cliente |
 //! | GET  | `/api/v1/spei/conciliacion`, `/api/v1/spei/en-revision` | operador / auditor |
 //! | POST | `/api/v1/operaciones/spei/recibidos/{id}/correccion` | operador: revierte un abono SPEI erróneo |

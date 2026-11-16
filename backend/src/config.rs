@@ -129,6 +129,12 @@ pub struct ConfigSpei {
     /// del ordenante (`SPEI_BANCO_NOMBRE`). La bóveda la muestra junto a la
     /// CLABE para depositar.
     pub banco_nombre: String,
+    /// Pagos SPEI a terceros (`POST /api/v1/spei/transfer`,
+    /// `SPEI_TRANSFERENCIAS_TERCEROS`). Apagados por omisión: un cliente de
+    /// patrimonio solo saca su dinero a una cuenta vinculada a su nombre
+    /// (0016), la postura que protege contra el vaciado de una cuenta robada.
+    /// Encenderlos es una decisión de producto y de cumplimiento.
+    pub transferencias_terceros: bool,
 }
 
 impl Default for ConfigSpei {
@@ -149,6 +155,7 @@ impl Default for ConfigSpei {
             margen_corte_seg: 600,
             // El participante liquidador (state.rs): sus CLABE empiezan con 646.
             banco_nombre: "STP".into(),
+            transferencias_terceros: false,
         }
     }
 }
@@ -558,6 +565,7 @@ impl Config {
                             nombre
                         }
                     },
+                    transferencias_terceros: var_o("SPEI_TRANSFERENCIAS_TERCEROS", d.transferencias_terceros)?,
                 }
             },
             http: {

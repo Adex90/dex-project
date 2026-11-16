@@ -113,7 +113,12 @@ impl Api {
 }
 
 async fn api(pool: &PgPool) -> (Api, Config) {
-    let cfg = preparar(pool).await;
+    api_con(pool, |_| {}).await
+}
+
+async fn api_con(pool: &PgPool, ajustar: impl FnOnce(&mut Config)) -> (Api, Config) {
+    let mut cfg = preparar(pool).await;
+    ajustar(&mut cfg);
     bootstrap::asegurar_operador(pool, "operador@synthetic.mx", "operador-de-pruebas-123").await.unwrap();
     (Api { app: routes::router(AppState::nuevo(pool.clone(), cfg.clone())), totp: Autenticadora::default() }, cfg)
 }
@@ -1905,7 +1910,8 @@ async fn segregacion_de_funciones(pool: PgPool) {
 /// responde los mismos bytes.
 #[sqlx::test(migrations = "../migrations")]
 async fn sin_aviso_al_cliente(pool: PgPool) {
-    let (api, cfg) = api(&pool).await;
+    // Beto dispersa por SPEI a terceros: encendidos para esta prueba.
+    let (api, cfg) = api_con(&pool, |c| c.spei.transferencias_terceros = true).await;
     let ana = cliente(&pool, &cfg, "Ana").await;
     let beto = cliente(&pool, &cfg, "Beto").await;
     let tok_ana = token_cliente(&api, "Ana").await;

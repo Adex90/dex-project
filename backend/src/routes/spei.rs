@@ -234,14 +234,23 @@ struct SolicitudTransferencia {
     clave_idempotencia: String,
 }
 
-/// Envía un SPEI: el saldo y la reserva bajan al instante y la orden queda
-/// PENDIENTE para el despachador. 201 si es nueva, 200 si es repetición.
+/// Envía un SPEI a un tercero: el saldo y la reserva bajan al instante y la
+/// orden queda PENDIENTE para el despachador. 201 si es nueva, 200 si es
+/// repetición. Solo con `SPEI_TRANSFERENCIAS_TERCEROS`: por omisión, 422
+/// `TRANSFERENCIAS_TERCEROS_NO_DISPONIBLES` antes de tocar dinero o PLD (la
+/// misma respuesta para todos, así que no delata nada).
 async fn transferir(
     State(e): State<AppState>,
     u: Usuario,
     Json(s): Json<SolicitudTransferencia>,
 ) -> AppResult<(StatusCode, Json<ResultadoOrden>)> {
     u.exigir_cliente()?;
+    if !e.config.spei.transferencias_terceros {
+        return Err(AppError::negocio(
+            "TRANSFERENCIAS_TERCEROS_NO_DISPONIBLES",
+            "los pagos SPEI a terceros no están disponibles; tu dinero sale solo a una cuenta vinculada a tu nombre",
+        ));
+    }
     let solicitud = SolicitudSpei {
         cliente_id: u.cliente_id,
         clabe_destino: s.clabe_destino,

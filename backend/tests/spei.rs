@@ -426,7 +426,8 @@ async fn captura_manual_con_otra_identidad_no_duplica(pool: PgPool) {
 
 #[sqlx::test(migrations = "../migrations")]
 async fn transferencia_saliente_ciclo_completo(pool: PgPool) {
-    let b = banco(&pool).await;
+    // Los pagos a terceros están apagados por omisión (tests/patrimonio.rs).
+    let b = banco_con(&pool, |c| c.spei.transferencias_terceros = true).await;
     let ana = cliente(&pool, &b.cfg, "Ana").await;
     depositar(&pool, &b.cfg, ana.cuenta_ifpe.id, "1000").await;
     b.pasarela.fijar_saldo_custodio(reserva_total(&pool).await);
