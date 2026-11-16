@@ -65,6 +65,13 @@ env:
   SHELLCHECK_SHA256: 8c3be12b05d5c177a04c29e3c78ce89ac86f1595681cab149b65b97c4e227198
   ACTIONLINT_VERSION: "1.7.12"
   ACTIONLINT_SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
+  # The contract suites: Foundry (installed by foundry-rs/foundry-toolchain) and
+  # forge-std, which they import. lib/ is not committed, so CI clones the tag and
+  # checks its src/ tree against this SHA-256 (the tree the suites were verified
+  # with): `find src -type f | LC_ALL=C sort | xargs sha256sum | sha256sum`.
+  FOUNDRY_VERSION: v1.7.1
+  FORGE_STD_VERSION: v1.9.4
+  FORGE_STD_SRC_SHA256: 6796bb6e13e5fe07ebc0f8f3e31f92c7d96cf226a428cd9e381cbf0ede15b14d
 
 jobs:
   # ---------------------------------------------------------------------------
@@ -212,6 +219,43 @@ jobs:
         working-directory: backend
         # sqlx::test gives every test a fresh database with all migrations applied.
         run: cargo test --locked --no-fail-fast
+
+  # ---------------------------------------------------------------------------
+  # StrawberrySwap's contracts (strawberryswap/contracts): the Foundry suites,
+  # with real Groth16 proofs of the circuits (DEV keys) in test/fixtures, fuzz
+  # and invariant tests, and the zk price feed against a real DarkPool.
+  contracts:
+    name: Contracts (Foundry; build, tests)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: strawberryswap/contracts
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install Foundry ${{ env.FOUNDRY_VERSION }}
+        uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: ${{ env.FOUNDRY_VERSION }}
+
+      - name: Fetch forge-std ${{ env.FORGE_STD_VERSION }} and check its source tree
+        run: |
+          git clone --quiet --depth 1 --branch "$FORGE_STD_VERSION" https://github.com/foundry-rs/forge-std.git lib/forge-std
+          got=$(cd lib/forge-std && find src -type f | LC_ALL=C sort | xargs sha256sum | sha256sum | cut -d' ' -f1)
+          if [ "$got" != "$FORGE_STD_SRC_SHA256" ]; then
+            echo "::error::forge-std $FORGE_STD_VERSION src/ tree is $got, expected $FORGE_STD_SRC_SHA256"
+            exit 1
+          fi
+          forge --version
+
+      - name: forge build
+        run: forge build
+
+      - name: forge test
+        run: forge test -vv
 
   # ---------------------------------------------------------------------------
   # StrawberrySwap's market-making engine (strawberryswap/bots/hft-engine-rust):
@@ -833,7 +877,7 @@ jobs:
   ci-ok:
     name: CI result
     if: ${{ always() }}
-    needs: [frontend, backend, hft-engine, threshold-signer, sql-suites, e2e, docker, iac-and-scripts]
+    needs: [frontend, backend, contracts, hft-engine, threshold-signer, sql-suites, e2e, docker, iac-and-scripts]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
