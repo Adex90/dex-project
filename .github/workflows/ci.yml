@@ -242,6 +242,8 @@ jobs:
             expect: "tests/db/0013_mercado_valores.sql: todas las pruebas pasaron (ROLLBACK)"
           - suite: 0015_ordenes_avanzadas
             expect: "tests/db/0015_ordenes_avanzadas.sql: todas las pruebas pasaron (ROLLBACK)"
+          - suite: 0016_cuentas_vinculadas
+            expect: "tests/db/0016_cuentas_vinculadas.sql: todas las pruebas pasaron (ROLLBACK)"
     services:
       postgres:
         image: postgres:16
