@@ -183,8 +183,11 @@ Test totals: Foundry 134, circuits 89 witness tests, Go all packages, wallet 17,
 
 ### Mainnet blockers (not solved by this phase)
 1. **Trusted setup.** Every verifier is built from single-party DEV keys; a public multi-party ceremony is required.
-2. **No production price oracle.** `DarkPool` needs an `IZKOracle` implementation (a feed of zk-DECO-attested prices);
-   only test mocks exist. Batches and rebalances depend on it being fresh (≤ 60 s).
+2. **No production price source yet.** `ZkPriceFeed` (Phase 1, `docs/ORACLE.md`) now implements `IZKOracle`: it
+   keeps the newest zk-DECO-attested price, with strict ordering and freshness rules. Nothing feeds it yet: the relayer,
+   notary and endpoint come in Phase 2. Testnet then runs a **trusted bootstrap**: we operate the endpoint and the notary,
+   and this is disclosed. Mainnet needs independent providers and a decentralized notary (or in-circuit TLS). Batches
+   and rebalances depend on the price being fresh (≤ 60 s).
 3. **No external audit.** The Phase-8 review is internal; open items are listed in `docs/AUDIT_PHASE8.md` §7
    (operator sandwich residual, oracle-relative slippage, anonymity floor on-chain, deadline window, intent relaying,
    searcher RPC architecture, among others).
