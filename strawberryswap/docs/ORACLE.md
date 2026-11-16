@@ -58,9 +58,9 @@ the testnet pool needs an **18-decimal USD stablecoin**. Circle's test USDC has 
 data really is. Before the first push it returns `(0, 0)`, which DarkPool treats as stale. Keeping the feed fresh is
 the relayers' job. On testnet, a relayer pushes every ~15 s, and anyone can run another.
 
-**Cost.** A push costs the relayer under 400,000 gas (the exact figure is in the `test_gasOfAPush` log). Most of that
-is the Groth16 pairing check. At one push every 15 s, that is affordable on an L2 such as Arbitrum, and not on Ethereum
-mainnet.
+**Cost.** A push costs the relayer **259,974 gas**: the first push, into a cold storage slot, as measured in CI by
+`test_gasOfAPush`. Most of that is the Groth16 pairing check. At one push every 15 s, that is about 1.5 B gas a day:
+affordable on an L2 such as Arbitrum, and not on Ethereum mainnet.
 
 ## Trust model
 
@@ -70,6 +70,9 @@ A price is as honest as:
 2. **The provider's notary**, registered immutably in `ZkDecoOracle`. A compromised notary key can attest any price
    within the feed's bounds for its provider. Until in-circuit TLS verification exists, the notary is the trust anchor.
 3. **The circuit and its trusted setup.** Today these are DEV keys from a single party.
+4. **The chain's clock.** Freshness is measured against `block.timestamp`. On Arbitrum the sequencer sets it, and the
+   protocol only keeps it within hours of L1 time. So the feed's windows, and DarkPool's own 60 s rule, assume an honest
+   sequencer clock. A sequencer that backdated blocks could make a stale price look fresh.
 
 A wrong price is not harmless. `flashRebalance` moves the pool toward the oracle, so a false price lets a searcher move
 the pool to it and keep the difference at true prices. That is why the price source is a mainnet blocker, not a detail.

@@ -34,10 +34,11 @@ import {IZKDecoOracle} from "../interfaces/IZKDecoOracle.sol";
 ///
 /// ⚠ TRUST MODEL (honest statement). A price is as honest as (a) the data provider, (b) the provider's notary
 ///   registered in `ZkDecoOracle`, until in-circuit TLS verification removes it, and (c) the circuit and its trusted
-///   setup. TESTNET IS A TRUSTED BOOTSTRAP: Rothbard Tecnologías Financieras operates both the price endpoint and the
-///   notary, and the verifier uses single-party DEV keys, so testnet prices are only as trustworthy as the operator.
-///   Mainnet requires independent providers, a decentralized notary (or in-circuit TLS), a multi-party setup ceremony
-///   and an external audit. See docs/ORACLE.md.
+///   setup; and it is as fresh as (d) the chain's clock, which on Arbitrum the sequencer sets.
+///   TESTNET IS A TRUSTED BOOTSTRAP: Rothbard Tecnologías Financieras operates both the price endpoint and the notary,
+///   and the verifier uses single-party DEV keys, so testnet prices are only as trustworthy as the operator. Mainnet
+///   requires independent providers, a decentralized notary (or in-circuit TLS), a multi-party setup ceremony and an
+///   external audit. See docs/ORACLE.md.
 contract ZkPriceFeed is IZKOracle {
     /// @notice DarkPool's MAX_PRICE: the largest price the pool accepts.
     uint256 public constant MAX_POOL_PRICE = 1e24;
@@ -99,7 +100,12 @@ contract ZkPriceFeed is IZKOracle {
         if (a.queryCommitment != queryCommitment) revert WrongInstrument(a.queryCommitment);
         uint64 latest = _observedAt;
         if (a.observedAt <= latest) revert NotNewer(a.observedAt, latest);
+        // Freshness is a comparison with the chain's clock by definition. On Arbitrum the sequencer sets it (the
+        // protocol keeps it within hours of L1 time), so these windows, like DarkPool's own 60 s rule, assume an honest
+        // sequencer clock: docs/ORACLE.md, trust model.
+        // forge-lint: disable-next-line(block-timestamp)
         if (a.observedAt > block.timestamp) revert FromTheFuture(a.observedAt, block.timestamp);
+        // forge-lint: disable-next-line(block-timestamp)
         if (block.timestamp - a.observedAt > maxSubmissionDelay) revert TooOld(a.observedAt, block.timestamp);
         if (a.price < minPrice || a.price > maxPrice) revert PriceOutOfBounds(a.price);
         if (!verifier.verifyAttestation(a, proof)) revert InvalidAttestation();

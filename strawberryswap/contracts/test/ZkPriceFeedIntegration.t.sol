@@ -154,11 +154,13 @@ contract ZkPriceFeedIntegrationTest is Test {
         (uint256 last,) = feed.latestVerifiedPrice();
         assertEq(last, 3458.0000000001e18, "ten fractional digits, exact");
 
-        // Replaying an older, valid attestation is refused.
+        // Replaying an older, valid attestation is refused. (The proof is built first: building it calls the oracle,
+        // and expectRevert applies to the next external call.)
         (IZKDecoOracle.Attestation memory a1, FeedFixtures.Attested memory f1) = _attestation(1);
         (, FeedFixtures.Attested memory f3) = _attestation(3);
+        bytes memory replay = _proof(f1.snark, f1.bodyCommitment, NOTARY_PK);
         vm.expectRevert(abi.encodeWithSelector(ZkPriceFeed.NotNewer.selector, f1.observedAt, f3.observedAt));
-        feed.submit(a1, _proof(f1.snark, f1.bodyCommitment, NOTARY_PK));
+        feed.submit(a1, replay);
     }
 
     // ------------------------------------------------------------------ what the feed refuses
@@ -166,7 +168,11 @@ contract ZkPriceFeedIntegrationTest is Test {
     function test_tamperedOrForeignAttestationsAreRefused() public {
         (IZKDecoOracle.Attestation memory a, FeedFixtures.Attested memory f) = _attestation(0);
         vm.warp(f.observedAt + 2);
+        // Every proof is built before its expectRevert: building one calls the oracle, and expectRevert applies to the
+        // next external call.
         bytes memory good = _proof(f.snark, f.bodyCommitment, NOTARY_PK);
+        bytes memory wrongSigner = _proof(f.snark, f.bodyCommitment, 0xB0B);
+        bytes memory wrongBody = _proof(f.snark, keccak256("another body"), NOTARY_PK);
 
         // A different price than the one proven.
         IZKDecoOracle.Attestation memory t = _copy(a);
@@ -182,11 +188,11 @@ contract ZkPriceFeedIntegrationTest is Test {
 
         // The right proof, signed by a key that is not the provider's notary.
         vm.expectRevert(ZkPriceFeed.InvalidAttestation.selector);
-        feed.submit(a, _proof(f.snark, f.bodyCommitment, 0xB0B));
+        feed.submit(a, wrongSigner);
 
         // A body commitment the notary signed but the proof is not about.
         vm.expectRevert(ZkPriceFeed.InvalidAttestation.selector);
-        feed.submit(a, _proof(f.snark, keccak256("another body"), NOTARY_PK));
+        feed.submit(a, wrongBody);
 
         // A truncated proof.
         bytes memory cut = new bytes(good.length - 1);
