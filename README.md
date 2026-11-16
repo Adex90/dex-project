@@ -1093,6 +1093,79 @@ nothing they show is sent to the backend.
   counter against the exact accrual as it ticks, the card's states, and the tab
   on a phone.
 
+## Linked accounts and withdrawals (migration `0016`)
+
+The fiat off-ramp. Money leaves the vault only to a bank account in the
+client's own name: the AML whitelist.
+
+- **Linked accounts** (`ifpe.cuentas_vinculadas`): the external CLABEs a
+  client may withdraw to. To link one, the database requires:
+  - the client can operate (`kyc.puede_operar`: KYC verified, not on the
+    blocked persons list);
+  - the holder is the client: their name in `kyc.clientes`, compared
+    without accents, case or punctuation (`ifpe.nombre_comparable`);
+  - the CLABE is valid and external (never one of Synthetic Capital's);
+  - the CLABE is active for one client only, so two clients with the same
+    name cannot share a withdrawal account.
+
+  A linked account is never deleted or edited. It is retired
+  (`ACTIVA -> BAJA`), and the retirement is final. Clients read only their
+  own accounts (RLS, as in `0011`).
+- **The whitelist in the SPEI engine** (`backend/src/spei/outbound.rs`).
+  An own-account withdrawal (no payee: the payee is the client) goes only
+  to an active linked account in the client's name with that CLABE. The
+  order records it in `spei_outbound.cuenta_vinculada_id`, and a trigger
+  checks it again: same client, active, same CLABE, the payee is the
+  holder (the SPEI name may be cut at 40 characters).
+  - The check runs after the AML evaluation, so a frozen client still gets
+    the neutral `OPERACION_NO_DISPONIBLE` and never a refusal that would
+    disclose the freeze.
+  - It covers both own-account routes. A third-party payment
+    (`/spei/transfer`) has no link.
+  - Otherwise the answer is 422 `CUENTA_NO_VINCULADA`.
+- **`GET /api/v1/wealth/linked-accounts`** (client):
+  `{"accounts": [{"id", "bank_code", "bank_name", "clabe_last4", "holder_name", "linked_at"}]}`.
+  The full CLABE never leaves the API. With `MODO_DEMO`, the first call by
+  a verified client with no account links one: BBVA México, in their KYC
+  name, with a valid CLABE ending in 1234 derived from their id. Concurrent
+  first calls link one.
+- **`POST /api/v1/wealth/withdraw`** (client):
+  `{"linked_account_id", "amount": "1250.50", "idempotency_key"}`.
+  - It is a SPEI withdrawal of available cash only: the engine checks
+    `saldo_disponible`, never `saldo_comprometido`, so cash held by open
+    limit and stop orders stays put.
+  - The RETIRO lowers the available cash and the custody reserve at once,
+    and the order is "processing" until the network settles it, or is
+    refunded if returned.
+  - The balance change bumps the vault's `seq` (`0012`), so the WebSocket
+    pushes the new balance.
+  - It answers `{"withdrawal": {"id", "status": "processing" | "settled" | "returned", "amount", "linked_account", "tracking_key", "requested_at"}}`:
+    201 when new, 200 with its current state when the key repeats it, and
+    409 when the key was used for something else.
+  - Another client's account, or a missing one, is 404 `NO_ENCONTRADO`.
+    A retired account is 422 `CUENTA_NO_VINCULADA`.
+- **The UI** (`frontend/src/components/wealth/withdrawal-drawer.tsx`): a
+  Withdraw button beside the Sovereign Yield counter opens a checkout in
+  three steps:
+  1. the linked account, with the holder and "In your name";
+  2. a numpad for the amount, with Max (rounded down to the cent) and a
+     note when open orders hold cash;
+  3. confirm, with a stark gold button.
+
+  The receipt says "processing" and gives the SPEI tracking key. One
+  idempotency key per account and amount, so a retry never sends twice.
+  `frontend/src/lib/withdrawal.ts` validates the answers and the amount.
+- Tests:
+  - `tests/db/0016_cuentas_vinculadas.sql` (database rules);
+  - `backend/tests/patrimonio.rs` (API, whitelist, AML ordering, KYC,
+    available vs. held cash, idempotency);
+  - the WebSocket push in `backend/tests/boveda.rs`;
+  - `frontend/src/lib/withdrawal.test.ts`;
+  - `frontend/e2e/smoke.mjs` (the flow on a desktop and a phone).
+- Left: linking a real account with the bank confirming the holder.
+  Outside `MODO_DEMO` no account is linked yet, so withdrawals need that
+  flow first (`docs/FRONTEND_ROADMAP.md`, module 16).
+
 ## Layout
 
 ```
@@ -1148,6 +1221,7 @@ psql "$EMPTY_DATABASE_URL" -f tests/db/0011_rls_por_cliente.sql
 psql "$EMPTY_DATABASE_URL" -f tests/db/0012_boveda_tiempo_real.sql
 psql "$EMPTY_DATABASE_URL" -f tests/db/0013_mercado_valores.sql
 psql "$EMPTY_DATABASE_URL" -f tests/db/0015_ordenes_avanzadas.sql
+psql "$EMPTY_DATABASE_URL" -f tests/db/0016_cuentas_vinculadas.sql
 cd frontend && npm test && npm run build
 FRONTEND_URL=http://localhost:3000 node e2e/smoke.mjs   # needs backend (MODO_DEMO=true) + next start
 # AML/PLD console against the real stack (structuring -> freeze -> four-eyes unfreeze, roles, no tipping off):
@@ -1330,9 +1404,11 @@ the password is hashed, so a parallel burst cannot test more than 5 passwords.
 | POST | `/api/v1/market/order` | client: order by amount (`OrderRequest`): market (`OrderReceipt`, filled at the current price), limit or stop (`PendingOrder`, its cash or units held until it fills) |
 | GET | `/api/v1/market/orders/pending` | client: its limit and stop orders still waiting (`PendingOrders`) |
 | POST | `/api/v1/market/orders/{id}/cancel` | client: cancels a pending order and releases what it held |
+| GET | `/api/v1/wealth/linked-accounts` | client: its linked bank accounts, all in its own name (`MODO_DEMO` links a demo one) |
+| POST | `/api/v1/wealth/withdraw` | client: withdraws available cash to a linked account by SPEI (`WithdrawalReceipt`, processing until settled) |
 | GET | `/api/v1/ifpe/cuenta`, `/api/v1/ifpe/movimientos` | client |
 | POST | `/api/v1/ifpe/transferencias` | client: internal transfer |
-| POST | `/api/v1/ifpe/retiros` | client: withdrawal to own external CLABE (an outgoing SPEI) |
+| POST | `/api/v1/ifpe/retiros` | client: withdrawal to own external CLABE (an outgoing SPEI), which must be a linked account |
 | POST | `/api/v1/ifpe/depositos/simulados` | client with verified KYC, `MODO_DEMO` only |
 | GET | `/api/v1/sofom/tasas` | public: terms and rates |
 | GET | `/api/v1/sofom/posicion` | client |

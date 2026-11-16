@@ -12,7 +12,8 @@
  * First pass: landing -> sign-up -> KYC-locked dashboard -> full onboarding
  * (personal data, INE photos and details, biometric consent + liveness) ->
  * VERIFICADO -> deposit, fixed-term investment, the Account tab's previews
- * (the Sovereign Yield counter, the debit card), Proof of Reserve, ledger,
+ * (the Sovereign Yield counter, the debit card), a withdrawal to the linked
+ * bank account, Proof of Reserve, ledger,
  * moving between the dashboard's tabs (Vault, Discover, Account, Invest,
  * Reserve). It ends on asset pages opened by their address (AUG1, an unknown
  * ticker, an address that is not a ticker, a market without live prices) and
@@ -191,8 +192,11 @@ async function openTab(page, name) {
   check((await link.getAttribute("aria-current")) === "page", `the ${name} tab is the current page`);
 }
 
-/** Full-page screenshot once finite animations (step reveal, transitions) have finished. */
-async function shot(page, name) {
+/**
+ * Full-page screenshot once finite animations (step reveal, transitions) have
+ * finished; `fullPage: false` keeps to the viewport, as a person sees a modal.
+ */
+async function shot(page, name, { fullPage = true } = {}) {
   await page.evaluate(() =>
     Promise.race([
       Promise.all(
@@ -204,7 +208,7 @@ async function shot(page, name) {
       new Promise((resolve) => setTimeout(resolve, 2000)),
     ]),
   );
-  await page.screenshot({ path: `${OUT}/${name}.png`, fullPage: true });
+  await page.screenshot({ path: `${OUT}/${name}.png`, fullPage });
 }
 
 /**
@@ -588,6 +592,122 @@ try {
         .waitFor({ timeout: 5_000 });
       await holdRows.nth(holdsBefore).waitFor({ timeout: 5_000 });
       check(true, "the Account tab shows the cash held for the order, and the hold in the ledger");
+
+      // Withdraw, while the limit buy holds 100.00: the off-ramp, by SPEI to the linked account in
+      // the client's own name (in demo mode, BBVA México ending in 1234). Only the available cash
+      // can leave (never what open orders hold), and it shows as processing. On a desktop
+      // first: this pass is on a phone since its tab bar checks, and goes back to it after.
+      await page.setViewportSize({ width: 1440, height: 1000 });
+      const withdrawDrawer = page.getByTestId("withdrawal-drawer");
+      const withdrawOpen = page.getByTestId("withdraw-open");
+      // The holder is the verified identity's name (kyc.clientes), in capitals as a bank keeps it.
+      const holder = [identity.profile.nombres, identity.profile.apellido_paterno, identity.profile.apellido_materno]
+        .filter(Boolean)
+        .join(" ")
+        .toUpperCase();
+      await withdrawOpen.click();
+      const accountOption = withdrawDrawer.getByTestId("withdraw-account");
+      await accountOption.waitFor();
+      check(
+        (await accountOption.count()) === 1 &&
+          (await accountOption.getAttribute("data-checked")) === "true" &&
+          (await accountOption.innerText()).includes("BBVA México") &&
+          /in your name/i.test(await accountOption.innerText()) &&
+          (await withdrawDrawer.getByTestId("withdraw-account-clabe").innerText()) === "•••• 1234" &&
+          (await withdrawDrawer.getByTestId("withdraw-account-holder").innerText()) === holder,
+        `Withdraw starts at the linked account, already selected: BBVA México •••• 1234, in the client's verified name (${holder})`,
+      );
+      await page.mouse.move(0, 0);
+      await shot(page, "withdraw-account-desktop", { fullPage: false });
+      const withdrawContinue = withdrawDrawer.getByTestId("withdraw-continue");
+      await withdrawContinue.click();
+      const withdrawAmount = withdrawDrawer.getByTestId("withdraw-amount");
+      await withdrawAmount.waitFor();
+      check(
+        (await withdrawDrawer.getByTestId("withdraw-available").innerText()) === "$16,134.56" &&
+          (await withdrawDrawer.getByTestId("withdraw-held").innerText()).startsWith("$100.00 held by your open orders") &&
+          !(await withdrawContinue.isEnabled()) &&
+          (await withdrawAmount.evaluate((el) => el === document.activeElement)),
+        "the amount step offers only the available 16,134.56 (the 100.00 the limit buy holds stays), takes the keyboard's focus, and needs an amount",
+      );
+      await withdrawDrawer.getByTestId("withdraw-max").click();
+      check((await withdrawAmount.inputValue()) === "16,134.56", "Max enters all the available cash, and nothing held");
+      await withdrawAmount.fill("16134.57");
+      check(
+        (await withdrawDrawer.getByTestId("withdraw-amount-hint").innerText()).includes("More than your available cash") &&
+          !(await withdrawContinue.isEnabled()),
+        "one cent more than the available cash cannot go on",
+      );
+      await withdrawAmount.fill("");
+      for (const key of ["1", "2", "5", "0", "Decimal point", "5"]) {
+        await withdrawDrawer.getByRole("button", { name: key, exact: true }).click();
+      }
+      check((await withdrawAmount.inputValue()) === "1,250.5", "the numpad types 1,250.5");
+      await withdrawContinue.click();
+      const review = withdrawDrawer.getByTestId("withdraw-step-review");
+      await review.waitFor();
+      const withdrawSummary = await withdrawDrawer.getByTestId("withdraw-summary").innerText();
+      check(
+        (await withdrawDrawer.getByTestId("withdraw-review-amount").innerText()).replace(/\s+/g, "") === "$1,250.50MXN" &&
+          withdrawSummary.includes("BBVA México •••• 1234") &&
+          withdrawSummary.includes(holder) &&
+          withdrawSummary.includes("$0.00") &&
+          (await withdrawDrawer.getByTestId("withdraw-after").innerText()).includes("$14,884.06"),
+        "Review: 1,250.50 to BBVA México •••• 1234 in the client's name, no fee, 14,884.06 left",
+      );
+      const confirmWithdrawal = withdrawDrawer.getByTestId("withdraw-confirm");
+      await page.mouse.move(0, 0);
+      check(
+        (await confirmWithdrawal.evaluate((el) => getComputedStyle(el).backgroundColor)) === "rgb(234, 179, 8)" &&
+          (await confirmWithdrawal.evaluate((el) => getComputedStyle(el).color)) === "rgb(0, 0, 0)" &&
+          /confirm withdrawal/i.test(await confirmWithdrawal.innerText()),
+        "Confirm withdrawal is the stark action: black on Synthetic Capital Yellow",
+      );
+      await shot(page, "withdraw-review-desktop", { fullPage: false });
+      await confirmWithdrawal.click();
+      const withdrawReceipt = withdrawDrawer.getByTestId("withdraw-receipt");
+      await withdrawReceipt.waitFor();
+      const trackingKey = await withdrawDrawer.getByTestId("withdraw-tracking-key").locator("dd").innerText();
+      check(
+        (await withdrawReceipt.getAttribute("data-status")) === "processing" &&
+          (await withdrawReceipt.innerText()).includes("$1,250.50 is on its way to BBVA México •••• 1234.") &&
+          /^[A-Z0-9]{10,30}$/.test(trackingKey),
+        `the receipt says processing, with the SPEI tracking key (${trackingKey})`,
+      );
+      // The vault's socket brings the new balance: the amount left the available cash at once.
+      await page.getByTestId("vault-available").filter({ hasText: "14,884.06" }).waitFor();
+      check(true, "the withdrawal leaves the available cash at once (14,884.06), pushed by the vault's socket");
+      await shot(page, "withdraw-receipt-desktop", { fullPage: false });
+      await withdrawDrawer.getByTestId("withdraw-done").click();
+      await withdrawDrawer.waitFor({ state: "detached" });
+      check(
+        await withdrawOpen.evaluate((el) => el === document.activeElement),
+        "Done closes the drawer and hands the focus back to Withdraw",
+      );
+      await page.getByRole("cell", { name: "Withdrawal" }).first().waitFor();
+      check(true, "the ledger lists the withdrawal");
+
+      // On a phone the drawer is a bottom sheet with a large numpad, as wide as the screen.
+      await page.setViewportSize({ width: 390, height: 844 });
+      await withdrawOpen.scrollIntoViewIfNeeded();
+      await withdrawOpen.click();
+      await accountOption.waitFor();
+      await withdrawContinue.click();
+      await withdrawAmount.waitFor();
+      const sheet = await withdrawDrawer.boundingBox();
+      const key = await withdrawDrawer.getByRole("button", { name: "5", exact: true }).boundingBox();
+      check(
+        sheet !== null &&
+          Math.round(sheet.width) === 390 &&
+          Math.abs(sheet.y + sheet.height - 844) <= 1 &&
+          key !== null &&
+          key.height >= 56 &&
+          (await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)),
+        "on a phone Withdraw opens as a bottom sheet across the width, with numpad keys 56 px tall",
+      );
+      await shot(page, "withdraw-amount-mobile", { fullPage: false });
+      await page.keyboard.press("Escape");
+      await withdrawDrawer.waitFor({ state: "detached" });
       const cancelled = await fetch(`${API}/api/v1/market/orders/${limitBuy.receipt.order_id}/cancel`, {
         method: "POST",
         headers: { authorization: `Bearer ${otherDevice}` },

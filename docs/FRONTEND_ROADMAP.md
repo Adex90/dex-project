@@ -254,10 +254,42 @@ what the module waits on. They do not change its scope.
   - Previewed on the card (module 14): a saveback tracker on simulated
     spending. Left: card payments to compute it from, round-ups, and where
     the money goes (cash, or a savings plan once module 4 is live).
-- [ ] **16. Linked Accounts & Withdrawals** (Whitelisting CLABE and fiat off-ramp)
-  - The backend already sends withdrawals to an own external CLABE
-    (`POST /api/v1/ifpe/retiros`). CLABE check-digit validation exists in
-    `lib/clabe.ts`. No UI yet.
+- [x] **16. Linked Accounts & Withdrawals** (Whitelisting CLABE and fiat off-ramp)
+  - The whitelist (migration 0016, README "Linked accounts and
+    withdrawals"): `ifpe.cuentas_vinculadas` holds the external CLABEs a
+    client may withdraw to. The holder must be the client's KYC name, the
+    client must be able to operate, the CLABE is never one of ours and is
+    active for one client only; rows are never deleted, only retired. Every
+    own-account withdrawal goes only to a linked account, on both routes,
+    and the order is tied to it (checked again by the database).
+  - The off-ramp: `POST /api/v1/wealth/withdraw` sends available cash, never
+    cash held by open orders, by SPEI. It leaves the available cash at once
+    with a RETIRO and stays "processing" (the SPEI order, PENDIENTE then
+    ENVIADA) until the network settles it, or comes back if the bank
+    returns it. The balance change bumps the vault's `seq`, and the
+    WebSocket pushes it. `GET /api/v1/wealth/linked-accounts` lists the
+    accounts (bank, last four digits, holder; never the full CLABE).
+  - The order of checks keeps AML holds undisclosed: the whitelist is
+    checked after the AML evaluation, so a frozen client gets the neutral
+    refusal, never "not linked".
+  - The UI: a Withdraw button beside the Sovereign Yield counter opens
+    `components/wealth/withdrawal-drawer.tsx`, a checkout in three steps.
+    The account step shows the linked accounts with the holder and "In your
+    name". The amount step is a numpad against the available cash, with Max
+    rounded down to the cent and a note when open orders hold cash. The
+    confirm step has a stark gold button. The receipt says "processing" and
+    gives the SPEI tracking key. One idempotency key per account and amount.
+  - Demo mode links one account per verified client on first look: BBVA
+    México, in the client's KYC name, with a valid CLABE ending in 1234.
+  - Tests: `tests/db/0016_cuentas_vinculadas.sql`, `backend/tests/patrimonio.rs`,
+    the WebSocket push in `backend/tests/boveda.rs`, `lib/withdrawal.test.ts`,
+    and smoke e2e (the whole flow on a desktop and a phone).
+  - Left: linking a real account, with the bank confirming the holder (for
+    example a penny test, or the holder's name and RFC/CURP on an incoming
+    SPEI from that CLABE), and unlinking it from the app. Outside demo mode
+    no account is linked until that exists, so production cannot withdraw
+    yet. Also left: a limit on accounts per client, and the withdrawal's
+    later states (settled, returned) in the app beyond the ledger.
 - [ ] **17. SPEI Dispute Tracker** (Banxico CEP integration for delayed transfers)
   - Orders already carry their tracking key (`clave_rastreo`). The lookup of
     Banxico's CEP (electronic payment receipt) goes through the backend.

@@ -101,6 +101,7 @@ internet -> host 80/443 (UFW, fail2ban) -> nginx (edge network)
 | A client's live vault channel carries only that client's data, and only while the session is valid | Same code on both: the WebSocket handshake runs the same JWT and database checks as every route (token as a subprotocol entry, never echoed), requires `Origin` = `FRONTEND_ORIGIN`, sits in the `API` rate-limit group and is capped per client and per task; the session is re-checked every 60 s and at JWT expiry (close 4001); reads run as `sc_cliente` under RLS | Same, plus nginx's dedicated location (`limit_conn` 20 per IP) | `tests/boveda.rs`, `tests/db/0012_boveda_tiempo_real.sql` |
 | A market order moves exactly the cash it records, at the catalog's price, for a client allowed to trade | Same code on both: one transaction under `sc_mercado` (in the IFPE ledger it may write only the market's four movement types, and only `saldo_disponible`, `saldo_comprometido` and the reserve). Each order is paired with its IFPE movement in the same transaction (deferred triggers). The database checks each order against the catalog price, the asset's increment, the maximal quantity, the cent-rounded amount, the position and the average cost; positions must replay their hash-chained ledger on commit. KYC is enforced by RLS. A buy is an AML channel with the freeze guard, and frozen clients cannot sell. Simulated prices are listed, quoted and traded only with `MODO_DEMO` | Same | `tests/mercado.rs`, `tests/db/0013_mercado_valores.sql` |
 | A pending limit or stop order's cash or units cannot be spent twice, and holding them never breaks the 100 % reserve | Same code on both: a buy's cash moves to `saldo_comprometido` by a hash-chained IFPE movement (`COMPROMISO_ORDEN`, back by `LIBERACION_ORDEN`) inside the account, never out of custody; a sell's units to `cantidad_comprometida`, which market sales cannot sell. At COMMIT the database requires held cash and units to equal the pending orders, every hold and release to be paired with its order, held cash to replay from the ledger, and each fill to meet its order's limit or stop and sell exactly its held units. Liabilities, Merkle leaves and the reserve cut count held cash. Terms are immutable; `sc_mercado` may only close an order | Same | `tests/ordenes_avanzadas.rs`, `tests/db/0015_ordenes_avanzadas.sql` |
+| Money leaves the vault only to a bank account in the client's own name (AML whitelist), and the check never discloses an AML hold | Same code on both: every own-account withdrawal goes only to an active linked account (`ifpe.cuentas_vinculadas`) whose holder is the client's KYC name, never a CLABE of ours and active for one client only. The order records its account, and a trigger re-checks it (client, state, CLABE, holder). The whitelist runs after the AML evaluation, so a frozen client gets the neutral refusal. Linked accounts are never deleted, only retired; clients read only their own | Same | `tests/patrimonio.rs`, `tests/db/0016_cuentas_vinculadas.sql` |
 | No request field outside the API contract is accepted | Same code on both: `deny_unknown_fields` on every body and query type (400 `VALIDACION`) | Same | `tests/entrada.rs` (source scan and HTTP) |
 | Least-privilege database identities | Service holds only `sc_app` (NOINHERIT, no owner rights); owner credentials only in the migrate task and with DBAs holding the `dba-tunnel` policy | Same, plus the schema owner is **not** a superuser (`deploy/postgres/10-schema-owner.sh`); the `postgres` superuser is break-glass only | `pg_authid` query in Appendix C |
 | Containers non-root, read-only, least capability, resource-limited | uid 65532, read-only rootfs, `drop ALL`, task CPU/memory | uid 65532 / 70 / 101, `read_only`, `cap_drop: ALL`, `no-new-privileges`, CPU/memory/PID limits | `docker inspect` in Appendix C |
@@ -1065,6 +1066,20 @@ following to operations.
   (default 5, 0 disables it); concurrent tasks are safe (account and order
   locks). The frontend reads the vault's new fields as 0 when an older
   backend omits them.
+- **Migration `0016`** (linked accounts) is additive. It creates
+  `ifpe.cuentas_vinculadas` (empty) with its triggers, grants and RLS, and
+  `ifpe.nombre_comparable`. It also adds the nullable
+  `spei_outbound.cuenta_vinculada_id`, with its index and trigger: no
+  rewrite, and existing orders keep `NULL`.
+
+  Deploy migrate, then the backend. Once the new backend serves, an
+  own-account withdrawal (`/api/v1/ifpe/retiros` too) needs a linked
+  account. Outside `MODO_DEMO` none is linked until the verification flow
+  exists, so production own-account withdrawals answer
+  `CUENTA_NO_VINCULADA` until then. Third-party SPEI transfers are
+  unchanged. An old binary on a migrated database still sends own-account
+  withdrawals without the check; finish the rollout before relying on the
+  whitelist.
 
 ---
 
@@ -1334,6 +1349,46 @@ available, so Session Manager itself was not exercised. Everything around it was
     ran, it had read the announcer and failed: 3 of 4 times on one run.
 - **Backend:** rustfmt and clippy `-D warnings` clean; 314 tests passed, 0 failed.
   hadolint, actionlint and ShellCheck (with the CI settings) are clean.
+
+**Linked accounts and withdrawals** (migration `0016`, `GET /api/v1/wealth/linked-accounts`,
+`POST /api/v1/wealth/withdraw`, the withdrawal drawer):
+
+- **Database:** every SQL suite passes on a fresh database with all
+  migrations, the new `tests/db/0016_cuentas_vinculadas.sql` included. It
+  covers:
+  - the holder being the client, without accents or case;
+  - KYC, our own CLABEs, and one active client per CLABE (homonyms);
+  - immutability and final retirement;
+  - the order's link (other client, other CLABE, other payee, retired
+    account, the 40-character SPEI name);
+  - RLS.
+
+  The 0011 suite now names its 8 tables, since later migrations add their
+  own.
+- **Backend:** rustfmt and clippy `-D warnings` clean. 383 tests passed, 0
+  failed; 10 are new:
+  - `tests/patrimonio.rs`: the demo account, a withdrawal and its
+    idempotency, available vs. held cash, the whitelist on both routes, a
+    frozen client's neutral refusal, KYC, input;
+  - the WebSocket push in `tests/boveda.rs`;
+  - the demo CLABE.
+
+  `comun::retirar` links its destination first, as the real flow requires.
+- **Frontend:** typecheck, lint, 264 unit tests (8 new, `lib/withdrawal.ts`)
+  and `next build`.
+- **End to end** on a fresh stack: smoke 198 checks (12 new) and AML console
+  123 checks.
+  - The new smoke checks run the whole withdrawal:
+    - the linked account in the client's verified name;
+    - only the available cash offered while an order holds 100.00;
+    - Max, and one cent more refused;
+    - the numpad, the review and the gold confirm;
+    - the receipt with its tracking key, and the new balance pushed by the
+      socket;
+    - the focus returning to Withdraw, and the ledger row;
+    - the phone sheet.
+  - The AML run still sees the neutral refusal for a frozen client's
+    withdrawal, and no tipping-off words.
 
 **Account: the Sovereign Yield counter and the debit card, as previews** (frontend only, no migration):
 
