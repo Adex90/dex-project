@@ -20,7 +20,7 @@
 //! | GET  | `/api/v1/ifpe/cuenta` | cliente |
 //! | GET  | `/api/v1/ifpe/movimientos` | cliente |
 //! | POST | `/api/v1/ifpe/transferencias` | cliente |
-//! | POST | `/api/v1/ifpe/retiros` | cliente |
+//! | POST | `/api/v1/ifpe/retiros` | cliente: retiro a cuenta propia, solo a una CLABE vinculada |
 //! | POST | `/api/v1/ifpe/depositos/simulados` | cliente (solo `MODO_DEMO`) |
 //! | GET  | `/api/v1/sofom/tasas` | público |
 //! | GET  | `/api/v1/sofom/posicion` | cliente |
@@ -39,6 +39,8 @@
 //! | POST | `/api/v1/market/order` | cliente: orden de mercado (ejecutada al precio vigente), límite o stop (pendiente, con su efectivo o sus títulos comprometidos) |
 //! | GET  | `/api/v1/market/orders/pending` | cliente: sus órdenes límite y stop que esperan |
 //! | POST | `/api/v1/market/orders/{id}/cancel` | cliente: cancela una orden pendiente y devuelve lo comprometido |
+//! | GET  | `/api/v1/wealth/linked-accounts` | cliente: sus cuentas vinculadas, a dónde puede retirar (con `MODO_DEMO`, vincula la de demostración) |
+//! | POST | `/api/v1/wealth/withdraw` | cliente: retira efectivo disponible a una cuenta vinculada (SPEI a cuenta propia, en proceso hasta liquidarse) |
 //! | GET  | `/api/v1/kyc/expediente` | cliente: estado, intentos, bloqueo y último resultado |
 //! | POST | `/api/v1/kyc/perfil` | cliente: datos personales y domicilio |
 //! | POST | `/api/v1/kyc/verificar` | cliente: INE + selfie (hasta 12 MB) |
@@ -91,6 +93,7 @@ mod kyc;
 pub mod limites;
 mod mercado;
 mod operaciones;
+mod patrimonio;
 mod reserva;
 mod sofom;
 mod spei;
@@ -137,7 +140,8 @@ pub fn router(estado: AppState) -> Router {
         .merge(spei::rutas())
         .merge(aml::rutas(estado.clone()))
         .merge(boveda::rutas())
-        .merge(mercado::rutas());
+        .merge(mercado::rutas())
+        .merge(patrimonio::rutas());
     let api = limites::aplicar(api, &por_ip.api)
         .merge(limites::aplicar(spei::webhooks().merge(kyc::webhooks()), &por_ip.webhook));
 

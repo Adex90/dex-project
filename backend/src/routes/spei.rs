@@ -251,6 +251,7 @@ async fn transferir(
         concepto: s.concepto,
         referencia_numerica: s.referencia_numerica,
         clave_idempotencia: u.clave(&s.clave_idempotencia)?,
+        cuenta_vinculada_id: None,
     };
     let r = outbound::solicitar(&e.pool, &e.config.pld, &e.config.spei, &solicitud).await?;
     Ok((status_de(r.idempotente), Json(r)))

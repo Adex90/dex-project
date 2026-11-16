@@ -110,6 +110,8 @@ async fn retirar(
         concepto: Some(s.concepto.unwrap_or_else(|| "RETIRO A CUENTA PROPIA".into())),
         referencia_numerica: None,
         clave_idempotencia: u.clave(&s.clave_idempotencia)?,
+        // La cuenta vinculada activa con esa CLABE (lista blanca, 0016).
+        cuenta_vinculada_id: None,
     };
     let r = outbound::solicitar(&e.pool, &e.config.pld, &e.config.spei, &solicitud).await?;
     Ok((status_de(r.idempotente), Json(r)))

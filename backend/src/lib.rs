@@ -9,6 +9,7 @@
 //! - [`mercado`]: mercado de valores: cotizaciones y órdenes de mercado, con su
 //!   ledger encadenado y el efectivo por la bóveda.
 //! - [`aml`]: monitoreo PLD/FT en línea (el esquema `aml` califica; Rust pasa hechos).
+//! - [`patrimonio`]: cuentas vinculadas (la lista blanca de retiros) y retiros a ellas.
 //! - [`routes`]: API HTTP (Axum).
 //! - [`cli`]: comandos del binario (servir, migrar, salud).
 //!
@@ -30,6 +31,7 @@ pub mod kyc;
 pub mod ledger;
 pub mod mercado;
 pub mod models;
+pub mod patrimonio;
 pub mod pld;
 pub mod reserva;
 pub mod routes;

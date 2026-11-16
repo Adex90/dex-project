@@ -272,6 +272,10 @@ pub async fn vencer_ordenes(pool: &PgPool) {
 }
 
 /// Retiro (SPEI saliente a cuenta propia).
+/// Retiro a cuenta propia (SPEI sin beneficiario) a `clabe_destino`, que
+/// antes se vincula a nombre del cliente ([`vincular`]): un retiro a cuenta
+/// propia solo va a una cuenta vinculada (migración 0016). Las pruebas de la
+/// lista blanca están en tests/patrimonio.rs.
 pub async fn retirar(
     pool: &PgPool,
     cfg: &Config,
@@ -281,6 +285,7 @@ pub async fn retirar(
     concepto: Option<&str>,
     clave_idempotencia: &str,
 ) -> AppResult<outbound::ResultadoOrden> {
+    vincular(pool, cliente_id, clabe_destino).await;
     outbound::solicitar(
         pool,
         &cfg.pld,
@@ -294,9 +299,60 @@ pub async fn retirar(
             concepto: concepto.map(Into::into),
             referencia_numerica: None,
             clave_idempotencia: clave_idempotencia.into(),
+            cuenta_vinculada_id: None,
         },
     )
     .await
+}
+
+/// Vincula `clabe` a nombre del cliente, como sc_ifpe y con el nombre de su
+/// expediente (una cuenta cuya titularidad se verificó). Devuelve la cuenta
+/// vinculada, o `None` si no se puede vincular y el retiro se rechazará antes
+/// por otra causa: el cliente no opera (KYC), la CLABE es inválida o es de
+/// Synthetic Capital. Si ya está vinculada al cliente, la devuelve; si está
+/// activa para otro cliente, ahí se da de baja primero (una CLABE de retiro
+/// está activa para un solo cliente).
+pub async fn vincular(pool: &PgPool, cliente_id: Uuid, clabe: &str) -> Option<Uuid> {
+    if synthetic_capital::spei::clabe::Clabe::parse(clabe).is_err() {
+        return None;
+    }
+    let mut tx = db::begin(pool, db::Rol::Ifpe).await.unwrap();
+    let activa: Option<(Uuid, Uuid)> =
+        sqlx::query_as("SELECT id, cliente_id FROM ifpe.cuentas_vinculadas WHERE clabe = $1 AND estado = 'ACTIVA'")
+            .bind(clabe)
+            .fetch_optional(&mut *tx)
+            .await
+            .unwrap();
+    match activa {
+        Some((id, dueno)) if dueno == cliente_id => {
+            tx.commit().await.unwrap();
+            return Some(id);
+        }
+        Some((id, _)) => {
+            sqlx::query("UPDATE ifpe.cuentas_vinculadas SET estado = 'BAJA' WHERE id = $1")
+                .bind(id)
+                .execute(&mut *tx)
+                .await
+                .unwrap();
+        }
+        None => {}
+    }
+    let id: Option<Uuid> = sqlx::query_scalar(
+        "INSERT INTO ifpe.cuentas_vinculadas (cliente_id, clabe, banco, titular, origen) \
+         SELECT c.id, $2, substr($2, 1, 3), concat_ws(' ', c.nombre, c.apellido_paterno, c.apellido_materno), \
+                'VERIFICACION' \
+           FROM kyc.clientes c \
+          WHERE c.id = $1 AND kyc.puede_operar(c.id) \
+            AND NOT EXISTS (SELECT 1 FROM ifpe.clabes_asignadas WHERE clabe = $2) \
+         RETURNING id",
+    )
+    .bind(cliente_id)
+    .bind(clabe)
+    .fetch_optional(&mut *tx)
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+    id
 }
 
 /// Simula el paso del tiempo para un mutuo: recorre `fecha_inicio` hacia

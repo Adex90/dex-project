@@ -7,6 +7,14 @@
 //! para siempre. El dinero ya no es del cliente aunque siga en el custodio
 //! hasta liquidarse: no puede gastarse dos veces.
 //!
+//! **Lista blanca** (migración 0016): un retiro a cuenta propia (sin
+//! beneficiario: el beneficiario es el cliente) solo va a una cuenta vinculada
+//! activa a nombre del cliente, y la orden queda ligada a ella
+//! (`cuenta_vinculada_id`, que la base de datos revisa). Se exige después de
+//! PLD: a un cliente congelado se le responde lo mismo que a cualquier
+//! operación bloqueada, nunca un rechazo que delate el congelamiento. Un pago
+//! a un tercero (`/spei/transfer`) no lleva cuenta vinculada.
+//!
 //! **Despacho** (rol `sc_spei`): el despachador reclama órdenes con un
 //! arrendamiento (`FOR UPDATE SKIP LOCKED`) y, para las PENDIENTE, cuenta el
 //! intento **antes** de llamar al proveedor (queda confirmado en la base de
@@ -95,6 +103,8 @@ pub struct SpeiOutbound {
     pub estado: String,
     pub tx_retiro_id: Uuid,
     pub tx_reverso_id: Option<Uuid>,
+    /// Retiro a cuenta propia: la cuenta vinculada a la que va (0016).
+    pub cuenta_vinculada_id: Option<Uuid>,
     pub id_proveedor: Option<String>,
     pub intentos_envio: i32,
     pub ultimo_error: Option<String>,
@@ -170,7 +180,8 @@ impl SpeiOutbound {
 pub struct SolicitudSpei {
     pub cliente_id: Uuid,
     pub clabe_destino: String,
-    /// `None`: retiro a una cuenta propia (el beneficiario es el cliente).
+    /// `None`: retiro a una cuenta propia (el beneficiario es el cliente),
+    /// que solo va a una cuenta vinculada.
     pub beneficiario_nombre: Option<String>,
     pub beneficiario_rfc_curp: Option<String>,
     pub monto: Decimal,
@@ -178,6 +189,10 @@ pub struct SolicitudSpei {
     pub referencia_numerica: Option<i32>,
     /// Clave ya acotada al cliente (`cli:<id>:<clave>`).
     pub clave_idempotencia: String,
+    /// Retiro a cuenta propia: la cuenta vinculada elegida, que debe tener la
+    /// CLABE destino. `None`: la cuenta vinculada activa del cliente con esa
+    /// CLABE. Un pago a un tercero no lleva.
+    pub cuenta_vinculada_id: Option<Uuid>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -221,6 +236,9 @@ fn validar(s: &SolicitudSpei) -> AppResult<SolicitudValida> {
     let referencia = s.referencia_numerica.unwrap_or(1);
     if !(1..=9_999_999).contains(&referencia) {
         return Err(AppError::validacion("referencia_numerica debe tener de 1 a 7 dígitos"));
+    }
+    if nombre.is_some() && s.cuenta_vinculada_id.is_some() {
+        return Err(AppError::validacion("un pago a un tercero no lleva cuenta vinculada"));
     }
     Ok(SolicitudValida { clabe, nombre, rfc, monto, concepto, referencia })
 }
@@ -302,6 +320,7 @@ async fn solicitar_tx(
             || previa.beneficiario_rfc_curp != rfc
             || previa.concepto != v.concepto
             || previa.referencia_numerica != v.referencia
+            || s.cuenta_vinculada_id.is_some_and(|id| previa.cuenta_vinculada_id != Some(id))
         {
             return Err(AppError::conflicto(
                 "CLAVE_IDEMPOTENCIA_REUTILIZADA",
@@ -352,6 +371,11 @@ async fn solicitar_tx(
     if d.decision == Decision::Bloquear {
         return aml::confirmar_bloqueo(tx, &d).await;
     }
+    // Lista blanca, después de PLD (ver el encabezado del módulo).
+    let vinculada = match v.nombre {
+        Some(_) => None,
+        None => Some(cuenta_vinculada(&mut tx, s.cliente_id, v.clabe.as_str(), s.cuenta_vinculada_id).await?),
+    };
     let reserva = ledger::bloquear_reserva(&mut tx).await?;
 
     // Pasivo y reserva bajan juntos: el dinero queda comprometido en la orden.
@@ -378,8 +402,8 @@ async fn solicitar_tx(
         "INSERT INTO ifpe.spei_outbound \
          (cliente_id, cuenta_id, clave_idempotencia, clave_rastreo, fecha_solicitud, ordenante_nombre, \
           ordenante_clabe, ordenante_rfc_curp, banco_receptor, beneficiario_clabe, beneficiario_nombre, \
-          beneficiario_rfc_curp, monto, concepto, referencia_numerica, tx_retiro_id) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16) RETURNING *",
+          beneficiario_rfc_curp, monto, concepto, referencia_numerica, tx_retiro_id, cuenta_vinculada_id) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17) RETURNING *",
     )
     .bind(s.cliente_id)
     .bind(cuenta.id)
@@ -397,11 +421,35 @@ async fn solicitar_tx(
     .bind(&v.concepto)
     .bind(v.referencia)
     .bind(t.id)
+    .bind(vinculada)
     .fetch_one(&mut *tx)
     .await?;
     tx.commit().await?;
     tracing::info!(rastreo = %orden.clave_rastreo, monto = %orden.monto, banco = %orden.banco_receptor, "orden SPEI registrada");
     Ok(ResultadoOrden { orden, transaccion: t, idempotente: false })
+}
+
+/// La cuenta vinculada activa del cliente con esa CLABE (y ese id, si se
+/// eligió) cuyo titular sigue siendo el cliente: su nombre en kyc.clientes,
+/// comparado como lo compara la base de datos (`ifpe.nombre_comparable`).
+async fn cuenta_vinculada(tx: &mut Tx, cliente_id: Uuid, clabe: &str, id: Option<Uuid>) -> AppResult<Uuid> {
+    let encontrada: Option<Uuid> = sqlx::query_scalar(
+        "SELECT v.id FROM ifpe.cuentas_vinculadas v JOIN kyc.clientes c ON c.id = v.cliente_id \
+          WHERE v.cliente_id = $1 AND v.clabe = $2 AND v.estado = 'ACTIVA' AND ($3::uuid IS NULL OR v.id = $3) \
+            AND ifpe.nombre_comparable(v.titular) \
+                = ifpe.nombre_comparable(concat_ws(' ', c.nombre, c.apellido_paterno, c.apellido_materno))",
+    )
+    .bind(cliente_id)
+    .bind(clabe)
+    .bind(id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    encontrada.ok_or_else(|| {
+        AppError::negocio(
+            "CUENTA_NO_VINCULADA",
+            "un retiro solo va a una cuenta vinculada a tu nombre; vincula la cuenta antes de retirar",
+        )
+    })
 }
 
 async fn transaccion(tx: &mut Tx, id: Uuid) -> AppResult<TransaccionIfpe> {
@@ -1399,6 +1447,7 @@ mod pruebas {
             concepto: Some("Renta de octubre".into()),
             referencia_numerica: Some(1_234_567),
             clave_idempotencia: "cli:x:1".into(),
+            cuenta_vinculada_id: None,
         }
     }
 

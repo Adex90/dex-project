@@ -183,6 +183,7 @@ impl Banco {
                 concepto: Some("Pago de prueba".into()),
                 referencia_numerica: Some(123),
                 clave_idempotencia: clave(),
+                cuenta_vinculada_id: None,
             },
         )
         .await
@@ -510,6 +511,7 @@ async fn validaciones_de_la_transferencia(pool: PgPool) {
             concepto: None,
             referencia_numerica: None,
             clave_idempotencia: clave(),
+            cuenta_vinculada_id: None,
         };
         async move {
             outbound::solicitar(&pool, &cfg.pld, &cfg.spei, &s).await.map(|_| ()).map_err(|e| e.codigo().to_string())
@@ -931,6 +933,7 @@ async fn dia_de_trafico_interbancario_intenso(pool: PgPool) {
                             concepto: None,
                             referencia_numerica: None,
                             clave_idempotencia: clave(),
+                            cuenta_vinculada_id: None,
                         };
                         match outbound::solicitar(&b.pool, &b.cfg.pld, &b.cfg.spei, &s).await {
                             Ok(_) => {}

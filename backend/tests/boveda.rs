@@ -472,6 +472,7 @@ async fn websocket_de_principio_a_fin(pool: PgPool) {
             concepto: Some("Pago de prueba".into()),
             referencia_numerica: Some(123),
             clave_idempotencia: clave(),
+            cuenta_vinculada_id: None,
         },
     )
     .await
@@ -551,6 +552,36 @@ async fn todas_las_pestanas_del_cliente_reciben_el_cambio(pool: PgPool) {
         assert_eq!((m["type"].as_str(), m["seq"].as_i64()), (Some("spei.transfer"), Some(1)), "{m}");
         assert_eq!(m["balance"]["available_cash"], "75.50000000");
     }
+    oyente.abort();
+}
+
+/// Un retiro a una cuenta vinculada (`POST /api/v1/wealth/withdraw`, 0016)
+/// saca el monto del disponible al instante: la foto con la versión
+/// siguiente. Vincular la cuenta no mueve saldo y no avisa.
+#[sqlx::test(migrations = "../migrations")]
+async fn un_retiro_a_una_cuenta_vinculada_avisa_con_la_version_siguiente(pool: PgPool) {
+    let cfg = preparar(&pool).await;
+    let srv = arrancar(AppState::nuevo(pool.clone(), cfg.clone())).await;
+    let app = routes::router(srv.estado.clone());
+    let ana = cliente(&pool, &cfg, "Ana").await;
+    depositar(&pool, &cfg, ana.cuenta_ifpe.id, "1000").await;
+    let token = token_cliente(&srv.estado, ana.cliente.id);
+    let mut ws = abrir(srv.dir, &token).await.unwrap();
+    assert_eq!(recibir(&mut ws).await["seq"], 1);
+    let oyente = tokio::spawn(central::escuchar(srv.estado.boveda.clone()));
+    assert_eq!(recibir(&mut ws).await["seq"], 1, "la foto al empezar a escuchar");
+
+    let (s, cuentas) = llamar_json(&app, "GET", "/api/v1/wealth/linked-accounts", Some(&token), None).await;
+    assert_eq!(s, StatusCode::OK, "{cuentas}");
+    nada_mas(&mut ws, Duration::from_millis(300)).await;
+    let cuerpo = json!({ "linked_account_id": cuentas["accounts"][0]["id"], "amount": "250.00",
+                         "idempotency_key": "prueba-retiro-ws" });
+    let (s, r) = llamar_json(&app, "POST", "/api/v1/wealth/withdraw", Some(&token), Some(cuerpo)).await;
+    assert_eq!(s, StatusCode::CREATED, "{r}");
+    let m = recibir(&mut ws).await;
+    assert_eq!((m["type"].as_str(), m["seq"].as_i64()), (Some("vault.snapshot"), Some(2)), "{m}");
+    assert_eq!(m["vault"]["balance"]["available_cash"], "750.00000000");
+    assert_eq!(m["vault"]["balance"]["total_mxn"], "750.00000000");
     oyente.abort();
 }
 
