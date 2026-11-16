@@ -1,4 +1,5 @@
 import type { LimitOrderRequest, MarketOrderRequest, StopOrderRequest } from "@/types/market";
+import type { WithdrawalRequest } from "@/types/wealth";
 
 import { request } from "./client";
 import type {
@@ -125,6 +126,24 @@ export const api = {
    */
   cancelOrder: (token: string, orderId: string) =>
     request<unknown>(`/api/v1/market/orders/${encodeURIComponent(orderId)}/cancel`, { method: "POST", token }),
+
+  /**
+   * The client's bank accounts linked for withdrawals, all in their own name.
+   * In demo mode the first call links one (BBVA México, ending in 1234).
+   * Untyped on purpose: `parseLinkedAccounts` validates the answer.
+   */
+  linkedAccounts: (token: string, signal?: AbortSignal) =>
+    request<unknown>("/api/v1/wealth/linked-accounts", { token, signal }),
+
+  /**
+   * Withdraws available cash (never cash held by open orders) to a linked
+   * account by SPEI: it leaves the available cash at once and stays
+   * "processing" until the network settles it. 201 for a new withdrawal, 200
+   * when the idempotency key repeats one. Untyped on purpose:
+   * `parseWithdrawalReceipt` validates the answer.
+   */
+  withdraw: (token: string, body: WithdrawalRequest) =>
+    request<unknown>("/api/v1/wealth/withdraw", { method: "POST", token, body }),
 
   movements: (token: string, params: { limit?: number; before?: number } = {}, signal?: AbortSignal) =>
     request<TransaccionIfpe[]>("/api/v1/ifpe/movimientos", {

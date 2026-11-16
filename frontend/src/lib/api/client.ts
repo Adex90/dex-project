@@ -144,6 +144,8 @@ const MESSAGES: Record<string, string> = {
   LIMITE_ORDENES_PENDIENTES: "You have the maximum of 50 open orders. Cancel one to place another.",
   ORDEN_NO_PENDIENTE: "This order is no longer open: it has already filled or was rejected.",
   TIPO_ORDEN_NO_DISPONIBLE: "Savings plans are not available yet. Nothing was scheduled.",
+  // Withdrawals (migration 0016): only to a bank account linked in the client's own name.
+  CUENTA_NO_VINCULADA: "Withdrawals go only to a bank account linked in your name. Nothing was sent.",
   // A client whose account is restricted gets this one neutral message whatever
   // the cause (no tipping off): it must not mention compliance, alerts or freezes.
   OPERACION_NO_DISPONIBLE: GENERIC_UNAVAILABLE_MESSAGE,

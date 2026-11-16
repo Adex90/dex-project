@@ -1,7 +1,9 @@
 "use client";
 
-import { useEffect, useId, useRef, useState } from "react";
+import { useEffect, useId, useRef, useState, type ReactNode } from "react";
+import { ArrowUpRight } from "lucide-react";
 
+import { KycLockNote } from "@/components/dashboard/kyc-status";
 import { cx } from "@/components/ui/primitives";
 import { formatAmount, formatMoney } from "@/lib/decimal";
 import {
@@ -32,13 +34,26 @@ import type { DecimalString } from "@/types/vault";
  * - Under it: the month so far as a gold bar, with what the whole month
  *   would earn; then the cash, a day's yield and the rate.
  * - Screen readers get the figure to the cent once (not every tick).
+ * - Withdraw, beside the counter: the off-ramp to a linked bank account in
+ *   the client's own name (components/wealth/withdrawal-drawer.tsx, opened by
+ *   the page). Until the identity is verified it is visibly disabled and says
+ *   why, like the deposit.
  */
 
 const RATE_LABEL = `${formatAmount(SOVEREIGN_YIELD_PCT, 2)}%`;
 
-export function CashYieldSection({ className }: { className?: string }) {
+export interface CashYieldSectionProps {
+  className?: string;
+  /** Opens the withdrawal drawer; without it there is no Withdraw button. */
+  onWithdraw?: () => void;
+  /** Identity not verified yet: Withdraw is disabled, with the reason. */
+  withdrawLocked?: boolean;
+}
+
+export function CashYieldSection({ className, onWithdraw, withdrawLocked = false }: CashYieldSectionProps) {
   const titleId = useId();
   const available = useVaultStore((s) => s.balance?.available_cash ?? null);
+  const action = onWithdraw ? <WithdrawAction onWithdraw={onWithdraw} locked={withdrawLocked} /> : null;
 
   return (
     <section
@@ -67,12 +82,43 @@ export function CashYieldSection({ className }: { className?: string }) {
           Preview · {RATE_LABEL} a year
         </span>
       </header>
-      {available === null ? <CounterSkeleton /> : <YieldCounter available={available} />}
+      {available === null ? <CounterSkeleton /> : <YieldCounter available={available} action={action} />}
     </section>
   );
 }
 
-function YieldCounter({ available }: { available: DecimalString }) {
+const WITHDRAW_BUTTON =
+  "inline-flex h-12 w-full items-center justify-center gap-2 bg-synthetic-yellow px-7 text-sm font-bold tracking-[0.2em] text-black uppercase transition-colors hover:bg-synthetic-yellow-hover active:bg-synthetic-yellow-pressed focus-visible:ring-2 focus-visible:ring-synthetic-yellow focus-visible:ring-offset-2 focus-visible:ring-offset-surface focus-visible:outline-none @2xl:w-auto";
+
+/** The off-ramp's door: gold and square; disabled, but focusable, until the identity is verified. */
+function WithdrawAction({ onWithdraw, locked }: { onWithdraw: () => void; locked: boolean }) {
+  const noteId = useId();
+  if (locked) {
+    return (
+      <div className="space-y-2 @2xl:max-w-60">
+        <button
+          type="button"
+          aria-disabled="true"
+          aria-describedby={noteId}
+          className={cx(WITHDRAW_BUTTON, "cursor-not-allowed opacity-45 hover:bg-synthetic-yellow")}
+          data-testid="withdraw-locked"
+        >
+          <ArrowUpRight className="size-4" aria-hidden />
+          Withdraw
+        </button>
+        <KycLockNote id={noteId}>Withdrawals unlock once your identity is verified.</KycLockNote>
+      </div>
+    );
+  }
+  return (
+    <button type="button" onClick={onWithdraw} className={WITHDRAW_BUTTON} data-testid="withdraw-open">
+      <ArrowUpRight className="size-4" aria-hidden />
+      Withdraw
+    </button>
+  );
+}
+
+function YieldCounter({ available, action }: { available: DecimalString; action: ReactNode }) {
   // The figures that do not tick are read once, when the balance arrives or changes.
   const [now, setNow] = useState(() => Date.now());
   useEffect(() => setNow(Date.now()), [available]);
@@ -112,39 +158,42 @@ function YieldCounter({ available }: { available: DecimalString }) {
 
   return (
     <>
-      <div className="mt-7">
-        <p className="flex items-center gap-2 text-sm text-muted">
-          {growing ? (
-            <span className="relative flex size-2" aria-hidden>
-              <span className="absolute inline-flex size-full rounded-full bg-synthetic-yellow opacity-60 motion-safe:animate-ping motion-safe:[animation-duration:2.4s]" />
-              <span className="relative inline-flex size-2 rounded-full bg-synthetic-yellow" />
-            </span>
-          ) : null}
-          Earned this month
-        </p>
-        <p className="sr-only">{`Earned this month, simulated: ${formatMoney(preview.earned)} MXN`}</p>
-        {/* Visual only, and live: the digits change many times a second. */}
-        <p
-          aria-hidden
-          className="mt-2 flex flex-wrap items-baseline gap-x-3 gap-y-1 leading-none"
-          data-testid="cash-yield-counter"
-        >
-          <span className="text-[clamp(2.5rem,9cqw,4.75rem)] font-light tracking-tighter text-ink tabular-nums">
-            <span className="mr-[0.06em] text-[0.5em] font-normal text-synthetic-yellow">$</span>
-            <span ref={integerRef} data-testid="cash-yield-earned">
-              {first.head}
-            </span>
-            <span ref={tailRef} className="text-[0.5em] text-muted">
-              {first.tail}
-            </span>
-          </span>
-          <span className="text-sm font-medium tracking-[0.12em] text-muted">MXN</span>
-        </p>
-        {growing ? null : (
-          <p className="mt-3 text-sm text-muted" data-testid="cash-yield-empty">
-            Add cash to your vault and watch it grow here.
+      <div className="mt-7 flex flex-col gap-5 @2xl:flex-row @2xl:items-end @2xl:justify-between">
+        <div className="min-w-0">
+          <p className="flex items-center gap-2 text-sm text-muted">
+            {growing ? (
+              <span className="relative flex size-2" aria-hidden>
+                <span className="absolute inline-flex size-full rounded-full bg-synthetic-yellow opacity-60 motion-safe:animate-ping motion-safe:[animation-duration:2.4s]" />
+                <span className="relative inline-flex size-2 rounded-full bg-synthetic-yellow" />
+              </span>
+            ) : null}
+            Earned this month
           </p>
-        )}
+          <p className="sr-only">{`Earned this month, simulated: ${formatMoney(preview.earned)} MXN`}</p>
+          {/* Visual only, and live: the digits change many times a second. */}
+          <p
+            aria-hidden
+            className="mt-2 flex flex-wrap items-baseline gap-x-3 gap-y-1 leading-none"
+            data-testid="cash-yield-counter"
+          >
+            <span className="text-[clamp(2.5rem,9cqw,4.75rem)] font-light tracking-tighter text-ink tabular-nums">
+              <span className="mr-[0.06em] text-[0.5em] font-normal text-synthetic-yellow">$</span>
+              <span ref={integerRef} data-testid="cash-yield-earned">
+                {first.head}
+              </span>
+              <span ref={tailRef} className="text-[0.5em] text-muted">
+                {first.tail}
+              </span>
+            </span>
+            <span className="text-sm font-medium tracking-[0.12em] text-muted">MXN</span>
+          </p>
+          {growing ? null : (
+            <p className="mt-3 text-sm text-muted" data-testid="cash-yield-empty">
+              Add cash to your vault and watch it grow here.
+            </p>
+          )}
+        </div>
+        {action ? <div className="shrink-0">{action}</div> : null}
       </div>
 
       {/* The month so far, and what the whole of it would earn at this balance. */}
