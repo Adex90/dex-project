@@ -31,10 +31,21 @@
 //! historial completo de anclas es público (`GET /reserva/cortes`), de modo que
 //! terceros pueden guardar copias: un ledger truncado o reescrito ya no
 //! contiene esos hashes y el verificador de la cadena lo detecta.
+//!
+//! **Posiciones (0018).** El corte también compromete las posiciones abiertas
+//! del mercado: un árbol de sumas por activo (hoja = cuenta y cantidad, con su
+//! sal y el orden barajado), publicado junto a la raíz del efectivo con su
+//! total, y el ancla del ledger del mercado. El árbol del efectivo no cambia.
+//! La prueba de un cliente lleva la ruta de su hoja en cada árbol donde tiene
+//! posición. No hay registro de la custodia de los subyacentes: la raíz de un
+//! activo prueba la inclusión y el pasivo total, no su respaldo.
 
-use std::sync::{
-    atomic::{AtomicU64, Ordering},
-    Arc,
+use std::{
+    collections::{BTreeMap, HashMap},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
 };
 
 use chrono::{DateTime, Utc};
@@ -46,11 +57,13 @@ use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use crate::{
-    crypto::merkle::{self, ArbolSuma, Hoja, Lado, Nodo, Paso},
+    crypto::merkle::{self, ArbolSuma, Hoja, HojaPosicion, Lado, Nodo, Paso},
     db::{self, Rol},
     dinero,
     error::{AppError, AppResult},
-    models::ifpe::{CorteReserva, EstadoReserva, HojaCorte, LedgerCabeza, ReservaCustodia},
+    models::ifpe::{
+        ActivoCorte, CorteReserva, EstadoReserva, HojaCorte, HojaPosicionCorte, LedgerCabeza, ReservaCustodia,
+    },
 };
 
 /// Estado de la reserva en tiempo real (público).
@@ -104,6 +117,26 @@ pub async fn estado_actual(pool: &PgPool) -> AppResult<EstadoReservaVista> {
 struct FilaHoja {
     cuenta_id: Uuid,
     saldo_total: Decimal,
+    saldo_disponible: Decimal,
+    saldo_bloqueado: Decimal,
+    saldo_comprometido: Decimal,
+}
+
+/// Una posición abierta y la cuenta IFPE de su cliente (`None` si no la tiene:
+/// el corte no se publica).
+#[derive(sqlx::FromRow)]
+struct FilaPosicion {
+    ticker: String,
+    cuenta_id: Option<Uuid>,
+    cantidad: Decimal,
+}
+
+/// Árbol de un activo listo para publicar: hojas en su orden barajado.
+struct ArbolActivoNuevo {
+    ticker: String,
+    hojas: Vec<HojaPosicion>,
+    hashes: Vec<merkle::Hash>,
+    raiz: Nodo,
 }
 
 fn aleatorio_32() -> [u8; 32] {
@@ -187,10 +220,22 @@ async fn generar_corte_tx(pool: &PgPool) -> AppResult<CorteReserva> {
     if !libre {
         return Err(AppError::conflicto("CORTE_EN_CURSO", "ya se está generando un corte de reserva"));
     }
-    let filas: Vec<FilaHoja> =
-        sqlx::query_as("SELECT cuenta_id, saldo_total FROM ifpe.v_hojas_reserva ORDER BY cuenta_id")
-            .fetch_all(&mut *tx)
-            .await?;
+    let filas: Vec<FilaHoja> = sqlx::query_as(
+        "SELECT cuenta_id, saldo_total, saldo_disponible, saldo_bloqueado, saldo_comprometido \
+         FROM ifpe.v_hojas_reserva ORDER BY cuenta_id",
+    )
+    .fetch_all(&mut *tx)
+    .await?;
+    // Posiciones abiertas del mercado con la cuenta de su cliente, en la misma foto (0018).
+    let posiciones: Vec<FilaPosicion> = sqlx::query_as(
+        "SELECT p.ticker, c.id AS cuenta_id, p.cantidad FROM mercado.posiciones p \
+         LEFT JOIN ifpe.cuentas c ON c.cliente_id = p.cliente_id AND c.moneda = 'MXN' \
+         WHERE p.cantidad > 0 ORDER BY p.ticker, c.id",
+    )
+    .fetch_all(&mut *tx)
+    .await?;
+    let cabeza_mercado: LedgerCabeza =
+        sqlx::query_as("SELECT ultima_secuencia, ultimo_hash FROM mercado.ledger_cabeza").fetch_one(&mut *tx).await?;
     let estado: EstadoReserva = sqlx::query_as(
         "SELECT pasivo_clientes, activo_reserva, coeficiente_reserva, actualizado_en FROM ifpe.estado_reserva",
     )
@@ -211,6 +256,16 @@ async fn generar_corte_tx(pool: &PgPool) -> AppResult<CorteReserva> {
             cabeza.ultima_secuencia
         )));
     }
+    // Tampoco el ledger del mercado retrocede respecto de su ancla publicada.
+    let ancla_mercado: i64 = sqlx::query_scalar("SELECT coalesce(max(secuencia_mercado), 0) FROM ifpe.cortes_reserva")
+        .fetch_one(&mut *tx)
+        .await?;
+    if cabeza_mercado.ultima_secuencia < ancla_mercado {
+        return Err(AppError::Integridad(format!(
+            "la cabeza del ledger del mercado ({}) está detrás de un corte ya publicado ({ancla_mercado}): ledger truncado",
+            cabeza_mercado.ultima_secuencia
+        )));
+    }
     // Cada saldo de la foto debe ser exactamente el que el ledger justifica.
     let sin_ledger = saldos_sin_ledger(&mut tx).await?;
     if sin_ledger > 0 {
@@ -223,15 +278,41 @@ async fn generar_corte_tx(pool: &PgPool) -> AppResult<CorteReserva> {
         .iter()
         .map(|f| Ok(Hoja { cuenta_id: f.cuenta_id, saldo: unidades(f.saldo_total)?, sal: aleatorio_32() }))
         .collect::<AppResult<_>>()?;
-    // Hash de cada hoja y árbol completo: CPU pura, fuera del ejecutor async.
-    let (hojas, hashes, arbol) = bloqueante(move || {
+    // El desglose de cada hoja va aparte del hash; la base de datos lo compara con la cuenta.
+    let desgloses: HashMap<Uuid, (Decimal, Decimal, Decimal)> =
+        filas.iter().map(|f| (f.cuenta_id, (f.saldo_disponible, f.saldo_bloqueado, f.saldo_comprometido))).collect();
+    let mut por_activo: BTreeMap<String, Vec<HojaPosicion>> = BTreeMap::new();
+    for p in &posiciones {
+        let cuenta_id = p.cuenta_id.ok_or_else(|| {
+            AppError::Integridad(format!("una posición abierta en {} no tiene la cuenta IFPE de su cliente", p.ticker))
+        })?;
+        por_activo.entry(p.ticker.clone()).or_default().push(HojaPosicion {
+            ticker: p.ticker.clone(),
+            cuenta_id,
+            cantidad: unidades(p.cantidad)?,
+            sal: aleatorio_32(),
+        });
+    }
+    // Hash de cada hoja y árboles completos: CPU pura, fuera del ejecutor async.
+    let (hojas, hashes, arbol, activos) = bloqueante(move || {
         let mut con_hash: Vec<(merkle::Hash, Hoja)> = hojas.into_iter().map(|h| (h.hash(), h)).collect();
         // Orden barajado en cada corte (el hash depende de la sal aleatoria).
         con_hash.sort_unstable_by_key(|(hash, _)| *hash);
         let nodos = con_hash.iter().map(|(hash, h)| Nodo { hash: *hash, suma: h.saldo }).collect();
         let arbol = ArbolSuma::desde_nodos(nodos).map_err(|e| AppError::Integridad(e.to_string()))?;
         let (hashes, hojas) = con_hash.into_iter().unzip::<_, _, Vec<_>, Vec<_>>();
-        Ok((hojas, hashes, arbol))
+        // Un árbol por activo, barajado igual.
+        let mut activos = Vec::with_capacity(por_activo.len());
+        for (ticker, hojas_activo) in por_activo {
+            let mut con_hash: Vec<(merkle::Hash, HojaPosicion)> =
+                hojas_activo.into_iter().map(|h| (h.hash(), h)).collect();
+            con_hash.sort_unstable_by_key(|(hash, _)| *hash);
+            let nodos = con_hash.iter().map(|(hash, h)| Nodo { hash: *hash, suma: h.cantidad }).collect();
+            let raiz = ArbolSuma::desde_nodos(nodos).map_err(|e| AppError::Integridad(e.to_string()))?.raiz();
+            let (hashes, hojas) = con_hash.into_iter().unzip::<_, _, Vec<_>, Vec<_>>();
+            activos.push(ArbolActivoNuevo { ticker, hojas, hashes, raiz });
+        }
+        Ok((hojas, hashes, arbol, activos))
     })
     .await?;
     let raiz = arbol.raiz();
@@ -247,10 +328,11 @@ async fn generar_corte_tx(pool: &PgPool) -> AppResult<CorteReserva> {
         )));
     }
 
-    let corte: CorteReserva = sqlx::query_as(
+    let mut corte: CorteReserva = sqlx::query_as(
         "INSERT INTO ifpe.cortes_reserva \
-         (id, merkle_root, num_hojas, total_pasivo, total_reserva, secuencia_ledger, hash_ledger, algoritmo) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *",
+         (id, merkle_root, num_hojas, total_pasivo, total_reserva, secuencia_ledger, hash_ledger, algoritmo, \
+          secuencia_mercado, hash_mercado) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING *",
     )
     .bind(Uuid::new_v4())
     .bind(hex::encode(raiz.hash))
@@ -260,6 +342,8 @@ async fn generar_corte_tx(pool: &PgPool) -> AppResult<CorteReserva> {
     .bind(cabeza.ultima_secuencia)
     .bind(&cabeza.ultimo_hash)
     .bind(merkle::ALGORITMO)
+    .bind(cabeza_mercado.ultima_secuencia)
+    .bind(&cabeza_mercado.ultimo_hash)
     .fetch_one(&mut *tx)
     .await?;
 
@@ -271,9 +355,23 @@ async fn generar_corte_tx(pool: &PgPool) -> AppResult<CorteReserva> {
         let saldos: Vec<Decimal> = lote.iter().map(|h| monto(h.saldo)).collect::<AppResult<_>>()?;
         let sales: Vec<String> = lote.iter().map(|h| hex::encode(h.sal)).collect();
         let hashes: Vec<String> = hashes[base..base + lote.len()].iter().map(hex::encode).collect();
+        let desglose: Vec<(Decimal, Decimal, Decimal)> = lote
+            .iter()
+            .map(|h| {
+                desgloses
+                    .get(&h.cuenta_id)
+                    .copied()
+                    .ok_or_else(|| AppError::Integridad(format!("hoja sin desglose: {}", h.cuenta_id)))
+            })
+            .collect::<AppResult<_>>()?;
+        let disponibles: Vec<Decimal> = desglose.iter().map(|d| d.0).collect();
+        let bloqueados: Vec<Decimal> = desglose.iter().map(|d| d.1).collect();
+        let comprometidos: Vec<Decimal> = desglose.iter().map(|d| d.2).collect();
         sqlx::query(
-            "INSERT INTO ifpe.cortes_reserva_hojas (corte_id, indice, cuenta_id, saldo_total, sal, hoja_hash) \
-             SELECT $1, * FROM UNNEST($2::int[], $3::uuid[], $4::numeric[], $5::text[], $6::text[])",
+            "INSERT INTO ifpe.cortes_reserva_hojas (corte_id, indice, cuenta_id, saldo_total, sal, hoja_hash, \
+                                                    saldo_disponible, saldo_bloqueado, saldo_comprometido) \
+             SELECT $1, * FROM UNNEST($2::int[], $3::uuid[], $4::numeric[], $5::text[], $6::text[], \
+                                      $7::numeric[], $8::numeric[], $9::numeric[])",
         )
         .bind(corte.id)
         .bind(&indices)
@@ -281,20 +379,93 @@ async fn generar_corte_tx(pool: &PgPool) -> AppResult<CorteReserva> {
         .bind(&saldos)
         .bind(&sales)
         .bind(&hashes)
+        .bind(&disponibles)
+        .bind(&bloqueados)
+        .bind(&comprometidos)
         .execute(&mut *tx)
         .await?;
     }
-    // El constraint trigger diferido comprueba Σhojas == total_pasivo y num_hojas al COMMIT.
+    // Los árboles de posiciones (0018): primero su raíz, después sus hojas.
+    for a in &activos {
+        let publicado: ActivoCorte = sqlx::query_as(
+            "INSERT INTO ifpe.cortes_reserva_activos (corte_id, ticker, merkle_root, num_hojas, total_cantidad) \
+             VALUES ($1, $2, $3, $4, $5) RETURNING ticker, merkle_root, num_hojas, total_cantidad",
+        )
+        .bind(corte.id)
+        .bind(&a.ticker)
+        .bind(hex::encode(a.raiz.hash))
+        .bind(i32::try_from(a.hojas.len()).map_err(|_| AppError::Integridad("demasiadas hojas".into()))?)
+        .bind(monto(a.raiz.suma)?)
+        .fetch_one(&mut *tx)
+        .await?;
+        for (n, lote) in a.hojas.chunks(5_000).enumerate() {
+            let base = n * 5_000;
+            let indices: Vec<i32> = (0..lote.len()).map(|i| (base + i) as i32).collect();
+            let cuentas: Vec<Uuid> = lote.iter().map(|h| h.cuenta_id).collect();
+            let cantidades: Vec<Decimal> = lote.iter().map(|h| monto(h.cantidad)).collect::<AppResult<_>>()?;
+            let sales: Vec<String> = lote.iter().map(|h| hex::encode(h.sal)).collect();
+            let hashes: Vec<String> = a.hashes[base..base + lote.len()].iter().map(hex::encode).collect();
+            sqlx::query(
+                "INSERT INTO ifpe.cortes_reserva_posiciones (corte_id, ticker, indice, cuenta_id, cantidad, sal, hoja_hash) \
+                 SELECT $1, $2, * FROM UNNEST($3::int[], $4::uuid[], $5::numeric[], $6::text[], $7::text[])",
+            )
+            .bind(corte.id)
+            .bind(&a.ticker)
+            .bind(&indices)
+            .bind(&cuentas)
+            .bind(&cantidades)
+            .bind(&sales)
+            .bind(&hashes)
+            .execute(&mut *tx)
+            .await?;
+        }
+        corte.activos.push(publicado);
+    }
+    // Los constraint triggers diferidos comprueban al COMMIT, en la misma foto,
+    // que las hojas y las posiciones son exactamente las vivas, sus sumas, sus
+    // hashes, el desglose y las dos anclas.
     tx.commit().await?;
-    tracing::info!(corte = %corte.id, raiz = %corte.merkle_root, hojas = corte.num_hojas, pasivo = %corte.total_pasivo, "corte de Proof of Reserve publicado");
+    tracing::info!(corte = %corte.id, raiz = %corte.merkle_root, hojas = corte.num_hojas, pasivo = %corte.total_pasivo, activos = corte.activos.len(), "corte de Proof of Reserve publicado");
     Ok(corte)
+}
+
+/// Llena los árboles de posiciones (0018) de cada corte, en una consulta.
+async fn con_activos(conexion: &mut PgConnection, cortes: &mut [CorteReserva]) -> AppResult<()> {
+    if cortes.is_empty() {
+        return Ok(());
+    }
+    let ids: Vec<Uuid> = cortes.iter().map(|c| c.id).collect();
+    let filas: Vec<(Uuid, String, String, i32, Decimal)> = sqlx::query_as(
+        "SELECT corte_id, ticker, merkle_root, num_hojas, total_cantidad FROM ifpe.cortes_reserva_activos \
+         WHERE corte_id = ANY($1) ORDER BY corte_id, ticker",
+    )
+    .bind(&ids)
+    .fetch_all(&mut *conexion)
+    .await?;
+    let mut por_corte: HashMap<Uuid, Vec<ActivoCorte>> = HashMap::new();
+    for (corte_id, ticker, merkle_root, num_hojas, total_cantidad) in filas {
+        por_corte.entry(corte_id).or_default().push(ActivoCorte {
+            ticker,
+            merkle_root,
+            num_hojas,
+            total_cantidad: dinero::con_escala(total_cantidad),
+        });
+    }
+    for c in cortes {
+        c.activos = por_corte.remove(&c.id).unwrap_or_default();
+    }
+    Ok(())
 }
 
 pub async fn ultimo_corte(pool: &PgPool) -> AppResult<Option<CorteReserva>> {
     let mut tx = db::begin_lectura(pool, Rol::Auditor).await?;
-    let corte = sqlx::query_as("SELECT * FROM ifpe.cortes_reserva ORDER BY creado_en DESC, id DESC LIMIT 1")
-        .fetch_optional(&mut *tx)
-        .await?;
+    let mut corte: Option<CorteReserva> =
+        sqlx::query_as("SELECT * FROM ifpe.cortes_reserva ORDER BY creado_en DESC, id DESC LIMIT 1")
+            .fetch_optional(&mut *tx)
+            .await?;
+    if let Some(c) = corte.as_mut() {
+        con_activos(&mut tx, std::slice::from_mut(c)).await?;
+    }
     tx.commit().await?;
     Ok(corte)
 }
@@ -303,7 +474,7 @@ pub async fn ultimo_corte(pool: &PgPool) -> AppResult<Option<CorteReserva>> {
 /// pagina por fecha de publicación.
 pub async fn listar_cortes(pool: &PgPool, antes: Option<DateTime<Utc>>, limite: i64) -> AppResult<Vec<CorteReserva>> {
     let mut tx = db::begin_lectura(pool, Rol::Auditor).await?;
-    let cortes = sqlx::query_as(
+    let mut cortes: Vec<CorteReserva> = sqlx::query_as(
         "SELECT * FROM ifpe.cortes_reserva WHERE $1::timestamptz IS NULL OR creado_en < $1 \
          ORDER BY creado_en DESC, id DESC LIMIT $2",
     )
@@ -311,16 +482,19 @@ pub async fn listar_cortes(pool: &PgPool, antes: Option<DateTime<Utc>>, limite: 
     .bind(limite.clamp(1, 500))
     .fetch_all(&mut *tx)
     .await?;
+    con_activos(&mut tx, &mut cortes).await?;
     tx.commit().await?;
     Ok(cortes)
 }
 
 pub async fn corte_por_id(pool: &PgPool, id: Uuid) -> AppResult<CorteReserva> {
     let mut tx = db::begin_lectura(pool, Rol::Auditor).await?;
-    let corte =
+    let corte: Option<CorteReserva> =
         sqlx::query_as("SELECT * FROM ifpe.cortes_reserva WHERE id = $1").bind(id).fetch_optional(&mut *tx).await?;
+    let mut corte = corte.ok_or_else(|| AppError::no_encontrado("corte no encontrado"))?;
+    con_activos(&mut tx, std::slice::from_mut(&mut corte)).await?;
     tx.commit().await?;
-    corte.ok_or_else(|| AppError::no_encontrado("corte no encontrado"))
+    Ok(corte)
 }
 
 // -----------------------------------------------------------------------------
@@ -344,7 +518,13 @@ pub struct CacheCortes {
 struct ArbolCorte {
     corte_id: Uuid,
     creado_en: DateTime<Utc>,
-    arbol: Arc<ArbolSuma>,
+    arboles: Arc<ArbolesCorte>,
+}
+
+/// Los árboles verificados de un corte: el del efectivo y uno por activo (0018).
+pub struct ArbolesCorte {
+    efectivo: ArbolSuma,
+    activos: BTreeMap<String, ArbolSuma>,
 }
 
 impl CacheCortes {
@@ -353,68 +533,142 @@ impl CacheCortes {
         self.construcciones.load(Ordering::Relaxed)
     }
 
-    async fn arbol(self: &Arc<Self>, pool: &PgPool, corte: &CorteReserva) -> AppResult<Arc<ArbolSuma>> {
+    async fn arboles(self: &Arc<Self>, pool: &PgPool, corte: &CorteReserva) -> AppResult<Arc<ArbolesCorte>> {
         let guardia = Arc::clone(&self.ultimo).lock_owned().await;
         if let Some(c) = guardia.as_ref().filter(|c| c.corte_id == corte.id) {
-            return Ok(Arc::clone(&c.arbol));
+            return Ok(Arc::clone(&c.arboles));
         }
         let (cache, pool, corte) = (Arc::clone(self), pool.clone(), corte.clone());
         tokio::spawn(async move {
             let mut guardia = guardia;
-            let arbol = Arc::new(construir_verificado(&pool, &corte).await?);
+            let arboles = Arc::new(construir_verificado(&pool, &corte).await?);
             cache.construcciones.fetch_add(1, Ordering::Relaxed);
             // Nunca se reemplaza un corte más reciente por uno anterior.
             if guardia.as_ref().map_or(true, |c| c.creado_en <= corte.creado_en) {
                 *guardia =
-                    Some(ArbolCorte { corte_id: corte.id, creado_en: corte.creado_en, arbol: Arc::clone(&arbol) });
+                    Some(ArbolCorte { corte_id: corte.id, creado_en: corte.creado_en, arboles: Arc::clone(&arboles) });
             }
-            Ok(arbol)
+            Ok(arboles)
         })
         .await
         .map_err(|e| AppError::Integridad(format!("construcción del árbol abortada: {e}")))?
     }
 }
 
-/// Lee las hojas almacenadas de un corte, recalcula cada hash y el árbol, y
-/// exige que la raíz y la suma coincidan con las publicadas: una hoja alterada
-/// después de publicar se detecta aquí.
-async fn construir_verificado(pool: &PgPool, corte: &CorteReserva) -> AppResult<ArbolSuma> {
+/// Lee las hojas almacenadas de un corte, recalcula cada hash y cada árbol, y
+/// exige que las raíces y las sumas coincidan con las publicadas: una hoja
+/// alterada después de publicar se detecta aquí. `corte.activos` debe venir
+/// lleno ([`con_activos`]).
+async fn construir_verificado(pool: &PgPool, corte: &CorteReserva) -> AppResult<ArbolesCorte> {
     let mut tx = db::begin_lectura(pool, Rol::Auditor).await?;
     let hojas: Vec<HojaCorte> =
         sqlx::query_as("SELECT * FROM ifpe.cortes_reserva_hojas WHERE corte_id = $1 ORDER BY indice")
             .bind(corte.id)
             .fetch_all(&mut *tx)
             .await?;
+    let posiciones: Vec<HojaPosicionCorte> =
+        sqlx::query_as("SELECT * FROM ifpe.cortes_reserva_posiciones WHERE corte_id = $1 ORDER BY ticker, indice")
+            .bind(corte.id)
+            .fetch_all(&mut *tx)
+            .await?;
     tx.commit().await?;
     let corte = corte.clone();
     bloqueante(move || {
-        if usize::try_from(corte.num_hojas).ok() != Some(hojas.len()) {
-            return Err(AppError::Integridad(format!("el corte {} declara {} hojas", corte.id, corte.num_hojas)));
-        }
-        let mut nodos = Vec::with_capacity(hojas.len());
-        for (i, h) in hojas.iter().enumerate() {
-            if usize::try_from(h.indice).ok() != Some(i) {
-                return Err(AppError::Integridad(format!("hojas del corte {} no contiguas", corte.id)));
-            }
-            let hoja = hoja_de_fila(h)?;
-            let hash = hoja.hash();
-            if hex::encode(hash) != h.hoja_hash {
-                return Err(AppError::Integridad(format!("hash de hoja alterado en corte {} índice {i}", corte.id)));
-            }
-            nodos.push(Nodo { hash, suma: hoja.saldo });
-        }
-        let arbol = ArbolSuma::desde_nodos(nodos).map_err(|e| AppError::Integridad(e.to_string()))?;
-        let raiz = arbol.raiz();
-        if hex::encode(raiz.hash) != corte.merkle_root || monto(raiz.suma)? != corte.total_pasivo {
-            return Err(AppError::Integridad(format!("la raíz recalculada del corte {} no coincide", corte.id)));
-        }
-        Ok(arbol)
+        let efectivo = arbol_del_efectivo(&corte, &hojas)?;
+        let activos = arboles_de_posiciones(&corte, posiciones)?;
+        Ok(ArbolesCorte { efectivo, activos })
     })
     .await
 }
 
+fn arbol_del_efectivo(corte: &CorteReserva, hojas: &[HojaCorte]) -> AppResult<ArbolSuma> {
+    if usize::try_from(corte.num_hojas).ok() != Some(hojas.len()) {
+        return Err(AppError::Integridad(format!("el corte {} declara {} hojas", corte.id, corte.num_hojas)));
+    }
+    let mut nodos = Vec::with_capacity(hojas.len());
+    for (i, h) in hojas.iter().enumerate() {
+        if usize::try_from(h.indice).ok() != Some(i) {
+            return Err(AppError::Integridad(format!("hojas del corte {} no contiguas", corte.id)));
+        }
+        let hoja = hoja_de_fila(h)?;
+        let hash = hoja.hash();
+        if hex::encode(hash) != h.hoja_hash {
+            return Err(AppError::Integridad(format!("hash de hoja alterado en corte {} índice {i}", corte.id)));
+        }
+        nodos.push(Nodo { hash, suma: hoja.saldo });
+    }
+    let arbol = ArbolSuma::desde_nodos(nodos).map_err(|e| AppError::Integridad(e.to_string()))?;
+    let raiz = arbol.raiz();
+    if hex::encode(raiz.hash) != corte.merkle_root || monto(raiz.suma)? != corte.total_pasivo {
+        return Err(AppError::Integridad(format!("la raíz recalculada del corte {} no coincide", corte.id)));
+    }
+    Ok(arbol)
+}
+
+/// Un árbol por cada activo declarado en el corte, y solo esos.
+fn arboles_de_posiciones(
+    corte: &CorteReserva,
+    posiciones: Vec<HojaPosicionCorte>,
+) -> AppResult<BTreeMap<String, ArbolSuma>> {
+    let mut por_activo: BTreeMap<String, Vec<HojaPosicionCorte>> = BTreeMap::new();
+    for p in posiciones {
+        por_activo.entry(p.ticker.clone()).or_default().push(p);
+    }
+    let declarados: BTreeMap<&str, &ActivoCorte> = corte.activos.iter().map(|a| (a.ticker.as_str(), a)).collect();
+    if por_activo.len() != declarados.len() || por_activo.keys().any(|t| !declarados.contains_key(t.as_str())) {
+        return Err(AppError::Integridad(format!(
+            "los árboles de posiciones del corte {} no son los declarados",
+            corte.id
+        )));
+    }
+    let mut arboles = BTreeMap::new();
+    for (ticker, filas) in por_activo {
+        let declarado = declarados[ticker.as_str()];
+        if usize::try_from(declarado.num_hojas).ok() != Some(filas.len()) {
+            return Err(AppError::Integridad(format!(
+                "el árbol de {ticker} del corte {} declara {} hojas",
+                corte.id, declarado.num_hojas
+            )));
+        }
+        let mut nodos = Vec::with_capacity(filas.len());
+        for (i, f) in filas.iter().enumerate() {
+            if usize::try_from(f.indice).ok() != Some(i) {
+                return Err(AppError::Integridad(format!("hojas de {ticker} del corte {} no contiguas", corte.id)));
+            }
+            let hoja = posicion_de_fila(f)?;
+            let hash = hoja.hash();
+            if hex::encode(hash) != f.hoja_hash {
+                return Err(AppError::Integridad(format!(
+                    "hash de posición alterado en corte {} ({ticker}, índice {i})",
+                    corte.id
+                )));
+            }
+            nodos.push(Nodo { hash, suma: hoja.cantidad });
+        }
+        let arbol = ArbolSuma::desde_nodos(nodos).map_err(|e| AppError::Integridad(e.to_string()))?;
+        let raiz = arbol.raiz();
+        if hex::encode(raiz.hash) != declarado.merkle_root || monto(raiz.suma)? != declarado.total_cantidad {
+            return Err(AppError::Integridad(format!(
+                "la raíz recalculada de {ticker} del corte {} no coincide",
+                corte.id
+            )));
+        }
+        arboles.insert(ticker, arbol);
+    }
+    Ok(arboles)
+}
+
 fn hoja_de_fila(h: &HojaCorte) -> AppResult<Hoja> {
     Ok(Hoja { cuenta_id: h.cuenta_id, saldo: unidades(h.saldo_total)?, sal: hash_desde_hex(&h.sal)? })
+}
+
+fn posicion_de_fila(p: &HojaPosicionCorte) -> AppResult<HojaPosicion> {
+    Ok(HojaPosicion {
+        ticker: p.ticker.clone(),
+        cuenta_id: p.cuenta_id,
+        cantidad: unidades(p.cantidad)?,
+        sal: hash_desde_hex(&p.sal)?,
+    })
 }
 
 // -----------------------------------------------------------------------------
@@ -442,13 +696,52 @@ pub struct PasoJson {
     pub suma: Decimal,
 }
 
+/// Hoja de un árbol de posiciones en JSON (0018).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HojaPosicionJson {
+    pub ticker: String,
+    pub cuenta_id: Uuid,
+    /// Cantidad con 8 decimales (las unidades del árbol son este valor × 10^8).
+    #[serde(with = "rust_decimal::serde::str")]
+    pub cantidad: Decimal,
+    pub sal: String,
+    #[serde(default)]
+    pub hash: Option<String>,
+}
+
+/// De qué se componía el saldo de la hoja en el corte (0018). No entra en el
+/// hash: la hoja compromete el total, y la base de datos comprobó al publicar
+/// que el desglose era el de la cuenta.
+#[derive(Debug, Clone, Serialize)]
+pub struct DesgloseSaldo {
+    pub disponible: Decimal,
+    pub bloqueado: Decimal,
+    pub comprometido: Decimal,
+}
+
+/// Prueba de inclusión de una posición en el árbol de su activo.
+#[derive(Debug, Clone, Serialize)]
+pub struct PruebaPosicion {
+    pub indice: usize,
+    pub hoja: HojaPosicionJson,
+    pub ruta: Vec<PasoJson>,
+    /// Verificación hecha por el servidor contra la raíz publicada del activo.
+    pub valida: bool,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct PruebaReserva {
     pub corte: CorteReserva,
     pub indice: usize,
     pub hoja: HojaJson,
+    /// `None` en los cortes anteriores a 0018.
+    pub desglose: Option<DesgloseSaldo>,
     pub ruta: Vec<PasoJson>,
-    /// Verificación hecha por el servidor (el cliente debe repetirla por su cuenta).
+    /// Una por cada posición abierta de la cuenta en el corte (0018).
+    pub posiciones: Vec<PruebaPosicion>,
+    /// Verificación hecha por el servidor, efectivo y posiciones (el cliente
+    /// debe repetirla por su cuenta).
     pub valida: bool,
     /// Saldo actual de la cuenta, para comparar con el saldo del corte.
     pub saldo_actual: Decimal,
@@ -457,6 +750,21 @@ pub struct PruebaReserva {
 fn hash_desde_hex(s: &str) -> AppResult<merkle::Hash> {
     let bytes = hex::decode(s).map_err(|_| AppError::validacion("hash hexadecimal inválido"))?;
     bytes.try_into().map_err(|_| AppError::validacion("el hash debe tener 32 bytes"))
+}
+
+impl HojaPosicionJson {
+    fn a_hoja(&self) -> AppResult<HojaPosicion> {
+        if !merkle::es_ticker(&self.ticker) {
+            return Err(AppError::validacion("ticker inválido"));
+        }
+        Ok(HojaPosicion {
+            ticker: self.ticker.clone(),
+            cuenta_id: self.cuenta_id,
+            cantidad: dinero::a_unidades_estricto(self.cantidad)
+                .ok_or_else(|| AppError::validacion("cantidad inválida: no negativa y con 8 decimales como máximo"))?,
+            sal: hash_desde_hex(&self.sal)?,
+        })
+    }
 }
 
 impl HojaJson {
@@ -546,27 +854,77 @@ async fn prueba_en_ultimo_corte(
         sqlx::query_as("SELECT * FROM ifpe.cortes_reserva ORDER BY creado_en DESC, id DESC LIMIT 1")
             .fetch_optional(&mut *tx)
             .await?;
-    let Some(corte) = corte else { return Ok(None) };
-    // Solo la hoja de esta cuenta (índice único por corte y cuenta).
+    let Some(mut corte) = corte else { return Ok(None) };
+    con_activos(&mut tx, std::slice::from_mut(&mut corte)).await?;
+    // Solo la hoja de esta cuenta (índice único por corte y cuenta)...
     let fila: Option<HojaCorte> =
         sqlx::query_as("SELECT * FROM ifpe.cortes_reserva_hojas WHERE corte_id = $1 AND cuenta_id = $2")
             .bind(corte.id)
             .bind(cuenta_id)
             .fetch_optional(&mut *tx)
             .await?;
+    // ...y sus hojas en los árboles de posiciones (una por activo, como mucho).
+    let posiciones: Vec<HojaPosicionCorte> = sqlx::query_as(
+        "SELECT * FROM ifpe.cortes_reserva_posiciones WHERE corte_id = $1 AND cuenta_id = $2 ORDER BY ticker",
+    )
+    .bind(corte.id)
+    .bind(cuenta_id)
+    .fetch_all(&mut *tx)
+    .await?;
     tx.commit().await?;
     let Some(fila) = fila else { return Ok(None) };
 
-    let arbol = cache.arbol(pool, &corte).await?;
+    let arboles = cache.arboles(pool, &corte).await?;
     let hoja = hoja_de_fila(&fila)?;
     let indice = usize::try_from(fila.indice).map_err(|_| AppError::Integridad("índice de hoja inválido".into()))?;
-    let prueba = arbol.prueba(indice).ok_or_else(|| AppError::Integridad("índice fuera del árbol".into()))?;
+    let prueba =
+        arboles.efectivo.prueba(indice).ok_or_else(|| AppError::Integridad("índice fuera del árbol".into()))?;
     // La fila leída ahora debe ser la misma hoja con la que se verificó el árbol.
     if prueba.hoja != hoja.nodo() || hex::encode(prueba.hoja.hash) != fila.hoja_hash {
         return Err(AppError::Integridad(format!("hoja alterada en corte {} índice {indice}", corte.id)));
     }
-    let raiz = arbol.raiz();
-    let valida = merkle::verificar(&hoja, &prueba.ruta, &raiz) && hex::encode(raiz.hash) == corte.merkle_root;
+    let raiz = arboles.efectivo.raiz();
+    let efectivo_valido = merkle::verificar(&hoja, &prueba.ruta, &raiz) && hex::encode(raiz.hash) == corte.merkle_root;
+
+    let mut pruebas_posiciones = Vec::with_capacity(posiciones.len());
+    for f in &posiciones {
+        let arbol = arboles
+            .activos
+            .get(&f.ticker)
+            .ok_or_else(|| AppError::Integridad(format!("el corte {} no tiene el árbol de {}", corte.id, f.ticker)))?;
+        let hoja = posicion_de_fila(f)?;
+        let indice = usize::try_from(f.indice).map_err(|_| AppError::Integridad("índice de hoja inválido".into()))?;
+        let p = arbol.prueba(indice).ok_or_else(|| AppError::Integridad("índice fuera del árbol".into()))?;
+        if p.hoja != hoja.nodo() || hex::encode(p.hoja.hash) != f.hoja_hash {
+            return Err(AppError::Integridad(format!(
+                "posición alterada en corte {} ({}, índice {indice})",
+                corte.id, f.ticker
+            )));
+        }
+        let raiz = arbol.raiz();
+        let publicada = corte.activos.iter().find(|a| a.ticker == f.ticker).map(|a| a.merkle_root.as_str());
+        pruebas_posiciones.push(PruebaPosicion {
+            indice,
+            valida: merkle::verificar_posicion(&hoja, &p.ruta, &raiz)
+                && publicada == Some(hex::encode(raiz.hash).as_str()),
+            ruta: ruta_a_json(&p.ruta)?,
+            hoja: HojaPosicionJson {
+                ticker: f.ticker.clone(),
+                cuenta_id: f.cuenta_id,
+                cantidad: dinero::con_escala(f.cantidad),
+                sal: f.sal.clone(),
+                hash: Some(f.hoja_hash.clone()),
+            },
+        });
+    }
+    let desglose = match (fila.saldo_disponible, fila.saldo_bloqueado, fila.saldo_comprometido) {
+        (Some(disponible), Some(bloqueado), Some(comprometido)) => Some(DesgloseSaldo {
+            disponible: dinero::con_escala(disponible),
+            bloqueado: dinero::con_escala(bloqueado),
+            comprometido: dinero::con_escala(comprometido),
+        }),
+        _ => None,
+    };
     Ok(Some(PruebaReserva {
         indice,
         hoja: HojaJson {
@@ -575,8 +933,10 @@ async fn prueba_en_ultimo_corte(
             sal: fila.sal,
             hash: Some(fila.hoja_hash),
         },
+        desglose,
         ruta: ruta_a_json(&prueba.ruta)?,
-        valida,
+        valida: efectivo_valido && pruebas_posiciones.iter().all(|p| p.valida),
+        posiciones: pruebas_posiciones,
         saldo_actual: dinero::con_escala(saldo_actual),
         corte,
     }))
@@ -588,29 +948,60 @@ pub struct SolicitudVerificacion {
     pub corte_id: Uuid,
     pub hoja: HojaJson,
     pub ruta: Vec<PasoJson>,
+    /// Pruebas de posiciones (0018), cada una contra el árbol de su activo.
+    #[serde(default)]
+    pub posiciones: Vec<SolicitudPosicion>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SolicitudPosicion {
+    pub hoja: HojaPosicionJson,
+    pub ruta: Vec<PasoJson>,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ResultadoVerificacionPrueba {
+    /// El efectivo y todas las posiciones de la solicitud.
     pub valida: bool,
     pub raiz_calculada: String,
     pub suma_calculada: Decimal,
     pub raiz_publicada: String,
     pub total_pasivo_publicado: Decimal,
     pub total_reserva_publicado: Decimal,
+    /// En el orden de la solicitud.
+    pub posiciones: Vec<ResultadoPosicion>,
 }
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ResultadoPosicion {
+    pub ticker: String,
+    pub valida: bool,
+    pub raiz_calculada: String,
+    pub suma_calculada: Decimal,
+    /// `None` si el corte no tiene árbol para ese activo.
+    pub raiz_publicada: Option<String>,
+    pub total_publicado: Option<Decimal>,
+}
+
+/// Máximo de posiciones por solicitud (una por activo del catálogo, con holgura).
+const MAX_POSICIONES_VERIFICACION: usize = 64;
 
 /// Verifica una prueba contra la raíz publicada de un corte (servicio público).
 pub async fn verificar_prueba(pool: &PgPool, s: &SolicitudVerificacion) -> AppResult<ResultadoVerificacionPrueba> {
-    if s.ruta.len() > 64 {
+    if s.ruta.len() > 64 || s.posiciones.iter().any(|p| p.ruta.len() > 64) {
         return Err(AppError::validacion("ruta demasiado larga"));
     }
+    if s.posiciones.len() > MAX_POSICIONES_VERIFICACION {
+        return Err(AppError::validacion("demasiadas posiciones"));
+    }
     let mut tx = db::begin_lectura(pool, Rol::Auditor).await?;
-    let corte: CorteReserva = sqlx::query_as("SELECT * FROM ifpe.cortes_reserva WHERE id = $1")
+    let corte: Option<CorteReserva> = sqlx::query_as("SELECT * FROM ifpe.cortes_reserva WHERE id = $1")
         .bind(s.corte_id)
         .fetch_optional(&mut *tx)
-        .await?
-        .ok_or_else(|| AppError::no_encontrado("corte no encontrado"))?;
+        .await?;
+    let mut corte = corte.ok_or_else(|| AppError::no_encontrado("corte no encontrado"))?;
+    con_activos(&mut tx, std::slice::from_mut(&mut corte)).await?;
     tx.commit().await?;
 
     let hoja = s.hoja.a_hoja()?;
@@ -618,12 +1009,33 @@ pub async fn verificar_prueba(pool: &PgPool, s: &SolicitudVerificacion) -> AppRe
     let calculada = merkle::raiz_desde_ruta(&hoja.nodo(), &ruta).map_err(|e| AppError::validacion(e.to_string()))?;
     let raiz_calculada = hex::encode(calculada.hash);
     let suma_calculada = monto(calculada.suma)?;
+    let efectivo_valido = raiz_calculada == corte.merkle_root && suma_calculada == corte.total_pasivo;
+
+    let mut posiciones = Vec::with_capacity(s.posiciones.len());
+    for p in &s.posiciones {
+        let hoja = p.hoja.a_hoja()?;
+        let ruta = ruta_desde_json(&p.ruta)?;
+        let calculada =
+            merkle::raiz_desde_ruta(&hoja.nodo(), &ruta).map_err(|e| AppError::validacion(e.to_string()))?;
+        let raiz_calculada = hex::encode(calculada.hash);
+        let suma_calculada = monto(calculada.suma)?;
+        let publicado = corte.activos.iter().find(|a| a.ticker == hoja.ticker);
+        posiciones.push(ResultadoPosicion {
+            valida: publicado.is_some_and(|a| a.merkle_root == raiz_calculada && a.total_cantidad == suma_calculada),
+            raiz_publicada: publicado.map(|a| a.merkle_root.clone()),
+            total_publicado: publicado.map(|a| a.total_cantidad),
+            ticker: hoja.ticker,
+            raiz_calculada,
+            suma_calculada,
+        });
+    }
     Ok(ResultadoVerificacionPrueba {
-        valida: raiz_calculada == corte.merkle_root && suma_calculada == corte.total_pasivo,
+        valida: efectivo_valido && posiciones.iter().all(|p| p.valida),
         raiz_calculada,
         suma_calculada,
         raiz_publicada: corte.merkle_root,
         total_pasivo_publicado: corte.total_pasivo,
         total_reserva_publicado: corte.total_reserva,
+        posiciones,
     })
 }

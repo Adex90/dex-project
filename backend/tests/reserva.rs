@@ -6,9 +6,12 @@ use comun::*;
 use rust_decimal::Decimal;
 use sqlx::PgPool;
 use synthetic_capital::{
-    crypto::merkle::{self, Hoja},
+    config::Config,
+    crypto::merkle::{self, Hoja, HojaPosicion},
     dinero,
-    reserva::{self, SolicitudVerificacion},
+    kyc::Registro,
+    mercado::{self, Lado, SolicitudOrden},
+    reserva::{self, PasoJson, SolicitudPosicion, SolicitudVerificacion},
 };
 
 #[sqlx::test(migrations = "../migrations")]
@@ -54,7 +57,12 @@ async fn corte_y_pruebas_para_todos_los_clientes(pool: PgPool) {
         assert_eq!(dinero::desde_unidades(raiz.suma).unwrap(), corte.total_pasivo);
 
         // Servicio público de verificación.
-        let solicitud = SolicitudVerificacion { corte_id: corte.id, hoja: p.hoja.clone(), ruta: p.ruta.clone() };
+        let solicitud = SolicitudVerificacion {
+            corte_id: corte.id,
+            hoja: p.hoja.clone(),
+            ruta: p.ruta.clone(),
+            posiciones: vec![],
+        };
         assert!(reserva::verificar_prueba(&pool, &solicitud).await.unwrap().valida);
         let mut falsa = solicitud.clone();
         falsa.hoja.saldo += Decimal::ONE;
@@ -89,11 +97,22 @@ async fn hoja_alterada_se_detecta(pool: PgPool) {
         .execute(&mut *conn)
         .await
         .unwrap();
-    sqlx::query("UPDATE ifpe.cortes_reserva_hojas SET saldo_total = saldo_total - 5 WHERE cuenta_id = $1")
+    // Bajar solo el total ya no pasa: el desglose de la hoja (0018) debe sumarlo.
+    let e = sqlx::query("UPDATE ifpe.cortes_reserva_hojas SET saldo_total = saldo_total - 5 WHERE cuenta_id = $1")
         .bind(beto.cuenta_ifpe.id)
         .execute(&mut *conn)
         .await
-        .unwrap();
+        .unwrap_err();
+    assert!(e.to_string().contains("ck_cortes_hojas_desglose"), "{e}");
+    // Alterado con su desglose, lo detecta la reconstrucción del árbol.
+    sqlx::query(
+        "UPDATE ifpe.cortes_reserva_hojas SET saldo_total = saldo_total - 5, saldo_disponible = saldo_disponible - 5 \
+         WHERE cuenta_id = $1",
+    )
+    .bind(beto.cuenta_ifpe.id)
+    .execute(&mut *conn)
+    .await
+    .unwrap();
     let e = reserva::prueba_de_cliente(&pool, &Default::default(), ana.cliente.id, 0).await.unwrap_err();
     assert_eq!(e.codigo(), "INTEGRIDAD");
 }
@@ -325,23 +344,31 @@ async fn publicar_corte_falso(
         None => sqlx::query_as("SELECT ultima_secuencia, ultimo_hash FROM ifpe.ledger_cabeza").fetch_one(pool).await?,
     };
     let total: Decimal = hojas.iter().map(|h| h.1).sum();
+    // Desde 0018 un corte también ancla el ledger del mercado.
+    let (secuencia_mercado, hash_mercado): (i64, String) =
+        sqlx::query_as("SELECT ultima_secuencia, ultimo_hash FROM mercado.ledger_cabeza").fetch_one(pool).await?;
     let mut tx = pool.begin().await?;
     let corte: uuid::Uuid = sqlx::query_scalar(
-        "INSERT INTO ifpe.cortes_reserva (merkle_root, num_hojas, total_pasivo, total_reserva, secuencia_ledger, hash_ledger) \
-         VALUES (repeat('a', 64), $1, $2, $2, $3, $4) RETURNING id",
+        "INSERT INTO ifpe.cortes_reserva (merkle_root, num_hojas, total_pasivo, total_reserva, secuencia_ledger, hash_ledger, \
+                                          secuencia_mercado, hash_mercado) \
+         VALUES (repeat('a', 64), $1, $2, $2, $3, $4, $5, $6) RETURNING id",
     )
     .bind(hojas.len() as i32)
     .bind(total)
     .bind(secuencia)
     .bind(hash)
+    .bind(secuencia_mercado)
+    .bind(hash_mercado)
     .fetch_one(&mut *tx)
     .await?;
     for (i, (cuenta, saldo, hash)) in hojas.iter().enumerate() {
         let sal = [7u8; 32];
         let real = Hoja { cuenta_id: *cuenta, saldo: dinero::a_unidades(*saldo).unwrap(), sal }.hash();
+        // El desglose, todo disponible (las cuentas de estas pruebas no tienen retenciones ni órdenes).
         sqlx::query(
-            "INSERT INTO ifpe.cortes_reserva_hojas (corte_id, indice, cuenta_id, saldo_total, sal, hoja_hash) \
-             VALUES ($1, $2, $3, $4, $5, $6)",
+            "INSERT INTO ifpe.cortes_reserva_hojas (corte_id, indice, cuenta_id, saldo_total, sal, hoja_hash, \
+                                                    saldo_disponible, saldo_bloqueado, saldo_comprometido) \
+             VALUES ($1, $2, $3, $4, $5, $6, $4, 0, 0)",
         )
         .bind(corte)
         .bind(i as i32)
@@ -398,7 +425,8 @@ async fn verificacion_publica_rechaza_montos_no_canonicos(pool: PgPool) {
     depositar(&pool, &cfg, beto.cuenta_ifpe.id, "5").await;
     reserva::generar_corte(&pool).await.unwrap();
     let p = reserva::prueba_de_cliente(&pool, &Default::default(), ana.cliente.id, 0).await.unwrap();
-    let base = SolicitudVerificacion { corte_id: p.corte.id, hoja: p.hoja.clone(), ruta: p.ruta.clone() };
+    let base =
+        SolicitudVerificacion { corte_id: p.corte.id, hoja: p.hoja.clone(), ruta: p.ruta.clone(), posiciones: vec![] };
     assert!(reserva::verificar_prueba(&pool, &base).await.unwrap().valida);
 
     let mut nueve_decimales = base.clone();
@@ -442,4 +470,193 @@ async fn arbol_del_corte_se_construye_una_vez(pool: PgPool) {
     assert_eq!(cache.construcciones(), 2);
     reserva::prueba_de_cliente(&pool, &cache, beto.cliente.id, 3600).await.unwrap();
     assert_eq!(cache.construcciones(), 2);
+}
+
+// -----------------------------------------------------------------------------
+// Posiciones del mercado en el corte (0018)
+// -----------------------------------------------------------------------------
+
+/// Una compra a mercado de `monto` pesos de `ticker`.
+async fn comprar(pool: &PgPool, cfg: &Config, r: &Registro, ticker: &str, monto: &str) {
+    let s = SolicitudOrden {
+        cliente_id: r.cliente.id,
+        ticker: ticker.into(),
+        lado: Lado::Compra,
+        monto: d(monto),
+        clave_idempotencia: format!("cli:{}:compra-{ticker}-{monto}", r.cliente.id),
+    };
+    mercado::colocar(pool, cfg, &s).await.unwrap();
+}
+
+fn a_pasos(ruta: &[PasoJson]) -> Vec<merkle::Paso> {
+    ruta.iter()
+        .map(|paso| merkle::Paso {
+            lado: paso.lado,
+            hermano: merkle::Nodo {
+                hash: hex::decode(&paso.hash).unwrap().try_into().unwrap(),
+                suma: dinero::a_unidades(paso.suma).unwrap(),
+            },
+        })
+        .collect()
+}
+
+async fn cantidad(pool: &PgPool, cliente: uuid::Uuid, ticker: &str) -> Decimal {
+    sqlx::query_scalar("SELECT cantidad FROM mercado.posiciones WHERE cliente_id = $1 AND ticker = $2")
+        .bind(cliente)
+        .bind(ticker)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+/// Cada posición abierta entra en el árbol de su activo, con el ancla del
+/// ledger del mercado; el desglose del efectivo acompaña a la hoja, y la
+/// prueba de un cliente lleva la ruta de cada posición.
+#[sqlx::test(migrations = "../migrations")]
+async fn las_posiciones_entran_en_el_corte(pool: PgPool) {
+    let cfg = preparar(&pool).await;
+    let ana = cliente(&pool, &cfg, "Ana").await;
+    let beto = cliente(&pool, &cfg, "Beto").await;
+    let carla = cliente(&pool, &cfg, "Carla").await;
+    for c in [&ana, &beto, &carla] {
+        depositar(&pool, &cfg, c.cuenta_ifpe.id, "20000").await;
+    }
+    comprar(&pool, &cfg, &ana, "AUG1", "1250.00").await;
+    comprar(&pool, &cfg, &beto, "AUG1", "500.00").await;
+    comprar(&pool, &cfg, &beto, "AGT1", "300.00").await;
+
+    let corte = reserva::generar_corte(&pool).await.unwrap();
+    let (secuencia, hash): (i64, String) =
+        sqlx::query_as("SELECT ultima_secuencia, ultimo_hash FROM mercado.ledger_cabeza")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(secuencia, 3);
+    assert_eq!((corte.secuencia_mercado, corte.hash_mercado.clone()), (Some(secuencia), Some(hash)));
+    // Un árbol por activo con posiciones (Carla no tiene ninguna), con su total.
+    let arboles: Vec<(&str, i32)> = corte.activos.iter().map(|a| (a.ticker.as_str(), a.num_hojas)).collect();
+    assert_eq!(arboles, vec![("AGT1", 1), ("AUG1", 2)]);
+    for a in &corte.activos {
+        let total: Decimal = sqlx::query_scalar("SELECT sum(cantidad) FROM mercado.posiciones WHERE ticker = $1")
+            .bind(&a.ticker)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(a.total_cantidad, total, "{}", a.ticker);
+    }
+    // La copia pública lleva las mismas raíces.
+    assert_eq!(reserva::corte_por_id(&pool, corte.id).await.unwrap().activos, corte.activos);
+    assert_eq!(reserva::ultimo_corte(&pool).await.unwrap().unwrap().activos, corte.activos);
+    let historial = reserva::listar_cortes(&pool, None, 10).await.unwrap();
+    assert_eq!(historial[0].activos, corte.activos);
+
+    let p = reserva::prueba_de_cliente(&pool, &Default::default(), beto.cliente.id, 0).await.unwrap();
+    assert!(p.valida);
+    let desglose = p.desglose.as_ref().expect("un corte 0018 trae el desglose");
+    assert_eq!(desglose.disponible + desglose.bloqueado + desglose.comprometido, p.hoja.saldo);
+    assert_eq!(desglose.disponible, p.saldo_actual);
+    let tickers: Vec<&str> = p.posiciones.iter().map(|x| x.hoja.ticker.as_str()).collect();
+    assert_eq!(tickers, vec!["AGT1", "AUG1"]);
+    for x in &p.posiciones {
+        assert!(x.valida, "{}", x.hoja.ticker);
+        assert_eq!(x.hoja.cuenta_id, beto.cuenta_ifpe.id);
+        assert_eq!(x.hoja.cantidad, cantidad(&pool, beto.cliente.id, &x.hoja.ticker).await);
+        // Verificación independiente, solo con la prueba y la raíz publicada del activo.
+        let hoja = HojaPosicion {
+            ticker: x.hoja.ticker.clone(),
+            cuenta_id: x.hoja.cuenta_id,
+            cantidad: dinero::a_unidades(x.hoja.cantidad).unwrap(),
+            sal: hex::decode(&x.hoja.sal).unwrap().try_into().unwrap(),
+        };
+        let raiz = merkle::raiz_desde_ruta(&hoja.nodo(), &a_pasos(&x.ruta)).unwrap();
+        let publicado = corte.activos.iter().find(|a| a.ticker == x.hoja.ticker).unwrap();
+        assert_eq!(hex::encode(raiz.hash), publicado.merkle_root);
+        assert_eq!(dinero::desde_unidades(raiz.suma).unwrap(), publicado.total_cantidad);
+    }
+    // Sin posiciones, la prueba solo trae el efectivo.
+    let pc = reserva::prueba_de_cliente(&pool, &Default::default(), carla.cliente.id, 0).await.unwrap();
+    assert!(pc.valida && pc.posiciones.is_empty());
+
+    // Verificación pública con las posiciones.
+    let solicitud = SolicitudVerificacion {
+        corte_id: corte.id,
+        hoja: p.hoja.clone(),
+        ruta: p.ruta.clone(),
+        posiciones: p
+            .posiciones
+            .iter()
+            .map(|x| SolicitudPosicion { hoja: x.hoja.clone(), ruta: x.ruta.clone() })
+            .collect(),
+    };
+    let r = reserva::verificar_prueba(&pool, &solicitud).await.unwrap();
+    assert!(r.valida && r.posiciones.len() == 2 && r.posiciones.iter().all(|x| x.valida), "{r:?}");
+    // Una unidad de más en una posición: esa falla y la prueba entera también.
+    let mut falsa = solicitud.clone();
+    falsa.posiciones[1].hoja.cantidad += d("0.00000001");
+    let r = reserva::verificar_prueba(&pool, &falsa).await.unwrap();
+    assert!(!r.valida && r.posiciones[0].valida && !r.posiciones[1].valida, "{r:?}");
+    // La hoja de la plata no pasa por oro.
+    let mut otro_activo = solicitud.clone();
+    otro_activo.posiciones[0].hoja.ticker = "AUG1".into();
+    assert!(!reserva::verificar_prueba(&pool, &otro_activo).await.unwrap().valida);
+    // Un activo sin árbol en el corte.
+    let mut sin_arbol = solicitud.clone();
+    sin_arbol.posiciones[0].hoja.ticker = "CETES28".into();
+    let r = reserva::verificar_prueba(&pool, &sin_arbol).await.unwrap();
+    assert!(!r.valida && r.posiciones[0].raiz_publicada.is_none(), "{r:?}");
+    // Un ticker mal formado es un error de validación.
+    let mut mal = solicitud.clone();
+    mal.posiciones[0].hoja.ticker = "agt1".into();
+    assert_eq!(reserva::verificar_prueba(&pool, &mal).await.unwrap_err().codigo(), "VALIDACION");
+}
+
+/// Una posición alterada después de publicar se detecta al reconstruir el
+/// árbol de su activo (también para la prueba de otro cliente).
+#[sqlx::test(migrations = "../migrations")]
+async fn posicion_alterada_se_detecta(pool: PgPool) {
+    let cfg = preparar(&pool).await;
+    let ana = cliente(&pool, &cfg, "Ana").await;
+    let beto = cliente(&pool, &cfg, "Beto").await;
+    for c in [&ana, &beto] {
+        depositar(&pool, &cfg, c.cuenta_ifpe.id, "5000").await;
+        comprar(&pool, &cfg, c, "AUG1", "1000.00").await;
+    }
+    reserva::generar_corte(&pool).await.unwrap();
+
+    let mut conn = pool.acquire().await.unwrap();
+    sqlx::query("ALTER TABLE ifpe.cortes_reserva_posiciones DISABLE TRIGGER trg_cortes_posiciones_inmutable")
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE ifpe.cortes_reserva_posiciones SET cantidad = cantidad / 2 WHERE cuenta_id = $1")
+        .bind(beto.cuenta_ifpe.id)
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+    let e = reserva::prueba_de_cliente(&pool, &Default::default(), ana.cliente.id, 0).await.unwrap_err();
+    assert_eq!(e.codigo(), "INTEGRIDAD");
+}
+
+/// La base de datos no publica un corte que omite las posiciones abiertas,
+/// aunque el efectivo cuadre.
+#[sqlx::test(migrations = "../migrations")]
+async fn corte_sin_posiciones_rechazado_por_la_base_de_datos(pool: PgPool) {
+    let cfg = preparar(&pool).await;
+    let ana = cliente(&pool, &cfg, "Ana").await;
+    let cuenta = ana.cuenta_ifpe.id;
+    depositar(&pool, &cfg, cuenta, "5000").await;
+    // Sin órdenes, el corte honesto del efectivo se publica.
+    publicar_corte_falso(&pool, &[(cuenta, d("5000"), None)], None).await.unwrap();
+
+    comprar(&pool, &cfg, &ana, "AUG1", "1000.00").await;
+    let saldo: Decimal = sqlx::query_scalar("SELECT saldo_disponible FROM ifpe.cuentas WHERE id = $1")
+        .bind(cuenta)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let e = publicar_corte_falso(&pool, &[(cuenta, saldo, None)], None).await.unwrap_err().to_string();
+    assert!(e.contains("SC_CORTE_INVALIDO") && e.contains("posiciones"), "{e}");
+    // El corte del backend sí las incluye.
+    let corte = reserva::generar_corte(&pool).await.unwrap();
+    assert_eq!(corte.activos.len(), 1);
 }

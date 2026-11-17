@@ -246,6 +246,8 @@ jobs:
             expect: "tests/db/0016_cuentas_vinculadas.sql: todas las pruebas pasaron (ROLLBACK)"
           - suite: 0017_kyc_declaraciones
             expect: "tests/db/0017_kyc_declaraciones.sql: todas las pruebas pasaron (ROLLBACK)"
+          - suite: 0018_reserva_posiciones
+            expect: "tests/db/0018_reserva_posiciones.sql: todas las pruebas pasaron (ROLLBACK)"
     services:
       postgres:
         image: postgres:16

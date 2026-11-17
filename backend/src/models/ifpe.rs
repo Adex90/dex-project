@@ -150,6 +150,25 @@ pub struct CorteReserva {
     pub hash_ledger: String,
     pub algoritmo: String,
     pub creado_en: DateTime<Utc>,
+    /// Ancla del ledger del mercado (0018): su cabeza en la foto del corte.
+    /// `None` en los cortes anteriores.
+    pub secuencia_mercado: Option<i64>,
+    pub hash_mercado: Option<String>,
+    /// Árbol de posiciones de cada activo con posiciones abiertas (0018), por
+    /// ticker. No es una columna: lo llena `reserva` al leer el corte. Vacío
+    /// en los cortes anteriores.
+    #[sqlx(skip)]
+    pub activos: Vec<ActivoCorte>,
+}
+
+/// Raíz del árbol de posiciones de un activo en un corte (0018).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, FromRow)]
+pub struct ActivoCorte {
+    pub ticker: String,
+    pub merkle_root: String,
+    pub num_hojas: i32,
+    /// Unidades del activo que el mercado debe a sus clientes.
+    pub total_cantidad: Decimal,
 }
 
 /// Hoja de un corte (cuenta + saldo + sal).
@@ -159,6 +178,22 @@ pub struct HojaCorte {
     pub indice: i32,
     pub cuenta_id: Uuid,
     pub saldo_total: Decimal,
+    pub sal: String,
+    pub hoja_hash: String,
+    /// Desglose del saldo en el corte (0018, fuera del hash); `None` antes.
+    pub saldo_disponible: Option<Decimal>,
+    pub saldo_bloqueado: Option<Decimal>,
+    pub saldo_comprometido: Option<Decimal>,
+}
+
+/// Hoja de un árbol de posiciones (0018): cuenta, cantidad del activo y sal.
+#[derive(Debug, Clone, FromRow)]
+pub struct HojaPosicionCorte {
+    pub corte_id: Uuid,
+    pub ticker: String,
+    pub indice: i32,
+    pub cuenta_id: Uuid,
+    pub cantidad: Decimal,
     pub sal: String,
     pub hoja_hash: String,
 }
