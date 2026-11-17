@@ -179,7 +179,9 @@ data really is. Before the first push it returns `(0, 0)`, which DarkPool treats
 the relayers' job. On testnet, a relayer pushes every ~15 s, and anyone can run another.
 
 **Cost.** A push costs the relayer **259,974 gas**: the first push, into a cold storage slot, as measured in CI by
-`test_gasOfAPush`. Most of that is the Groth16 pairing check. At one push every 15 s, that is about 1.5 B gas a day:
+`test_gasOfAPush`. Most of that is the Groth16 pairing check. As whole transactions (base cost and calldata included),
+the pipeline's end-to-end test measured 284,694 gas for the first push and 267,608 for each one after it; proving took
+0.78 s, and a full cycle 1.85 s. At one push every 15 s, that is about 1.5 B gas a day:
 affordable on an L2 such as Arbitrum, and not on Ethereum mainnet.
 
 ## Trust model

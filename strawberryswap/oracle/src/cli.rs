@@ -150,7 +150,9 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("zk-oracle-salt-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         let file = dir.join("salt");
+        // A fresh file each time: a read-only one cannot be rewritten (except by root, which hides the mistake).
         let write = |text: &str, mode: u32| {
+            let _ = fs::remove_file(&file);
             fs::write(&file, text).unwrap();
             fs::set_permissions(&file, fs::Permissions::from_mode(mode)).unwrap();
         };
