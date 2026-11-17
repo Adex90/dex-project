@@ -23,6 +23,7 @@ alloy = { version = "2.5.0", default-features = false, features = [
     "consensus",
     "contract",
     "eips",
+    "json-rpc",
     "k256",
     "provider-http",
     "reqwest-rustls-tls",
@@ -46,6 +47,9 @@ tokio = { version = "1.54.1", features = ["rt", "macros", "time", "signal", "net
 k256 = { version = "0.13.4", default-features = false, features = ["ecdsa"] }
 # The end-to-end test's memory scan (tests/vault_e2e.rs). Already in the graph (through serde_json and hyper).
 memchr = "2.8.3"
+# The live chain's tests record every JSON-RPC request alloy's mock transport answers (src/live.rs). Already in the
+# graph (through alloy and hyper).
+tower-service = "0.3.3"
 
 [profile.release]
 # Integer overflow panics in release too: a wrapped amount must never reach a quote.

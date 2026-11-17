@@ -384,30 +384,45 @@ fn scan_memory(pid: u32, needles: &[(&'static str, Vec<u8>)]) -> Scan {
 // Tests
 // ---------------------------------------------------------------------------------------------------------------------
 
-/// One broadcast transaction from the engine's `SENT nonce=… tx=… signer=… status=… raw=0x…` line.
+/// A `key=value` field of an event line.
+fn field(line: &str, key: &str) -> String {
+    let start = line
+        .find(&format!(" {key}="))
+        .unwrap_or_else(|| panic!("no {key} in {line}"))
+        + key.len()
+        + 2;
+    line[start..].split(' ').next().unwrap().to_string()
+}
+
+/// One broadcast transaction from the engine's `SENT nonce=… tx=… raw=0x…` line.
 struct Sent {
     nonce: u64,
     hash: String,
-    status: String,
     raw: Vec<u8>,
 }
 
 fn parse_sent(line: &str) -> Sent {
-    let field = |key: &str| {
-        let start = line
-            .find(&format!(" {key}="))
-            .unwrap_or_else(|| panic!("no {key} in {line}"))
-            + key.len()
-            + 2;
-        line[start..].split(' ').next().unwrap().to_string()
-    };
-    let status_start = line.find(" status=").unwrap() + " status=".len();
-    let status_end = line.find(" raw=").unwrap_or(line.len());
     Sent {
-        nonce: field("nonce").parse().unwrap(),
-        hash: field("tx"),
-        status: line[status_start..status_end].to_string(),
-        raw: hex::decode(field("raw")).unwrap(),
+        nonce: field(line, "nonce").parse().unwrap(),
+        hash: field(line, "tx"),
+        raw: hex::decode(field(line, "raw")).unwrap(),
+    }
+}
+
+/// Its receipt, from the `MINED nonce=… tx=… from=… status=… block=… gas=… after_ms=…` line.
+struct Mined {
+    nonce: u64,
+    hash: String,
+    from: String,
+    status: String,
+}
+
+fn parse_mined(line: &str) -> Mined {
+    Mined {
+        nonce: field(line, "nonce").parse().unwrap(),
+        hash: field(line, "tx"),
+        from: field(line, "from"),
+        status: field(line, "status"),
     }
 }
 
@@ -425,21 +440,26 @@ fn the_engine_trades_through_the_vault_and_never_holds_its_key() {
         "the engine reports the vault's signer: {vault_line}"
     );
 
-    // 1. Five rebalances, each checked here without the engine's help.
-    let mut sent = Vec::new();
-    while sent.len() < 5 {
-        // (A read can miss its budget on a loaded machine: a SKIPPED tick is not a failure, and is not waited for.)
+    // 1. Five rebalances, each checked here without the engine's help, and their receipts. (A read can miss its budget
+    // on a loaded machine: a SKIPPED tick is not a failure, and is not waited for.)
+    let (mut sent, mut mined) = (Vec::new(), Vec::new());
+    while mined.len() < 5 {
         let line = engine.wait_for(Duration::from_secs(120), |l| {
-            ["SENT ", "WITHDRAWN", "REJECTED"]
+            ["SENT ", "MINED ", "WITHDRAWN", "REJECTED", "BEATEN"]
                 .iter()
                 .any(|event| l.starts_with(event))
         });
-        assert!(
-            line.starts_with("SENT "),
-            "with the vault up nothing is withdrawn or rejected: {line}"
-        );
-        sent.push(parse_sent(&line));
+        if line.starts_with("SENT ") {
+            sent.push(parse_sent(&line));
+        } else {
+            assert!(
+                line.starts_with("MINED "),
+                "with the vault up nothing is withdrawn, rejected or beaten: {line}"
+            );
+            mined.push(parse_mined(&line));
+        }
     }
+    sent.truncate(5);
     for (i, tx) in sent.iter().enumerate() {
         let TxEnvelope::Eip1559(signed) = TxEnvelope::decode_2718(&mut tx.raw.as_slice()).unwrap()
         else {
@@ -462,11 +482,15 @@ fn the_engine_trades_through_the_vault_and_never_holds_its_key() {
             (tx.nonce, body.input.len(), &body.input[..4]),
             (i as u64, 4 + 5 * 32, &REBALANCE_SELECTOR[..])
         );
+        // One transaction in flight: each is mined before the next is sent.
+        let receipt = &mined[i];
         assert_eq!(
-            tx.status, "success",
+            (receipt.nonce, &receipt.hash, receipt.status.as_str()),
+            (tx.nonce, &tx.hash, "success"),
             "nonce {}: the mock chain executed it from the operator",
             tx.nonce
         );
+        assert_eq!(receipt.from, VAULT_ADDRESS.to_string());
     }
 
     // 2. The key: in the vault's memory (the scan works), in none of its encodings in the engine's.
@@ -505,10 +529,10 @@ fn the_engine_trades_through_the_vault_and_never_holds_its_key() {
     );
     let stdout = engine.stdout();
     let s = summary(&stdout);
-    assert!(s["sent"] >= 5.0, "{s:?}");
+    assert!(s["sent"] >= 5.0 && s["mined"] >= 5.0, "{s:?}");
     assert_eq!(
-        (s["withdrawn"], s["rejected"], s["reverted"]),
-        (0.0, 0.0, 0.0),
+        (s["withdrawn"], s["rejected"], s["reverted"], s["beaten"]),
+        (0.0, 0.0, 0.0, 0.0),
         "{s:?}"
     );
     assert!(engine.stderr().is_empty(), "{}", engine.transcript());

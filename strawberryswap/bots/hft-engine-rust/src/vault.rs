@@ -17,7 +17,7 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 
-use crate::tx::signing_payload;
+use crate::tx::{TxConfig, signing_payload};
 
 /// Longest reply accepted, bytes (a signed rebalance is about 600 in hex).
 const MAX_REPLY: usize = 64 * 1024;
@@ -57,7 +57,50 @@ pub(crate) struct SignedTx {
 
 /// What the loop needs from a signer. The only implementation is the vault's socket.
 pub(crate) trait TxSigner {
+    /// The address its signatures recover to (the SearcherExecutor's operator), once known: the sender the engine
+    /// simulates each rebalance from.
+    fn address(&self) -> Option<Address>;
     async fn sign(&mut self, tx: &TxEip1559) -> Result<SignedTx, VaultError>;
+}
+
+/// What the vault signs (its `policy` method): the chain, the destination and the caps.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct VaultPolicy {
+    pub chain_id: u64,
+    pub executor: Address,
+    pub max_gas: u64,
+    pub max_fee_per_gas: u128,
+}
+
+impl VaultPolicy {
+    /// Why the vault would refuse every transaction built from `cfg`, if it would.
+    pub fn refuses(&self, cfg: &TxConfig) -> Option<String> {
+        if cfg.chain_id != self.chain_id {
+            return Some(format!(
+                "the vault signs for chain {}, the engine builds for chain {}",
+                self.chain_id, cfg.chain_id
+            ));
+        }
+        if cfg.executor != self.executor {
+            return Some(format!(
+                "the vault signs calls to {}, the engine calls {}",
+                self.executor, cfg.executor
+            ));
+        }
+        if cfg.gas_limit > self.max_gas {
+            return Some(format!(
+                "gas limit {} above the vault's cap {}",
+                cfg.gas_limit, self.max_gas
+            ));
+        }
+        if cfg.max_fee_per_gas > self.max_fee_per_gas {
+            return Some(format!(
+                "max fee {} wei above the vault's cap {}",
+                cfg.max_fee_per_gas, self.max_fee_per_gas
+            ));
+        }
+        None
+    }
 }
 
 /// One open connection to the vault: the reply reader and the request writer.
@@ -82,11 +125,6 @@ impl VaultClient {
         }
     }
 
-    /// The vault's address, once known.
-    pub fn address(&self) -> Option<Address> {
-        self.address
-    }
-
     /// Asks the vault for its address (the SearcherExecutor's operator) and remembers it.
     pub async fn fetch_address(&mut self) -> Result<Address, VaultError> {
         let result = self.call("address", None).await?;
@@ -96,6 +134,25 @@ impl VaultClient {
             .ok_or_else(|| VaultError::Protocol("address reply without an address".into()))?;
         self.address = Some(address);
         Ok(address)
+    }
+
+    /// Asks the vault what it signs.
+    pub async fn fetch_policy(&mut self) -> Result<VaultPolicy, VaultError> {
+        let result = self.call("policy", None).await?;
+        let bad =
+            |field: &str| VaultError::Protocol(format!("policy reply without a valid {field}"));
+        Ok(VaultPolicy {
+            chain_id: result["chain_id"].as_u64().ok_or_else(|| bad("chain_id"))?,
+            executor: result["executor"]
+                .as_str()
+                .and_then(|a| a.parse().ok())
+                .ok_or_else(|| bad("executor"))?,
+            max_gas: result["max_gas"].as_u64().ok_or_else(|| bad("max_gas"))?,
+            max_fee_per_gas: result["max_fee_per_gas"]
+                .as_str()
+                .and_then(|fee| fee.parse().ok())
+                .ok_or_else(|| bad("max_fee_per_gas"))?,
+        })
     }
 
     /// One request and its reply, within the deadline (connecting included).
@@ -235,6 +292,10 @@ pub(crate) fn verify_signed(
 }
 
 impl TxSigner for VaultClient {
+    fn address(&self) -> Option<Address> {
+        self.address
+    }
+
     async fn sign(&mut self, tx: &TxEip1559) -> Result<SignedTx, VaultError> {
         let vault = match self.address {
             Some(address) => address,
@@ -310,6 +371,13 @@ mod tests {
             Some("address") => {
                 json!({ "id": id, "result": { "address": fixtures::VAULT_ADDRESS.to_string() } })
             }
+            Some("policy") => json!({ "id": id, "result": {
+                "chain_id": 31_337,
+                "executor": fixtures::EXECUTOR.to_string(),
+                "max_gas": 1_000_000,
+                "max_fee_per_gas": "500000000000",
+                "max_signs_per_sec": 20.0,
+            } }),
             Some("sign_transaction") => {
                 let expected = hex::encode_prefixed(signing_payload(&fixtures::scenario_tx()));
                 if request["params"]["tx"] == expected {
@@ -337,6 +405,59 @@ mod tests {
             matches!(client.sign(&other).await, Err(VaultError::Refused { code, .. }) if code == "policy")
         );
         assert!(client.sign(&fixtures::scenario_tx()).await.is_ok());
+        server.abort();
+    }
+
+    /// The engine checks its transactions' fixed fields against the vault's policy before it runs.
+    #[tokio::test]
+    async fn the_policy_says_which_transactions_the_vault_would_refuse() {
+        let path = socket("policy");
+        let server = fake_vault(&path.path(), honest).await;
+        let mut client = VaultClient::new(path.path(), Duration::from_millis(500));
+        let policy = client.fetch_policy().await.unwrap();
+        assert_eq!(
+            policy,
+            VaultPolicy {
+                chain_id: 31_337,
+                executor: fixtures::EXECUTOR,
+                max_gas: 1_000_000,
+                max_fee_per_gas: 500_000_000_000,
+            }
+        );
+        assert_eq!(policy.refuses(&fixtures::CONFIG), None);
+        for (cfg, why) in [
+            (
+                TxConfig {
+                    chain_id: 1,
+                    ..fixtures::CONFIG
+                },
+                "chain",
+            ),
+            (
+                TxConfig {
+                    executor: Address::repeat_byte(9),
+                    ..fixtures::CONFIG
+                },
+                "calls",
+            ),
+            (
+                TxConfig {
+                    gas_limit: 2_000_000,
+                    ..fixtures::CONFIG
+                },
+                "gas limit",
+            ),
+            (
+                TxConfig {
+                    max_fee_per_gas: 600_000_000_000,
+                    ..fixtures::CONFIG
+                },
+                "max fee",
+            ),
+        ] {
+            let refusal = policy.refuses(&cfg).expect("refused");
+            assert!(refusal.contains(why), "{refusal}");
+        }
         server.abort();
     }
 

@@ -156,6 +156,10 @@ pub(crate) enum EngineError {
     Timeout,
     /// The oracle reading is older than MAX_ORACLE_AGE_SEC, or stamped too far in the future.
     StaleOracle { updated_at: u64, now: u64 },
+    /// The rebalance would revert now (its eth_call fails): someone moved the pool first, or the plan is stale.
+    Simulation(String),
+    /// The base fee is above the engine's max fee: a transaction would wait unmined.
+    FeesAboveCap { base_fee: u128, cap: u128 },
 }
 
 impl fmt::Display for EngineError {
@@ -175,6 +179,10 @@ impl fmt::Display for EngineError {
                 "oracle reading stamped {updated_at}, now {now}: outside [now − {MAX_ORACLE_AGE_SEC} s, now + \
                  {MAX_CLOCK_SKEW_SEC} s]"
             ),
+            Self::Simulation(reason) => write!(f, "the rebalance would revert: {reason}"),
+            Self::FeesAboveCap { base_fee, cap } => {
+                write!(f, "base fee {base_fee} wei above the max fee {cap}")
+            }
         }
     }
 }
