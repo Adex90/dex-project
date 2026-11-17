@@ -121,6 +121,9 @@ One JSON object per line, in each direction.
   * Every transaction the engine broadcasts recovers to this vault's address and is in its audit log.
   * A policy refusal withdraws the rebalance.
   * The test key is found in this process's memory, and nowhere in the engine's.
+* **Live** (`bots/hft-engine-rust/tests/live_e2e.rs`, CI's system end to end): on anvil, as the SearcherExecutor's
+  operator, this binary signs the engine's rebalances of the real DarkPool. Each is mined from this address and listed
+  in the audit log, and the memory scan runs again while the engine trades live.
 * **Code checks:**
   * `#![forbid(unsafe_code)]`, and clippy with `-D warnings`, with and without the test-key feature.
   * valgrind memcheck on the whole test suite: 0 errors, 0 bytes definitely or indirectly lost.

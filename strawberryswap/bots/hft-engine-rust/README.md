@@ -1,41 +1,53 @@
 # hft-engine-rust
 
-StrawberrySwap's market-making execution engine, **iteration 1**. On a 100 ms tokio loop, the engine does five things:
+StrawberrySwap's market-making execution engine, **iteration 2: the live chain**. On a 100 ms tokio loop, the engine:
 
-1. It quotes with the Avellaneda–Stoikov closed forms of the Python lab (`hft-engine/python-sim`).
-2. It sizes a DarkPool rebalance with the C++ engine's curve planner, ported bit for bit.
-3. It builds the unsigned EIP-1559 `SearcherExecutor.rebalance` transaction.
-4. It has the transaction signed by the **threshold vault** (`strawberryswap/vaults/threshold-signer`) over its Unix
-   socket.
-5. It checks the signed transaction, then broadcasts it.
+1. **Reads** the chain in one batched RPC request: the zk oracle, the pool, the executor's inventory, the block, the
+   operator's nonces and gas balance, and the receipt of the transaction in flight.
+2. **Quotes** with the Avellaneda–Stoikov closed forms of the Python lab (`hft-engine/python-sim`).
+3. **Sizes** a DarkPool rebalance with the C++ engine's curve planner, ported bit for bit, and builds the unsigned
+   EIP-1559 `SearcherExecutor.rebalance` transaction.
+4. **Simulates** it (`eth_call` from the vault's address): a rebalance a competing searcher already made unprofitable
+   is dropped before any signature is asked for.
+5. **Has it signed** by the **threshold vault** (`strawberryswap/vaults/threshold-signer`) over its Unix socket.
+6. **Checks** the signed transaction, then broadcasts it: one transaction in flight at a time.
 
 **The engine holds no key and links no signer crate.** A signature that does not come back within its deadline, or
 that does not check out, means the rebalance is withdrawn: nothing is broadcast for it.
 
-The chain is still a **mock**: the C++ engine's SimChain, behind a real transaction boundary. It accepts only signed
-EIP-1559 transactions, recovers the sender and enforces the operator. The vault is the real daemon.
+With `--rpc-url` the chain is live. Without it, the chain is a **mock**: the C++ engine's SimChain, behind a real
+transaction boundary. It accepts only signed EIP-1559 transactions, recovers the sender and enforces the operator.
 
 ```bash
-# the vault (a mock in-memory key; see its README)
-cargo run --manifest-path ../../vaults/threshold-signer/Cargo.toml -- --chain-id 31337 \
-    --executor 0x5FbDB2315678afecb367f032d93F642f64180aa3
-# the engine, on the vault's default socket
+# the vault (a mock in-memory key; see its README), for the chain and the executor it signs for
+cargo run --manifest-path ../../vaults/threshold-signer/Cargo.toml -- --chain-id 421614 --executor 0x<SearcherExecutor>
+# the engine, live (the RPC URL is never printed: it may hold an API key)
+cargo run --release -- --rpc-url <RPC> --chain-id 421614 --executor 0x<SearcherExecutor> --feed 0x<ZkPriceFeed> --json
+# or on the mock chain
 cargo run --release -- --ticks 300 --log-txs
 
-cargo test                                  # 39 unit tests, plus 4 end-to-end tests that run both binaries
+cargo test                    # 56 unit tests and 4 end-to-end tests with the vault binary
+cargo test --test live_e2e -- --ignored   # the live end to end: anvil, contracts, oracle pipeline, vault (CI runs it)
 ```
 
 | flag | meaning |
 |---|---|
+| `--rpc-url URL` | the chain's JSON-RPC: live mode. Never printed, and redacted from every error |
+| `--feed ADDRESS` | live: the ZkPriceFeed the pool must read, checked at start |
 | `--vault-socket PATH` | the vault's socket. Default: the vault's own default, `$XDG_RUNTIME_DIR/strawberryswap-vault/vault.sock` |
 | `--vault-timeout-ms MS` | deadline of each signature, from connecting to the checked reply. Default 15 |
 | `--chain-id ID` | chain id of the transactions. Default 31337 |
 | `--executor ADDRESS` | the SearcherExecutor. Default `0x5FbDB2315678afecb367f032d93F642f64180aa3` |
 | `--target-token0 TOKENS` | the executor's token0 target; the model's inventory q is the balance minus it. Default 20000 |
 | `--calibration PATH` | the `engine` block of the lab's `calibration.json`. Default: mock parameters |
+| `--gas-limit GAS` | a rebalance's gas limit. Default 300000 |
+| `--max-fee-wei WEI`, `--priority-fee-wei WEI` | the fee caps. Defaults 30 gwei and 1 gwei. With the gas limit, they must be within the vault's policy |
+| `--gas-cost TOKENS1`, `--min-net TOKENS1` | the planner's cost of a rebalance's gas, and the least net profit worth one. Defaults 0.01 |
 | `--ticks N` | stop after N ticks. Default: run until Ctrl-C or SIGTERM |
-| `--mid PRICE` | starting price of the mock chain. Default 2 |
-| `--seed N` | seed of the mock chain. Default 7; a run is reproducible for a seed |
+| `--json` | events, alerts and metrics as JSON lines |
+| `--metrics-every TICKS` | a metrics snapshot every TICKS ticks. Default 100 (10 s); 0 for none |
+| `--mid PRICE` | mock: starting price. Default 2 |
+| `--seed N` | mock: seed. Default 7; a run is reproducible for a seed |
 | `--log-txs` | print every broadcast transaction in full (EIP-2718 hex) |
 
 `--lot` is gone. The planner sizes each rebalance from the pool, the quotes and the balances. γ is still per token0 of
@@ -45,39 +57,104 @@ with the σ², κ and τ of the same run, never on its own.
 ## One tick
 
 ```text
-chain.read() ──► fresh oracle? ──► A-S quote r ∓ δ/2 ──► planner ──► Rebalance (wei) ──► unsigned EIP-1559 tx
-   80 ms           45 s / 5 s       q = balance − target    C++ port     rounded for the pool        nonce from chain
-                                                                                                         │
-       broadcast ◄── checked: same tx, signed by the vault's address ◄── vault, over its Unix socket ◄────┘
-                                                                          (deadline; else WITHDRAWN)
+read (one batch) ──► in flight? ──► fresh oracle? ──► A-S quote ──► planner ──► unsigned EIP-1559 tx
+   80 ms            wait for its     45 s / 5 s       r ∓ δ/2       C++ port     next nonce, capped fees
+                    receipt                                                          │
+                                                                                     ▼
+broadcast ◄── checked: same tx, signed by the vault ◄── vault (Unix socket) ◄── simulate (eth_call from the vault)
+(one in flight)                                         deadline; else WITHDRAWN    reverts? BEATEN, never signed
 ```
 
-1. **Read** the oracle, the executor's balances, the pool's reserves and the operator's nonce, within 80 ms. A late or
-   failed read skips the tick.
-2. **Freshness:** reject an oracle reading older than 45 s or stamped more than 5 s ahead. `DarkPool.MAX_ORACLE_AGE`
+1. **Read** the chain in one batched request, within 80 ms. A late or failed read skips the tick.
+2. **The transaction in flight.** While one waits for its receipt, nothing else is planned. It is settled by:
+   * its receipt (`MINED`);
+   * another transaction spending its nonce (`nonce_spent`);
+   * the node not knowing it 3 s after the broadcast (`tx_dropped`: the nonce is reused).
+
+   The next nonce never goes below what the engine knows it spent, even when the node lags. A pending transaction from
+   the operator that the engine did not send holds the engine.
+3. **Fees:** a base fee above `--max-fee-wei` holds the engine; its transaction would wait unmined.
+4. **Freshness:** reject an oracle reading older than 45 s or stamped more than 5 s ahead. `DarkPool.MAX_ORACLE_AGE`
    is 60 s.
-3. **Quote:** r = s − q·γ·σ²·τ and δ = γ·σ²·τ + (2/γ)·ln(1 + γ/κ). The planner gets bid = r − δ/2 and ask = r + δ/2,
+5. **Quote:** r = s − q·γ·σ²·τ and δ = γ·σ²·τ + (2/γ)·ln(1 + γ/κ). The planner gets bid = r − δ/2 and ask = r + δ/2,
    as bots/inventory-cpp hands them to its own: no tick grid and no clamp to the mid. They are prices for trading
    against the pool, not resting orders.
-4. **Plan** (`planner.rs`): the closed-form flash rebalance that moves the pool toward the oracle, if one pays its gas
+6. **Plan** (`planner.rs`): the closed-form flash rebalance that moves the pool toward the oracle, if one pays its gas
    and the minimum net. Its feasibility bounds use the executor's balances, shrunk by a few parts per billion
    (`tx::spendable`) so that the rounded transaction still fits.
-5. **Build** (`tx.rs`): amounts in wei, rounded in the pool's favour. The pool's payouts round down; the executor's
+7. **Build** (`tx.rs`): amounts in wei, rounded in the pool's favour. The pool's payouts round down; the executor's
    repayments round up, with a 1e-9 relative margin; the Treasury allowance rounds up. Then the `rebalance` calldata
    (selector `0xc0661737`) and the EIP-1559 signing payload `0x02 ‖ rlp(fields)`.
-6. **Sign** (`vault.rs`): one NDJSON request on the vault's socket, within `--vault-timeout-ms`. The reply must decode
+8. **Simulate** the transaction as an `eth_call` from the vault's address on the latest block. If it would revert —
+   a competing searcher moved the pool first, or the plan went stale — it is dropped as `BEATEN`, with DarkPool's or
+   the executor's error decoded. The vault is never asked, and no gas is spent.
+9. **Sign** (`vault.rs`): one NDJSON request on the vault's socket, within `--vault-timeout-ms`. The reply must decode
    to exactly the requested transaction, and its signature must recover to the vault's address. A late, refused or
    mismatched reply **withdraws** the rebalance. Nothing is retried blind: the next tick plans afresh on new reads.
-7. **Broadcast** the checked bytes, within 80 ms.
+10. **Broadcast** the checked bytes, within 80 ms. It is now the transaction in flight. A broadcast that gets no answer
+    in time is tracked all the same: its receipt, its nonce, or the node not knowing it settles it.
 
 Missed ticks are skipped, not bunched. Repeated identical notes (the same skip or withdrawal reason) are printed once.
-On Ctrl-C or SIGTERM the engine prints `summary ticks=… sent=… withdrawn=…` and exits 0.
+On Ctrl-C or SIGTERM the engine prints `summary ticks=… sent=… mined=… …` and exits 0.
 
 **The vault client** keeps one connection and checks each reply's id. The connection is taken out for the exchange and
 put back only when the stream is in step, so a call that fails, times out or is cancelled half-way leaves no unread
 reply behind. A kept connection that the vault closed in the meantime (it closes connections idle for 30 s) is
 replaced within the same call. Without a vault at start, the engine runs anyway and withdraws every rebalance until
 the vault answers.
+
+## The live chain (`live.rs`)
+
+**One batched request per tick.** The engine sends:
+
+* EngineLens's creation code as an `eth_call` without a `to` (`contracts/src/periphery/EngineLens.sol`, never
+  deployed). Its constructor reads, all from **one execution at one block**:
+  * the oracle, through the pool as DarkPool reads it;
+  * the pool's reserves and virtual reserves;
+  * the executor's balances;
+  * the block's number, timestamp and base fee.
+
+  It returns them as the would-be code. A batch of separate `eth_call`s could straddle two blocks; Arbitrum makes one
+  every 250 ms.
+* the operator's nonce, at `latest` and at `pending`;
+* the operator's ether balance;
+* while a transaction is in flight, its receipt and `eth_getTransactionByHash`.
+
+The lens's creation code is pinned in `src/lens.hex`, and CI checks the pin against the forge build.
+
+**At start** the engine refuses to run unless all of these hold:
+
+* the vault answers;
+* the vault's `policy` covers the engine's chain, executor, gas limit and max fee;
+* the RPC's chain id is `--chain-id`;
+* there is a contract at the executor, and its `operator()` is the vault's address (otherwise every rebalance would
+  revert `NotOperator`);
+* the executor and its pool trade the same tokens;
+* with `--feed`, the pool reads that feed.
+
+## Metrics and alerts (`metrics.rs`)
+
+* **Events.** `SENT`, `MINED`, `BEATEN`, `WITHDRAWN`, `REJECTED`, `SKIPPED`, `ALERT` and `RESOLVED`, printed as text
+  or, with `--json`, as JSON lines.
+* **Metrics.** Every `--metrics-every` ticks, a snapshot of:
+  * the counters;
+  * latency histograms (mean, p50, p99, max) of the read, the simulation, the signature, the broadcast, the whole
+    tick, and from broadcast to receipt;
+  * gauges: block, base fee, oracle age, the pool's deviation from the oracle in bps, mid, inventory, balances,
+    gas balance, nonces, the transaction in flight;
+  * the active alerts.
+* **Alerts.** Each is raised once and resolved once.
+
+| alert | raised when |
+|---|---|
+| `rpc_down` | reads fail or miss their budget for 1 s (10 ticks) |
+| `oracle_stale` | the oracle reading is too old to trade on for 1 s: the relayer is not pushing |
+| `vault_down` | the vault fails to answer 10 times in a row |
+| `fees_above_cap` | the base fee is above the max fee for 1 s |
+| `tx_stuck` | a transaction has waited 30 s for its receipt |
+| `foreign_transaction` | a transaction from the operator that the engine did not send is pending |
+| `low_gas_balance` | the operator holds less than 10 rebalances' gas at the max fee |
+| `tx_reverted`, `nonce_moved`, `nonce_spent`, `tx_dropped` | one-offs: what the names say |
 
 ## The planner
 
@@ -100,7 +177,8 @@ are plans (90 sells, 82 buys). Every double is printed in its shortest round-tri
 
 `chain::MockChain` is the C++ SimChain (`sim.hpp`) behind a transaction boundary.
 
-**Broadcast.** `send_raw_transaction` checks before inclusion:
+**Broadcast.** `send_raw_transaction` mines at once, and the engine reads the receipt on its next tick, as it does
+live. It checks before inclusion:
 
 * the bytes decode as an EIP-1559 transaction;
 * on this chain id;
@@ -133,6 +211,7 @@ public phrase, whose address viem computed independently. The key file is delete
 | `without_the_vault_nothing_is_broadcast` | With no vault, 200 ticks: every rebalance is withdrawn and nothing is sent. |
 | `a_vault_that_refuses_the_transactions_gets_them_withdrawn` | A vault whose policy refuses the engine's fee: every rebalance is withdrawn, and the refusal is in the vault's audit log. |
 | `no_crate_that_can_hold_a_wallet_key_is_in_the_engines_graph` | The engine's `Cargo.lock` has no local, hardware or cloud signer, keystore or mnemonic crate. The same parser finds `alloy-signer-local` in the vault's lock. |
+| `live_e2e::the_engine_rebalances_the_live_pool_through_the_vault` (CI, `--ignored`) | **The live path end to end on anvil.** The contracts are real: DarkPool, SearcherExecutor with the vault as operator, ZkPriceFeed, ZkDecoOracle and the dev verifier. The oracle pipeline pushes proven, KMS-signed prices every 2 s. The engine runs live. When the market moves 1.25 %, the engine rebalances the pool through the vault. The rebalance is mined from the vault's address, the pool moves toward the oracle, the Treasury is paid, nothing reverts, and every broadcast was simulated first. While it trades, the engine's memory holds no encoding of the key; the vault's does. |
 
 **Mutation check.** I ran a build of the engine that keeps the key in memory. The memory test fails with `the key is in
 the engine's memory as {"big-endian bytes"}`.
@@ -150,6 +229,8 @@ vault once and passes it in `THRESHOLD_SIGNER_BIN`; without it, the test builds 
 | The vault's signature | `fixtures::SIGNED_REBALANCE` is the C++ end-to-end scenario's rebalance, signed by the real vault. viem recovers the vault's address from it. Signing in process with k256 produces the same bytes (RFC 6979). |
 | Vault client | Accepts our transaction signed by the vault. Rejects a transaction we did not ask for, or one signed by another address. A missing, silent, closing or flaky vault fails within the deadline. A cancelled call does not desynchronise the next one, and a connection closed between calls is replaced within the call. |
 | Loop, on paused virtual time | Ticks exactly every 100 ms. A 5,000-tick run: every rebalance is signed, included and accepted, with 0 reverts. The pool stays within 1 % of the oracle on average. The inventory stays in [10k, 30k]. A late, refusing or silent vault withdraws every rebalance, sends nothing and keeps the pace. Quoting resumes when the vault recovers. Runs are reproducible for a seed. |
+| Live adapter (alloy's mock transport, every request recorded) | A tick is exactly one batch: the lens call with its creation code and arguments, both nonces and the gas balance, plus the receipt and status of the transaction in flight. Each value is parsed where the engine expects it, and a short lens answer or a failed batch is an error, not a reading. The simulation's revert is decoded (`DeviationNotReduced`, `NotOperator`, a panic) and told apart from a node failure. The broadcast's errors never show the RPC URL's key. The start-up checks refuse a wrong chain, no contract, an operator other than the vault, and a pool reading another feed. |
+| Loop, on a misbehaving node | A rebalance that would revert is never signed (no vault call, no transaction). One transaction in flight: consecutive nonces, each sent once, nothing new while one waits. A dropped transaction is forgotten after 3 s and its nonce reused. A foreign pending transaction holds the engine and raises `foreign_transaction`. A node a block behind on the nonce does not make the engine reuse one. Fees above the cap hold it and raise `fees_above_cap`, resolved when they fall. Late reads raise `rpc_down`. Events and metrics are structured. |
 | Memory | `#![forbid(unsafe_code)]`. valgrind memcheck shows 0 errors on the release binary trading against the vault (150 ticks) and on the unit tests. Nothing is definitely or indirectly lost. The only block reported is 48 bytes "possibly lost": std's handle for the main thread, allocated once for the life of the process. |
 | Lint | `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings` |
 
@@ -167,30 +248,25 @@ To regenerate:
 * **alloy 2.5.0, without default features:**
   * `consensus` and `eips`: the transaction, its signing payload and the decoding of the vault's reply;
   * `k256`: signature recovery;
-  * the HTTP provider over rustls and `sol!` bindings, for the live chain.
+  * the HTTP provider over rustls, JSON-RPC batches and `sol!` bindings, for the live chain;
+  * `json-rpc`: the revert data of a failed simulation.
 
   **No signer feature** (`signer-local`, keystores, mnemonics).
 * **Dev-only:**
   * `k256`, already in the graph: the loop tests' in-process stand-in for the vault;
-  * `memchr`, already in the graph: the memory scan.
+  * `memchr`, already in the graph: the memory scan;
+  * `tower-service`, already in the graph: recording the requests alloy's mock transport answers.
 
   A dev-dependency is never linked into the binary.
 * Release builds keep integer-overflow checks.
 
-## Next: the live chain
+## Next
 
-1. **`Chain::read`:** one batched `eth_call` through an alloy provider:
-   * `IZKOracle.latestVerifiedPrice()`;
-   * `balanceOf` for both tokens;
-   * DarkPool's reserves;
-   * the operator's pending nonce.
-
-   Subscribe to new heads over WebSocket instead of polling.
-2. **Before signing:** a preflight `eth_call` of the rebalance from the operator. Check once at start that the vault's
-   address is `SearcherExecutor.operator()`.
-3. **`send_raw_transaction`:** `eth_sendRawTransaction`, with nonce and replacement management for transactions that
-   are pending.
-4. **The vault:** the threshold (MPC/TSS) backend behind the same socket protocol. The engine does not change.
+1. **Heads over WebSocket** instead of a read every 100 ms, where the RPC offers it.
+2. **Stuck transactions.** Fee bumping (a replacement at the same nonce, re-signed by the vault). Today a stuck
+   transaction raises `tx_stuck` and the engine waits.
+3. **The vault:** the threshold (MPC/TSS) backend behind the same socket protocol. The engine does not change.
+4. **Costs from the chain.** The planner's gas cost from the live base fee and the measured gas of a rebalance.
 5. **Estimation and guards:**
    * estimate σ² and κ online (the C++ `VarianceEstimator` and `KappaEstimator`);
    * add the oracle-divergence guard once a second price source exists.
