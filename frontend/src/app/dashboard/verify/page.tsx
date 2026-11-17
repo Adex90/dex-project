@@ -115,7 +115,7 @@ export default function VerifyPage() {
   // Page-level, so it survives leaving the review: why the last submission was refused.
   const [notice, setNotice] = useState<SubmitNotice | null>(null);
   const [problem, setProblem] = useState<SubmitProblem | null>(null);
-  // POST /kyc/verificar in flight: the progress bar is frozen until it answers.
+  // POST /kyc/verificar in flight: the progress bar is locked until it answers.
   const [submitting, setSubmitting] = useState(false);
   // The identity (CURP|RFC|voter key) last refused with IDENTIDAD_EN_USO.
   const [conflictKey, setConflictKey] = useState<string | null>(null);
@@ -412,7 +412,7 @@ export default function VerifyPage() {
     );
   }
 
-  const title = current === "status" ? "Verification status" : (STEPS.find((s) => s.n === current)?.title ?? "");
+  const title = current === "status" ? "Your verification" : (STEPS.find((s) => s.n === current)?.title ?? "");
   const lastRejected =
     canRetry(file) && file.ultimo_resultado?.resultado === "RECHAZADO" ? file.ultimo_resultado : null;
 

@@ -398,9 +398,9 @@ try {
   await cp.fill("#password", client.password);
   await cp.fill("#confirm", client.password);
   await cp.click("button[type=submit]");
-  await cp.waitForURL("**/auth/onboarding");
+  await cp.waitForURL("**/dashboard/verify");
   await cp.getByTestId("onboarding-step-1").waitFor();
-  check(true, "client signs up and lands on onboarding step 1");
+  check(true, "client signs up and lands on the verification wizard (step 1)");
   clientId = await cp.evaluate(() => JSON.parse(sessionStorage.getItem("synthetic-capital-session")).state.clientId);
 
   const p = identity.profile;
@@ -437,15 +437,32 @@ try {
   const step3 = cp.getByTestId("onboarding-step-3");
   await step3.waitFor();
   await cp.check("#consentimiento");
-  const verify = cp.waitForResponse((r) => r.url().includes("/kyc/verificar") && r.request().method() === "POST", { timeout: 60_000 });
   await step3.getByRole("button", { name: "Start liveness check" }).click();
+  await step3.getByTestId("liveness-captured").waitFor({ timeout: 60_000 });
+  await cp.fill("#ocupacion", "Economist");
+  await cp.selectOption("#origen-recursos", "SALARIO");
+  await cp.check("#declara-pep-no");
+  // What regulation asks the client is worded for the client: no compliance vocabulary.
+  const declarationsHits = [...((await step3.textContent()) ?? "").matchAll(TIP_OFF)].map((m) => m[0]);
+  check(declarationsHits.length === 0, `the liveness and declarations step has no tipping-off words${declarationsHits.length ? `: ${declarationsHits.join(", ")}` : ""}`);
+  await step3.getByTestId("step3-continue").click();
+  const step4 = cp.getByTestId("onboarding-step-4");
+  await step4.waitFor();
+  // textContent: the agreements' collapsed text counts too.
+  const reviewHits = [...((await step4.textContent()) ?? "").matchAll(TIP_OFF)].map((m) => m[0]);
+  check(reviewHits.length === 0, `the review and the agreements have no tipping-off words${reviewHits.length ? `: ${reviewHits.join(", ")}` : ""}`);
+  await cp.check("#acuerdo-contrato-cuenta");
+  await cp.check("#acuerdo-aviso-privacidad");
+  await cp.check("#acuerdo-declaracion-veracidad");
+  const verify = cp.waitForResponse((r) => r.url().includes("/kyc/verificar") && r.request().method() === "POST", { timeout: 60_000 });
+  await step4.getByTestId("submit-verification").click();
   const vr = await verify;
   const verdict = await vr.json();
   check(vr.status() === 200 && verdict.resultado?.resultado === "APROBADO", `KYC verification ${vr.status()} ${verdict.resultado?.resultado ?? JSON.stringify(verdict)}`);
-  const step4 = cp.getByTestId("onboarding-step-4");
-  await step4.waitFor();
-  await step4.getByTestId("kyc-status-badge").and(cp.locator("[data-status=VERIFICADO]")).waitFor({ timeout: 30_000 });
-  await step4.getByRole("button", { name: "Go to dashboard" }).click();
+  const status = cp.getByTestId("onboarding-status");
+  await status.waitFor();
+  await status.getByTestId("kyc-status-badge").and(cp.locator("[data-status=VERIFICADO]")).waitFor({ timeout: 30_000 });
+  await status.getByRole("button", { name: "Go to dashboard" }).click();
   await cp.waitForURL("**/dashboard");
   await cp.getByTestId("kyc-header-badge").and(cp.locator("[data-status=VERIFICADO]")).waitFor();
   check(true, "client completes onboarding (VERIFICADO) and reaches the dashboard");

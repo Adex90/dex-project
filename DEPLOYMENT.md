@@ -101,7 +101,8 @@ internet -> host 80/443 (UFW, fail2ban) -> nginx (edge network)
 | A client's live vault channel carries only that client's data, and only while the session is valid | Same code on both: the WebSocket handshake runs the same JWT and database checks as every route (token as a subprotocol entry, never echoed), requires `Origin` = `FRONTEND_ORIGIN`, sits in the `API` rate-limit group and is capped per client and per task; the session is re-checked every 60 s and at JWT expiry (close 4001); reads run as `sc_cliente` under RLS | Same, plus nginx's dedicated location (`limit_conn` 20 per IP) | `tests/boveda.rs`, `tests/db/0012_boveda_tiempo_real.sql` |
 | A market order moves exactly the cash it records, at the catalog's price, for a client allowed to trade | Same code on both: one transaction under `sc_mercado` (in the IFPE ledger it may write only the market's four movement types, and only `saldo_disponible`, `saldo_comprometido` and the reserve). Each order is paired with its IFPE movement in the same transaction (deferred triggers). The database checks each order against the catalog price, the asset's increment, the maximal quantity, the cent-rounded amount, the position and the average cost; positions must replay their hash-chained ledger on commit. KYC is enforced by RLS. A buy is an AML channel with the freeze guard, and frozen clients cannot sell. Simulated prices are listed, quoted and traded only with `MODO_DEMO` | Same | `tests/mercado.rs`, `tests/db/0013_mercado_valores.sql` |
 | A pending limit or stop order's cash or units cannot be spent twice, and holding them never breaks the 100 % reserve | Same code on both: a buy's cash moves to `saldo_comprometido` by a hash-chained IFPE movement (`COMPROMISO_ORDEN`, back by `LIBERACION_ORDEN`) inside the account, never out of custody; a sell's units to `cantidad_comprometida`, which market sales cannot sell. At COMMIT the database requires held cash and units to equal the pending orders, every hold and release to be paired with its order, held cash to replay from the ledger, and each fill to meet its order's limit or stop and sell exactly its held units. Liabilities, Merkle leaves and the reserve cut count held cash. Terms are immutable; `sc_mercado` may only close an order | Same | `tests/ordenes_avanzadas.rs`, `tests/db/0015_ordenes_avanzadas.sql` |
-| Money leaves the vault only to a bank account in the client's own name (AML whitelist), and the check never discloses an AML hold | Same code on both: every own-account withdrawal goes only to an active linked account (`ifpe.cuentas_vinculadas`) whose holder is the client's KYC name, never a CLABE of ours and active for one client only. The order records its account, and a trigger re-checks it (client, state, CLABE, holder). The whitelist runs after the AML evaluation, so a frozen client gets the neutral refusal. Linked accounts are never deleted, only retired; clients read only their own | Same | `tests/patrimonio.rs`, `tests/db/0016_cuentas_vinculadas.sql` |
+| Money leaves the vault only to a bank account in the client's own name (AML whitelist), and the check never discloses an AML hold | Same code on both: every own-account withdrawal goes only to an active linked account (`ifpe.cuentas_vinculadas`) whose holder is the client's KYC name, never a CLABE of ours and active for one client only. The order records its account, and a trigger re-checks it (client, state, CLABE, holder). The whitelist runs after the AML evaluation, so a frozen client gets the neutral refusal. Linked accounts are never deleted, only retired; clients read only their own. Payments to someone else's account (`/api/v1/spei/transfer`) are refused unless `SPEI_TRANSFERENCIAS_TERCEROS=true` | Same | `tests/patrimonio.rs`, `tests/db/0016_cuentas_vinculadas.sql` |
+| A client is verified only with the declarations AML/CFT rules ask for and the agreements in force, and a declared politically exposed person only by a person | Same code on both: the database refuses a KYC submission without occupation, source of funds and the PEP answer, or without the agreements' version in force (`kyc.parametros.contratos_version`); it stamps the acceptance time itself and freezes the answers with the identity. It refuses `VERIFICADO` for a declared PEP unless an operator decides, and then marks the client PEP with risk `ALTO` | Same | `tests/kyc.rs`, `tests/db/0017_kyc_declaraciones.sql` |
 | No request field outside the API contract is accepted | Same code on both: `deny_unknown_fields` on every body and query type (400 `VALIDACION`) | Same | `tests/entrada.rs` (source scan and HTTP) |
 | Least-privilege database identities | Service holds only `sc_app` (NOINHERIT, no owner rights); owner credentials only in the migrate task and with DBAs holding the `dba-tunnel` policy | Same, plus the schema owner is **not** a superuser (`deploy/postgres/10-schema-owner.sh`); the `postgres` superuser is break-glass only | `pg_authid` query in Appendix C |
 | Containers non-root, read-only, least capability, resource-limited | uid 65532, read-only rootfs, `drop ALL`, task CPU/memory | uid 65532 / 70 / 101, `read_only`, `cap_drop: ALL`, `no-new-privileges`, CPU/memory/PID limits | `docker inspect` in Appendix C |
@@ -1076,10 +1077,44 @@ following to operations.
   own-account withdrawal (`/api/v1/ifpe/retiros` too) needs a linked
   account. Outside `MODO_DEMO` none is linked until the verification flow
   exists, so production own-account withdrawals answer
-  `CUENTA_NO_VINCULADA` until then. Third-party SPEI transfers are
-  unchanged. An old binary on a migrated database still sends own-account
-  withdrawals without the check; finish the rollout before relying on the
-  whitelist.
+  `CUENTA_NO_VINCULADA` until then. Third-party SPEI payments are a
+  separate switch (next item). An old binary on a migrated database still
+  sends own-account withdrawals without the check; finish the rollout
+  before relying on the whitelist.
+- **Third-party SPEI payments are off by default**
+  (`SPEI_TRANSFERENCIAS_TERCEROS`, default `false`). With it off,
+  `POST /api/v1/spei/transfer` answers 422
+  `TRANSFERENCIAS_TERCEROS_NO_DISPONIBLES` before any money moves, so money
+  leaves only for an account linked in the client's own name. The first
+  release with this switch turns third-party payments off for every client.
+  Turning them on is a product and compliance decision: set the variable in
+  `deploy/compose.env` on a single host, or in `app_environment` on AWS.
+- **Migration `0017`** (KYC declarations and agreements) adds nullable
+  columns to `kyc.kyc_perfiles` and `kyc.parametros.contratos_version`
+  (`2026-11`, a constant default), a trigger on `kyc.kyc_perfiles`, and a
+  new `kyc.fn_sincronizar_cliente`. No table is rewritten. From then on the
+  database refuses a KYC submission without the declarations and the
+  agreements' version in force, so the submission path is not backward
+  compatible:
+  - an old backend on a migrated database cannot submit (the trigger
+    refuses its requests with `KYC_DECLARACIONES_INCOMPLETAS`);
+  - a new backend refuses the old wizard's requests (400 `VALIDACION`)
+    until the new frontend serves.
+
+  Either refusal leaves the client's attempts untouched. Deploy migrate,
+  then the backend and the frontend together, at a quiet hour. Nothing
+  else changes: deposits, trading and withdrawals are unaffected, and files
+  already in review finish normally. Clients verified before the migration
+  have no declarations on file (§12).
+  - A declared PEP's file waits for a person: it appears in
+    `GET /api/v1/operaciones/kyc/pendientes`, and an operator verifies or
+    rejects it with `POST /api/v1/operaciones/kyc/{cliente_id}`. There is
+    no console screen for it yet.
+  - New agreement texts ship with a new version, in the same release:
+    change the texts in `frontend/src/components/onboarding/agreements.ts`
+    and raise `kyc.parametros.contratos_version` in a migration. A wizard
+    opened before the release gets `KYC_CONTRATOS_DESACTUALIZADOS`, reloads
+    the version and asks the client to accept again.
 
 ---
 
@@ -1134,6 +1169,8 @@ to the specific provisions.
 | 20 | The backend's per-IP limits count in each process | with N tasks behind the ALB, an address can make up to N times the quota | the WAF's rate-based rules are global per IP; nginx counts once on a single host | a shared store (for example ElastiCache) if exact global limits are needed in the backend |
 | 21 | RLS keys on a transaction-local setting that the backend writes | SQL injection inside a client transaction could rewrite `sc.cliente_actual` | every query is parameterized (sqlx binds); `sc_cliente` only reads; the policies stop wrong-id and missing-`WHERE` bugs | none planned: per-client database roles do not scale |
 | 22 | Dependency audit exception: RUSTSEC-2023-0071 (`rsa`, no fixed version); six moderate npm findings in lint tooling (minimatch, GHSA-g3hv-75wg-m249) | none: `rsa` is in Cargo.lock only through sqlx's unused MySQL driver, and the npm findings are in dev-only tooling, below the gate's threshold | the backend build fails if `rsa` enters the build graph; dev tooling never reaches an image | review the `rsa` exception when sqlx moves to 0.9; take the eslint update Dependabot proposes |
+| 23 | The onboarding agreements are shown as summaries: the full legal texts are not served, and the client gets no signed copy | a client accepts a summary of the account and custody agreement | the version accepted and the time are recorded with the submission's IP and browser; the full privacy notice is available on request (compliance address) | publish the full texts under their version, and a downloadable signed copy (legal, frontend) — **launch blocker** |
+| 24 | Clients verified before migration `0017` have no declarations on file (occupation, source of funds, PEP) | their KYC file lacks answers that newer clients give | the AML engine still applies its risk matrix, and an operator can raise a client's risk level | collect the declarations from those clients (compliance, frontend) |
 
 ---
 
@@ -1349,6 +1386,51 @@ available, so Session Manager itself was not exercised. Everything around it was
     ran, it had read the announcer and failed: 3 of 4 times on one run.
 - **Backend:** rustfmt and clippy `-D warnings` clean; 314 tests passed, 0 failed.
   hadolint, actionlint and ShellCheck (with the CI settings) are clean.
+
+**Identity verification: declarations, agreements and the wizard** (migration `0017`, the
+extended `POST /api/v1/kyc/verificar`, `/dashboard/verify`), and third-party SPEI payments off
+by default:
+
+- **Database:** every SQL suite passes on its own fresh database with all migrations
+  (12 suites), the new `tests/db/0017_kyc_declaraciones.sql` (22 checks) included. It
+  covers:
+  - a submission without declarations, with half of them, with a source of funds outside
+    the list or an empty occupation;
+  - a submission without the agreements or with an older version, and the acceptance
+    time, which only the database sets;
+  - the answers frozen after submission, the owner included;
+  - a declared PEP: no automatic verification even with an approving result, review,
+    an operator's approval, then PEP with risk `ALTO` and the AML log's
+    `RIESGO_CLIENTE_ELEVADO` (`BAJO` to `ALTO`);
+  - occupation and source of funds copied to the client.
+
+  The 0006 and 0007 suites now declare before they submit, as the backend does.
+- **Backend:** rustfmt and clippy `-D warnings` clean. 387 tests passed, 0 failed (383
+  before), among them:
+  - `tests/kyc.rs`: the declarations and the agreements travel with the submission,
+    refusals included, and a declared PEP is approved by an operator;
+  - `tests/patrimonio.rs`: `/spei/transfer` refused by default, accepted when enabled;
+  - the PEP rule of `kyc/verificacion.rs`.
+- **Frontend:** typecheck, lint, 268 unit tests (routing between the steps,
+  declarations, agreements, the PEP notice in English) and `next build`.
+- **End to end** on a fresh stack: smoke 223 checks (198 before) and AML console 125
+  (123 before).
+  - The smoke run goes through the whole wizard:
+    - the gold progress bar of square segments;
+    - the date of birth and nationality read from the CURP;
+    - the passport shown as not yet available, and the back of the INE dropped onto its
+      card;
+    - the liveness frames kept in the page until the review;
+    - the declarations with no defaults;
+    - the review, the three agreements (two are not enough) and the gold submit;
+    - the request's declarations and agreements, and the file keeping them.
+
+    After the approval the header reads Verified, and deposits, withdrawals and the
+    fixed-term investment are unlocked in the same document: no page reload.
+  - The AML run checks the declarations step and the review, the agreements' collapsed
+    text included, for tipping-off words.
+- **Phone** (390 px wide): the four steps and the in-review status have no horizontal
+  scroll.
 
 **Linked accounts and withdrawals** (migration `0016`, `GET /api/v1/wealth/linked-accounts`,
 `POST /api/v1/wealth/withdraw`, the withdrawal drawer):

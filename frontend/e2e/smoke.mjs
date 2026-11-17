@@ -9,9 +9,10 @@
  * install) and a Chromium build (PLAYWRIGHT_BROWSERS_PATH). Chromium runs with
  * a fake camera (an animated test pattern), so the liveness frames differ.
  *
- * First pass: landing -> sign-up -> KYC-locked dashboard -> full onboarding
- * (personal data, INE photos and details, biometric consent + liveness) ->
- * VERIFICADO -> deposit, fixed-term investment, the Account tab's previews
+ * First pass: landing -> sign-up -> KYC-locked dashboard -> the four-step
+ * verification at /dashboard/verify (identity, INE photos and details,
+ * liveness + declarations, review + agreements) -> VERIFICADO, unlocked
+ * without a reload -> deposit, fixed-term investment, the Account tab's previews
  * (the Sovereign Yield counter, the debit card), a withdrawal to the linked
  * bank account, Proof of Reserve, ledger,
  * moving between the dashboard's tabs (Vault, Discover, Account, Invest,
@@ -208,7 +209,17 @@ async function shot(page, name, { fullPage = true } = {}) {
       new Promise((resolve) => setTimeout(resolve, 2000)),
     ]),
   );
+  // A full-page capture draws fixed and sticky parts (the sidebar, the header) at
+  // the current scroll offset: capture from the top, then put the scroll back.
+  const scrollY = fullPage
+    ? await page.evaluate(() => {
+        const y = window.scrollY;
+        window.scrollTo({ top: 0, behavior: "instant" });
+        return y;
+      })
+    : 0;
   await page.screenshot({ path: `${OUT}/${name}.png`, fullPage });
+  if (scrollY > 0) await page.evaluate((y) => window.scrollTo({ top: y, behavior: "instant" }), scrollY);
 }
 
 /**
@@ -761,9 +772,20 @@ try {
     await page.fill("#password", password);
     await page.fill("#confirm", password);
     await page.click("button[type=submit]");
-    await page.waitForURL("**/auth/onboarding");
+    await page.waitForURL("**/dashboard/verify");
     await page.getByTestId("onboarding-step-1").waitFor();
-    check(true, "sign-up lands on the onboarding wizard (step 1)");
+    check(true, "sign-up lands on the verification wizard (/dashboard/verify, step 1)");
+    // The wizard lives in the dashboard: its header, not the banner that leads to it.
+    await page.getByTestId("kyc-header-badge").and(page.locator("[data-status=PENDIENTE]")).waitFor();
+    check(
+      (await page.getByTestId("kyc-banner").count()) === 0,
+      "the wizard does not repeat the KYC banner that leads to it",
+    );
+    // Old links (e-mails, bookmarks) still reach it.
+    await page.goto(`${BASE}/auth/onboarding`);
+    await page.waitForURL("**/dashboard/verify");
+    await page.getByTestId("onboarding-step-1").waitFor();
+    check(true, "the old /auth/onboarding address redirects to /dashboard/verify");
 
     // The dashboard is reachable but money movements are locked.
     await page.goto(`${BASE}/dashboard`);
@@ -809,9 +831,25 @@ try {
     // Onboarding step 1: personal data (a unique, valid identity).
     // ---------------------------------------------------------------------
     await page.getByTestId("kyc-banner-cta").click();
-    await page.waitForURL("**/auth/onboarding");
+    await page.waitForURL("**/dashboard/verify");
     const step1 = page.getByTestId("onboarding-step-1");
     await step1.waitFor();
+    check(true, "Complete verification opens the wizard");
+    // A gold progress bar of four square segments; the first is current.
+    const progress = await page.getByTestId("verify-progress").evaluate((nav) =>
+      [...nav.querySelectorAll("li")].map((li) => {
+        const bar = getComputedStyle(li.querySelector("span[aria-hidden]"));
+        return { current: li.getAttribute("aria-current"), color: bar.backgroundColor, radius: bar.borderRadius };
+      }),
+    );
+    check(
+      progress.length === 4 &&
+        progress[0].current === "step" &&
+        progress[0].color === "rgb(234, 179, 8)" &&
+        progress.slice(1).every((s) => s.current === null && s.color !== "rgb(234, 179, 8)") &&
+        progress.every((s) => s.radius === "0px"),
+      "a four-step progress bar fills step 1 in gold, with square segments",
+    );
     const p = identity.profile;
     const d = p.domicilio;
     await page.fill("#nombres", p.nombres);
@@ -830,6 +868,17 @@ try {
       (await step1.locator("[aria-invalid=true]").count()) === 0,
       `step 1 accepts the identity ${p.curp} / ${p.rfc} with no field errors`,
     );
+    const born = new Intl.DateTimeFormat("en-US", {
+      year: "numeric",
+      month: "long",
+      day: "numeric",
+      timeZone: "UTC",
+    }).format(new Date(`${identity.fechaNacimiento}T00:00:00Z`));
+    check(
+      (await step1.getByTestId("identity-birth-date").innerText()) === born &&
+        (await step1.getByTestId("identity-nationality").innerText()) === "Mexican",
+      `step 1 reads the date of birth (${born}) and the nationality from the CURP`,
+    );
     await shot(page, "onboarding-1-personal");
     await page.getByRole("button", { name: "Save and continue" }).click();
 
@@ -839,6 +888,12 @@ try {
     const step2 = page.getByTestId("onboarding-step-2");
     await step2.waitFor();
     check(true, "step 1 saves without warnings and advances to the INE step");
+    check(
+      (await step2.locator("input[name=documento][value=INE]").isChecked()) &&
+        (await step2.locator("input[name=documento][value=PASAPORTE]").isDisabled()) &&
+        (await step2.getByTestId("passport-note").isVisible()),
+      "the INE is the document; the passport is shown as not yet available",
+    );
     // Camera privacy: hiding the page turns the INE camera off, and closing it hands focus back.
     await step2.locator("#ine-frente-camera").click();
     const ineVideo = step2.locator("video[aria-label='Camera preview for the INE front']");
@@ -881,9 +936,21 @@ try {
     const back = await renderJpeg(page, "INE REVERSO", 20);
     check(!front.equals(back) && front.length > 1024 && back.length > 1024, "generated two different JPEGs > 1 KB");
     await page.setInputFiles("#ine-frente-file", { name: "ine-frente.jpg", mimeType: "image/jpeg", buffer: front });
-    await page.setInputFiles("#ine-reverso-file", { name: "ine-reverso.jpg", mimeType: "image/jpeg", buffer: back });
+    // The back is dragged onto its card: the same path as an upload.
+    const dropped = await page.evaluateHandle((b64) => {
+      const bytes = Uint8Array.from(atob(b64), (ch) => ch.charCodeAt(0));
+      const transfer = new DataTransfer();
+      transfer.items.add(new File([bytes], "ine-reverso.jpg", { type: "image/jpeg" }));
+      return transfer;
+    }, back.toString("base64"));
+    await step2.getByTestId("ine-reverso-dropzone").dispatchEvent("drop", { dataTransfer: dropped });
     await step2.getByAltText("Captured front of your INE").waitFor();
     await step2.getByAltText("Captured back of your INE").waitFor();
+    check(
+      (await step2.getByTestId("ine-frente-dropzone").getAttribute("data-captured")) === "true" &&
+        (await step2.getByTestId("ine-reverso-dropzone").getAttribute("data-captured")) === "true",
+      "the front is uploaded and the back dropped onto its card, both previewed at once",
+    );
     const thumbs = await step2.locator("img[alt^='Captured']").evaluateAll((imgs) => imgs.map((i) => i.src));
     check(
       thumbs.length === 2 && thumbs.every((s) => s.startsWith("data:image/jpeg;base64,")) && thumbs[0] !== thumbs[1],
@@ -904,7 +971,8 @@ try {
     await step2.getByRole("button", { name: "Continue" }).click();
 
     // ---------------------------------------------------------------------
-    // Step 3: biometric consent, then the liveness check with the fake camera.
+    // Step 3: biometric consent, the liveness check with the fake camera, and
+    // the declarations. Nothing is submitted yet: the frames wait in the page.
     // ---------------------------------------------------------------------
     const step3 = page.getByTestId("onboarding-step-3");
     await step3.waitFor();
@@ -913,18 +981,10 @@ try {
     await page.check("#consentimiento");
     check(await start.isEnabled(), "biometric consent enables the liveness check");
     await shot(page, "onboarding-3-consent");
-    const verify = page.waitForResponse((r) => r.url().includes("/kyc/verificar") && r.request().method() === "POST", {
-      timeout: 45_000,
-    });
-    // The file the page reloads right after the verification (GET /kyc/expediente).
     let verifySent = false;
     page.on("request", (r) => {
       if (r.url().includes("/kyc/verificar") && r.method() === "POST") verifySent = true;
     });
-    const reloaded = page.waitForResponse(
-      (r) => verifySent && r.url().includes("/kyc/expediente") && r.request().method() === "GET",
-      { timeout: 60_000 },
-    );
     await start.click();
     // The countdown runs while the camera preview is live; then a random challenge.
     await step3.locator("video").and(page.locator("[aria-label='Camera preview (mirrored)']")).waitFor();
@@ -937,6 +997,100 @@ try {
       { timeout: 15_000 },
     );
     await shot(page, "onboarding-3-liveness-camera");
+    await step3.getByTestId("liveness-captured").waitFor({ timeout: 45_000 });
+    check(!verifySent, "the liveness check captures the frames without submitting them (that happens at the review)");
+    // Camera released and nothing biometric persisted in the browser.
+    const privacy = await page.evaluate(() => {
+      const live = [...document.querySelectorAll("video")].some(
+        (v) => v.srcObject instanceof MediaStream && v.srcObject.getTracks().some((t) => t.readyState === "live"),
+      );
+      const dump = (store) => Object.keys(store).map((k) => `${k}=${store.getItem(k)}`).join("\n");
+      return {
+        live,
+        sessionKeys: Object.keys(sessionStorage),
+        localKeys: Object.keys(localStorage),
+        images: /data:image/.test(dump(sessionStorage) + dump(localStorage)),
+      };
+    });
+    check(!privacy.live, "the camera is released once the frames are captured (no live track)");
+    check(
+      privacy.sessionKeys.length === 1 &&
+        privacy.sessionKeys[0] === "synthetic-capital-session" &&
+        privacy.localKeys.length === 0 &&
+        !privacy.images,
+      `browser storage holds only the session and no image data (session: ${privacy.sessionKeys.join(",")}; local: ${privacy.localKeys.join(",")})`,
+    );
+    // The three declarations have no defaults: Continue says what is missing.
+    await step3.getByTestId("step3-continue").click();
+    await step3.locator("#ocupacion[aria-invalid=true]").waitFor();
+    check(
+      (await step3.locator("#origen-recursos[aria-invalid=true]").count()) === 1 &&
+        (await step3.locator("#declara-pep-error").count()) === 1 &&
+        (await page.evaluate(() => document.activeElement?.id)) === "ocupacion",
+      "occupation, source of funds and PEP must be answered: Continue flags all three and focuses the first",
+    );
+    await page.fill("#ocupacion", "Economist");
+    await page.selectOption("#origen-recursos", "SALARIO");
+    await page.check("#declara-pep-si");
+    await step3.getByTestId("pep-note").waitFor();
+    check(true, "a yes to PEP explains that a person on the team approves the file");
+    await page.check("#declara-pep-no");
+    check(
+      (await step3.getByTestId("pep-note").count()) === 0 && (await step3.locator("[aria-invalid=true]").count()) === 0,
+      "the declarations are complete (occupation, salary, not a PEP)",
+    );
+    await shot(page, "onboarding-3-declarations");
+    await step3.getByTestId("step3-continue").click();
+
+    // ---------------------------------------------------------------------
+    // Step 4: review, the three agreements, and Submit for Verification.
+    // ---------------------------------------------------------------------
+    const step4 = page.getByTestId("onboarding-step-4");
+    await step4.waitFor();
+    const sections = step4.getByTestId("review-section");
+    check(
+      (await sections.count()) === 3 &&
+        (await sections.nth(0).innerText()).includes(p.curp) &&
+        (await sections.nth(1).innerText()).includes(c.clave_elector) &&
+        (await sections.nth(2).getByText("Economist").isVisible()) &&
+        (await sections.nth(2).getByText("Salary or wages").isVisible()),
+      "the review shows identity, ID and liveness/funds as entered, each with Edit",
+    );
+    const submit = step4.getByTestId("submit-verification");
+    check(await submit.isDisabled(), "Submit for Verification stays disabled until the three agreements are accepted");
+    check(
+      (await step4.getByTestId("agreement").count()) === 3 &&
+        (await step4.getByTestId("agreements-version").innerText()).includes("2026-11"),
+      "the three agreements in force (version 2026-11) are listed, each to accept on its own",
+    );
+    await page.check("#acuerdo-contrato-cuenta");
+    await page.check("#acuerdo-aviso-privacidad");
+    check(await submit.isDisabled(), "two of three agreements are not enough");
+    await page.check("#acuerdo-declaracion-veracidad");
+    check(await submit.isEnabled(), "accepting the three agreements enables Submit for Verification");
+    await page.mouse.move(0, 0);
+    const submitStyle = await submit.evaluate((el) => ({
+      color: getComputedStyle(el).backgroundColor,
+      radius: getComputedStyle(el).borderRadius,
+    }));
+    check(
+      submitStyle.color === "rgb(234, 179, 8)" && submitStyle.radius === "0px",
+      "Submit for Verification is a square, solid gold button",
+    );
+    await shot(page, "onboarding-4-review");
+    const verify = page.waitForResponse((r) => r.url().includes("/kyc/verificar") && r.request().method() === "POST", {
+      timeout: 45_000,
+    });
+    // The file the page reloads right after the verification (GET /kyc/expediente).
+    const reloaded = page.waitForResponse(
+      (r) => verifySent && r.url().includes("/kyc/expediente") && r.request().method() === "GET",
+      { timeout: 60_000 },
+    );
+    // Gone if anything reloads the page from here on: the unlock must not need one.
+    await page.evaluate(() => {
+      window.__sameDocument = true;
+    });
+    await submit.click();
     const response = await verify;
     const sent = JSON.parse(response.request().postData() ?? "{}");
     const frames = sent.selfie?.frames ?? [];
@@ -947,6 +1101,18 @@ try {
     check(
       sent.ine?.frente !== sent.ine?.reverso && !frames.includes(sent.ine?.frente) && !frames.includes(sent.ine?.reverso),
       "INE front, back and selfie frames are all different images",
+    );
+    check(
+      sent.declaraciones?.ocupacion === "Economist" &&
+        sent.declaraciones?.origen_recursos === "SALARIO" &&
+        sent.declaraciones?.declara_pep === false,
+      "POST /kyc/verificar carries the declarations (occupation, source of funds, not a PEP)",
+    );
+    check(
+      sent.contratos?.version === "2026-11" &&
+        [...(sent.contratos?.documentos ?? [])].sort().join() ===
+          "AVISO_PRIVACIDAD,CONTRATO_CUENTA,DECLARACION_VERACIDAD",
+      "POST /kyc/verificar carries the three agreements accepted at version 2026-11",
     );
     const verdict = await response.json();
     check(
@@ -970,44 +1136,41 @@ try {
         findings.every((d) => !/\b0\.\d{2,}/.test(d.mensaje)),
       "the face-match score and threshold are not disclosed to the client (fields or findings)",
     );
-    // Camera released and nothing biometric persisted in the browser.
-    const privacy = await page.evaluate(() => {
-      const live = [...document.querySelectorAll("video")].some(
-        (v) => v.srcObject instanceof MediaStream && v.srcObject.getTracks().some((t) => t.readyState === "live"),
-      );
-      const dump = (store) => Object.keys(store).map((k) => `${k}=${store.getItem(k)}`).join("\n");
-      return {
-        live,
-        sessionKeys: Object.keys(sessionStorage),
-        localKeys: Object.keys(localStorage),
-        images: /data:image/.test(dump(sessionStorage) + dump(localStorage)),
-      };
-    });
-    check(!privacy.live, "the camera is released once the frames are captured (no live track)");
     check(
-      privacy.sessionKeys.length === 1 &&
-        privacy.sessionKeys[0] === "synthetic-capital-session" &&
-        privacy.localKeys.length === 0 &&
-        !privacy.images,
-      `browser storage holds only the session and no image data (session: ${privacy.sessionKeys.join(",")}; local: ${privacy.localKeys.join(",")})`,
+      file.ocupacion === "Economist" &&
+        file.origen_recursos === "SALARIO" &&
+        file.declara_pep === false &&
+        file.contratos_version === "2026-11" &&
+        typeof file.contratos_aceptados_en === "string",
+      `the file keeps the declarations and the agreements' version and time (${file.contratos_aceptados_en})`,
     );
 
     // ---------------------------------------------------------------------
-    // Step 4: status page.
+    // Status: verified at once in demo mode, and unlocked in place.
     // ---------------------------------------------------------------------
-    const step4 = page.getByTestId("onboarding-step-4");
-    await step4.waitFor();
-    const statusBadge = step4.getByTestId("kyc-status-badge");
+    const status = page.getByTestId("onboarding-status");
+    await status.waitFor();
+    const statusBadge = status.getByTestId("kyc-status-badge");
     await statusBadge.and(page.locator("[data-status=VERIFICADO]")).waitFor();
     check(true, "status badge reads VERIFICADO");
-    await step4.getByText("Your identity is verified").waitFor();
-    check(await step4.getByText("Approved", { exact: true }).isVisible(), "last verification shows Approved");
+    await status.getByText("Your identity is verified").waitFor();
+    check(await status.getByText("Approved", { exact: true }).isVisible(), "last verification shows Approved");
     check(
-      (await step4.getByText(/^Face match/).count()) === 0,
+      (await status.getByText(/^Face match/).count()) === 0,
       "status page shows no face-match score or row (the API withholds it)",
     );
-    await shot(page, "onboarding-4-status");
-    await step4.getByRole("button", { name: "Go to dashboard" }).click();
+    // The dashboard reloads its summary by itself: the header follows without a page reload.
+    await page.getByTestId("kyc-header-badge").and(page.locator("[data-status=VERIFICADO]")).waitFor();
+    check(
+      await page.evaluate(() => window.__sameDocument === true),
+      "the header reads Verified as soon as the file is approved, with no page reload",
+    );
+    check(
+      (await status.getByTestId("verified-add-funds").getAttribute("href")) === "/dashboard/account",
+      "the verified status offers to add funds (Account tab)",
+    );
+    await shot(page, "onboarding-5-status");
+    await status.getByRole("button", { name: "Go to dashboard" }).click();
     await page.waitForURL("**/dashboard");
 
     // ---------------------------------------------------------------------
@@ -1036,6 +1199,15 @@ try {
 
     await openTab(page, "Account");
     check((await page.getByTestId("deposit-locked").count()) === 0, "deposit control is unlocked");
+    check(
+      (await page.getByTestId("withdraw-locked").count()) === 0 &&
+        (await page.getByTestId("withdraw-open").count()) === 1,
+      "the Withdraw button is unlocked",
+    );
+    check(
+      await page.evaluate(() => window.__sameDocument === true),
+      "deposits and withdrawals unlocked in the same document the verification ran in (no reload)",
+    );
 
     // Demo SPEI deposit.
     await page.getByRole("button", { name: /Add funds/ }).click();
@@ -1047,6 +1219,10 @@ try {
     // IFPE -> SOFOM bridge.
     await openTab(page, "Invest");
     check(await page.locator("#bridge-amount").isEnabled(), "investment form is enabled once verified");
+    check(
+      await page.evaluate(() => window.__sameDocument === true),
+      "the investment form unlocked with no page reload either",
+    );
     await page.fill("#bridge-amount", "10000");
     await page.getByText("182d").click();
     await page.getByText("You receive").waitFor();

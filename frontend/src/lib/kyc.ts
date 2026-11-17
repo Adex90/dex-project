@@ -1037,6 +1037,9 @@ const EXACT: Record<string, string> = {
   // Face-similarity findings carry neither the score nor the threshold.
   "la similitud facial entre la selfie y la credencial no alcanza el mínimo aceptable": FACE_NO_MATCH,
   "la similitud facial entre la selfie y la credencial requiere revisión humana": FACE_NEEDS_REVIEW,
+  // verificacion.rs: a declared PEP is approved by a person, not by the automatic check.
+  "declaraste ser persona políticamente expuesta: una persona de nuestro equipo revisa y aprueba tu expediente":
+    "You told us you are a politically exposed person, so a person on our team reviews and approves your file.",
   // curp.rs
   "la CURP debe tener 18 caracteres": M.curpLength,
   "la CURP no tiene la estructura oficial (4 letras, fecha AAMMDD, sexo, entidad, 3 consonantes, homoclave y dígito)":

@@ -657,6 +657,15 @@ test("distinct seeds give distinct CURPs, RFCs and claves de elector", () => {
 // Backend messages in English
 // -----------------------------------------------------------------------------
 
+test("the notice of a declared PEP reads in English", () => {
+  assert.equal(
+    kycMessageInEnglish(
+      "declaraste ser persona políticamente expuesta: una persona de nuestro equipo revisa y aprueba tu expediente",
+    ),
+    "You told us you are a politically exposed person, so a person on our team reviews and approves your file.",
+  );
+});
+
 test("backend messages are translated to English", () => {
   assert.equal(kycMessageInEnglish("el dígito verificador de la CURP no corresponde"), KYC_MESSAGES.curpCheckDigit);
   assert.equal(kycMessageInEnglish("la entidad de nacimiento ZZ no existe"), "Birth state ZZ in the CURP does not exist.");

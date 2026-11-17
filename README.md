@@ -88,9 +88,14 @@ IFPE vault and its custody reserve; the SOFOM never sees it.
   Pre-0004 credits that kept only the bare tracking key match with the same
   ±7-day window as everything else, so a payer who reuses a tracking key
   every week is not held forever.
-- **Sending:** `POST /api/v1/spei/transfer`. The balance and the reserve go
-  down at once (the money is committed to the order and cannot be spent
-  twice), and the order is dispatched by a background worker. The worker
+- **Sending:** `POST /api/v1/spei/transfer` pays someone else's account. It
+  is off unless `SPEI_TRANSFERENCIAS_TERCEROS=true`; otherwise it answers
+  422 `TRANSFERENCIAS_TERCEROS_NO_DISPONIBLES` before any money moves, and
+  money leaves only for an account linked in the client's own name ("Linked
+  accounts and withdrawals"). For every outgoing order, withdrawals
+  included, the balance and the reserve go down at once (the money is
+  committed to the order and cannot be spent twice), and the order is
+  dispatched by a background worker. The worker
   never refunds on a timeout or an ambiguous answer. A rejection counts as
   final only on the first attempt; afterwards (for example "duplicate
   tracking key" on a resend) the order goes to manual review. A first-attempt
@@ -151,11 +156,12 @@ gateway reproduces STP's behaviour, including duplicate rejections on resend
 and delayed status queries. A production STP client (RSA-signed orders,
 participant catalog) plugs in there.
 
-## Digital onboarding and biometric KYC (migration `0006`)
+## Digital onboarding and biometric KYC (migrations `0006` and `0017`)
 
 Remote identification of individuals (CNBV / Ley Fintech, AML/CFT): personal
 data, INE (front and back) and a liveness selfie matched against the
-credential photograph.
+credential photograph, plus the client's declarations and the signed
+agreements. Clients do it in the dashboard, at `/dashboard/verify`.
 
 - **Strict gating, enforced by PostgreSQL row-level security.** A client
   whose KYC is not `VERIFICADO` cannot receive deposits (SPEI or simulated),
@@ -231,6 +237,51 @@ credential photograph.
     match, liveness and document checks have their own columns.
   - `/kyc/verificar` runs at most 8 at a time, and cheap checks run before
     any image is decoded.
+- **Declarations and agreements** (migration `0017`). `POST /kyc/verificar`
+  also carries:
+  - `declaraciones`: the client's occupation, the source of their funds
+    (`SALARIO`, `NEGOCIO_PROPIO`, `HONORARIOS`, `INVERSIONES`, `PENSION`,
+    `HERENCIA_O_DONACION`, `VENTA_DE_BIENES`, `APOYO_FAMILIAR`) and whether
+    they are, or were in the last year, a politically exposed person (PEP),
+    or a PEP's spouse, relative or close associate (`declara_pep`);
+  - `contratos`: the version accepted and the three documents:
+    `CONTRATO_CUENTA` (the account and custody agreement with Synthetic
+    Capital, S.A.P.I. de C.V.), `AVISO_PRIVACIDAD` (the privacy notice) and
+    `DECLARACION_VERACIDAD` (the sworn statement).
+
+  The backend refuses a missing document (422 `KYC_SIN_ACEPTACION`) or an
+  outdated version (422 `KYC_CONTRATOS_DESACTUALIZADOS`), and the database
+  checks again on submission (`KYC_DECLARACIONES_INCOMPLETAS`,
+  `KYC_CONTRATOS_SIN_ACEPTAR`). It requires the version in force
+  (`kyc.parametros.contratos_version`) and stamps the time itself; with the
+  submission's IP and browser (above) that makes a simple electronic
+  signature. The answers freeze with the identity. `GET /kyc/expediente`
+  returns them, the version in force (`contratos_vigentes`) and when the
+  client accepted. On verification, occupation and source of funds are
+  copied to `kyc.clientes`.
+- **A declared PEP is approved by a person.** The automatic check never
+  verifies such a file: an approving provider result sends it to review
+  (`EN_REVISION`, with a warning the client sees), and the database refuses
+  `VERIFICADO` for it unless an operator decides
+  (`POST /operaciones/kyc/{id}`). On verification the client is marked PEP
+  and its risk level becomes `ALTO`, which the AML engine weighs; the AML
+  log records `RIESGO_CLIENTE_ELEVADO`.
+- **The wizard** (`frontend/src/app/dashboard/verify`), where the KYC
+  banner's "Complete verification" leads (`/auth/onboarding` redirects to
+  it), in four steps under a gold progress bar:
+  1. identity: legal name, CURP and RFC checked as typed, the date of birth
+     and nationality read from the CURP, and the address
+     (`POST /kyc/perfil`);
+  2. the INE: both sides by camera, upload or drag and drop, re-encoded and
+     previewed in the browser, and the printed details;
+  3. biometric consent and the liveness check (the frames stay in memory
+     until submitted), then the three declarations, none with a default;
+  4. a review of every answer, each part with Edit, the three agreements
+     accepted one by one, and "Submit for Verification".
+
+  Then the status page. When the file is `VERIFICADO` (at once with the
+  simulated provider) the page reloads the dashboard's summary, so
+  deposits, withdrawals and trading unlock without a page reload.
 - **Identity squatting:** CURP, RFC and voter key are unique only among
   submitted or verified files. A value merely typed at sign-up blocks no one.
 - **No side doors** (`0007`): only the bridge role (`sc_puente`) writes
@@ -1121,7 +1172,7 @@ client's own name: the AML whitelist.
     the neutral `OPERACION_NO_DISPONIBLE` and never a refusal that would
     disclose the freeze.
   - It covers both own-account routes. A third-party payment
-    (`/spei/transfer`) has no link.
+    (`/spei/transfer`, off by default) has no link.
   - Otherwise the answer is 422 `CUENTA_NO_VINCULADA`.
 - **`GET /api/v1/wealth/linked-accounts`** (client):
   `{"accounts": [{"id", "bank_code", "bank_name", "clabe_last4", "holder_name", "linked_at"}]}`.
@@ -1162,9 +1213,11 @@ client's own name: the AML whitelist.
   - the WebSocket push in `backend/tests/boveda.rs`;
   - `frontend/src/lib/withdrawal.test.ts`;
   - `frontend/e2e/smoke.mjs` (the flow on a desktop and a phone).
-- Left: linking a real account with the bank confirming the holder.
-  Outside `MODO_DEMO` no account is linked yet, so withdrawals need that
-  flow first (`docs/FRONTEND_ROADMAP.md`, module 16).
+- Left: linking a real account with the bank confirming the holder. The
+  decided design is an STP penny drop to the CLABE plus the holder's name
+  on Banxico's CEP for it, matched against the KYC name. Outside
+  `MODO_DEMO` no account is linked yet, so withdrawals need that flow
+  first (`docs/FRONTEND_ROADMAP.md`, module 16).
 
 ## Layout
 
@@ -1180,7 +1233,7 @@ backend/      Rust: axum + sqlx + tokio
   src/spei/              CLABE, signed SPEI webhooks, outbound dispatcher, gateway
   src/boveda/            Sovereign Vault: snapshot, LISTEN/NOTIFY fan-out, WebSocket
   src/routes/            HTTP API (/api/v1)
-frontend/     Next.js app: the client dashboard (tabs Vault, Account, Invest, Reserve), onboarding,
+frontend/     Next.js app: the client dashboard (tabs Vault, Discover, Account, Invest, Reserve) with identity verification,
               the compliance console; "Sovereign Gold" theme tokens in src/app/globals.css
 tests/db/     SQL invariant tests for the schema
 terraform/    AWS reference architecture (VPC, RDS, ECS Fargate, ALB + WAF)
@@ -1222,6 +1275,7 @@ psql "$EMPTY_DATABASE_URL" -f tests/db/0012_boveda_tiempo_real.sql
 psql "$EMPTY_DATABASE_URL" -f tests/db/0013_mercado_valores.sql
 psql "$EMPTY_DATABASE_URL" -f tests/db/0015_ordenes_avanzadas.sql
 psql "$EMPTY_DATABASE_URL" -f tests/db/0016_cuentas_vinculadas.sql
+psql "$EMPTY_DATABASE_URL" -f tests/db/0017_kyc_declaraciones.sql
 cd frontend && npm test && npm run build
 FRONTEND_URL=http://localhost:3000 node e2e/smoke.mjs   # needs backend (MODO_DEMO=true) + next start
 # AML/PLD console against the real stack (structuring -> freeze -> four-eyes unfreeze, roles, no tipping off):
@@ -1390,9 +1444,9 @@ the password is hashed, so a parallel burst cannot test more than 5 passwords.
 | POST | `/api/v1/auth/registro`, `/api/v1/auth/login` | public (sign-up starts with KYC `PENDIENTE`; staff sign-in needs the second step) |
 | POST | `/api/v1/auth/verify-mfa`, `/api/v1/auth/mfa/setup`, `/api/v1/auth/mfa/enable` | two-step verification (see above) |
 | POST | `/api/v1/auth/password/forgot`, `/api/v1/auth/password/reset` | public: password reset by single-use link |
-| GET | `/api/v1/kyc/expediente` | client: onboarding state, attempts, last biometric result |
+| GET | `/api/v1/kyc/expediente` | client: onboarding state, attempts, last biometric result, own declarations and the agreements' version in force |
 | POST | `/api/v1/kyc/perfil` | client: step 1, personal data, CURP, RFC and address |
-| POST | `/api/v1/kyc/verificar` | client: steps 2-3, INE images and data + liveness frames + consent (up to 12 MB) |
+| POST | `/api/v1/kyc/verificar` | client: the wizard's submission, INE images and data + liveness frames + consent + declarations + accepted agreements (up to 12 MB) |
 | POST | `/api/v1/kyc/webhook` | biometric provider (HMAC signature `X-Kyc-Firma`) |
 | GET | `/api/v1/operaciones/kyc/pendientes` | operator: files awaiting human review |
 | POST | `/api/v1/operaciones/kyc/{cliente_id}` | operator: verify / reject (with reason) / reopen, risk level (not lowered while the client is under AML review); answers the client projection, without risk fields; an empty dictamen is 400 |
@@ -1423,7 +1477,7 @@ the password is hashed, so a parallel burst cannot test more than 5 passwords.
 | POST | `/api/v1/operaciones/creditos`, `.../{id}/pagos`, `.../{id}/castigo` | operator: loans, collections, write-offs (losses absorbed by SOFOM capital) |
 | POST | `/api/v1/operaciones/usuarios/{id}/revocar-sesiones` | operator: invalidate a user's JWTs immediately |
 | POST | `/api/v1/spei/webhook/inbound`, `/api/v1/spei/webhook/estado` | SPEI provider (HMAC signature) |
-| POST | `/api/v1/spei/transfer` | client: send an SPEI |
+| POST | `/api/v1/spei/transfer` | client: send an SPEI to someone else's account; off unless `SPEI_TRANSFERENCIAS_TERCEROS=true` (422 `TRANSFERENCIAS_TERCEROS_NO_DISPONIBLES`) |
 | GET | `/api/v1/spei/transferencias`, `/api/v1/spei/recibidos` | client |
 | GET | `/api/v1/spei/conciliacion`, `/api/v1/spei/en-revision` | operator / auditor |
 | POST | `/api/v1/operaciones/spei/recibidos/{id}/correccion` | operator: reverse a wrong SPEI credit |

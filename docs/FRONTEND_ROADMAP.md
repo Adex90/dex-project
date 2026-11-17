@@ -284,21 +284,63 @@ what the module waits on. They do not change its scope.
   - Tests: `tests/db/0016_cuentas_vinculadas.sql`, `backend/tests/patrimonio.rs`,
     the WebSocket push in `backend/tests/boveda.rs`, `lib/withdrawal.test.ts`,
     and smoke e2e (the whole flow on a desktop and a phone).
-  - Left: linking a real account, with the bank confirming the holder (for
-    example a penny test, or the holder's name and RFC/CURP on an incoming
-    SPEI from that CLABE), and unlinking it from the app. Outside demo mode
-    no account is linked until that exists, so production cannot withdraw
-    yet. Also left: a limit on accounts per client, and the withdrawal's
-    later states (settled, returned) in the app beyond the ledger.
+  - Payments to someone else's account (`POST /api/v1/spei/transfer`) are
+    off by default (`SPEI_TRANSFERENCIAS_TERCEROS=false`, 422
+    `TRANSFERENCIAS_TERCEROS_NO_DISPONIBLES`): money leaves only for an
+    account in the client's own name, which limits what a taken-over
+    session can drain. Decided with the product owner after this module.
+  - Left: linking a real account. The decided design is an STP penny drop
+    to the CLABE plus the holder's name on Banxico's CEP for it, matched
+    against the KYC name. Until that exists no account is linked outside
+    demo mode, so production cannot withdraw yet. Also left: unlinking from
+    the app, a limit on accounts per client, and the withdrawal's later
+    states (settled, returned) in the app beyond the ledger.
 - [ ] **17. SPEI Dispute Tracker** (Banxico CEP integration for delayed transfers)
   - Orders already carry their tracking key (`clave_rastreo`). The lookup of
     Banxico's CEP (electronic payment receipt) goes through the backend.
 
 ## Phase 4: Identity, Security & KYC
 
-- [ ] **18. AML/KYC Onboarding** (ID scan, liveness check, contract signing)
-  - Foundation: `/auth/onboarding` (personal data, INE photos, consent and
-    liveness, verdict). Contract signing is missing.
+- [x] **18. AML/KYC Onboarding** (ID scan, liveness check, contract signing)
+  - The wizard: `/dashboard/verify`, inside the dashboard, where "Complete
+    verification" leads (`/auth/onboarding` redirects there). Four steps
+    under a gold progress bar: (1) legal name, CURP and RFC checked as
+    typed, with the date of birth and nationality read from the CURP, and
+    the address; (2) the INE's two sides by camera, upload or drag and drop,
+    previewed and validated in the browser, and its printed details;
+    (3) biometric consent and the live camera check (frames stay in memory),
+    then occupation, source of funds and the politically exposed person
+    (PEP) question, none with a default; (4) a review of every answer with
+    Edit, the three agreements (account and custody agreement, privacy
+    notice, sworn statement) accepted one by one, and a gold "Submit for
+    Verification". Then the status page.
+  - The contract (migration 0017, README "Digital onboarding and biometric
+    KYC"): the declarations and the accepted agreements travel with the
+    existing `POST /api/v1/kyc/verificar`; no endpoint was added. The
+    database requires them on submission, records the agreements' version
+    in force (`kyc.parametros.contratos_version`) and the time, freezes them
+    with the identity, and copies occupation and source of funds to the
+    client on verification. A declared PEP never passes on the automatic
+    check: the file goes to a person, and only an operator can verify it;
+    the client is then marked PEP with high risk.
+  - In demo mode the simulated provider answers at once. When the file is
+    VERIFICADO the page reloads the dashboard's summary, so deposits,
+    withdrawals and trading unlock without a page reload.
+  - The new screens carry none of the words that would tip a client off
+    about an AML hold; the AML e2e checks the declarations and the
+    agreements, collapsed text included.
+  - Tests: `tests/db/0017_kyc_declaraciones.sql`, the declarations and
+    agreements and the PEP path in `backend/tests/kyc.rs`, the routing,
+    declarations and agreements in `components/onboarding/logic.test.ts`,
+    smoke e2e (the whole wizard, and the unlock with no reload), and the
+    AML e2e.
+  - Left: passports (the backend verifies INEs against the electoral
+    registry only), a real identity and biometric provider instead of the
+    simulated one, a console screen for an operator to approve a PEP's file
+    (today `POST /api/v1/operaciones/kyc/{cliente_id}`), the agreements'
+    full legal text with a downloadable signed copy, and a way to collect
+    the declarations of clients verified before migration 0017, who have
+    none on file.
 - [ ] **19. Investor Profiling & Quizzes** (Gatekeeping Margin/Options tiers)
   - Gates modules 5 and 29.
 - [ ] **20. Security Center** (FaceID/TouchID, PIN reset)
