@@ -268,6 +268,8 @@ pub async fn verificar_identidad(
         ));
     }
     expediente::exigir_consentimiento(s)?;
+    expediente::validar_declaraciones(&s.declaraciones)?;
+    expediente::exigir_contratos(&s.contratos, &expediente::contratos_vigentes(pool).await?)?;
     expediente::exigir_enviable(pool, cliente_id).await?;
     let imagenes = expediente::decodificar_imagenes(s)?;
     let enviado = match expediente::enviar(pool, cliente_id, s, &imagenes, origen, spei::hoy_cdmx()).await {

@@ -99,6 +99,9 @@ pub struct Evaluacion {
 pub const SIMILITUD_INSUFICIENTE: &str =
     "la similitud facial entre la selfie y la credencial no alcanza el mínimo aceptable";
 pub const SIMILITUD_EN_REVISION: &str = "la similitud facial entre la selfie y la credencial requiere revisión humana";
+/// Diligencia reforzada (0017): un PEP declarado lo aprueba una persona.
+pub const PEP_EN_REVISION: &str =
+    "declaraste ser persona políticamente expuesta: una persona de nuestro equipo revisa y aprueba tu expediente";
 
 impl Evaluacion {
     pub fn detalles(&self) -> Vec<Detalle> {
@@ -176,6 +179,9 @@ pub fn evaluar(
             errores.extend(e);
             advertencias.extend(a);
         }
+    }
+    if identidad.declara_pep {
+        advertencias.push(PEP_EN_REVISION.to_owned());
     }
     let score = match r.comparacion_facial.score {
         // Truncar (nunca redondear hacia arriba) a la escala de la columna.
@@ -437,6 +443,7 @@ mod pruebas {
             emision: 2022,
             vigencia: 2032,
             codigo_postal: Some("06000".into()),
+            declara_pep: false,
         }
     }
 
@@ -546,6 +553,21 @@ mod pruebas {
         let e = evaluar(&r, &id, Some(&evidencia()), &U, hoy());
         assert_eq!(e.resultado, Resultado::Revision, "{e:?}");
         assert!(e.errores.is_empty());
+    }
+
+    #[test]
+    fn un_pep_declarado_va_a_revision_aun_con_todo_correcto() {
+        let mut id = identidad();
+        id.declara_pep = true;
+        let e = evaluar(&resultado(Some(d("0.99"))), &id, Some(&evidencia()), &U, hoy());
+        assert_eq!(e.resultado, Resultado::Revision, "{e:?}");
+        assert!(e.errores.is_empty() && e.coincide_identidad);
+        assert_eq!(e.advertencias, vec![PEP_EN_REVISION.to_owned()]);
+        // Con la similitud bajo el umbral de revisión se rechaza igual.
+        assert_eq!(
+            evaluar(&resultado(Some(d("0.5"))), &id, Some(&evidencia()), &U, hoy()).resultado,
+            Resultado::Rechazado
+        );
     }
 
     #[test]

@@ -5,6 +5,8 @@
 //! 2. [`enviar`]: datos de la INE + imágenes (anverso, reverso y cuadros de la
 //!    selfie) -> el expediente pasa a EN_REVISION. Las imágenes no se guardan:
 //!    solo sus huellas SHA-256, que el resultado del proveedor debe repetir.
+//!    Con ellos, las declaraciones PLD del cliente (ocupación, origen de los
+//!    recursos, PEP) y la aceptación de los contratos vigentes (0017).
 //!
 //! El rol `sc_kyc` solo ve como editable un expediente PENDIENTE (RLS): una
 //! actualización sobre otro estado afecta 0 filas y aquí se traduce en 409.
@@ -51,6 +53,33 @@ impl EstadoKyc {
     }
 }
 
+/// Origen de los recursos del cliente (catálogo de 0017).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
+#[sqlx(type_name = "text", rename_all = "SCREAMING_SNAKE_CASE")]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum OrigenRecursos {
+    Salario,
+    NegocioPropio,
+    Honorarios,
+    Inversiones,
+    Pension,
+    HerenciaODonacion,
+    VentaDeBienes,
+    ApoyoFamiliar,
+}
+
+/// Los documentos que el cliente acepta al enviar su expediente (0017), en
+/// la versión vigente (`kyc.parametros.contratos_version`).
+pub const CONTRATOS: [&str; 3] = [
+    // Contrato de la cuenta de fondos de pago electrónico y de custodia con
+    // Synthetic Capital, S.A.P.I. de C.V.
+    "CONTRATO_CUENTA",
+    "AVISO_PRIVACIDAD",
+    // Bajo protesta de decir verdad: los datos son verídicos y el cliente
+    // actúa por cuenta propia, con recursos propios.
+    "DECLARACION_VERACIDAD",
+];
+
 /// Fila de `kyc.kyc_perfiles` (sin IP ni huellas de las imágenes).
 #[derive(Debug, Clone, Serialize, FromRow)]
 pub struct Expediente {
@@ -83,13 +112,23 @@ pub struct Expediente {
     pub revisado_por: Option<Uuid>,
     pub creado_en: DateTime<Utc>,
     pub actualizado_en: DateTime<Utc>,
+    /// Declaraciones PLD del cliente (0017): las suyas, no la determinación
+    /// de cumplimiento.
+    pub ocupacion: Option<String>,
+    pub origen_recursos: Option<OrigenRecursos>,
+    pub declara_pep: Option<bool>,
+    /// Versión de los contratos que aceptó al enviar, y el instante (lo fija
+    /// la base de datos).
+    pub contratos_version: Option<String>,
+    pub contratos_aceptados_en: Option<DateTime<Utc>>,
 }
 
 pub(crate) const COLUMNAS: &str = "cliente_id, nombres, apellido_paterno, apellido_materno, apellidos, curp, rfc, \
      fecha_nacimiento, sexo::text AS sexo, entidad_nacimiento::text AS entidad_nacimiento, \
      nacionalidad::text AS nacionalidad, domicilio, ine_clave_elector, ine_cic, ine_identificador_ciudadano, \
      ine_emision, ine_vigencia, estado_kyc::text AS estado_kyc, intentos, verificacion_en_curso, enviado_en, \
-     evidencia, metadata_proveedor, motivo_rechazo, verificado_en, revisado_por, creado_en, actualizado_en";
+     evidencia, metadata_proveedor, motivo_rechazo, verificado_en, revisado_por, creado_en, actualizado_en, \
+     ocupacion, origen_recursos, declara_pep, contratos_version, contratos_aceptados_en";
 
 /// Identidad completa de un expediente enviado (todas las columnas que
 /// `ck_perfil_envio_completo` exige).
@@ -108,6 +147,8 @@ pub struct IdentidadPropia {
     pub emision: i16,
     pub vigencia: i16,
     pub codigo_postal: Option<String>,
+    /// Declaró ser PEP (0017): su expediente lo aprueba un operador.
+    pub declara_pep: bool,
 }
 
 impl IdentidadPropia {
@@ -128,6 +169,7 @@ impl IdentidadPropia {
             emision: e.ine_emision.ok_or_else(falta)?,
             vigencia: e.ine_vigencia.ok_or_else(falta)?,
             codigo_postal: e.domicilio.get("codigo_postal").and_then(|v| v.as_str()).map(str::to_owned),
+            declara_pep: e.declara_pep.unwrap_or(false),
         })
     }
 
@@ -238,6 +280,8 @@ pub struct VistaExpediente {
     /// expediente RECHAZADO).
     pub estatus_cliente: EstatusKyc,
     pub max_intentos: i16,
+    /// Versión vigente de los contratos: la que un envío debe aceptar (0017).
+    pub contratos_vigentes: String,
     /// 0 si hay un bloqueo.
     pub intentos_restantes: i16,
     /// Por qué un expediente PENDIENTE no puede enviarse.
@@ -272,8 +316,10 @@ pub async fn vista(pool: &PgPool, cliente_id: Uuid) -> AppResult<VistaExpediente
             .bind(cliente_id)
             .fetch_one(&mut *tx)
             .await?;
-    let max_intentos: i16 =
-        sqlx::query_scalar("SELECT max_intentos FROM kyc.parametros WHERE id").fetch_one(&mut *tx).await?;
+    let (max_intentos, contratos_vigentes): (i16, String) =
+        sqlx::query_as("SELECT max_intentos, contratos_version FROM kyc.parametros WHERE id")
+            .fetch_one(&mut *tx)
+            .await?;
     let bloqueo = bloqueo(&mut tx, &expediente, max_intentos).await?;
     let ultimo_resultado = sqlx::query_as(
         "SELECT verificacion_id, proveedor, score_similitud, prueba_vida_exitosa, documento_valido, coincide_identidad, \
@@ -290,6 +336,7 @@ pub async fn vista(pool: &PgPool, cliente_id: Uuid) -> AppResult<VistaExpediente
         tipo_persona,
         estatus_cliente,
         max_intentos,
+        contratos_vigentes,
         intentos_restantes,
         bloqueo,
         ultimo_resultado,
@@ -500,6 +547,27 @@ pub struct Selfie {
     pub reto: Option<String>,
 }
 
+/// Declaraciones PLD del cliente (0017): obligatorias para enviar.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Declaraciones {
+    /// Su ocupación, en sus palabras ("Ingeniera civil").
+    pub ocupacion: String,
+    pub origen_recursos: OrigenRecursos,
+    /// Es, o fue en el último año, una persona políticamente expuesta, o lo
+    /// es su cónyuge, un familiar o un colaborador cercano.
+    pub declara_pep: bool,
+}
+
+/// Aceptación de los contratos (0017): la versión que vio el cliente y los
+/// documentos que aceptó, todos los de [`CONTRATOS`].
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Aceptacion {
+    pub version: String,
+    pub documentos: Vec<String>,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SolicitudVerificacion {
@@ -508,6 +576,47 @@ pub struct SolicitudVerificacion {
     /// Consentimiento expreso para tratar datos biométricos (dato personal
     /// sensible, LFPDPPP art. 9). Sin él no se envía nada al proveedor.
     pub consentimiento_biometrico: bool,
+    pub declaraciones: Declaraciones,
+    pub contratos: Aceptacion,
+}
+
+/// La ocupación declarada, limpia (espacios simples, hasta 120 caracteres,
+/// con letras).
+pub fn validar_declaraciones(d: &Declaraciones) -> AppResult<String> {
+    let ocupacion = texto::texto_corto("ocupacion", &d.ocupacion, 120).map_err(AppError::validacion)?;
+    if ocupacion.chars().count() < 2 || texto::palabras(&ocupacion).is_empty() {
+        return Err(AppError::validacion("ocupacion: describe tu ocupación"));
+    }
+    Ok(ocupacion)
+}
+
+/// La aceptación debe ser de la versión vigente y de todos los documentos.
+pub fn exigir_contratos(a: &Aceptacion, vigente: &str) -> AppResult<()> {
+    if a.documentos.len() > CONTRATOS.len() * 2 || a.documentos.iter().any(|d| !CONTRATOS.contains(&d.as_str())) {
+        return Err(AppError::validacion(format!("contratos.documentos admite solo {}", CONTRATOS.join(", "))));
+    }
+    if a.version != vigente {
+        return Err(AppError::negocio(
+            "KYC_CONTRATOS_DESACTUALIZADOS",
+            format!("los contratos cambiaron (versión {vigente}); léelos y acéptalos de nuevo"),
+        ));
+    }
+    if CONTRATOS.iter().any(|c| !a.documentos.iter().any(|d| d == c)) {
+        return Err(AppError::negocio(
+            "KYC_SIN_ACEPTACION",
+            "para enviar tu expediente acepta el contrato de la cuenta, el aviso de privacidad y la declaración de veracidad",
+        ));
+    }
+    Ok(())
+}
+
+/// Versión vigente de los contratos (`kyc.parametros`).
+pub async fn contratos_vigentes(pool: &PgPool) -> AppResult<String> {
+    let mut tx = db::begin_lectura(pool, Rol::Kyc).await?;
+    let vigente =
+        sqlx::query_scalar("SELECT contratos_version FROM kyc.parametros WHERE id").fetch_one(&mut *tx).await?;
+    tx.commit().await?;
+    Ok(vigente)
 }
 
 /// Imagen decodificada con su huella.
@@ -655,6 +764,7 @@ pub async fn enviar(
     hoy: NaiveDate,
 ) -> AppResult<Expediente> {
     exigir_consentimiento(s)?;
+    let ocupacion = validar_declaraciones(&s.declaraciones)?;
     let clave_elector = s.ine.clave_elector.trim().to_uppercase();
     let cic = s.ine.cic.trim().to_owned();
     let identificador = s.ine.identificador_ciudadano.as_deref().map(str::trim).filter(|v| !v.is_empty());
@@ -699,13 +809,16 @@ pub async fn enviar(
     if distintas.len() != todas.len() {
         return Err(AppError::validacion("cada imagen (anverso, reverso y cuadros de la selfie) debe ser distinta"));
     }
-    // Las huellas y el consentimiento quedan con el envío (y en la bitácora).
+    // Las huellas, el consentimiento y los documentos aceptados quedan con el
+    // envío (y en la bitácora); el instante de la aceptación lo fija la base de datos.
     let mut evidencia = serde_json::to_value(imagenes.evidencia()).map_err(|e| AppError::Interno(e.into()))?;
     evidencia["consentimiento_biometrico"] = serde_json::json!({ "otorgado": true, "registrado_en": Utc::now() });
+    evidencia["contratos"] = serde_json::json!({ "version": s.contratos.version, "documentos": CONTRATOS });
     let user_agent: Option<String> = origen.user_agent.as_deref().map(|u| u.chars().take(512).collect());
     let n = sqlx::query(
         "UPDATE kyc.kyc_perfiles SET ine_clave_elector = $2, ine_cic = $3, ine_identificador_ciudadano = $4, \
-                ine_emision = $5, ine_vigencia = $6, evidencia = $7, envio_ip = $8::inet, envio_user_agent = $9 \
+                ine_emision = $5, ine_vigencia = $6, evidencia = $7, envio_ip = $8::inet, envio_user_agent = $9, \
+                ocupacion = $10, origen_recursos = $11, declara_pep = $12, contratos_version = $13 \
          WHERE cliente_id = $1",
     )
     .bind(cliente_id)
@@ -717,6 +830,10 @@ pub async fn enviar(
     .bind(evidencia)
     .bind(origen.ip.map(|ip| ip.to_string()))
     .bind(user_agent)
+    .bind(&ocupacion)
+    .bind(s.declaraciones.origen_recursos)
+    .bind(s.declaraciones.declara_pep)
+    .bind(&s.contratos.version)
     .execute(&mut *tx)
     .await?
     .rows_affected();
@@ -738,6 +855,40 @@ pub async fn enviar(
 #[cfg(test)]
 mod pruebas {
     use super::*;
+
+    fn aceptacion(version: &str, documentos: &[&str]) -> Aceptacion {
+        Aceptacion { version: version.into(), documentos: documentos.iter().map(|d| (*d).to_owned()).collect() }
+    }
+
+    #[test]
+    fn declaraciones_y_contratos() {
+        let d = |ocupacion: &str| Declaraciones {
+            ocupacion: ocupacion.into(),
+            origen_recursos: OrigenRecursos::HerenciaODonacion,
+            declara_pep: false,
+        };
+        assert_eq!(validar_declaraciones(&d("  Ingeniera   civil ")).unwrap(), "Ingeniera civil");
+        for mala in ["", " ", "x", "1234", &"a".repeat(121)] {
+            assert_eq!(validar_declaraciones(&d(mala)).unwrap_err().codigo(), "VALIDACION", "{mala:?}");
+        }
+        assert_eq!(
+            serde_json::from_value::<OrigenRecursos>(serde_json::json!("HERENCIA_O_DONACION")).unwrap(),
+            OrigenRecursos::HerenciaODonacion
+        );
+        assert!(exigir_contratos(&aceptacion("2026-11", &CONTRATOS), "2026-11").is_ok());
+        assert_eq!(
+            exigir_contratos(&aceptacion("2026-10", &CONTRATOS), "2026-11").unwrap_err().codigo(),
+            "KYC_CONTRATOS_DESACTUALIZADOS"
+        );
+        assert_eq!(
+            exigir_contratos(&aceptacion("2026-11", &CONTRATOS[..2]), "2026-11").unwrap_err().codigo(),
+            "KYC_SIN_ACEPTACION"
+        );
+        assert_eq!(
+            exigir_contratos(&aceptacion("2026-11", &["CONTRATO_CUENTA", "OTRO"]), "2026-11").unwrap_err().codigo(),
+            "VALIDACION"
+        );
+    }
 
     fn datos() -> DatosPersonales {
         DatosPersonales {

@@ -1124,3 +1124,117 @@ async fn el_cliente_no_ve_el_score_exacto(pool: PgPool) {
     assert_eq!(cola[0].expediente.cliente_id, ana);
     assert_eq!(cola[0].score_similitud, Some(d("0.78")));
 }
+
+// -----------------------------------------------------------------------------
+// Declaraciones PLD y contratos (migración 0017)
+// -----------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "../migrations")]
+async fn las_declaraciones_y_los_contratos_viajan_con_el_envio(pool: PgPool) {
+    let cfg = preparar(&pool).await;
+    let p = Arc::new(proveedor(&cfg));
+    let api = api_con(&pool, &cfg, p.clone());
+    let (token, cliente_id) = registrar_http(&api, "Ana").await;
+    let id = IdentidadPrueba::nueva("Ana");
+    let (s, r) = api.llamar("POST", "/api/v1/kyc/perfil", Some(&token), Some(id.datos_json()), &[]).await;
+    assert_eq!(s, StatusCode::OK, "{r}");
+
+    // El expediente dice qué versión de los contratos se acepta; aún nada declarado.
+    let (s, f) = api.llamar("GET", "/api/v1/kyc/expediente", Some(&token), None, &[]).await;
+    assert_eq!(s, StatusCode::OK, "{f}");
+    assert_eq!(
+        (&f["contratos_vigentes"], &f["declara_pep"], &f["ocupacion"]),
+        (&json!("2026-11"), &Value::Null, &Value::Null)
+    );
+
+    // Cada falta se rechaza antes de tocar el expediente (sin gastar intentos).
+    let base = id.solicitud_json();
+    let con = |ajuste: &dyn Fn(&mut Value)| {
+        let mut cuerpo = base.clone();
+        ajuste(&mut cuerpo);
+        cuerpo
+    };
+    for (cuerpo, esperado) in [
+        (con(&|c| drop(c.as_object_mut().unwrap().remove("declaraciones"))), (StatusCode::BAD_REQUEST, "VALIDACION")),
+        (con(&|c| c["declaraciones"]["ocupacion"] = json!(" ")), (StatusCode::BAD_REQUEST, "VALIDACION")),
+        (con(&|c| c["declaraciones"]["origen_recursos"] = json!("LOTERIA")), (StatusCode::BAD_REQUEST, "VALIDACION")),
+        (con(&|c| drop(c.as_object_mut().unwrap().remove("contratos"))), (StatusCode::BAD_REQUEST, "VALIDACION")),
+        (
+            con(&|c| c["contratos"]["documentos"] = json!(["CONTRATO_CUENTA", "AVISO_PRIVACIDAD", "OTRO"])),
+            (StatusCode::BAD_REQUEST, "VALIDACION"),
+        ),
+        (
+            con(&|c| c["contratos"]["version"] = json!("2026-10")),
+            (StatusCode::UNPROCESSABLE_ENTITY, "KYC_CONTRATOS_DESACTUALIZADOS"),
+        ),
+        (
+            con(&|c| c["contratos"]["documentos"] = json!(["CONTRATO_CUENTA", "AVISO_PRIVACIDAD"])),
+            (StatusCode::UNPROCESSABLE_ENTITY, "KYC_SIN_ACEPTACION"),
+        ),
+    ] {
+        let (s, e) = api.llamar("POST", "/api/v1/kyc/verificar", Some(&token), Some(cuerpo.clone()), &[]).await;
+        assert_eq!((s, e["error"]["codigo"].as_str().unwrap_or_default()), esperado, "{cuerpo}: {e}");
+    }
+    assert_eq!(estado(&pool, cliente_id).await, ("PENDIENTE".into(), "PENDIENTE".into(), 0));
+
+    // Completo: verificado, con lo declarado y la aceptación en su expediente.
+    let (s, v) = api.llamar("POST", "/api/v1/kyc/verificar", Some(&token), Some(base), &[]).await;
+    assert_eq!((s, &v["resultado"]["resultado"]), (StatusCode::OK, &json!("APROBADO")), "{v}");
+    let (_, f) = api.llamar("GET", "/api/v1/kyc/expediente", Some(&token), None, &[]).await;
+    assert_eq!(
+        (&f["ocupacion"], &f["origen_recursos"], &f["declara_pep"], &f["contratos_version"]),
+        (&json!("Economista"), &json!("SALARIO"), &json!(false), &json!("2026-11")),
+        "{f}"
+    );
+    assert!(f["contratos_aceptados_en"].is_string(), "{f}");
+    let (documentos, ocupacion, origen, pep): (Value, Option<String>, Option<String>, bool) = sqlx::query_as(
+        "SELECT p.evidencia -> 'contratos' -> 'documentos', c.ocupacion, c.origen_recursos, c.es_pep \
+           FROM kyc.kyc_perfiles p JOIN kyc.clientes c ON c.id = p.cliente_id WHERE p.cliente_id = $1",
+    )
+    .bind(cliente_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(documentos, json!(expediente::CONTRATOS));
+    assert_eq!((ocupacion.as_deref(), origen.as_deref(), pep), (Some("Economista"), Some("SALARIO"), false));
+}
+
+#[sqlx::test(migrations = "../migrations")]
+async fn un_pep_declarado_lo_aprueba_un_operador(pool: PgPool) {
+    let cfg = preparar(&pool).await;
+    let op = operador(&pool).await;
+    let p = proveedor(&cfg);
+    let ana = cliente_sin_kyc(&pool, &cfg, "Ana").await;
+    let id = IdentidadPrueba::nueva("Ana");
+    expediente::guardar_datos(&pool, ana.cliente.id, &id.datos_personales(), chrono::Utc::now().date_naive())
+        .await
+        .unwrap();
+    let mut s = id.solicitud();
+    s.declaraciones.ocupacion = "Diputada local".into();
+    s.declaraciones.declara_pep = true;
+
+    // Biometría impecable, pero la diligencia reforzada la decide una persona.
+    let r = kyc::verificar_identidad(&pool, &cfg.kyc, &p, ana.cliente.id, &s, &OrigenEnvio::default()).await.unwrap();
+    assert_eq!(r.estado_kyc, EstadoKyc::EnRevision);
+    let v = r.resultado.unwrap();
+    assert_eq!(v.resultado, Resultado::Revision);
+    assert!(v.detalles.iter().any(|d| d.mensaje == kyc::verificacion::PEP_EN_REVISION), "{:?}", v.detalles);
+    let (pep, nivel): (bool, String) =
+        sqlx::query_as("SELECT es_pep, nivel_riesgo_pld FROM kyc.clientes WHERE id = $1")
+            .bind(ana.cliente.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(!pep, "nada pasa al cliente antes de verificar ({nivel})");
+
+    // El operador la aprueba: PEP con riesgo ALTO, y su ocupación en el cliente.
+    kyc::dictaminar(&pool, op, ana.cliente.id, &verificar(&pool, ana.cliente.id).await).await.unwrap();
+    let (pep, nivel, ocupacion): (bool, String, Option<String>) =
+        sqlx::query_as("SELECT es_pep, nivel_riesgo_pld, ocupacion FROM kyc.clientes WHERE id = $1")
+            .bind(ana.cliente.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!((pep, nivel.as_str(), ocupacion.as_deref()), (true, "ALTO", Some("Diputada local")));
+    depositar(&pool, &cfg, ana.cuenta_ifpe.id, "10").await;
+}

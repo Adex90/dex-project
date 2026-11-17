@@ -63,7 +63,10 @@ LANGUAGE sql AS $$
            fecha_nacimiento = '1990-01-01', sexo = 'H', entidad_nacimiento = 'DF',
            domicilio = '{"calle": "a", "numero_exterior": "1", "colonia": "c", "municipio": "m", "estado": "e", "codigo_postal": "06000"}',
            ine_clave_elector = $3, ine_cic = '123456789', ine_emision = 2022, ine_vigencia = 2032,
-           evidencia = '{"ine_frente": "a", "ine_reverso": "b", "selfie": ["c"]}'
+           evidencia = '{"ine_frente": "a", "ine_reverso": "b", "selfie": ["c"]}',
+           -- Declaraciones y contratos (0017).
+           ocupacion = 'Economista', origen_recursos = 'SALARIO', declara_pep = FALSE,
+           contratos_version = (SELECT contratos_version FROM kyc.parametros)
      WHERE cliente_id = $1
 $$;
 

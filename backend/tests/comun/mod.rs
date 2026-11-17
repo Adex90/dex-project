@@ -26,7 +26,10 @@ use synthetic_capital::{
         self,
         biometria::ProveedorSimulado,
         curp::{self, Sexo},
-        expediente::{self, DatosIne, DatosPersonales, Domicilio, OrigenEnvio, Selfie, SolicitudVerificacion},
+        expediente::{
+            self, Aceptacion, DatosIne, DatosPersonales, Declaraciones, Domicilio, OrigenEnvio, OrigenRecursos, Selfie,
+            SolicitudVerificacion, CONTRATOS,
+        },
         ine, rfc, DatosRegistro, EnvioVerificacion, Registro,
     },
     ledger::{hash, Movimiento},
@@ -42,6 +45,9 @@ use synthetic_capital::{
     },
 };
 use uuid::Uuid;
+
+/// La versión de los contratos que siembra la migración 0017 (`kyc.parametros`).
+pub const CONTRATOS_VIGENTES: &str = "2026-11";
 
 pub fn d(s: &str) -> Decimal {
     Decimal::from_str(s).unwrap()
@@ -185,6 +191,15 @@ impl IdentidadPrueba {
                 reto: Some("PARPADEA".into()),
             },
             consentimiento_biometrico: true,
+            declaraciones: Declaraciones {
+                ocupacion: "Economista".into(),
+                origen_recursos: OrigenRecursos::Salario,
+                declara_pep: false,
+            },
+            contratos: Aceptacion {
+                version: CONTRATOS_VIGENTES.into(),
+                documentos: CONTRATOS.iter().map(|d| (*d).to_owned()).collect(),
+            },
         }
     }
 
@@ -206,6 +221,8 @@ impl IdentidadPrueba {
             },
             "selfie": { "frames": s.selfie.frames, "reto": s.selfie.reto },
             "consentimiento_biometrico": true,
+            "declaraciones": { "ocupacion": "Economista", "origen_recursos": "SALARIO", "declara_pep": false },
+            "contratos": { "version": CONTRATOS_VIGENTES, "documentos": CONTRATOS },
         })
     }
 }

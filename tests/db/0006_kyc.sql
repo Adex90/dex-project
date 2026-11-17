@@ -129,6 +129,15 @@ SELECT pg_temp.debe_fallar('RLS: SPEI recibido para un cliente PENDIENTE', pg_te
 -- -----------------------------------------------------------------------------
 -- Captura y envío a revisión (sc_kyc)
 -- -----------------------------------------------------------------------------
+-- Declaraciones y contratos (0017): sin ellos no hay envío (tests/db/0017_kyc_declaraciones.sql).
+SELECT pg_temp.debe_pasar('Declaraciones (0017): ocupación, origen de los recursos, PEP y contratos vigentes', ARRAY[
+  'SET LOCAL ROLE sc_kyc',
+  $q$UPDATE kyc.kyc_perfiles SET ocupacion = 'Economista', origen_recursos = 'SALARIO', declara_pep = FALSE,
+       contratos_version = (SELECT contratos_version FROM kyc.parametros)
+     WHERE cliente_id = '3c000000-0000-0000-0000-00000000003c'$q$,
+  'RESET ROLE'
+]);
+
 SELECT pg_temp.debe_fallar('Envío: expediente incompleto', ARRAY[
   'SET LOCAL ROLE sc_kyc',
   $q$UPDATE kyc.kyc_perfiles SET estado_kyc = 'EN_REVISION' WHERE cliente_id = '3c000000-0000-0000-0000-00000000003c'$q$
@@ -379,7 +388,8 @@ SELECT pg_temp.debe_fallar('Unicidad: no puede enviar a revisión una CURP en re
   $q$UPDATE kyc.kyc_perfiles SET rfc = 'HAXF990508AB2', fecha_nacimiento = '1999-05-08', sexo = 'H', entidad_nacimiento = 'DF',
        domicilio = '{"calle": "a", "numero_exterior": "1", "colonia": "c", "municipio": "m", "estado": "e", "codigo_postal": "06000"}',
        ine_clave_elector = 'HYXXFR99050809H101', ine_cic = '123456780', ine_emision = 2020, ine_vigencia = 2030,
-       evidencia = '{"ine_frente": "a", "ine_reverso": "b", "selfie": ["c"]}'
+       evidencia = '{"ine_frente": "a", "ine_reverso": "b", "selfie": ["c"]}',
+       ocupacion = 'Economista', origen_recursos = 'SALARIO', declara_pep = FALSE, contratos_version = '2026-11'
      WHERE cliente_id = '4c000000-0000-0000-0000-00000000004c'$q$,
   'SET LOCAL ROLE sc_kyc_verificador',
   $q$UPDATE kyc.kyc_perfiles SET estado_kyc = 'RECHAZADO', motivo_rechazo = 'r' WHERE cliente_id = '3c000000-0000-0000-0000-00000000003c'$q$,

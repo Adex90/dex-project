@@ -355,9 +355,20 @@ async function apiOnboard(page, seed, email) {
   if (perfil.status >= 300) throw new Error(`perfil ${email}: ${perfil.status} ${JSON.stringify(perfil.body)}`);
   const imgs = [];
   for (const [label, hue] of [["INE F", 200], ["INE R", 20], ["S1", 90], ["S2", 130], ["S3", 170]]) imgs.push(await renderDataUrl(page, `${label} ${seed}`, hue));
+  // The declarations and the agreements in force (migration 0017) travel with the submission.
+  const file = await apiCall("GET", "/api/v1/kyc/expediente", { token });
   const ver = await apiCall("POST", "/api/v1/kyc/verificar", {
     token,
-    body: { ine: { ...id.credential, frente: imgs[0], reverso: imgs[1] }, selfie: { frames: imgs.slice(2) }, consentimiento_biometrico: true },
+    body: {
+      ine: { ...id.credential, frente: imgs[0], reverso: imgs[1] },
+      selfie: { frames: imgs.slice(2) },
+      consentimiento_biometrico: true,
+      declaraciones: { ocupacion: "Economista", origen_recursos: "SALARIO", declara_pep: false },
+      contratos: {
+        version: file.body.contratos_vigentes,
+        documentos: ["CONTRATO_CUENTA", "AVISO_PRIVACIDAD", "DECLARACION_VERACIDAD"],
+      },
+    },
   });
   if (ver.body?.resultado?.estado_kyc !== "VERIFICADO") throw new Error(`verificar ${email}: ${ver.status} ${JSON.stringify(ver.body).slice(0, 300)}`);
   return { email, token, id: reg.body.sesion.cliente_id, clabe: reg.body.cuenta_ifpe.clabe, nombre: `${id.profile.nombres} ${id.profile.apellido_paterno}` };
