@@ -14,6 +14,7 @@ import {
   ShieldAlert,
   ShieldCheck,
   ShieldOff,
+  Wallet,
   XCircle,
 } from "lucide-react";
 
@@ -323,10 +324,20 @@ export function StepStatus({
 
       <div className="space-y-2">
         {file.estado_kyc === "VERIFICADO" ? (
-          <Button type="button" size="lg" className="w-full" onClick={onDashboard}>
-            <CheckCircle2 className="size-4" aria-hidden />
-            Go to dashboard
-          </Button>
+          <>
+            <Button type="button" size="lg" className="w-full" onClick={onDashboard}>
+              <CheckCircle2 className="size-4" aria-hidden />
+              Go to dashboard
+            </Button>
+            <Link
+              href="/dashboard/account"
+              className="flex h-11 items-center justify-center gap-2 border border-border-strong text-sm font-semibold text-ink transition hover:bg-surface-2 focus-visible:ring-2 focus-visible:ring-accent focus-visible:outline-none"
+              data-testid="verified-add-funds"
+            >
+              <Wallet className="size-4" aria-hidden />
+              Add funds to your account
+            </Link>
+          </>
         ) : null}
         {file.estado_kyc === "PENDIENTE" && !locked ? (
           canRetry(file) ? (

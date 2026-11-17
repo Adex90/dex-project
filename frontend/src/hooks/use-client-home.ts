@@ -8,7 +8,7 @@ import { request } from "@/lib/api/client";
 import type { Cliente, EstatusKyc, Rol, Sesion } from "@/lib/api/types";
 
 export const DASHBOARD_PATH = "/dashboard";
-export const ONBOARDING_PATH = "/auth/onboarding";
+export const ONBOARDING_PATH = "/dashboard/verify";
 export const ADMIN_AML_PATH = "/admin/aml";
 export const MFA_SETUP_PATH = "/auth/mfa-setup";
 
@@ -26,8 +26,9 @@ export function homeForStaff(role: Rol): string | null {
 
 /**
  * Where an account holder belongs: the dashboard once their identity is
- * VERIFICADO, the onboarding wizard otherwise (pending, in review, rejected
- * or suspended: the wizard shows the state of their KYC file).
+ * VERIFICADO, the verification wizard (/dashboard/verify) otherwise
+ * (pending, in review, rejected or suspended: the wizard shows the state of
+ * their KYC file).
  */
 export function homeForKycStatus(status: EstatusKyc): string {
   return status === "VERIFICADO" ? DASHBOARD_PATH : ONBOARDING_PATH;

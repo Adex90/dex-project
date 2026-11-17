@@ -315,6 +315,36 @@ export interface DatosPersonalesInput {
   domicilio: Domicilio;
 }
 
+/** Source of funds: the backend's catalog (migration 0017). */
+export type OrigenRecursos =
+  | "SALARIO"
+  | "NEGOCIO_PROPIO"
+  | "HONORARIOS"
+  | "INVERSIONES"
+  | "PENSION"
+  | "HERENCIA_O_DONACION"
+  | "VENTA_DE_BIENES"
+  | "APOYO_FAMILIAR";
+
+/** The client's AML declarations, sent with the verification (migration 0017). */
+export interface Declaraciones {
+  /** In their own words, 2 to 120 characters ("Civil engineer"). */
+  ocupacion: string;
+  origen_recursos: OrigenRecursos;
+  /** Is, or was in the last year, a politically exposed person, or their spouse, a relative or a close associate is. */
+  declara_pep: boolean;
+}
+
+/** The agreements a client accepts with the verification (migration 0017). */
+export type DocumentoContrato = "CONTRATO_CUENTA" | "AVISO_PRIVACIDAD" | "DECLARACION_VERACIDAD";
+
+export interface AceptacionContratos {
+  /** The version shown: it must be the one in force (`contratos_vigentes`), or the API answers KYC_CONTRATOS_DESACTUALIZADOS. */
+  version: string;
+  /** All three documents, or the API answers KYC_SIN_ACEPTACION. */
+  documentos: DocumentoContrato[];
+}
+
 /** One finding of a verification: errors reject it, warnings send it to human review. */
 export interface DetalleKyc {
   tipo: "ERROR" | "ADVERTENCIA";
@@ -354,6 +384,13 @@ export interface ExpedienteKyc {
   revisado_por: Uuid | null;
   creado_en: IsoDateTime;
   actualizado_en: IsoDateTime;
+  /** The client's declarations of the last submission (null before the first one). */
+  ocupacion: string | null;
+  origen_recursos: OrigenRecursos | null;
+  declara_pep: boolean | null;
+  /** The agreements version accepted, and when (set by the database on submission). */
+  contratos_version: string | null;
+  contratos_aceptados_en: IsoDateTime | null;
 }
 
 /** Last biometric result of the file (`kyc.kyc_auditoria_biometrica`). */
@@ -387,6 +424,8 @@ export interface VistaExpediente extends ExpedienteKyc {
   /** The account status (`estatus_kyc` of the client): mirrors the file, except SUSPENDIDO. */
   estatus_cliente: EstatusKyc;
   max_intentos: number;
+  /** The agreements version in force: the one a submission must accept. */
+  contratos_vigentes: string;
   /** 0 while `bloqueo` is set. */
   intentos_restantes: number;
   bloqueo: BloqueoKyc | null;
@@ -430,6 +469,8 @@ export interface SolicitudVerificacion {
   selfie: SelfieInput;
   /** Explicit consent to process biometric data; without it the API answers KYC_SIN_CONSENTIMIENTO. */
   consentimiento_biometrico: true;
+  declaraciones: Declaraciones;
+  contratos: AceptacionContratos;
 }
 
 /** Verdict on a verification (POST /kyc/verificar and the provider webhook). */

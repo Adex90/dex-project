@@ -193,7 +193,7 @@ export function StepPersonal({
       </fieldset>
 
       <fieldset className="space-y-4">
-        <legend className="mb-3 text-sm font-semibold text-ink">Identity numbers</legend>
+        <legend className="mb-3 text-sm font-semibold text-ink">Fiscal identity</legend>
         <FormField
           id="curp"
           label="CURP"
@@ -247,6 +247,24 @@ export function StepPersonal({
             </p>
           </Alert>
         ) : null}
+        {/* Read from the CURP, never typed: nothing to get wrong, and nothing to retype. */}
+        <dl className="grid grid-cols-1 gap-px bg-border ring-1 ring-border sm:grid-cols-2">
+          <div className="bg-surface-2 px-4 py-3">
+            <dt className="text-[11px] font-medium tracking-[0.16em] text-muted uppercase">Date of birth</dt>
+            <dd className="mt-1 text-sm text-ink tabular-nums" data-testid="identity-birth-date">
+              {curp ? birthDate.format(new Date(`${curp.fechaNacimiento}T00:00:00Z`)) : "From your CURP"}
+            </dd>
+          </div>
+          <div className="bg-surface-2 px-4 py-3">
+            <dt className="text-[11px] font-medium tracking-[0.16em] text-muted uppercase">Nationality</dt>
+            <dd className="mt-1 text-sm text-ink" data-testid="identity-nationality">
+              Mexican
+            </dd>
+          </div>
+        </dl>
+        <p className="text-xs text-muted">
+          Both are read from your CURP. Verifying remotely with an INE is for Mexican nationals.
+        </p>
       </fieldset>
 
       <fieldset className="space-y-4">

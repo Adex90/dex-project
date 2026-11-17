@@ -7,6 +7,7 @@ import { Lock } from "lucide-react";
 import { useDashboard } from "@/components/layout/dashboard-shell";
 import { OpenOrdersList } from "@/components/markets/open-orders-list";
 import { Alert, Button } from "@/components/ui/primitives";
+import { ONBOARDING_PATH } from "@/hooks/use-client-home";
 import { AssetList, AssetListSkeleton } from "@/components/vault/asset-list";
 import { PortfolioAnalytics, PortfolioAnalyticsSkeleton } from "@/components/vault/portfolio-analytics";
 import { PortfolioChart } from "@/components/vault/portfolio-chart";
@@ -144,7 +145,7 @@ function DepositLocked() {
         </div>
       </div>
       <Link
-        href="/auth/onboarding"
+        href={ONBOARDING_PATH}
         className="mt-6 inline-flex min-h-11 w-full items-center justify-center rounded-xl bg-synthetic-yellow px-4 text-sm font-semibold text-black transition hover:bg-synthetic-yellow-hover focus-visible:ring-2 focus-visible:ring-synthetic-yellow focus-visible:ring-offset-2 focus-visible:ring-offset-surface focus-visible:outline-none active:bg-synthetic-yellow-pressed"
       >
         Continue verification

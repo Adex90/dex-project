@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import { ArrowLeft, Loader2, Lock, RotateCcw, ScanFace, VideoOff } from "lucide-react";
+import { CheckCircle2, Loader2, Lock, RotateCcw, ScanFace, VideoOff } from "lucide-react";
 
 import { Alert, Button, cx } from "@/components/ui/primitives";
 import { COMPLIANCE_EMAIL } from "@/lib/config";
@@ -9,20 +9,21 @@ import { checkVerificationImages, imageLabel } from "@/lib/kyc";
 
 import {
   FRAME_INTERVAL_MS,
-  IDENTITY_CONFLICT_RETRY,
   SELFIE_FRAMES,
   SELFIE_MAX_SIDE,
   describeCameraProblem,
   pickChallenge,
   type Challenge,
-  type VerificationAction,
 } from "./logic";
 import { ImageError, captureVideoFrame, sleep, useCamera } from "./media";
 
-/** What the page answers after POST /kyc/verificar (on success it moves to step 4). */
-export type VerificationOutcome = { ok: true } | { ok: false; message: string; action: VerificationAction };
+/** What the liveness check hands to the page: the frames and the challenge shown. */
+export interface LivenessCapture {
+  frames: string[];
+  reto: string;
+}
 
-type Phase = "idle" | "starting" | "countdown" | "challenge" | "submitting" | "error";
+type Phase = "idle" | "starting" | "countdown" | "challenge" | "error";
 
 const COUNTDOWN_FROM = 3;
 const COUNTDOWN_TICK_MS = 800;
@@ -42,39 +43,53 @@ function isAbort(error: unknown): boolean {
 class CameraStopped extends Error {}
 
 /**
- * Step 3: explicit biometric consent, then a live camera check: a random
- * challenge is shown while 4 distinct frames are captured, and everything
- * (INE photos + frames) is submitted for verification. There is deliberately
- * no file upload here: liveness must come from a live camera.
+ * Step 3, first half: explicit biometric consent, then a live camera check. A
+ * random challenge is shown while 4 distinct frames are captured. The frames
+ * stay in this tab's memory until the review step submits them with
+ * everything else; the camera turns off as soon as they are taken. There is
+ * deliberately no file upload here: liveness must come from a live camera.
  */
 export function StepLiveness({
   ineImages,
-  identityConflict,
-  onSubmit,
-  onBack,
-  onEditProfile,
+  captured,
+  initialConsent,
+  onConsentChange,
+  onCaptured,
+  onRetake,
 }: {
   ineImages: { frente: string; reverso: string };
-  /** The declared CURP / RFC / voter key were refused as in use elsewhere and have not changed since. */
-  identityConflict: boolean;
-  onSubmit: (selfie: { frames: string[]; reto: string }) => Promise<VerificationOutcome>;
-  onBack: () => void;
-  onEditProfile: () => void;
+  /** The frames of this session, if the check was already done. */
+  captured: LivenessCapture | null;
+  /** Consent given earlier in this session (kept when the step is revisited). */
+  initialConsent: boolean;
+  onConsentChange: (consent: boolean) => void;
+  onCaptured: (capture: LivenessCapture) => void;
+  /** Discards the captured frames to take them again. */
+  onRetake: () => void;
 }) {
   const { videoRef, state: camera, start, stop } = useCamera("user");
-  const [consent, setConsent] = useState(false);
+  const [consent, setConsent] = useState(initialConsent);
   const [phase, setPhase] = useState<Phase>("idle");
   const [count, setCount] = useState(COUNTDOWN_FROM);
   const [challenge, setChallenge] = useState<Challenge | null>(null);
   const [framesTaken, setFramesTaken] = useState(0);
-  const [error, setError] = useState<{ message: string; action: VerificationAction } | null>(null);
+  const [error, setError] = useState<string | null>(null);
   const runRef = useRef<AbortController | null>(null);
-  const consentRef = useRef<HTMLInputElement>(null);
+  const doneRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => () => runRef.current?.abort(), []);
 
-  const busy = phase === "starting" || phase === "countdown" || phase === "challenge" || phase === "submitting";
-  const submitting = phase === "submitting";
+  const busy = phase === "starting" || phase === "countdown" || phase === "challenge";
+
+  const changeConsent = (next: boolean) => {
+    setConsent(next);
+    onConsentChange(next);
+    if (!next) {
+      cancelRun();
+      // Without consent no biometric data may stay, not even in memory.
+      if (captured) onRetake();
+    }
+  };
 
   const cancelRun = () => {
     runRef.current?.abort();
@@ -90,7 +105,7 @@ export function StepLiveness({
   };
 
   const run = async () => {
-    if (!consent || busy || identityConflict) return;
+    if (!consent || busy) return;
     runRef.current?.abort();
     const ctrl = new AbortController();
     runRef.current = ctrl;
@@ -137,38 +152,26 @@ export function StepLiveness({
         if (frames.length < SELFIE_FRAMES) await sleep(FRAME_INTERVAL_MS, ctrl.signal);
       }
       stop();
-
       const problems = checkVerificationImages({ ...ineImages, frames });
       if (problems.length > 0) {
-        setError({ message: problems.join(" "), action: "selfie" });
+        setError(problems.join(" "));
         setPhase("error");
         return;
       }
-      setPhase("submitting");
-      const outcome = await onSubmit({ frames, reto: picked.code });
-      if (ctrl.signal.aborted) return;
-      if (!outcome.ok) {
-        setError({ message: outcome.message, action: outcome.action });
-        setPhase("error");
-        if (outcome.action === "consent") {
-          setConsent(false);
-          // After the commit: until then the checkbox is still disabled and focus() would do nothing.
-          requestAnimationFrame(() => consentRef.current?.focus());
-        }
-      }
+      setPhase("idle");
+      setChallenge(null);
+      onCaptured({ frames, reto: picked.code });
+      requestAnimationFrame(() => doneRef.current?.focus());
     } catch (e) {
       if (isAbort(e)) return;
       if (e instanceof CameraStopped) {
-        // Nothing was sent; keep the camera's own explanation ("turned off", "stopped") visible.
+        // Nothing was kept; the camera's own explanation ("turned off", "stopped") stays visible.
         setPhase("idle");
         setChallenge(null);
         return;
       }
       stop();
-      setError({
-        message: e instanceof ImageError ? e.message : "The liveness check could not be completed. Try again.",
-        action: "selfie",
-      });
+      setError(e instanceof ImageError ? e.message : "The liveness check could not be completed. Try again.");
       setPhase("error");
     }
   };
@@ -183,17 +186,21 @@ export function StepLiveness({
         ? "Get ready. Center your face in the oval."
         : phase === "challenge" && challenge
           ? `Now: ${challenge.text}.`
-          : phase === "submitting"
-            ? "Verifying your identity. This can take a few seconds."
-            : "";
+          : "";
 
   return (
-    <div className="space-y-5">
-      <section aria-labelledby="biometric-notice-title" className="space-y-2 rounded-lg border border-border bg-surface-2/60 p-4 text-sm">
-        <h3 id="biometric-notice-title" className="flex items-center gap-1.5 font-semibold text-ink">
-          <Lock className="size-4 text-accent" aria-hidden />
+    <section aria-labelledby="liveness-title" className="space-y-5" data-testid="liveness">
+      <h3 id="liveness-title" className="text-sm font-semibold text-ink">
+        Liveness check
+      </h3>
+      <div
+        aria-labelledby="biometric-notice-title"
+        className="space-y-2 border border-border bg-surface-2/60 p-4 text-sm"
+      >
+        <h4 id="biometric-notice-title" className="flex items-center gap-1.5 font-semibold text-ink">
+          <Lock className="size-4 text-synthetic-yellow" aria-hidden />
           Biometric data notice
-        </h3>
+        </h4>
         <p className="text-ink-2">
           To open your account remotely we must confirm that you are the person on the INE. Your camera takes a few
           frames of your face, which are compared with the photo on your credential. Under Mexico&apos;s personal data
@@ -217,15 +224,18 @@ export function StepLiveness({
           </li>
           <li>
             <span className="font-medium text-ink-2">How long:</span> anti-money-laundering rules require us to keep
-            identification records for at least 10 years after the relationship ends, so a cancellation request
-            cannot erase this audit record before then.
+            identification records for at least 10 years after the relationship ends, so a cancellation request cannot
+            erase this audit record before then.
           </li>
           <li>
-            <span className="font-medium text-ink-2">Your choice:</span> remote verification requires this consent;
-            if you do not give it, contact us to ask about alternatives. To get our full privacy notice (aviso de
+            <span className="font-medium text-ink-2">Your choice:</span> remote verification requires this consent; if
+            you do not give it, contact us to ask about alternatives. To get our full privacy notice (aviso de
             privacidad integral), exercise your ARCO rights (access, rectification, cancellation, opposition) or
             withdraw this consent, write to{" "}
-            <a href={`mailto:${COMPLIANCE_EMAIL}`} className="font-medium text-accent underline underline-offset-2">
+            <a
+              href={`mailto:${COMPLIANCE_EMAIL}`}
+              className="font-medium text-synthetic-yellow underline underline-offset-2"
+            >
               {COMPLIANCE_EMAIL}
             </a>
             .
@@ -233,167 +243,143 @@ export function StepLiveness({
         </ul>
         <label htmlFor="consentimiento" className="flex cursor-pointer items-start gap-2.5 pt-1 text-sm text-ink">
           <input
-            ref={consentRef}
             id="consentimiento"
             type="checkbox"
             checked={consent}
-            disabled={submitting}
-            onChange={(e) => {
-              setConsent(e.target.checked);
-              if (!e.target.checked) cancelRun();
-            }}
-            className="mt-0.5 size-4 shrink-0 accent-accent"
+            onChange={(e) => changeConsent(e.target.checked)}
+            className="mt-0.5 size-4 shrink-0 accent-synthetic-yellow"
           />
           <span>
             I consent to Synthetic Capital processing my biometric data (images of my face and of my INE) to verify my
             identity, as described above.
           </span>
         </label>
-      </section>
-
-      <div
-        className={cx(
-          "relative mx-auto aspect-[3/4] w-full max-w-72 overflow-hidden rounded-xl bg-black",
-          !previewOn && "bg-surface-2",
-        )}
-      >
-        <video
-          ref={videoRef}
-          className={cx("size-full -scale-x-100 object-cover", !previewOn && "invisible")}
-          playsInline
-          muted
-          autoPlay
-          aria-label="Camera preview (mirrored)"
-        />
-        {camera.status === "live" ? (
-          <div className="pointer-events-none absolute inset-0 flex items-center justify-center" aria-hidden>
-            <div
-              className={cx(
-                "aspect-[3/4] w-[62%] rounded-[50%] border-2 shadow-[0_0_0_9999px_rgba(0,0,0,0.5)] transition-colors",
-                phase === "challenge" ? "border-accent" : "border-white/90",
-              )}
-            />
-          </div>
-        ) : null}
-        {!previewOn ? (
-          <div className="absolute inset-0 flex flex-col items-center justify-center gap-2 px-6 text-center text-xs text-muted">
-            {problem ? <VideoOff className="size-7" aria-hidden /> : <ScanFace className="size-8" aria-hidden />}
-            {phase === "submitting" ? "Camera off. Verifying…" : "The camera turns on when you start the check."}
-          </div>
-        ) : null}
-        {camera.status === "starting" ? (
-          <div className="absolute inset-0 flex items-center justify-center gap-2 text-sm text-white/85" aria-hidden>
-            <Loader2 className="size-4 animate-spin" /> Starting camera…
-          </div>
-        ) : null}
-        {phase === "countdown" && camera.status === "live" ? (
-          <div className="absolute inset-x-0 top-0 flex flex-col items-center gap-0.5 bg-gradient-to-b from-black/70 to-transparent px-3 pt-3 pb-6 text-white" aria-hidden>
-            <span className="text-3xl font-semibold tabular-nums">{count}</span>
-            <span className="text-xs">Center your face in the oval</span>
-          </div>
-        ) : null}
-        {phase === "challenge" && challenge ? (
-          <div className="absolute inset-x-0 bottom-0 space-y-1.5 bg-black/70 px-3 py-3 text-center text-white" aria-hidden>
-            <p className="text-lg font-semibold">{challenge.text}</p>
-            <div className="flex justify-center gap-1.5">
-              {Array.from({ length: SELFIE_FRAMES }, (_, i) => (
-                <span key={i} className={cx("size-2 rounded-full", i < framesTaken ? "bg-accent" : "bg-white/35")} />
-              ))}
-            </div>
-          </div>
-        ) : null}
       </div>
 
-      <p className="sr-only" role="status" aria-live="polite">
-        {announcement}
-      </p>
-
-      {phase === "submitting" ? (
-        <div className="flex items-start gap-3 rounded-lg border border-info/30 bg-info-soft px-3 py-3 text-sm text-info">
-          <Loader2 className="mt-0.5 size-4 shrink-0 animate-spin" aria-hidden />
-          <div>
-            <p className="font-semibold">Verifying your identity…</p>
-            <p className="text-[13px]">
-              Uploading {SELFIE_FRAMES} frames and your INE photos, checking liveness and matching your face with your
-              credential. Do not close this page.
-            </p>
-          </div>
+      {captured ? (
+        <div
+          ref={doneRef}
+          tabIndex={-1}
+          className="flex flex-wrap items-center justify-between gap-3 border-2 border-synthetic-yellow bg-synthetic-yellow/[0.05] px-4 py-4 focus:outline-none"
+          data-testid="liveness-captured"
+        >
+          <p className="flex items-start gap-2.5 text-sm text-ink">
+            <CheckCircle2 className="mt-0.5 size-5 shrink-0 text-synthetic-yellow" aria-hidden />
+            <span>
+              <span className="block font-semibold">Liveness check complete</span>
+              <span className="block text-xs text-muted">
+                {captured.frames.length} frames captured. The camera is off; they are sent only when you submit.
+              </span>
+            </span>
+          </p>
+          <Button type="button" variant="secondary" size="sm" onClick={onRetake}>
+            <RotateCcw className="size-3.5" aria-hidden />
+            Retake
+          </Button>
         </div>
-      ) : null}
-
-      {problem ? (
-        <Alert tone="error" title={problem.title}>
-          {problem.message}
-        </Alert>
-      ) : null}
-
-      {error ? (
-        <Alert tone="error" title="Verification not submitted">
-          <p>{error.message}</p>
-          {error.action === "id" || error.action === "profile" ? (
-            <Button
-              type="button"
-              variant="secondary"
-              size="sm"
-              className="mt-2"
-              onClick={error.action === "id" ? onBack : onEditProfile}
-            >
-              {error.action === "id" ? "Edit ID details and photos" : "Edit personal data"}
-            </Button>
-          ) : null}
-          {error.action === "identity" ? (
-            <div className="mt-2 flex flex-wrap gap-2">
-              <Button type="button" variant="secondary" size="sm" onClick={onBack}>
-                Edit ID details
-              </Button>
-              <Button type="button" variant="secondary" size="sm" onClick={onEditProfile}>
-                Edit personal data
-              </Button>
-            </div>
-          ) : null}
-        </Alert>
-      ) : identityConflict ? (
-        <Alert tone="warning" title="Your identity details are already in use">
-          {IDENTITY_CONFLICT_RETRY}
-        </Alert>
-      ) : null}
-
-      {phase !== "submitting" ? (
-        <ul className="list-disc space-y-0.5 pl-4 text-xs text-muted">
-          <li>Face a light source; remove glasses, hats or masks.</li>
-          <li>Hold the camera at eye level and follow the instruction that appears.</li>
-        </ul>
-      ) : null}
-
-      {/* Stacked on narrow screens so the main button's label never overflows it. */}
-      <div className="flex flex-col-reverse gap-3 sm:flex-row">
-        <Button type="button" variant="secondary" size="lg" onClick={onBack} disabled={submitting}>
-          <ArrowLeft className="size-4" aria-hidden />
-          Back
-        </Button>
-        {phase === "starting" || phase === "countdown" || phase === "challenge" ? (
-          // Also while the camera starts: a permission prompt left unanswered must not trap the customer.
-          <Button type="button" variant="ghost" size="lg" className="sm:flex-1" onClick={cancelRun}>
-            {phase === "starting" ? <Loader2 className="size-4 animate-spin" aria-hidden /> : null}
-            Cancel
-          </Button>
-        ) : (
-          <Button
-            type="button"
-            size="lg"
-            className="sm:flex-1"
-            onClick={() => void run()}
-            disabled={!consent || busy || identityConflict}
-            loading={submitting}
+      ) : (
+        <>
+          <div
+            className={cx(
+              "relative mx-auto aspect-[3/4] w-full max-w-72 overflow-hidden border border-border bg-black",
+              !previewOn && "bg-surface-2",
+            )}
           >
-            {phase === "error" || problem ? <RotateCcw className="size-4" aria-hidden /> : <ScanFace className="size-4" aria-hidden />}
-            {phase === "error" || problem ? "Start liveness check again" : "Start liveness check"}
-          </Button>
-        )}
-      </div>
-      {!consent && !busy ? (
-        <p className="text-center text-xs text-muted">Check the consent box above to start.</p>
-      ) : null}
-    </div>
+            <video
+              ref={videoRef}
+              className={cx("size-full -scale-x-100 object-cover", !previewOn && "invisible")}
+              playsInline
+              muted
+              autoPlay
+              aria-label="Camera preview (mirrored)"
+            />
+            {camera.status === "live" ? (
+              <div className="pointer-events-none absolute inset-0 flex items-center justify-center" aria-hidden>
+                <div
+                  className={cx(
+                    "aspect-[3/4] w-[62%] rounded-[50%] border-2 shadow-[0_0_0_9999px_rgba(0,0,0,0.5)] transition-colors",
+                    phase === "challenge" ? "border-synthetic-yellow" : "border-white/90",
+                  )}
+                />
+              </div>
+            ) : null}
+            {!previewOn ? (
+              <div className="absolute inset-0 flex flex-col items-center justify-center gap-2 px-6 text-center text-xs text-muted">
+                {problem ? <VideoOff className="size-7" aria-hidden /> : <ScanFace className="size-8" aria-hidden />}
+                The camera turns on when you start the check.
+              </div>
+            ) : null}
+            {camera.status === "starting" ? (
+              <div
+                className="absolute inset-0 flex items-center justify-center gap-2 text-sm text-white/85"
+                aria-hidden
+              >
+                <Loader2 className="size-4 animate-spin" /> Starting camera…
+              </div>
+            ) : null}
+            {phase === "countdown" && camera.status === "live" ? (
+              <div
+                className="absolute inset-x-0 top-0 flex flex-col items-center gap-0.5 bg-gradient-to-b from-black/70 to-transparent px-3 pt-3 pb-6 text-white"
+                aria-hidden
+              >
+                <span className="text-3xl font-semibold tabular-nums">{count}</span>
+                <span className="text-xs">Center your face in the oval</span>
+              </div>
+            ) : null}
+            {phase === "challenge" && challenge ? (
+              <div
+                className="absolute inset-x-0 bottom-0 space-y-1.5 bg-black/70 px-3 py-3 text-center text-white"
+                aria-hidden
+              >
+                <p className="text-lg font-semibold">{challenge.text}</p>
+                <div className="flex justify-center gap-1.5">
+                  {Array.from({ length: SELFIE_FRAMES }, (_, i) => (
+                    <span key={i} className={cx("size-2", i < framesTaken ? "bg-synthetic-yellow" : "bg-white/35")} />
+                  ))}
+                </div>
+              </div>
+            ) : null}
+          </div>
+
+          <p className="sr-only" role="status" aria-live="polite">
+            {announcement}
+          </p>
+
+          {problem ? (
+            <Alert tone="error" title={problem.title}>
+              {problem.message}
+            </Alert>
+          ) : null}
+          {error ? (
+            <Alert tone="error" title="Liveness check not completed">
+              {error}
+            </Alert>
+          ) : null}
+
+          <ul className="list-disc space-y-0.5 pl-4 text-xs text-muted">
+            <li>Face a light source; remove glasses, hats or masks.</li>
+            <li>Hold the camera at eye level and follow the instruction that appears.</li>
+          </ul>
+
+          {busy ? (
+            // Also while the camera starts: a permission prompt left unanswered must not trap the customer.
+            <Button type="button" variant="secondary" size="lg" className="w-full" onClick={cancelRun}>
+              {phase === "starting" ? <Loader2 className="size-4 animate-spin" aria-hidden /> : null}
+              Cancel
+            </Button>
+          ) : (
+            <Button type="button" size="lg" className="w-full" onClick={() => void run()} disabled={!consent}>
+              {phase === "error" || problem ? (
+                <RotateCcw className="size-4" aria-hidden />
+              ) : (
+                <ScanFace className="size-4" aria-hidden />
+              )}
+              {phase === "error" || problem ? "Start liveness check again" : "Start liveness check"}
+            </Button>
+          )}
+          {!consent ? <p className="text-center text-xs text-muted">Check the consent box above to start.</p> : null}
+        </>
+      )}
+    </section>
   );
 }

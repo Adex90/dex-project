@@ -1,7 +1,7 @@
 "use client";
 
-import { useMemo, useRef, useState, type ChangeEvent } from "react";
-import { ArrowLeft, ArrowRight, Camera, CheckCircle2, IdCard, Loader2, Upload } from "lucide-react";
+import { useMemo, useRef, useState, type ChangeEvent, type DragEvent } from "react";
+import { ArrowLeft, ArrowRight, BookOpen, Camera, CheckCircle2, IdCard, Loader2, Upload } from "lucide-react";
 
 import { Alert, Button, cx } from "@/components/ui/primitives";
 import { cleanIdInput, todayInMexicoCity, type CredentialField, type ParsedCurp } from "@/lib/kyc";
@@ -46,7 +46,12 @@ const COMPLETE_AT: Record<CredentialField, number> = {
   vigencia: 4,
 };
 
-/** Step 2: both sides of the voting credential and its typed data. */
+/**
+ * Step 2: the official ID. The INE (voting credential): both sides, by camera,
+ * upload or drag and drop, previewed at once (re-encoded in the browser), and
+ * its printed details. A passport is shown but not offered yet: remote
+ * verification checks the INE, and the backend verifies no other document.
+ */
 export function StepIne({
   curp,
   draft,
@@ -118,6 +123,44 @@ export function StepIne({
           </p>
         </Alert>
       ) : null}
+
+      <fieldset>
+        <legend className="mb-3 text-sm font-semibold text-ink">Document</legend>
+        <div className="grid gap-2 sm:grid-cols-2">
+          <label className="flex items-start gap-3 border-2 border-synthetic-yellow bg-synthetic-yellow/[0.05] p-4">
+            <input type="radio" name="documento" value="INE" checked readOnly className="sr-only" />
+            <IdCard className="mt-0.5 size-5 shrink-0 text-synthetic-yellow" aria-hidden />
+            <span className="min-w-0">
+              <span className="block text-sm font-semibold text-ink">INE</span>
+              <span className="block text-xs text-muted">Voting credential: front and back</span>
+            </span>
+          </label>
+          <label className="flex cursor-not-allowed items-start gap-3 border-2 border-dashed border-border p-4 opacity-60">
+            <input
+              type="radio"
+              name="documento"
+              value="PASAPORTE"
+              disabled
+              aria-describedby="documento-pasaporte-nota"
+              className="sr-only"
+            />
+            <BookOpen className="mt-0.5 size-5 shrink-0 text-muted" aria-hidden />
+            <span className="min-w-0">
+              <span className="flex items-center gap-2 text-sm font-semibold text-ink">
+                Passport
+                <span className="border border-border-strong px-1.5 py-px text-[10px] font-semibold tracking-[0.14em] text-muted uppercase">
+                  Not yet
+                </span>
+              </span>
+              <span className="block text-xs text-muted">Photo page</span>
+            </span>
+          </label>
+        </div>
+        <p id="documento-pasaporte-nota" className="mt-2 text-xs text-muted" data-testid="passport-note">
+          Remote verification checks your INE against the electoral registry. Passport verification is coming; for now,
+          use your INE.
+        </p>
+      </fieldset>
 
       <fieldset className="space-y-4">
         <legend className="mb-1 text-sm font-semibold text-ink">Photos of your credential</legend>
@@ -259,6 +302,7 @@ function IdSide({
   const fileRef = useRef<HTMLInputElement>(null);
   const cameraButtonRef = useRef<HTMLButtonElement>(null);
   const [busy, setBusy] = useState(false);
+  const [dragging, setDragging] = useState(false);
   const [uploadError, setUploadError] = useState<string | null>(null);
   // Polite screen-reader announcement: processing, captured, replaced.
   const [announcement, setAnnouncement] = useState("");
@@ -279,7 +323,20 @@ function IdSide({
     const file = event.target.files?.[0];
     // Reset so choosing the same file again still fires a change.
     event.target.value = "";
-    if (!file) return;
+    if (file) await processFile(file);
+  };
+
+  /** A photo dragged onto the card: the same path as an upload. */
+  const carriesFile = (event: DragEvent) => Array.from(event.dataTransfer.types).includes("Files");
+  const onDrop = (event: DragEvent<HTMLDivElement>) => {
+    if (!carriesFile(event)) return;
+    event.preventDefault();
+    setDragging(false);
+    const file = event.dataTransfer.files[0];
+    if (file && !busy && !cameraOpen) void processFile(file);
+  };
+
+  const processFile = async (file: File) => {
     setBusy(true);
     setUploadError(null);
     setAnnouncement("Processing photo…");
@@ -298,13 +355,35 @@ function IdSide({
       role="group"
       aria-labelledby={titleId}
       aria-describedby={message ? messageId : undefined}
-      className={cx("space-y-3 rounded-lg border p-3", message ? "border-danger/50" : "border-border")}
+      onDragOver={(event) => {
+        if (!carriesFile(event) || busy || cameraOpen) return;
+        event.preventDefault();
+        setDragging(true);
+      }}
+      onDragLeave={() => setDragging(false)}
+      onDrop={onDrop}
+      className={cx(
+        "space-y-4 border-2 p-4 transition-colors",
+        dragging
+          ? "border-dashed border-synthetic-yellow bg-synthetic-yellow/[0.05]"
+          : message
+            ? "border-dashed border-danger/60"
+            : value
+              ? "border-border-strong"
+              : "border-dashed border-border-strong",
+      )}
+      data-testid={`ine-${side}-dropzone`}
+      data-captured={value !== null}
     >
-      <div className="flex items-start gap-3">
-        <div className="flex h-16 w-24 shrink-0 items-center justify-center overflow-hidden rounded-md border border-dashed border-border-strong bg-surface-2">
+      <div className="flex items-start gap-4">
+        <div className="flex aspect-[86/54] w-32 shrink-0 items-center justify-center overflow-hidden border border-border-strong bg-surface-2 sm:w-40">
           {value ? (
             // eslint-disable-next-line @next/next/no-img-element -- local data URL, nothing to optimize
-            <img src={value} alt={`Captured ${info.title.toLowerCase()} of your INE`} className="size-full object-cover" />
+            <img
+              src={value}
+              alt={`Captured ${info.title.toLowerCase()} of your INE`}
+              className="size-full object-cover"
+            />
           ) : busy ? (
             <Loader2 className="size-5 animate-spin text-muted" aria-hidden />
           ) : (
@@ -322,6 +401,9 @@ function IdSide({
             ) : null}
           </p>
           <p className="text-xs text-muted">{busy ? "Processing photo…" : info.contents}</p>
+          {!value && !busy ? (
+            <p className="mt-2 hidden text-xs text-ink-2 sm:block">Drop a photo here, or use the buttons below.</p>
+          ) : null}
         </div>
       </div>
 

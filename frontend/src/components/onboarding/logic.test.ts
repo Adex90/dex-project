@@ -1,6 +1,7 @@
 /**
- * Onboarding wizard logic: resume step, step routing, form mapping, credential
- * checks against the CURP of step 1, image sizing and error copy.
+ * Verification wizard logic: resume step, step routing, form mapping, credential
+ * checks against the CURP of step 1, the declarations of step 3, image sizing
+ * and error copy.
  *
  * Run with: npm test   (Node >= 22.18 strips TypeScript types natively)
  */
@@ -16,9 +17,13 @@ import {
   identityKey,
   PROFILE_FIELDS,
   PROFILE_INPUT_IDS,
+  EMPTY_DECLARATIONS,
+  SOURCES_OF_FUNDS,
   canRetry,
   canVisitStep,
   checkCredentialDraft,
+  checkDeclarations,
+  declarationsFromFile,
   checkIneImages,
   describeCameraProblem,
   duplicateIndexes,
@@ -35,6 +40,7 @@ import {
   profileInputFromForm,
   profileProblem,
   resumeStep,
+  sourceOfFundsLabel,
   splitDetails,
   statusHeadline,
   verificationProblem,
@@ -87,6 +93,11 @@ function expediente(overrides: Partial<ExpedienteKyc> = {}): ExpedienteKyc {
     revisado_por: null,
     creado_en: "2026-10-14T10:00:00Z",
     actualizado_en: "2026-10-14T10:00:00Z",
+    ocupacion: null,
+    origen_recursos: null,
+    declara_pep: null,
+    contratos_version: null,
+    contratos_aceptados_en: null,
     ...overrides,
   };
 }
@@ -97,6 +108,7 @@ function vista(overrides: Partial<VistaExpediente> = {}): VistaExpediente {
     tipo_persona: "FISICA",
     estatus_cliente: "PENDIENTE",
     max_intentos: 3,
+    contratos_vigentes: "2026-11",
     intentos_restantes: 3,
     bloqueo: null,
     ultimo_resultado: null,
@@ -112,26 +124,82 @@ test("resume: step 1 until the profile (with address) is saved, then step 2; sta
   assert.equal(resumeStep(expediente({ curp: "LOOA531113HTCPBN08" })), 1);
   assert.equal(resumeStep(expediente()), 2);
   for (const estado of ["EN_REVISION", "VERIFICADO", "RECHAZADO"] as const) {
-    assert.equal(resumeStep(expediente({ estado_kyc: estado, domicilio: {} })), 4);
+    assert.equal(resumeStep(expediente({ estado_kyc: estado, domicilio: {} })), "status");
   }
   assert.equal(isProfileSaved(expediente({ apellido_paterno: null })), false);
 });
 
-test("routing: steps 2-4 need what comes before them; a closed file only has the status page", () => {
-  const base = { estado_kyc: "PENDIENTE" as const, profileSaved: true, ineReady: true, hasAttempt: false };
-  assert.equal(effectiveStep(3, base), 3);
+test("routing: each step needs what comes before it; a closed file only has the status page", () => {
+  const base = {
+    estado_kyc: "PENDIENTE" as const,
+    profileSaved: true,
+    ineReady: true,
+    livenessReady: true,
+    hasAttempt: false,
+  };
+  assert.equal(effectiveStep(4, base), 4);
+  assert.equal(effectiveStep(4, { ...base, livenessReady: false }), 3);
+  assert.equal(effectiveStep(4, { ...base, ineReady: false }), 2);
   assert.equal(effectiveStep(3, { ...base, ineReady: false }), 2);
   assert.equal(effectiveStep(2, { ...base, profileSaved: false }), 1);
-  assert.equal(effectiveStep(3, { ...base, profileSaved: false }), 1);
-  assert.equal(effectiveStep(4, { ...base, profileSaved: false }), 4);
-  assert.equal(effectiveStep(1, { ...base, estado_kyc: "EN_REVISION" }), 4);
-  assert.equal(effectiveStep(2, { ...base, estado_kyc: "VERIFICADO" }), 4);
+  assert.equal(effectiveStep(4, { ...base, profileSaved: false }), 1);
+  assert.equal(effectiveStep("status", { ...base, profileSaved: false }), "status");
+  assert.equal(effectiveStep(1, { ...base, estado_kyc: "EN_REVISION" }), "status");
+  assert.equal(effectiveStep(4, { ...base, estado_kyc: "VERIFICADO" }), "status");
 
   assert.equal(canVisitStep(1, base), true);
   assert.equal(canVisitStep(3, { ...base, ineReady: false }), false);
-  assert.equal(canVisitStep(4, base), false);
-  assert.equal(canVisitStep(4, { ...base, hasAttempt: true }), true);
+  assert.equal(canVisitStep(4, { ...base, livenessReady: false }), false);
+  assert.equal(canVisitStep(4, base), true);
+  assert.equal(canVisitStep("status", base), false);
+  assert.equal(canVisitStep("status", { ...base, hasAttempt: true }), true);
   assert.equal(canVisitStep(1, { ...base, estado_kyc: "RECHAZADO" }), false);
+  assert.equal(canVisitStep("status", { ...base, estado_kyc: "RECHAZADO" }), true);
+});
+
+test("declarations: all three are required, and the occupation is cleaned like the backend does", () => {
+  assert.deepEqual(checkDeclarations(EMPTY_DECLARATIONS).input, null);
+  assert.deepEqual(Object.keys(checkDeclarations(EMPTY_DECLARATIONS).errors).sort(), [
+    "declara_pep",
+    "ocupacion",
+    "origen_recursos",
+  ]);
+  const ok = checkDeclarations({ ocupacion: "  Ingeniera   civil ", origen_recursos: "SALARIO", declara_pep: false });
+  assert.deepEqual(ok, {
+    input: { ocupacion: "Ingeniera civil", origen_recursos: "SALARIO", declara_pep: false },
+    errors: {},
+  });
+  // "No" is an answer; only an unanswered question is missing.
+  assert.equal(
+    checkDeclarations({ ocupacion: "Chef", origen_recursos: "NEGOCIO_PROPIO", declara_pep: true }).input?.declara_pep,
+    true,
+  );
+  for (const ocupacion of ["", " ", "x", "1234", "a".repeat(121)]) {
+    assert.ok(
+      checkDeclarations({ ocupacion, origen_recursos: "SALARIO", declara_pep: false }).errors.ocupacion,
+      ocupacion,
+    );
+  }
+  // A retry starts from what the last submission declared.
+  assert.deepEqual(
+    declarationsFromFile(expediente({ ocupacion: "Chef", origen_recursos: "INVERSIONES", declara_pep: false })),
+    { ocupacion: "Chef", origen_recursos: "INVERSIONES", declara_pep: false },
+  );
+  assert.deepEqual(declarationsFromFile(expediente()), EMPTY_DECLARATIONS);
+  // The catalog is the backend's, with English labels.
+  assert.equal(SOURCES_OF_FUNDS.length, 8);
+  assert.equal(sourceOfFundsLabel("HERENCIA_O_DONACION"), "Inheritance or gift");
+  assert.equal(sourceOfFundsLabel(""), "—");
+});
+
+test("refusals of the declarations and the agreements send the customer to the right step", () => {
+  assert.equal(verificationProblem("KYC_SIN_ACEPTACION", "")?.action, "agreements");
+  assert.equal(verificationProblem("KYC_CONTRATOS_DESACTUALIZADOS", "")?.action, "agreements");
+  assert.equal(verificationProblem("KYC_DECLARACIONES_INCOMPLETAS", "")?.action, "declarations");
+  assert.equal(verificationProblem("VALIDACION", "ocupacion: describe tu ocupación")?.action, "declarations");
+  assert.equal(verificationProblem("VALIDACION", "contratos.documentos admite solo ...")?.action, "agreements");
+  // The rest keep their routes.
+  assert.equal(verificationProblem("VALIDACION", "ine.frente: la imagen debe pesar entre 1 KB y 3 MB")?.action, "id");
 });
 
 test("retry and headline follow the attempts left", () => {
@@ -362,4 +430,24 @@ test("status page formatting", () => {
   ]);
   assert.deepEqual(split.errors, ["The credential is not valid: front and back are the same image."]);
   assert.deepEqual(split.warnings, ["texto libre de un operador"]);
+});
+
+test("agreements: all three, in the version in force, or nothing is accepted", async () => {
+  const { AGREEMENTS, acceptanceFor } = await import("./agreements.ts");
+  assert.deepEqual(
+    AGREEMENTS.map((a) => a.id),
+    ["CONTRATO_CUENTA", "AVISO_PRIVACIDAD", "DECLARACION_VERACIDAD"],
+  );
+  const all = new Set(AGREEMENTS.map((a) => a.id));
+  assert.deepEqual(acceptanceFor("2026-11", all), {
+    version: "2026-11",
+    documentos: ["CONTRATO_CUENTA", "AVISO_PRIVACIDAD", "DECLARACION_VERACIDAD"],
+  });
+  assert.equal(acceptanceFor("2026-11", new Set(["CONTRATO_CUENTA", "AVISO_PRIVACIDAD"] as const)), null);
+  // Nothing on a client screen may use the words of an AML hold (e2e/aml.mjs TIP_OFF).
+  const tipOff =
+    /\b(compliance hold|compliance review|frozen|freeze|restrict\w*|AML|PLD|suspicious|alert|congel\w*|preventiv\w*|UIF|investigat\w*|risk)\b/i;
+  for (const a of AGREEMENTS) {
+    for (const text of [a.title, a.accept, ...a.points]) assert.doesNotMatch(text, tipOff, text);
+  }
 });

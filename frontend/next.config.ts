@@ -7,6 +7,10 @@ const nextConfig: NextConfig = {
   output: process.env.NEXT_OUTPUT === "standalone" ? "standalone" : undefined,
   reactStrictMode: true,
   poweredByHeader: false,
+  // Identity verification moved into the dashboard (roadmap #18): old links still land on it.
+  async redirects() {
+    return [{ source: "/auth/onboarding", destination: "/dashboard/verify", permanent: false }];
+  },
   async headers() {
     return [
       {
@@ -15,11 +19,11 @@ const nextConfig: NextConfig = {
           { key: "X-Frame-Options", value: "DENY" },
           { key: "X-Content-Type-Options", value: "nosniff" },
           { key: "Referrer-Policy", value: "strict-origin-when-cross-origin" },
-          // camera=(self): the onboarding wizard (/auth/onboarding) photographs the
-          // INE and takes the liveness selfie. It must hold for every page, not
+          // camera=(self): the verification wizard (/dashboard/verify) photographs
+          // the INE and runs the liveness check. It must hold for every page, not
           // only that route: a document keeps the policy it was loaded with, so
-          // after a client-side navigation (e.g. dashboard -> onboarding) a
-          // route-scoped header would never apply. Third-party frames still get
+          // after a client-side navigation (e.g. Vault -> verify) a route-scoped
+          // header would never apply. Third-party frames still get
           // no camera, and the browser still asks the user for permission.
           { key: "Permissions-Policy", value: "camera=(self), microphone=(), geolocation=()" },
         ],

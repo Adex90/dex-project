@@ -7,6 +7,7 @@ import { DashboardHeader } from "@/components/dashboard/dashboard-header";
 import { KycBanner, isKycLocked } from "@/components/dashboard/kyc-status";
 import { Navigation, activeItem, resetNavOrigin, useNavOrigin } from "@/components/layout/navigation";
 import { Alert, Button } from "@/components/ui/primitives";
+import { ONBOARDING_PATH } from "@/hooks/use-client-home";
 import { useDashboardData } from "@/hooks/use-dashboard-data";
 import { useSession } from "@/hooks/use-session";
 import { useVaultData } from "@/hooks/use-vault-data";
@@ -23,8 +24,8 @@ import { displayedRealtime, useVaultStore } from "@/store/vault";
 
 /*
  * The dashboard's frame, shared by every tab (Vault, Discover, Account,
- * Invest, Reserve) and the asset pages: the navigation, the header, the load
- * errors and the KYC banner.
+ * Invest, Reserve), the asset pages and identity verification: the
+ * navigation, the header, the load errors and the KYC banner.
  *
  * It owns the data: the summary, the ledger and the vault load once here and
  * stay in their stores while the client moves between tabs, so switching
@@ -105,13 +106,15 @@ export function DashboardShell({ children }: { children: ReactNode }) {
 
   if (!context) return null;
   const section = activeItem(pathname, origin);
+  // The verification wizard is the banner's destination: it does not repeat it.
+  const verifying = pathname === ONBOARDING_PATH;
 
   return (
     <DashboardContext value={context}>
       <Navigation />
       <div className="lg:pl-60">
         <DashboardHeader
-          title={section?.label ?? "Dashboard"}
+          title={verifying ? "Verify identity" : (section?.label ?? "Dashboard")}
           client={client}
           realtime={realtime}
           lastUpdated={lastUpdated}
@@ -132,7 +135,7 @@ export function DashboardShell({ children }: { children: ReactNode }) {
           {error && summary ? (
             <Alert tone="warning">Showing the last data received. {describeError(error)}</Alert>
           ) : null}
-          {client && kycLocked ? <KycBanner client={client} token={context.token} /> : null}
+          {client && kycLocked && !verifying ? <KycBanner client={client} token={context.token} /> : null}
           {children}
         </main>
       </div>

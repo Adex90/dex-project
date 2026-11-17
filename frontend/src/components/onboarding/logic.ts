@@ -1,7 +1,8 @@
 /**
- * Pure helpers of the onboarding wizard (no React, no DOM), so `node --test`
+ * Pure helpers of the verification wizard (no React, no DOM), so `node --test`
  * can import them: where to resume, form <-> API mapping, image sizing, the
- * liveness challenges and the English copy for camera and server errors.
+ * liveness challenges, the declarations of step 3 and the English copy for
+ * camera and server errors.
  *
  * The Mexican ID rules themselves live in src/lib/kyc.ts (ported from the
  * backend); this module only adapts them to the wizard's forms.
@@ -9,9 +10,11 @@
 import type {
   BloqueoKyc,
   DatosPersonalesInput,
+  Declaraciones,
   DetalleKyc,
   EstadoKyc,
   ExpedienteKyc,
+  OrigenRecursos,
   VistaExpediente,
 } from "../../lib/api/types.ts";
 import type { CredentialField, CredentialInput, ParsedCurp, ProfileField } from "../../lib/kyc.ts";
@@ -30,22 +33,39 @@ import {
 // Steps
 // -----------------------------------------------------------------------------
 
+/** The four steps a customer fills in. */
 export type Step = 1 | 2 | 3 | 4;
+
+/** What the wizard shows: a step, or the status page once a verification was submitted. */
+export type View = Step | "status";
 
 export interface StepInfo {
   n: Step;
-  /** Short label for the stepper. */
+  /** Short label for the progress bar. */
   label: string;
   /** Heading of the step. */
   title: string;
 }
 
 export const STEPS: readonly StepInfo[] = [
-  { n: 1, label: "Personal data", title: "Personal data" },
-  { n: 2, label: "ID (INE)", title: "Your voting credential (INE)" },
-  { n: 3, label: "Liveness selfie", title: "Liveness selfie" },
-  { n: 4, label: "Status", title: "Verification status" },
+  { n: 1, label: "Identity", title: "Personal and fiscal identity" },
+  { n: 2, label: "ID document", title: "Your official ID" },
+  { n: 3, label: "Liveness & funds", title: "Liveness and source of funds" },
+  { n: 4, label: "Review & sign", title: "Review and sign" },
 ];
+
+/** What decides which steps are open (see `effectiveStep`). */
+export interface RoutingState {
+  estado_kyc: EstadoKyc;
+  /** Step 1 is saved on the server. */
+  profileSaved: boolean;
+  /** Both photos of the ID and its details are complete (step 2). */
+  ineReady: boolean;
+  /** The liveness frames are captured and the declarations are complete (step 3). */
+  livenessReady: boolean;
+  /** A verification was submitted before: the status page has something to show. */
+  hasAttempt: boolean;
+}
 
 type ProfileColumns = Pick<ExpedienteKyc, "nombres" | "apellido_paterno" | "curp" | "rfc" | "domicilio">;
 
@@ -66,32 +86,28 @@ export function isProfileSaved(file: ProfileColumns): boolean {
 }
 
 /** Where the wizard resumes: step 1 or 2 while PENDIENTE, the status page otherwise. */
-export function resumeStep(file: ProfileColumns & Pick<ExpedienteKyc, "estado_kyc">): Step {
-  if (file.estado_kyc !== "PENDIENTE") return 4;
+export function resumeStep(file: ProfileColumns & Pick<ExpedienteKyc, "estado_kyc">): View {
+  if (file.estado_kyc !== "PENDIENTE") return "status";
   return isProfileSaved(file) ? 2 : 1;
 }
 
 /**
- * The step actually shown for the one requested: a file that is no longer
- * PENDIENTE only has the status page; steps 2-3 need step 1 saved; step 3
- * needs the INE photos and data of step 2.
+ * The view actually shown for the one requested: a file that is no longer
+ * PENDIENTE only has the status page; each step needs the ones before it
+ * (step 2 the saved profile, step 3 the ID, step 4 the liveness frames and
+ * the declarations).
  */
-export function effectiveStep(
-  requested: Step,
-  file: { estado_kyc: EstadoKyc; profileSaved: boolean; ineReady: boolean },
-): Step {
-  if (file.estado_kyc !== "PENDIENTE") return 4;
-  if ((requested === 2 || requested === 3) && !file.profileSaved) return 1;
-  if (requested === 3 && !file.ineReady) return 2;
+export function effectiveStep(requested: View, file: Omit<RoutingState, "hasAttempt">): View {
+  if (file.estado_kyc !== "PENDIENTE" || requested === "status") return "status";
+  if (requested >= 2 && !file.profileSaved) return 1;
+  if (requested >= 3 && !file.ineReady) return 2;
+  if (requested === 4 && !file.livenessReady) return 3;
   return requested;
 }
 
-/** Steps the stepper lets the customer jump to (besides the current one). */
-export function canVisitStep(
-  step: Step,
-  file: { estado_kyc: EstadoKyc; profileSaved: boolean; ineReady: boolean; hasAttempt: boolean },
-): boolean {
-  if (file.estado_kyc !== "PENDIENTE") return step === 4;
+/** Views the progress bar lets the customer jump to (besides the current one). */
+export function canVisitStep(step: View, file: RoutingState): boolean {
+  if (file.estado_kyc !== "PENDIENTE") return step === "status";
   switch (step) {
     case 1:
       return true;
@@ -100,6 +116,8 @@ export function canVisitStep(
     case 3:
       return file.profileSaved && file.ineReady;
     case 4:
+      return file.profileSaved && file.ineReady && file.livenessReady;
+    case "status":
       return file.hasAttempt;
   }
 }
@@ -536,7 +554,16 @@ export function pickChallenge(random: number): Challenge {
  * "identity": the declared identity is in use elsewhere, so edit the CURP,
  * RFC or voter key before retrying.
  */
-export type VerificationAction = "status" | "profile" | "id" | "identity" | "selfie" | "consent" | null;
+export type VerificationAction =
+  | "status"
+  | "profile"
+  | "id"
+  | "identity"
+  | "selfie"
+  | "consent"
+  | "declarations"
+  | "agreements"
+  | null;
 
 export interface VerificationProblem {
   message: string;
@@ -549,10 +576,23 @@ export interface VerificationProblem {
 export function verificationProblem(code: string, mensaje: string): VerificationProblem | null {
   switch (code) {
     case "VALIDACION": {
+      if (/ocupacion|origen_recursos|declaraciones/.test(mensaje)) {
+        return { message: DECLARATIONS_INVALID, action: "declarations" };
+      }
+      if (/contratos/.test(mensaje)) return { message: AGREEMENTS_OUTDATED, action: "agreements" };
       const message = kycMessageInEnglish(mensaje) ?? mensaje;
       const selfie = /selfie|cuadros de la cámara|prueba de vida/.test(mensaje) && !/ine\.(frente|reverso)/.test(mensaje);
       return { message, action: selfie ? "selfie" : "id" };
     }
+    case "KYC_DECLARACIONES_INCOMPLETAS":
+      return { message: DECLARATIONS_INVALID, action: "declarations" };
+    case "KYC_SIN_ACEPTACION":
+      return {
+        message: "Accept the account agreement, the privacy notice and the sworn statement to submit.",
+        action: "agreements",
+      };
+    case "KYC_CONTRATOS_DESACTUALIZADOS":
+      return { message: AGREEMENTS_OUTDATED, action: "agreements" };
     case "KYC_SIN_CONSENTIMIENTO":
       return {
         message: "To verify your identity we need your explicit consent to process your biometric data.",
@@ -580,8 +620,81 @@ export function verificationProblem(code: string, mensaje: string): Verification
   }
 }
 
+const DECLARATIONS_INVALID =
+  "Complete your occupation, the source of your funds and the politically exposed person question (step 3).";
+const AGREEMENTS_OUTDATED = "Our agreements were updated. Read them again and accept the new version to submit.";
+
 // -----------------------------------------------------------------------------
-// Step 4: status
+// Step 3: declarations (migration 0017)
+// -----------------------------------------------------------------------------
+
+/** The backend's catalog (`kyc.kyc_perfiles.origen_recursos`), in the order offered. */
+export const SOURCES_OF_FUNDS: readonly { value: OrigenRecursos; label: string }[] = [
+  { value: "SALARIO", label: "Salary or wages" },
+  { value: "NEGOCIO_PROPIO", label: "My own business" },
+  { value: "HONORARIOS", label: "Professional fees (self-employed)" },
+  { value: "INVERSIONES", label: "Investment returns" },
+  { value: "PENSION", label: "Pension or retirement" },
+  { value: "HERENCIA_O_DONACION", label: "Inheritance or gift" },
+  { value: "VENTA_DE_BIENES", label: "Sale of property or other assets" },
+  { value: "APOYO_FAMILIAR", label: "Support from my family" },
+];
+
+export interface DeclarationsDraft {
+  ocupacion: string;
+  origen_recursos: OrigenRecursos | "";
+  /** null until answered: there is no default answer. */
+  declara_pep: boolean | null;
+}
+
+export type DeclarationField = keyof DeclarationsDraft;
+
+export const EMPTY_DECLARATIONS: DeclarationsDraft = { ocupacion: "", origen_recursos: "", declara_pep: null };
+
+/** Element ids, to move the focus to a field with a problem. */
+export const DECLARATION_INPUT_IDS: Record<DeclarationField, string> = {
+  ocupacion: "ocupacion",
+  origen_recursos: "origen-recursos",
+  declara_pep: "declara-pep-no",
+};
+
+/** What a previous submission declared (a retry starts from it). */
+export function declarationsFromFile(
+  file: Partial<Pick<ExpedienteKyc, "ocupacion" | "origen_recursos" | "declara_pep">> | null,
+): DeclarationsDraft {
+  return {
+    ocupacion: file?.ocupacion ?? "",
+    origen_recursos: file?.origen_recursos ?? "",
+    declara_pep: file?.declara_pep ?? null,
+  };
+}
+
+/** The declarations as the API takes them, or why not (the backend's rules: 2 to 120 characters, with letters). */
+export function checkDeclarations(draft: DeclarationsDraft): {
+  input: Declaraciones | null;
+  errors: Partial<Record<DeclarationField, string>>;
+} {
+  const errors: Partial<Record<DeclarationField, string>> = {};
+  const ocupacion = draft.ocupacion.trim().replace(/\s+/g, " ");
+  if (ocupacion.length < 2 || !/\p{L}/u.test(ocupacion)) {
+    errors.ocupacion = "Tell us your occupation, for example \u201cCivil engineer\u201d.";
+  } else if (ocupacion.length > 120) {
+    errors.ocupacion = "Use at most 120 characters.";
+  }
+  if (draft.origen_recursos === "") errors.origen_recursos = "Choose where the money you will deposit comes from.";
+  if (draft.declara_pep === null) errors.declara_pep = "Answer whether you are a politically exposed person.";
+  if (Object.keys(errors).length > 0 || draft.origen_recursos === "" || draft.declara_pep === null) {
+    return { input: null, errors };
+  }
+  return { input: { ocupacion, origen_recursos: draft.origen_recursos, declara_pep: draft.declara_pep }, errors };
+}
+
+export function sourceOfFundsLabel(value: OrigenRecursos | "" | null | undefined): string {
+  return SOURCES_OF_FUNDS.find((s) => s.value === value)?.label ?? "—";
+}
+
+// -----------------------------------------------------------------------------
+// Status page
 // -----------------------------------------------------------------------------
 
 /** "0.9300" -> "93.0%"; null or garbage -> null. */
@@ -639,7 +752,7 @@ export function statusHeadline(
     case "VERIFICADO":
       return {
         title: "Your identity is verified",
-        body: "Deposits, transfers, withdrawals and fixed-term investments are now enabled on your account.",
+        body: "Deposits, withdrawals, trading and fixed-term investments are now enabled on your account.",
       };
     case "EN_REVISION":
       return {

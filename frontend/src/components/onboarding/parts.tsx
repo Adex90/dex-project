@@ -5,31 +5,34 @@ import { Check, XCircle } from "lucide-react";
 
 import { Input, cx } from "@/components/ui/primitives";
 
-import { STEPS, type Step } from "./logic";
+import { STEPS, type Step, type View } from "./logic";
 
 // -----------------------------------------------------------------------------
-// Stepper
+// Progress
 // -----------------------------------------------------------------------------
 
 /**
- * Progress through the four steps. The current step carries
- * aria-current="step"; earlier steps the customer may revisit are buttons.
+ * Progress through the four steps: a gold bar in four segments, gold up to
+ * the current step, with each step's number and label under it (labels from
+ * sm up; on a phone the step's own heading says where you are). The current
+ * step carries aria-current="step"; steps the customer may revisit are
+ * buttons.
  */
-export function Stepper({
+export function Progress({
   current,
   canVisit,
-  isDone = (step) => step < current,
+  isDone,
   onVisit,
 }: {
-  current: Step;
+  current: View;
   canVisit: (step: Step) => boolean;
-  /** Whether a step is shown as completed (default: every step before the current one). */
-  isDone?: (step: Step) => boolean;
+  /** Whether a step is shown as completed. */
+  isDone: (step: Step) => boolean;
   onVisit: (step: Step) => void;
 }) {
   return (
-    <nav aria-label="Verification steps">
-      <ol className="grid grid-cols-4 gap-1">
+    <nav aria-label="Verification steps" data-testid="verify-progress">
+      <ol className="grid grid-cols-4 gap-1.5">
         {STEPS.map(({ n, label }) => {
           const isCurrent = n === current;
           const done = !isCurrent && isDone(n);
@@ -37,49 +40,49 @@ export function Stepper({
           const content = (
             <>
               <span
-                className={cx(
-                  "flex size-7 items-center justify-center rounded-full border text-xs font-semibold tabular-nums transition",
-                  isCurrent && "border-accent bg-accent text-accent-ink shadow-sm",
-                  done && "border-verified/40 bg-verified-soft text-verified",
-                  !isCurrent && !done && "border-border-strong bg-surface text-muted",
-                )}
                 aria-hidden
-              >
-                {done ? <Check className="size-3.5" /> : n}
-              </span>
-              <span
                 className={cx(
-                  "text-[11px] leading-tight",
-                  isCurrent ? "font-semibold text-ink" : done ? "text-ink-2" : "text-muted",
+                  "block h-1.5 w-full transition-colors",
+                  isCurrent || done ? "bg-synthetic-yellow" : "bg-surface-2",
                 )}
-              >
-                <span className="sr-only">Step {n}: </span>
-                {label}
-                <span className="sr-only">{isCurrent ? " (current step)" : done ? " (completed)" : ""}</span>
+              />
+              <span className="mt-2 flex min-w-0 items-baseline gap-1.5">
+                <span
+                  aria-hidden
+                  className={cx(
+                    "font-mono text-[11px] font-semibold tabular-nums",
+                    isCurrent || done ? "text-synthetic-yellow" : "text-muted",
+                  )}
+                >
+                  {String(n).padStart(2, "0")}
+                </span>
+                <span
+                  className={cx(
+                    "hidden truncate text-[10px] font-semibold tracking-[0.16em] uppercase sm:inline",
+                    isCurrent ? "text-ink" : done ? "text-ink-2" : "text-muted",
+                  )}
+                >
+                  {label}
+                </span>
+                <span className="sr-only">
+                  Step {n}: {label}
+                  {isCurrent ? " (current step)" : done ? " (completed)" : ""}
+                </span>
               </span>
             </>
           );
           return (
-            <li key={n} aria-current={isCurrent ? "step" : undefined} className="relative">
-              {n > 1 ? (
-                <span
-                  className={cx(
-                    "absolute top-3.5 right-1/2 mr-4 h-px w-[calc(100%-2rem)]",
-                    n <= current ? "bg-verified/40" : "bg-border",
-                  )}
-                  aria-hidden
-                />
-              ) : null}
+            <li key={n} aria-current={isCurrent ? "step" : undefined} className="min-w-0">
               {visitable ? (
                 <button
                   type="button"
                   onClick={() => onVisit(n)}
-                  className="relative flex w-full flex-col items-center gap-1 rounded-md py-0.5 text-center transition hover:bg-surface-2 focus-visible:ring-2 focus-visible:ring-accent focus-visible:outline-none"
+                  className="block w-full text-left focus-visible:ring-2 focus-visible:ring-synthetic-yellow focus-visible:ring-offset-4 focus-visible:ring-offset-bg focus-visible:outline-none"
                 >
                   {content}
                 </button>
               ) : (
-                <div className="relative flex flex-col items-center gap-1 py-0.5 text-center">{content}</div>
+                <div>{content}</div>
               )}
             </li>
           );
@@ -94,32 +97,40 @@ export function Stepper({
 // -----------------------------------------------------------------------------
 
 /**
- * Container of one step: a labelled region whose heading receives focus when
- * the step changes (so screen readers announce the new step).
+ * Container of one view: a labelled, square panel whose heading receives focus
+ * when the view changes (so screen readers announce it). Steps say "Step N of
+ * 4"; the status page does not.
  */
 export function StepFrame({
-  step,
+  view,
   title,
   description,
   headingRef,
   children,
 }: {
-  step: Step;
+  view: View;
   title: string;
   description?: ReactNode;
   headingRef?: Ref<HTMLHeadingElement>;
   children: ReactNode;
 }) {
-  const headingId = `onboarding-step-${step}-title`;
+  const key = view === "status" ? "status" : `step-${view}`;
+  const headingId = `onboarding-${key}-title`;
   return (
-    <section data-testid={`onboarding-step-${step}`} aria-labelledby={headingId} className="animate-reveal space-y-5">
-      <div className="space-y-1">
-        <p className="text-[11px] font-semibold tracking-[0.12em] text-muted uppercase">Step {step} of 4</p>
+    <section
+      data-testid={`onboarding-${key}`}
+      aria-labelledby={headingId}
+      className="animate-reveal space-y-6 border border-border bg-surface p-5 sm:p-7"
+    >
+      <div className="space-y-1.5">
+        <p className="text-[11px] font-semibold tracking-[0.24em] text-synthetic-yellow uppercase">
+          {view === "status" ? "Verification status" : `Step ${view} of 4`}
+        </p>
         <h2
           id={headingId}
           ref={headingRef}
           tabIndex={-1}
-          className="rounded-sm text-lg font-semibold tracking-tight text-ink focus-visible:ring-2 focus-visible:ring-accent focus-visible:outline-none"
+          className="text-xl font-semibold tracking-tight text-ink focus-visible:ring-2 focus-visible:ring-synthetic-yellow focus-visible:outline-none"
         >
           {title}
         </h2>
