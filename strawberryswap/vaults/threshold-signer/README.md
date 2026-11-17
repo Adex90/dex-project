@@ -6,8 +6,8 @@ key and the chain-aware parts of the policy are mocked. The engine routes every 
 its end-to-end tests run this binary.
 
 ```bash
-cargo test                                                     # 12 tests, offline
-cargo test --features insecure-test-key                        # 13: also the test-key loader
+cargo test                                                     # 13 tests, offline
+cargo test --features insecure-test-key                        # 14: also the test-key loader
 cargo run --release -- --chain-id 31337 --executor 0x<SearcherExecutor address>
 ```
 
@@ -73,10 +73,16 @@ One JSON object per line, in each direction.
 {"id": 1, "method": "address"}
 {"id": 1, "result": {"address": "0xE250…2c09"}}
 
-{"id": 2, "method": "sign_transaction", "params": {"tx": "0x02f8…"}}
-{"id": 2, "result": {"r": "0x…", "s": "0x…", "y_parity": 0, "signing_hash": "0x…", "tx_hash": "0x…", "signed_tx": "0x02f8…"}}
-{"id": 3, "error": {"code": "policy", "message": "sweep moves inventory out of the executor: never signed by this vault"}}
+{"id": 2, "method": "policy"}
+{"id": 2, "result": {"chain_id": 421614, "executor": "0x…", "max_gas": 1000000, "max_fee_per_gas": "500000000000", "max_signs_per_sec": 20.0}}
+
+{"id": 3, "method": "sign_transaction", "params": {"tx": "0x02f8…"}}
+{"id": 3, "result": {"r": "0x…", "s": "0x…", "y_parity": 0, "signing_hash": "0x…", "tx_hash": "0x…", "signed_tx": "0x02f8…"}}
+{"id": 4, "error": {"code": "policy", "message": "sweep moves inventory out of the executor: never signed by this vault"}}
 ```
+
+* **`policy`** is read-only: the chain, the executor and the caps the vault signs within. The engine checks its own
+  configuration against it at start, so that it never builds a transaction the vault would refuse.
 
 * **`params.tx`** is the EIP-1559 signing payload: `0x02 ‖ rlp([chain_id, nonce, max_priority_fee_per_gas,
   max_fee_per_gas, gas_limit, to, value, data, access_list])`.
@@ -103,8 +109,8 @@ One JSON object per line, in each direction.
   * The signature recovers to the vault's address.
   * The signed transaction decodes back to the same transaction and recovers to the vault.
   * It hashes to `tx_hash`.
-* **Socket:** directory 0700, socket 0600, the full protocol, an oversized line, refusing a live socket or a non-socket
-  file, refusing an open directory, and refusing a foreign uid.
+* **Socket:** directory 0700, socket 0600, the full protocol (the `policy` method included), an oversized line,
+  refusing a live socket or a non-socket file, refusing an open directory, and refusing a foreign uid.
 * **Across processes:**
   * A separate client process got a rebalance signed. A `sweep`, a wrong chain and attached ether were each denied
     with their reason.

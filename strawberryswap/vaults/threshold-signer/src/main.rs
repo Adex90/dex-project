@@ -270,10 +270,12 @@ struct Vault {
     /// The only uid allowed to connect (checked with SO_PEERCRED, which the kernel fills in).
     allowed_uid: u32,
     bucket: Mutex<TokenBucket>,
+    /// The rate limit, for the `policy` method.
+    signs_per_sec: f64,
 }
 
-/// One request line: `{"id": 1, "method": "address"}` or
-/// `{"id": 2, "method": "sign_transaction", "params": {"tx": "0x02…"}}`.
+/// One request line: `{"id": 1, "method": "address"}`, `{"id": 2, "method": "policy"}` or
+/// `{"id": 3, "method": "sign_transaction", "params": {"tx": "0x02…"}}`.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Request {
@@ -308,7 +310,21 @@ impl Vault {
             signer,
             allowed_uid,
             bucket,
+            signs_per_sec,
         }
+    }
+
+    /// What the vault signs, for its client to check its own transactions against before asking. Read-only, and
+    /// nothing in it is secret: the same rules are in the vault's command line and audit log.
+    fn describe_policy(&self) -> Value {
+        json!({
+            "chain_id": self.policy.chain_id,
+            "executor": self.policy.executor.to_string(),
+            "max_gas": self.policy.max_gas,
+            // A decimal string: a u128 does not fit a JSON number exactly.
+            "max_fee_per_gas": self.policy.max_fee_per_gas.to_string(),
+            "max_signs_per_sec": self.signs_per_sec,
+        })
     }
 
     /// One request line in, one response out.
@@ -326,7 +342,9 @@ impl Vault {
                 Ok(result) => json!({ "id": id, "result": result }),
                 Err((code, message)) => error(Some(id), code, message),
             },
+            ("policy", None) => json!({ "id": id, "result": self.describe_policy() }),
             ("address", Some(_)) => error(Some(id), "parse", "address takes no params"),
+            ("policy", Some(_)) => error(Some(id), "parse", "policy takes no params"),
             ("sign_transaction", None) => {
                 error(Some(id), "parse", "sign_transaction needs params.tx")
             }
@@ -1146,6 +1164,31 @@ mod tests {
         assert_eq!(
             address["result"]["address"],
             vault.signer.address().to_string()
+        );
+        assert_eq!(
+            code(
+                vault
+                    .handle(br#"{"id":3,"method":"policy","params":{"tx":"0x"}}"#)
+                    .await
+            ),
+            "parse"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_policy_tells_the_engine_what_will_be_signed() {
+        let vault = vault(0, 20.0);
+        let reply = vault.handle(br#"{"id":4,"method":"policy"}"#).await;
+        assert_eq!(reply["id"], 4);
+        assert_eq!(
+            reply["result"],
+            json!({
+                "chain_id": 31_337,
+                "executor": EXECUTOR.to_string(),
+                "max_gas": 1_000_000,
+                "max_fee_per_gas": "500000000000",
+                "max_signs_per_sec": 20.0,
+            })
         );
     }
 
