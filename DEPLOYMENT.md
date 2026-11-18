@@ -1431,6 +1431,68 @@ available, so Session Manager itself was not exercised. Everything around it was
 - **Backend:** rustfmt and clippy `-D warnings` clean; 314 tests passed, 0 failed.
   hadolint, actionlint and ShellCheck (with the CI settings) are clean.
 
+**Security Center and per-device sessions** (migration `0019`, the routes
+`/api/v1/auth/sessions`, `/auth/logout`, `/auth/password/change` and
+`/auth/security/*`, the Security page):
+
+- **Database:** every SQL suite passes on its own fresh database with all migrations
+  (14 suites), the new `tests/db/0019_sesiones_seguridad.sql` (62 checks) included.
+  It covers:
+  - a session born valid with the database's timestamps (`sc_auth` can neither
+    choose them nor open one already revoked), its device summary's length, an
+    expiry after opening, a revocation with its reason, and only reasons from the
+    catalog;
+  - immutability, for the schema owner too: last use only moves forward; no
+    extending a session, gaining the second factor, or changing device, IP or
+    owner; a revocation is final; no deletes or truncation;
+  - the inactivity preference (5, 15, 30 or 60) and who may write it;
+  - the new events with a numeric detail, still append-only, and still unreadable
+    by `sc_auth`;
+  - privileges: `sc_kyc` reads only what validation needs, no other application
+    role touches the three tables, and a client reads only their own rows and
+    writes none.
+- **Backend:** rustfmt and clippy `-D warnings` clean. 412 tests passed, 0
+  failed (393 before):
+  - `tests/sesiones.rs`:
+    - devices and IPs from real sign-ins and sign-up;
+    - tokens refused without a live session of their own: an invented one,
+      another person's, none (as before 0019), or an expired one;
+    - revoking one session (404 when gone or foreign), all the others (idle ones
+      closed but not counted) and one's own;
+    - revocation by an operator and by a password reset;
+    - the inactivity timeout: the choice, and idle sessions closed so a longer
+      timeout revives nothing;
+    - last use marked at most once a minute, never by the socket's revalidation;
+    - the password change: policy, same password, a wrong current one counted,
+      success signing out the others and voiding a reset link; with two-step
+      verification, the code required, refused when wrong, never reused; the
+      lockout ending the session that caused it;
+    - failed sign-ins and the lockout in the log, tries during a lockout not
+      logged; paging; staff sessions.
+  - the vault socket closing for a session revoked from another device while
+    the other stays open; the tipping-off guard reading the three new client
+    endpoints; unit tests for the device summary and the `sid` claim.
+- **Frontend:** typecheck, lint, 292 unit tests (279 before: every answer of
+  the new endpoints validated; the log in words, with no tipping-off word; the
+  password rules; the idle check and its sign-in notice) and `next build`.
+- **End to end** on a fresh stack: smoke 261 checks (242 before) and AML console
+  133 (130 before).
+  - The smoke run, on the Security page:
+    - every session listed, this browser first under the only gold, square
+      "Current device" badge, the API's phone and laptop by name;
+    - Revoke and "Sign out all other devices" (one confirmation, with the
+      count) checked against those devices' tokens (401);
+    - the inactivity timeout surviving a reload;
+    - a wrong current password refused, then the change; afterwards the old
+      password no longer signs in and the new one does;
+    - the log showing all of it, newest first;
+    - on a phone, another client opens Security from the header's gold lock
+      (the tab bar keeps five tabs) and turns two-step verification on from
+      there; at a 5-minute timeout, a fake clock six minutes on signs them out
+      here and on the server, and the sign-in page says why.
+  - The AML run checks a frozen client's Security tab and its three API reads:
+    no tipping-off words.
+
 **Cryptographic Solvency Explorer: asset positions in the reserve cut** (migration
 `0018`, `GET /api/v1/reserva/prueba` and the public cuts extended, the Reserve tab):
 
