@@ -12,12 +12,16 @@
 
 export const LOGIN_PATH = "/auth/login";
 export const EXPIRED_LOGIN_PATH = "/auth/login?expired=1";
+/** Signed out by the inactivity timeout the client chose (Security page): the sign-in page says so. */
+export const IDLE_LOGIN_PATH = "/auth/login?expired=idle";
 
 export interface SessionSnapshot {
   token: string | null;
   expiresAt: string | null;
   /** The last session ended by expiry or by a 401 (not by signing out). */
   expired: boolean;
+  /** ...and by the inactivity timeout in particular: the notice says so. */
+  idle?: boolean;
 }
 
 /** A token whose local expiry is still ahead. */
@@ -28,5 +32,6 @@ export function isSessionUsable(s: Pick<SessionSnapshot, "token" | "expiresAt">,
 /** The sign-in URL for a session that cannot be used, or null while it can. */
 export function guardRedirect(s: SessionSnapshot, now = Date.now()): string | null {
   if (isSessionUsable(s, now)) return null;
+  if (s.idle) return IDLE_LOGIN_PATH;
   return s.expired || s.token ? EXPIRED_LOGIN_PATH : LOGIN_PATH;
 }

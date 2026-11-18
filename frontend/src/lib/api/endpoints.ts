@@ -1,4 +1,6 @@
+import { passwordChangeBody } from "@/lib/security";
 import type { LimitOrderRequest, MarketOrderRequest, StopOrderRequest } from "@/types/market";
+import type { InactivityMinutes, PasswordChange } from "@/types/security";
 import type { WithdrawalRequest } from "@/types/wealth";
 
 import { request } from "./client";
@@ -76,6 +78,41 @@ export const api = {
 
   resetPassword: (token: string, password: string) =>
     request<{ estado: "OK" }>("/api/v1/auth/password/reset", { method: "POST", body: { token, password } }),
+
+  // Security Center (migration 0019): every session is a row on the server.
+
+  /** Ends this session on the server (204): its token stops working at once. */
+  logout: (token: string) => request<null>("/api/v1/auth/logout", { method: "POST", token }),
+
+  /** The signed-in devices; validate with `parseDeviceSessions`. */
+  sessions: (token: string, signal?: AbortSignal) => request<unknown>("/api/v1/auth/sessions", { token, signal }),
+
+  /** Signs one device out (204); 404 when it had already ended. */
+  revokeSession: (token: string, sessionId: string) =>
+    request<null>(`/api/v1/auth/sessions/${encodeURIComponent(sessionId)}/revoke`, { method: "POST", token }),
+
+  /** Signs every other device out; validate with `parseRevokedCount`. */
+  revokeOtherSessions: (token: string) =>
+    request<unknown>("/api/v1/auth/sessions/revoke-others", { method: "POST", token }),
+
+  /** Current password (and authenticator code, with two-step verification on); signs other devices out. */
+  changePassword: (token: string, change: PasswordChange) =>
+    request<unknown>("/api/v1/auth/password/change", { method: "POST", token, body: passwordChangeBody(change) }),
+
+  /** The security log, newest first; validate with `parseSecurityEvents`. */
+  securityEvents: (token: string, signal?: AbortSignal) =>
+    request<unknown>("/api/v1/auth/security/events", { token, signal }),
+
+  /** Inactivity timeout and two-step status; validate with `parseSecurityPreferences`. */
+  securityPreferences: (token: string, signal?: AbortSignal) =>
+    request<unknown>("/api/v1/auth/security/preferences", { token, signal }),
+
+  saveSecurityPreferences: (token: string, inactivityMinutes: InactivityMinutes) =>
+    request<unknown>("/api/v1/auth/security/preferences", {
+      method: "POST",
+      token,
+      body: { inactividad_minutos: inactivityMinutes },
+    }),
 
   dashboard: (token: string, signal?: AbortSignal) => request<Tablero>("/api/v1/tablero", { token, signal }),
 

@@ -7,15 +7,24 @@ import { ShieldCheck } from "lucide-react";
 
 import { Alert, Button, Field, Input, Skeleton } from "@/components/ui/primitives";
 import { NO_CONSOLE_MESSAGE, homeAfterSignIn } from "@/hooks/use-client-home";
+import { useSession } from "@/hooks/use-session";
 import { ApiError, describeError } from "@/lib/api/client";
 import type { ConfiguracionMfa } from "@/lib/api/types";
 import { formatSecretForManualEntry, isTotpCode, normalizeTotpInput } from "@/lib/mfa";
+import { SECURITY_PATH, TWO_STEP_ON_PATH } from "@/lib/security";
 import { isPendingUsable, useAuthStore } from "@/store/auth";
 
 /**
- * Two-step verification enrollment. Staff reach it from sign-in (their
- * password alone never starts a session): scan the QR code with an
- * authenticator app, confirm the first code, and the session starts.
+ * Two-step verification enrollment, two ways in:
+ *
+ * - Staff, from sign-in (their password alone never starts a session): scan
+ *   the QR code with an authenticator app, confirm the first code, and the
+ *   session starts.
+ * - A signed-in client, from the Security page. Turning it on ends every
+ *   session, this one included, and starts a new one that verified the code:
+ *   the page swaps the token and goes back to Security. It runs outside the
+ *   dashboard on purpose: nothing there (the vault's socket, the polling) can
+ *   use the old token while it is being replaced.
  */
 export default function MfaSetupPage() {
   const router = useRouter();
@@ -23,6 +32,7 @@ export default function MfaSetupPage() {
   const setupMfa = useAuthStore((s) => s.setupMfa);
   const enableMfa = useAuthStore((s) => s.enableMfa);
   const clearPending = useAuthStore((s) => s.clearPending);
+  const { hydrated, valid: signedIn } = useSession();
   const [config, setConfig] = useState<ConfiguracionMfa | null>(null);
   const [code, setCode] = useState("");
   const [error, setError] = useState<string | null>(null);
@@ -30,7 +40,10 @@ export default function MfaSetupPage() {
   const [submitting, setSubmitting] = useState(false);
   const requested = useRef(false);
 
-  const enrolling = pending?.kind === "enroll" && isPendingUsable(pending);
+  const staffEnrolling = pending?.kind === "enroll" && isPendingUsable(pending);
+  // A signed-in client turning it on from the Security page.
+  const fromSecurity = !staffEnrolling && signedIn;
+  const enrolling = staffEnrolling || fromSecurity;
 
   // An enrollment that can no longer finish (expired, revoked, locked) goes
   // back to sign-in; a wrong code just tries again.
@@ -56,6 +69,10 @@ export default function MfaSetupPage() {
     setSubmitting(true);
     try {
       const session = await enableMfa(code);
+      if (fromSecurity) {
+        router.replace(TWO_STEP_ON_PATH);
+        return;
+      }
       const home = await homeAfterSignIn(session);
       if (home) {
         router.replace(home);
@@ -84,6 +101,15 @@ export default function MfaSetupPage() {
     );
   }
 
+  if (!hydrated && !config) {
+    return (
+      <div className="space-y-3" aria-busy="true" aria-label="Loading">
+        <Skeleton className="h-6 w-2/3" />
+        <Skeleton className="mx-auto size-48" />
+      </div>
+    );
+  }
+
   if (!enrolling && !config) {
     return (
       <div className="space-y-5">
@@ -104,9 +130,15 @@ export default function MfaSetupPage() {
       <div className="space-y-1">
         <h1 className="text-xl font-semibold tracking-tight">Set up two-step verification</h1>
         <p className="text-sm text-muted">
-          Your role requires a code from your phone every time you sign in. Set it up once with an authenticator
-          app such as Google Authenticator, Microsoft Authenticator or 1Password.
+          {fromSecurity
+            ? "Every sign-in will also ask for a code from your phone. "
+            : "Your role requires a code from your phone every time you sign in. "}
+          Set it up once with an authenticator app such as Google Authenticator, Microsoft Authenticator or
+          1Password.
         </p>
+        {fromSecurity ? (
+          <p className="text-xs text-muted">Turning it on signs out every other device.</p>
+        ) : null}
       </div>
 
       {error ? <Alert tone="error">{error}</Alert> : null}
@@ -164,12 +196,22 @@ export default function MfaSetupPage() {
             </Button>
           </form>
         </>
-      ) : (
+      ) : error ? null : (
         <div className="space-y-3" aria-busy="true" aria-label="Preparing your authenticator key">
           <Skeleton className="mx-auto size-48" />
           <Skeleton className="h-9 w-full" />
         </div>
       )}
+
+      {fromSecurity ? (
+        <Link
+          href={SECURITY_PATH}
+          className="block text-center text-sm font-medium text-accent hover:underline"
+          data-testid="mfa-back-to-security"
+        >
+          Back to Security
+        </Link>
+      ) : null}
     </div>
   );
 }

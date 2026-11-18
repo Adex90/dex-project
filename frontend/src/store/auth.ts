@@ -31,6 +31,8 @@ interface AuthState {
   email: string | null;
   /** The last session ended by expiry or by a 401, not by signing out (see `guardRedirect`). Not persisted. */
   expired: boolean;
+  /** ...by the inactivity timeout in particular. Not persisted. */
+  idle: boolean;
   /** Not persisted. */
   pending: PendingSignIn | null;
   /** First step: a session, or the second step still to complete (see `pending`). */
@@ -43,10 +45,17 @@ interface AuthState {
   enableMfa: (code: string) => Promise<Sesion>;
   clearPending: () => void;
   register: (input: RegistroInput) => Promise<RegistroRespuesta>;
-  /** Signing out. */
+  /** Signing out: this tab forgets the session and the server ends it (its token stops working). */
   logout: () => void;
   /** The session expired or the API answered 401: same as logout, but the sign-in page says why. */
   expire: () => void;
+  /** No activity for the client's inactivity timeout: ends the session on the server too, with the notice. */
+  expireIdle: () => void;
+}
+
+/** Ends a session on the server; best effort: a session the server already ended needs nothing more. */
+function endOnServer(token: string | null): void {
+  if (token) void api.logout(token).catch(() => undefined);
 }
 
 const EMPTY = { token: null, expiresAt: null, clientId: null, role: null, email: null } as const;
@@ -68,6 +77,7 @@ export const useAuthStore = create<AuthState>()(
           role: session.rol,
           email,
           expired: false,
+          idle: false,
           pending: null,
         });
       /** Token for the enrollment endpoints: the pending enrollment, or the current session. */
@@ -81,6 +91,7 @@ export const useAuthStore = create<AuthState>()(
       return {
         ...EMPTY,
         expired: false,
+        idle: false,
         pending: null,
 
         login: async (email, password) => {
@@ -95,7 +106,7 @@ export const useAuthStore = create<AuthState>()(
             result.estado === "2FA_REQUIRED"
               ? { kind: "verify", token: result.token_mfa, expiresAt: result.expira_en, email: normalized }
               : { kind: "enroll", token: result.token_inscripcion, expiresAt: result.expira_en, email: normalized };
-          set({ ...EMPTY, expired: false, pending });
+          set({ ...EMPTY, expired: false, idle: false, pending });
           return pending;
         },
 
@@ -127,13 +138,23 @@ export const useAuthStore = create<AuthState>()(
             role: result.sesion.rol,
             email: result.cliente.email,
             expired: false,
+            idle: false,
             pending: null,
           });
           return result;
         },
 
-        logout: () => set({ ...EMPTY, expired: false, pending: null }),
-        expire: () => set({ ...EMPTY, expired: true, pending: null }),
+        logout: () => {
+          const token = get().token;
+          set({ ...EMPTY, expired: false, idle: false, pending: null });
+          endOnServer(token);
+        },
+        expire: () => set({ ...EMPTY, expired: true, idle: false, pending: null }),
+        expireIdle: () => {
+          const token = get().token;
+          set({ ...EMPTY, expired: true, idle: true, pending: null });
+          endOnServer(token);
+        },
       };
     },
     {

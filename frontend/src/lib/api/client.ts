@@ -106,6 +106,11 @@ const MESSAGES: Record<string, string> = {
   MFA_YA_ACTIVO: "Two-step verification is already turned on for this account.",
   MFA_SIN_CONFIGURAR: "Set up your authenticator app first.",
   TOKEN_RESTABLECIMIENTO_INVALIDO: "This reset link is invalid or has expired. Please request a new one.",
+  // Security Center: changing the password from a signed-in session.
+  CONTRASENA_ACTUAL_INCORRECTA: "Your current password is not correct.",
+  CONTRASENA_REPETIDA: "Choose a new password that is different from your current one.",
+  CODIGO_MFA_REQUERIDO: "Enter the 6-digit code from your authenticator app.",
+  CONTRASENA_CAMBIADA_EN_PARALELO: "Your password or code was used somewhere else at the same time. Please try again.",
   PROHIBIDO: "You are not allowed to perform this operation.",
   EMAIL_REGISTRADO: "That email is already registered.",
   IDENTIDAD_REGISTRADA: "That CURP/RFC is already registered.",

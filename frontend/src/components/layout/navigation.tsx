@@ -3,11 +3,12 @@
 import { useEffect } from "react";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { Landmark, Search, ShieldCheck, TrendingUp, Vault, type LucideIcon } from "lucide-react";
+import { Landmark, LockKeyhole, Search, ShieldCheck, TrendingUp, Vault, type LucideIcon } from "lucide-react";
 import { create } from "zustand";
 
 import { Brand } from "@/components/brand";
 import { cx } from "@/components/ui/primitives";
+import { SECURITY_PATH } from "@/lib/security";
 
 /*
  * Dashboard navigation: one list of destinations, two presentations.
@@ -24,6 +25,9 @@ import { cx } from "@/components/ui/primitives";
  * An asset's page is not a tab of its own: it opens from the Vault's holdings
  * and from Discover, and the tab that opened it stays current there (its
  * Back link returns to that tab). Opened by its address, it is the Vault's.
+ *
+ * Settings pages (Security) sit in the sidebar's own "Account" group and, on
+ * phones, behind the header's shield button: the tab bar keeps five tabs.
  */
 
 export interface NavItem {
@@ -32,6 +36,8 @@ export interface NavItem {
   icon: LucideIcon;
   /** Active only on this exact path (a section root whose sub-pages are other items). */
   exact?: boolean;
+  /** A settings page: the sidebar's "Account" group and the header, never the phone's tab bar. */
+  settings?: boolean;
 }
 
 const HOME = "/dashboard";
@@ -43,6 +49,7 @@ export const DASHBOARD_NAV: readonly NavItem[] = [
   { href: "/dashboard/account", label: "Account", icon: Landmark },
   { href: "/dashboard/invest", label: "Invest", icon: TrendingUp },
   { href: "/dashboard/reserve", label: "Reserve", icon: ShieldCheck },
+  { href: SECURITY_PATH, label: "Security", icon: LockKeyhole, settings: true },
 ];
 
 /** Pages that open from more than one tab: they belong to the tab that opened them. */
@@ -109,6 +116,8 @@ export const SIDEBAR_WIDTH = "w-60";
 export function Navigation({ items = DASHBOARD_NAV }: { items?: readonly NavItem[] }) {
   const pathname = usePathname();
   const current = activeItem(pathname, useNavOrigin(items), items);
+  const tabs = items.filter((item) => !item.settings);
+  const settings = items.filter((item) => item.settings);
 
   return (
     <>
@@ -124,12 +133,26 @@ export function Navigation({ items = DASHBOARD_NAV }: { items?: readonly NavItem
         <nav aria-label="Main" className="flex-1 overflow-y-auto px-3 py-5">
           <p className="px-3 pb-3 text-[10px] font-semibold tracking-[0.24em] text-muted uppercase">Menu</p>
           <ul className="space-y-1">
-            {items.map((item) => (
+            {tabs.map((item) => (
               <li key={item.href}>
                 <SidebarLink item={item} active={item === current} />
               </li>
             ))}
           </ul>
+          {settings.length > 0 ? (
+            <>
+              <p className="px-3 pt-6 pb-3 text-[10px] font-semibold tracking-[0.24em] text-muted uppercase">
+                Account
+              </p>
+              <ul className="space-y-1">
+                {settings.map((item) => (
+                  <li key={item.href}>
+                    <SidebarLink item={item} active={item === current} />
+                  </li>
+                ))}
+              </ul>
+            </>
+          ) : null}
         </nav>
         <p className="border-t border-border px-5 py-4 text-[11px] leading-relaxed text-muted">
           <span className="font-semibold text-synthetic-yellow">100% reserve.</span> Every peso is held in custody,
@@ -143,9 +166,9 @@ export function Navigation({ items = DASHBOARD_NAV }: { items?: readonly NavItem
       >
         <ul
           className="mx-auto grid max-w-lg"
-          style={{ gridTemplateColumns: `repeat(${items.length}, minmax(0, 1fr))` }}
+          style={{ gridTemplateColumns: `repeat(${tabs.length}, minmax(0, 1fr))` }}
         >
-          {items.map((item) => (
+          {tabs.map((item) => (
             <li key={item.href}>
               <TabLink item={item} active={item === current} />
             </li>

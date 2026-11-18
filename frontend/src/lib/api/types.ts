@@ -25,6 +25,8 @@ export interface Sesion {
   expira_en: IsoDateTime;
   cliente_id: Uuid;
   rol: Rol;
+  /** Its row on the server (migration 0019): the Security page's "current device". */
+  sesion_id?: Uuid;
 }
 
 /**

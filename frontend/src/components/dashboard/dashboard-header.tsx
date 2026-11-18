@@ -1,11 +1,13 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { LogOut, RefreshCw } from "lucide-react";
+import Link from "next/link";
+import { LockKeyhole, LogOut, RefreshCw } from "lucide-react";
 
 import { Brand } from "@/components/brand";
 import { KycHeaderBadge } from "@/components/dashboard/kyc-status";
 import { Button, cx } from "@/components/ui/primitives";
+import { SECURITY_PATH } from "@/lib/security";
 import type { Cliente } from "@/lib/api/types";
 import type { RealtimeStatus } from "@/store/vault";
 
@@ -26,6 +28,7 @@ export function DashboardHeader({
   refreshing,
   onRefresh,
   onLogout,
+  securityActive = false,
 }: {
   /** The section on screen (the page's heading). */
   title: string;
@@ -36,6 +39,8 @@ export function DashboardHeader({
   refreshing: boolean;
   onRefresh: () => void;
   onLogout: () => void;
+  /** The Security page is on screen: its shortcut is current. */
+  securityActive?: boolean;
 }) {
   const seconds = useSecondsSince(lastUpdated);
   const name = client
@@ -64,6 +69,22 @@ export function DashboardHeader({
             </div>
           ) : null}
           {client ? <KycHeaderBadge status={client.estatus_kyc} /> : null}
+          {/* Below lg the sidebar is gone: Security is one tap away here, gold when current. */}
+          <Link
+            href={SECURITY_PATH}
+            aria-label="Security"
+            aria-current={securityActive ? "page" : undefined}
+            data-testid="header-security"
+            className={cx(
+              "inline-flex size-8 items-center justify-center transition-colors lg:hidden",
+              "focus-visible:ring-2 focus-visible:ring-synthetic-yellow focus-visible:outline-none",
+              securityActive
+                ? "bg-synthetic-yellow text-black"
+                : "border border-border-strong text-ink-2 hover:bg-surface-2 hover:text-ink",
+            )}
+          >
+            <LockKeyhole className="size-4" strokeWidth={securityActive ? 2.25 : 1.75} aria-hidden />
+          </Link>
           {/* Named for screen readers on phones too, where only the icon shows. */}
           <Button variant="secondary" size="sm" onClick={onLogout} aria-label="Sign out">
             <LogOut className="size-3.5" aria-hidden />

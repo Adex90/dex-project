@@ -9,17 +9,21 @@ import { Navigation, activeItem, resetNavOrigin, useNavOrigin } from "@/componen
 import { Alert, Button } from "@/components/ui/primitives";
 import { ONBOARDING_PATH } from "@/hooks/use-client-home";
 import { useDashboardData } from "@/hooks/use-dashboard-data";
+import { useIdleSignOut } from "@/hooks/use-idle-sign-out";
 import { useSession } from "@/hooks/use-session";
 import { useVaultData } from "@/hooks/use-vault-data";
 import { useVaultSocket } from "@/hooks/use-vault-socket";
 import { describeError } from "@/lib/api/client";
+import { api } from "@/lib/api/endpoints";
 import type { Cliente } from "@/lib/api/types";
-import { EXPIRED_LOGIN_PATH } from "@/lib/session";
+import { SECURITY_PATH, parseSecurityPreferences } from "@/lib/security";
+import { EXPIRED_LOGIN_PATH, IDLE_LOGIN_PATH } from "@/lib/session";
 import { useAuthStore } from "@/store/auth";
 import { useCardStore } from "@/store/card";
 import { useDashboardStore } from "@/store/dashboard";
 import { useMarketStore } from "@/store/market";
 import { useOrdersStore } from "@/store/orders";
+import { useSecurityStore } from "@/store/security";
 import { displayedRealtime, useVaultStore } from "@/store/vault";
 
 /*
@@ -34,6 +38,10 @@ import { displayedRealtime, useVaultStore } from "@/store/vault";
  * investment) the summary and the ledger reload too, so every tab, the chart
  * included, follows within a moment. Pages read the stores and get the
  * session, the KYC lock and `refresh` from `useDashboard()`.
+ *
+ * It also enforces the inactivity timeout the client chose on the Security
+ * page: after that long without a click, key or touch in this tab, the
+ * session ends here and on the server (see `useIdleSignOut`).
  */
 
 export interface DashboardContextValue {
@@ -66,6 +74,25 @@ export function DashboardShell({ children }: { children: ReactNode }) {
     router.replace(EXPIRED_LOGIN_PATH);
   }, [router]);
   useVaultSocket(token, { onAdvance: () => void refreshDashboard(), onSessionEnded: endSession });
+  const signOutIdle = useCallback(() => {
+    useAuthStore.getState().expireIdle();
+    router.replace(IDLE_LOGIN_PATH);
+  }, [router]);
+  const inactivityMinutes = useSecurityStore((s) => s.inactivityMinutes);
+  useIdleSignOut(inactivityMinutes, signOutIdle);
+  // The timeout the client chose, once per session (the server enforces it too).
+  useEffect(() => {
+    if (!token) return;
+    const controller = new AbortController();
+    api.securityPreferences(token, controller.signal).then(
+      (body) => {
+        const preferences = parseSecurityPreferences(body);
+        if (preferences) useSecurityStore.getState().setInactivityMinutes(preferences.inactivityMinutes);
+      },
+      () => undefined, // the default (30 minutes) applies; the server keeps the real one
+    );
+    return () => controller.abort();
+  }, [token]);
   const realtime = useVaultStore(displayedRealtime);
   const summary = useDashboardStore((s) => s.summary);
   const loading = useDashboardStore((s) => s.loading);
@@ -81,6 +108,7 @@ export function DashboardShell({ children }: { children: ReactNode }) {
       useMarketStore.getState().reset();
       useOrdersStore.getState().reset();
       useCardStore.getState().reset();
+      useSecurityStore.getState().reset();
       resetNavOrigin();
     },
     [],
@@ -121,6 +149,7 @@ export function DashboardShell({ children }: { children: ReactNode }) {
           refreshing={loading}
           onRefresh={() => void refresh()}
           onLogout={signOut}
+          securityActive={pathname === SECURITY_PATH}
         />
         {/* Bottom padding below lg: the tab bar (and the phone's home indicator) never covers content. */}
         <main className="mx-auto max-w-7xl space-y-6 px-4 pt-6 pb-[calc(6rem+env(safe-area-inset-bottom))] sm:px-6 lg:pb-10">
