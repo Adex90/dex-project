@@ -16,7 +16,9 @@
 --     Una revocación es definitiva y lleva su motivo; fuera de ella solo cambia
 --     el último uso, que nunca retrocede. Las filas no se borran.
 --  2. `kyc.preferencias_seguridad`: el cierre por inactividad que elige el
---     cliente (5, 15, 30 o 60 minutos; sin fila, el backend aplica 30).
+--     cliente (5, 15, 30 o 60 minutos; sin fila, el backend aplica 30). Al
+--     cambiarla, las sesiones ya inactivas según la anterior se revocan
+--     (`INACTIVIDAD`): alargar el plazo no revive una sesión abandonada.
 --  3. `kyc.eventos_autenticacion` (0010) registra además los inicios de sesión
 --     (correctos, fallidos y el bloqueo de la cuenta), los cierres y las
 --     revocaciones, el cambio de contraseña y su rechazo, y el cambio de
@@ -53,6 +55,8 @@ CREATE TABLE kyc.sesiones (
                           'CONTRASENA_CAMBIADA',       -- cambió la contraseña desde otra sesión
                           'CONTRASENA_RESTABLECIDA',   -- restableció la contraseña por correo
                           'MFA_ACTIVADO',              -- activó el segundo factor
+                          'INACTIVIDAD',               -- inactiva al cambiar la preferencia (no revive)
+                          'BLOQUEO',                   -- agotó los intentos al cambiar la contraseña
                           'OPERADOR')),                -- un operador revocó sus sesiones
     CONSTRAINT ck_sesiones_vigencia CHECK (expira_en > creada_en),
     CONSTRAINT ck_sesiones_uso CHECK (ultimo_uso_en >= creada_en),

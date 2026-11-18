@@ -12,12 +12,12 @@ use std::{
 
 use axum::{
     extract::{ConnectInfo, FromRequest, FromRequestParts},
-    http::{request::Parts, Extensions, HeaderMap},
+    http::{header, request::Parts, Extensions, HeaderMap},
     response::{IntoResponse, Response},
 };
 use serde::Serialize;
 
-use crate::{error::AppError, state::AppState};
+use crate::{auth::sesiones::Origen, error::AppError, state::AppState};
 
 #[derive(FromRequest)]
 #[from_request(via(axum::Json), rejection(AppError))]
@@ -58,6 +58,18 @@ impl FromRequestParts<AppState> for IpCliente {
 
     async fn from_request_parts(parts: &mut Parts, estado: &AppState) -> Result<Self, Self::Rejection> {
         Ok(Self(ip_cliente(&parts.headers, &parts.extensions, estado.config.http.proxy_confiable)))
+    }
+}
+
+/// IP (la regla de [`IpCliente`]) y dispositivo, resumido del User-Agent, de
+/// la petición: lo que guardan las sesiones y la bitácora de seguridad.
+impl FromRequestParts<AppState> for Origen {
+    type Rejection = Infallible;
+
+    async fn from_request_parts(parts: &mut Parts, estado: &AppState) -> Result<Self, Self::Rejection> {
+        let ip = ip_cliente(&parts.headers, &parts.extensions, estado.config.http.proxy_confiable);
+        let user_agent = parts.headers.get(header::USER_AGENT).and_then(|v| v.to_str().ok());
+        Ok(Origen::nuevo(ip, user_agent))
     }
 }
 

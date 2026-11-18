@@ -35,8 +35,9 @@ impl Mercado {
         Self { app: routes::router(estado.clone()), estado }
     }
 
-    fn token(&self, cliente_id: Uuid) -> String {
-        self.estado.jwt.emitir(cliente_id, RolUsuario::Cliente, false).unwrap().0
+    /// Token de una sesión real del cliente (su fila en `kyc.sesiones`).
+    async fn token(&self, cliente_id: Uuid) -> String {
+        token_de(&self.estado, cliente_id, RolUsuario::Cliente, false).await
     }
 
     async fn ordenar(&self, token: &str, cuerpo: Value) -> (StatusCode, Value) {
@@ -170,7 +171,7 @@ async fn una_compra_limite_compromete_su_efectivo_y_espera(pool: PgPool) {
     let m = Mercado::nuevo(&pool, cfg.clone());
     let ana = con_efectivo(&pool, &cfg, "Ana", "20000").await;
     let cuenta = ana.cuenta_ifpe.id;
-    let token = m.token(ana.cliente.id);
+    let token = m.token(ana.cliente.id).await;
 
     // Comprar 1 250 MXN de oro a 1 600 o menos, con el precio en 1 612.40: espera.
     let cuerpo = limite("AUG1", "buy", "1250.00", "1600.0000", "limite-1");
@@ -281,7 +282,7 @@ async fn el_motor_ejecuta_cada_orden_al_alcanzar_su_precio(pool: PgPool) {
     let m = Mercado::nuevo(&pool, cfg.clone());
     let ana = con_efectivo(&pool, &cfg, "Ana", "20000").await;
     let (cliente_id, cuenta) = (ana.cliente.id, ana.cuenta_ifpe.id);
-    let token = m.token(cliente_id);
+    let token = m.token(cliente_id).await;
 
     // 1 250 MXN de oro a mercado: 0.7752 g por 1 249.93.
     m.colocada(&token, orden("AUG1", "buy", "1250.00", "compra")).await;
@@ -365,7 +366,7 @@ async fn una_orden_limite_ejecutable_se_ejecuta_al_colocarse(pool: PgPool) {
     let m = Mercado::nuevo(&pool, cfg.clone());
     let ana = con_efectivo(&pool, &cfg, "Ana", "20000").await;
     let cuenta = ana.cuenta_ifpe.id;
-    let token = m.token(ana.cliente.id);
+    let token = m.token(ana.cliente.id).await;
 
     // Comprar a 1 700 o menos con el precio en 1 612.40: se ejecuta en seguida.
     let cuerpo = limite("AUG1", "buy", "1250.00", "1700", "compra-ejecutable");
@@ -423,7 +424,7 @@ async fn reglas_de_las_ordenes_limite_y_stop(pool: PgPool) {
     let m = Mercado::nuevo(&pool, cfg.clone());
     let ana = con_efectivo(&pool, &cfg, "Ana", "1000").await;
     let cuenta = ana.cuenta_ifpe.id;
-    let token = m.token(ana.cliente.id);
+    let token = m.token(ana.cliente.id).await;
 
     let base = |extra: Value| {
         let mut o = orden("AUG1", "buy", "100.00", &format!("regla-{}", Uuid::new_v4().simple()));
@@ -498,11 +499,12 @@ async fn sin_modo_demo_no_se_colocan_ni_se_disparan_precios_simulados(pool: PgPo
     let cfg = preparar(&pool).await;
     let ana = con_efectivo(&pool, &cfg, "Ana", "1000").await;
     let demo = Mercado::nuevo(&pool, cfg.clone());
-    let o = demo.colocada(&demo.token(ana.cliente.id), limite("AUG1", "buy", "100.00", "1600", "demo")).await;
+    let o = demo.colocada(&demo.token(ana.cliente.id).await, limite("AUG1", "buy", "100.00", "1600", "demo")).await;
 
     let produccion = Config { modo_demo: false, ..cfg.clone() };
     let m = Mercado::nuevo(&pool, produccion.clone());
-    let (s, codigo) = m.rechazada(&m.token(ana.cliente.id), limite("AUG1", "buy", "100.00", "1600", "prod")).await;
+    let (s, codigo) =
+        m.rechazada(&m.token(ana.cliente.id).await, limite("AUG1", "buy", "100.00", "1600", "prod")).await;
     assert_eq!((s, codigo.as_str()), (StatusCode::SERVICE_UNAVAILABLE, "MERCADO_NO_DISPONIBLE"));
     // El motor no ejecuta a un precio simulado fuera de MODO_DEMO: la orden espera.
     precio(&pool, "AUG1", "1590").await;
@@ -523,7 +525,7 @@ async fn cancelar_devuelve_lo_comprometido(pool: PgPool) {
     let m = Mercado::nuevo(&pool, cfg.clone());
     let ana = con_efectivo(&pool, &cfg, "Ana", "5000").await;
     let (cliente_id, cuenta) = (ana.cliente.id, ana.cuenta_ifpe.id);
-    let token = m.token(cliente_id);
+    let token = m.token(cliente_id).await;
 
     // Una compra: el efectivo regresa, con su LIBERACION_ORDEN.
     let compra = m.colocada(&token, limite("AUG1", "buy", "500.00", "1500", "cancelar-compra")).await;
@@ -564,7 +566,7 @@ async fn cancelar_devuelve_lo_comprometido(pool: PgPool) {
 
     // La de otro cliente no existe para Beto; ni la ve.
     let beto = con_efectivo(&pool, &cfg, "Beto", "100").await;
-    let token_beto = m.token(beto.cliente.id);
+    let token_beto = m.token(beto.cliente.id).await;
     let otra_de_ana = m.colocada(&token, limite("AUG1", "buy", "100.00", "1500", "de-ana")).await;
     let (s, e) = m.cancelar(&token_beto, &otra_de_ana["order_id"]).await;
     assert_eq!((s, &e["error"]["codigo"]), (StatusCode::NOT_FOUND, &json!("NO_ENCONTRADO")), "{e}");
@@ -583,7 +585,7 @@ async fn cancelar_devuelve_lo_comprometido(pool: PgPool) {
     // Solo clientes: el personal interno no cancela.
     let (oficial_id, _) = oficial(&pool, "Olga").await;
     activar_mfa(&m.estado, oficial_id).await;
-    let token_oficial = m.estado.jwt.emitir(oficial_id, RolUsuario::Cumplimiento, true).unwrap().0;
+    let token_oficial = token_de(&m.estado, oficial_id, RolUsuario::Cumplimiento, true).await;
     let (s, _) = m.cancelar(&token_oficial, &otra_de_ana["order_id"]).await;
     assert_eq!(s, StatusCode::FORBIDDEN);
 
@@ -611,7 +613,7 @@ async fn una_venta_de_mercado_no_vende_titulos_comprometidos(pool: PgPool) {
     let m = Mercado::nuevo(&pool, cfg.clone());
     let ana = con_efectivo(&pool, &cfg, "Ana", "5000").await;
     let cliente_id = ana.cliente.id;
-    let token = m.token(cliente_id);
+    let token = m.token(cliente_id).await;
 
     m.colocada(&token, orden("AUG1", "buy", "1250.00", "compra")).await;
     // 1 000 MXN a 1 700 son 0.5882 g: quedan libres 0.1870, que valen 301.51888.
@@ -651,7 +653,7 @@ async fn una_orden_disparada_que_ya_no_procede_se_rechaza(pool: PgPool) {
 
     // Un stop de compra de 10 MXN de SCT28 (enteros, a 9.92) que se dispara a 10.50: ya no alcanza un certificado.
     let ana = con_efectivo(&pool, &cfg, "Ana", "1000").await;
-    let token_ana = m.token(ana.cliente.id);
+    let token_ana = m.token(ana.cliente.id).await;
     let cetes = m.colocada(&token_ana, stop("SCT28", "buy", "10.00", "9.95", "stop-cetes")).await;
     assert_eq!(saldos(&pool, ana.cuenta_ifpe.id).await, (d("990"), d("10")));
     precio(&pool, "SCT28", "10.50").await;
@@ -664,7 +666,7 @@ async fn una_orden_disparada_que_ya_no_procede_se_rechaza(pool: PgPool) {
     let mut ordenes = Vec::new();
     for nombre in ["Beto", "Caro", "Dani"] {
         let r = con_efectivo(&pool, &cfg, nombre, "500").await;
-        let o = m.colocada(&m.token(r.cliente.id), limite("AUG1", "buy", "100.00", "1600", nombre)).await;
+        let o = m.colocada(&m.token(r.cliente.id).await, limite("AUG1", "buy", "100.00", "1600", nombre)).await;
         ordenes.push((r, o));
     }
     revocar_kyc(&pool, ordenes[0].0.cliente.id).await;
@@ -691,7 +693,7 @@ async fn una_orden_disparada_que_ya_no_procede_se_rechaza(pool: PgPool) {
 
     // Un activo suspendido no rechaza la orden: espera a que vuelva a operar.
     let dani = &ordenes[2].0;
-    let token_dani = m.token(dani.cliente.id);
+    let token_dani = m.token(dani.cliente.id).await;
     let espera = m.colocada(&token_dani, limite("AUG1", "buy", "100.00", "1580", "espera")).await;
     sqlx::query("UPDATE mercado.activos SET operable = FALSE WHERE ticker = 'AUG1'").execute(&pool).await.unwrap();
     precio(&pool, "AUG1", "1570").await;
@@ -712,7 +714,7 @@ async fn un_congelamiento_pld_rechaza_sin_aviso_y_devuelve_lo_comprometido(pool:
     let m = Mercado::nuevo(&pool, cfg.clone());
     let fer = con_efectivo(&pool, &cfg, "Fer", "1000").await;
     let cuenta = fer.cuenta_ifpe.id;
-    let token = m.token(fer.cliente.id);
+    let token = m.token(fer.cliente.id).await;
     let disparable = m.colocada(&token, limite("AUG1", "buy", "300.00", "1600", "disparable")).await;
     let cancelable = m.colocada(&token, limite("AUG1", "buy", "200.00", "1500", "cancelable")).await;
 
@@ -753,7 +755,7 @@ async fn cancelar_y_ejecutar_a_la_vez_cierran_la_orden_una_sola_vez(pool: PgPool
     let m = Mercado::nuevo(&pool, cfg.clone());
     let ana = con_efectivo(&pool, &cfg, "Ana", "1000").await;
     let (cliente_id, cuenta) = (ana.cliente.id, ana.cuenta_ifpe.id);
-    let token = m.token(cliente_id);
+    let token = m.token(cliente_id).await;
 
     // Dos órdenes de 600 con 1 000 disponibles: solo una compromete.
     let (a, b) = tokio::join!(
@@ -791,7 +793,7 @@ async fn la_auditoria_detecta_efectivo_comprometido_sin_orden(pool: PgPool) {
     let cfg = preparar(&pool).await;
     let m = Mercado::nuevo(&pool, cfg.clone());
     let ana = con_efectivo(&pool, &cfg, "Ana", "1000").await;
-    let token = m.token(ana.cliente.id);
+    let token = m.token(ana.cliente.id).await;
     m.colocada(&token, limite("AUG1", "buy", "300.00", "1500", "auditada")).await;
     assert!(hash::verificar_cadena_mercado(&pool).await.unwrap().valido);
 

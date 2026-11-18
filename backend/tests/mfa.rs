@@ -172,8 +172,8 @@ async fn oficial_sin_segundo_factor_no_entra_a_la_consola_pld(pool: PgPool) {
 
     // Ni el token de inscripción, ni un token de acceso sin el claim `mfa`, ni
     // uno que diga `mfa: true` sin el factor activo en la base de datos.
-    let sin_mfa = b.estado.jwt.emitir(id, RolUsuario::Cumplimiento, false).unwrap().0;
-    let falsificado = b.estado.jwt.emitir(id, RolUsuario::Cumplimiento, true).unwrap().0;
+    let sin_mfa = token_de(&b.estado, id, RolUsuario::Cumplimiento, false).await;
+    let falsificado = token_de(&b.estado, id, RolUsuario::Cumplimiento, true).await;
     for (metodo, ruta) in rutas_aml() {
         let (s, v) = b.llamar(metodo, &ruta, Some(inscripcion), None).await;
         assert_eq!(
@@ -195,7 +195,7 @@ async fn oficial_sin_segundo_factor_no_entra_a_la_consola_pld(pool: PgPool) {
 
     // Lo mismo para el resto del personal: el auditor en la consola, el operador en las operaciones.
     let (aud, _) = auditor(&pool, "Aurelio").await;
-    let token = b.estado.jwt.emitir(aud, RolUsuario::Auditor, false).unwrap().0;
+    let token = token_de(&b.estado, aud, RolUsuario::Auditor, false).await;
     let (s, v) = b.llamar("GET", "/api/v1/aml/alertas", Some(&token), None).await;
     assert_eq!((s, codigo_de_error(&v)), (StatusCode::FORBIDDEN, Some("MFA_REQUERIDO")), "{v}");
     bootstrap::asegurar_operador(&pool, "operador@synthetic.mx", "operador-de-pruebas-123").await.unwrap();
@@ -203,7 +203,7 @@ async fn oficial_sin_segundo_factor_no_entra_a_la_consola_pld(pool: PgPool) {
         .fetch_one(&pool)
         .await
         .unwrap();
-    let token = b.estado.jwt.emitir(op, RolUsuario::Operador, false).unwrap().0;
+    let token = token_de(&b.estado, op, RolUsuario::Operador, false).await;
     let (s, v) = b.llamar("GET", "/api/v1/operaciones/creditos", Some(&token), None).await;
     assert_eq!((s, codigo_de_error(&v)), (StatusCode::FORBIDDEN, Some("MFA_REQUERIDO")), "{v}");
 
@@ -296,8 +296,13 @@ async fn la_inscripcion_guarda_el_secreto_cifrado_y_activa_con_el_primer_codigo(
     let ev: Vec<String> = eventos(&pool, id).await.into_iter().map(|(e, quien)| format!("{e}/{quien}")).collect();
     assert_eq!(
         ev,
-        ["MFA_SECRETO_GENERADO/sc_auth", "MFA_CODIGO_RECHAZADO/sc_auth", "MFA_ACTIVADO/sc_auth"],
-        "la bitácora registra la inscripción"
+        [
+            "MFA_SECRETO_GENERADO/sc_auth",
+            "MFA_CODIGO_RECHAZADO/sc_auth",
+            "MFA_ACTIVADO/sc_auth",
+            "INICIO_SESION/sc_auth"
+        ],
+        "la bitácora registra la inscripción y la sesión que abre"
     );
 }
 
@@ -322,7 +327,7 @@ async fn con_segundo_factor_el_login_exige_el_codigo_y_no_acepta_repetirlo(pool:
     assert_eq!(s, StatusCode::UNAUTHORIZED);
     // Y nada que no sea un desafío vigente sirve como desafío.
     let secreto = b.totp.secreto(&email).unwrap();
-    let acceso = b.estado.jwt.emitir(id, RolUsuario::Cumplimiento, true).unwrap().0;
+    let acceso = b.estado.jwt.emitir(id, RolUsuario::Cumplimiento, true, Uuid::new_v4()).unwrap().0;
     for otro in [&inscripcion, &acceso, &"no-es-un-jwt".to_string()] {
         let (s, v) = b.verificar(otro, &codigo_actual(&secreto)).await;
         assert_eq!((s, codigo_de_error(&v)), (StatusCode::UNAUTHORIZED, Some("DESAFIO_MFA_VENCIDO")), "{v}");
@@ -480,8 +485,12 @@ async fn restablecer_la_contrasena_con_un_enlace_de_un_solo_uso(pool: PgPool) {
     let (s, v) = b.restablecer(token, "otra-contraseña-789").await;
     assert_eq!((s, codigo_de_error(&v)), (StatusCode::UNPROCESSABLE_ENTITY, Some("TOKEN_RESTABLECIMIENTO_INVALIDO")));
 
+    // El alta abrió una sesión; después, el restablecimiento y los dos inicios.
     let ev: Vec<String> = eventos(&pool, id).await.into_iter().map(|(e, _)| e).collect();
-    assert_eq!(ev, ["RESTABLECIMIENTO_SOLICITADO", "CONTRASENA_RESTABLECIDA"]);
+    assert_eq!(
+        ev,
+        ["INICIO_SESION", "RESTABLECIMIENTO_SOLICITADO", "CONTRASENA_RESTABLECIDA", "INICIO_FALLIDO", "INICIO_SESION"]
+    );
 }
 
 #[sqlx::test(migrations = "../migrations")]

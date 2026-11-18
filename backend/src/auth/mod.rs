@@ -1,11 +1,14 @@
 //! Autenticación: contraseñas Argon2id, JWT HS256, segundo factor TOTP,
-//! restablecimiento de contraseña y extractor de usuario.
+//! restablecimiento de contraseña, sesiones por dispositivo, centro de
+//! seguridad y extractor de usuario.
 
 pub mod correo;
 pub mod jwt;
 pub mod mfa;
 pub mod password;
 pub mod restablecimiento;
+pub mod seguridad;
+pub mod sesiones;
 
 use axum::{
     extract::{FromRef, FromRequestParts},
@@ -16,6 +19,7 @@ use serde::Serialize;
 use sqlx::PgPool;
 use uuid::Uuid;
 
+use self::sesiones::{Evento, Origen};
 use crate::{
     db::{self, Rol},
     error::{AppError, AppResult},
@@ -31,6 +35,8 @@ pub struct Usuario {
     /// La sesión verificó el segundo factor. Siempre `true` para el personal
     /// interno: sin él, el extractor rechaza la petición (`MFA_REQUERIDO`).
     pub mfa: bool,
+    /// La sesión del token (`kyc.sesiones`, migración 0019).
+    pub sesion_id: Uuid,
 }
 
 impl Usuario {
@@ -121,26 +127,37 @@ where
         }
         let estado = AppState::from_ref(state);
         let claims = estado.jwt.validar(bearer(parts)?)?;
-        validar_contra_bd(&estado.pool, &claims).await
+        validar_contra_bd(&estado.pool, &claims, Uso::Peticion).await
     }
 }
 
 /// Las mismas comprobaciones del extractor [`Usuario`] (firma, audiencia y
-/// vigencia del JWT; después, en la base de datos, rol actual, revocación,
-/// bloqueo y segundo factor) para un token que no llega en `Authorization`:
-/// un navegador no puede poner cabeceras en un WebSocket. Devuelve también
-/// los claims, cuyo `exp` acota la vida de la conexión.
+/// vigencia del JWT; después, en la base de datos, rol actual, sesión vigente,
+/// revocación, bloqueo y segundo factor) para un token que no llega en
+/// `Authorization`: un navegador no puede poner cabeceras en un WebSocket.
+/// Abrir la conexión cuenta como actividad de la sesión. Devuelve también los
+/// claims, cuyo `exp` acota la vida de la conexión.
 pub async fn autenticar_token(estado: &AppState, token: &str) -> AppResult<(Usuario, jwt::Claims)> {
     let claims = estado.jwt.validar(token)?;
-    let usuario = validar_contra_bd(&estado.pool, &claims).await?;
+    let usuario = validar_contra_bd(&estado.pool, &claims, Uso::Peticion).await?;
     Ok((usuario, claims))
 }
 
 /// Vuelve a confirmar contra la base de datos una sesión ya abierta: una
-/// conexión larga no debe sobrevivir a una revocación, un cambio de rol o un
-/// bloqueo.
+/// conexión larga no debe sobrevivir a una revocación, un cambio de rol, un
+/// bloqueo ni al cierre por inactividad. No cuenta como actividad: una
+/// pestaña abierta sin peticiones también se cierra.
 pub async fn revalidar(pool: &PgPool, claims: &jwt::Claims) -> AppResult<Usuario> {
-    validar_contra_bd(pool, claims).await
+    validar_contra_bd(pool, claims, Uso::Revalidacion).await
+}
+
+/// Por qué se valida un token.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Uso {
+    /// Una petición de la persona: marca el último uso de la sesión.
+    Peticion,
+    /// La revalidación periódica de una conexión abierta: no lo marca.
+    Revalidacion,
 }
 
 fn bearer(parts: &Parts) -> AppResult<&str> {
@@ -158,18 +175,34 @@ struct FilaSesion {
     en_lista_bloqueadas: bool,
     revocado: bool,
     mfa_enabled: bool,
+    /// La sesión del token es de esta persona y sigue vigente: no revocada,
+    /// sin vencer y usada dentro de su cierre por inactividad.
+    sesion_vigente: bool,
+    /// Su último uso tiene más de [`sesiones::SEGUNDOS_ENTRE_USOS`].
+    tocar: bool,
 }
 
+/// Lo que valida cada petición, en una sola lectura con sc_kyc. Sin `sid`
+/// (los desafíos), `sesion_vigente` es `false`.
 async fn leer_sesion(pool: &PgPool, claims: &jwt::Claims) -> AppResult<Option<FilaSesion>> {
     let mut tx = db::begin_lectura(pool, Rol::Kyc).await?;
     let fila: Option<FilaSesion> = sqlx::query_as(
         "SELECT cr.rol, c.en_lista_bloqueadas, cr.mfa_enabled, \
-                coalesce(floor(extract(epoch FROM cr.tokens_validos_desde)) > $2, false) AS revocado \
+                coalesce(floor(extract(epoch FROM cr.tokens_validos_desde)) > $2, false) AS revocado, \
+                coalesce(s.revocada_en IS NULL AND s.expira_en > now() \
+                         AND s.ultimo_uso_en > now() - make_interval(mins => coalesce(p.inactividad_minutos, $4)), \
+                         false) AS sesion_vigente, \
+                coalesce(s.ultimo_uso_en < now() - make_interval(secs => $5), false) AS tocar \
          FROM kyc.credenciales cr JOIN kyc.clientes c ON c.id = cr.cliente_id \
+         LEFT JOIN kyc.sesiones s ON s.id = $3 AND s.cliente_id = cr.cliente_id \
+         LEFT JOIN kyc.preferencias_seguridad p ON p.cliente_id = cr.cliente_id \
          WHERE cr.cliente_id = $1",
     )
     .bind(claims.sub)
     .bind(claims.iat)
+    .bind(claims.sid)
+    .bind(sesiones::INACTIVIDAD_PREDETERMINADA)
+    .bind(f64::from(sesiones::SEGUNDOS_ENTRE_USOS))
     .fetch_optional(&mut *tx)
     .await?;
     tx.commit().await?;
@@ -178,14 +211,18 @@ async fn leer_sesion(pool: &PgPool, claims: &jwt::Claims) -> AppResult<Option<Fi
 
 /// La firma del JWT no basta: en cada petición se confirma contra la base de
 /// datos que la persona existe, que su rol **actual** coincide con el del
-/// token, que sus sesiones no fueron revocadas y que no está bloqueada. Así,
-/// degradar a un operador o revocar sus sesiones surte efecto de inmediato.
+/// token, que la sesión del token sigue vigente (no revocada, sin vencer y
+/// activa: ver [`sesiones`]), que sus sesiones no fueron revocadas todas y que
+/// no está bloqueada. Así, degradar a un operador, cerrar una sesión o
+/// revocarlas todas surte efecto de inmediato. Un token sin sesión (`sid`,
+/// emitido antes de 0019) no vale.
 ///
 /// Segundo factor: si la persona lo tiene activo, la sesión debe haberlo
 /// verificado; el personal interno, además, no opera sin él (`MFA_REQUERIDO`).
-async fn validar_contra_bd(pool: &PgPool, claims: &jwt::Claims) -> AppResult<Usuario> {
+async fn validar_contra_bd(pool: &PgPool, claims: &jwt::Claims, uso: Uso) -> AppResult<Usuario> {
+    let sesion_id = claims.sid.ok_or(AppError::NoAutenticado)?;
     let fila = leer_sesion(pool, claims).await?.ok_or(AppError::NoAutenticado)?;
-    if fila.revocado || fila.rol != claims.rol {
+    if fila.revocado || fila.rol != claims.rol || !fila.sesion_vigente {
         return Err(AppError::NoAutenticado);
     }
     if fila.en_lista_bloqueadas {
@@ -198,7 +235,10 @@ async fn validar_contra_bd(pool: &PgPool, claims: &jwt::Claims) -> AppResult<Usu
     if mfa::exige_mfa(fila.rol) && !mfa {
         return Err(AppError::MfaRequerido);
     }
-    Ok(Usuario { cliente_id: claims.sub, rol: fila.rol, mfa })
+    if uso == Uso::Peticion && fila.tocar {
+        sesiones::tocar(pool, sesion_id).await;
+    }
+    Ok(Usuario { cliente_id: claims.sub, rol: fila.rol, mfa, sesion_id })
 }
 
 /// Quien inscribe su segundo factor (`/auth/mfa/setup`, `/auth/mfa/enable`):
@@ -231,14 +271,16 @@ where
             }
             return Ok(Self { cliente_id: claims.sub, rol: fila.rol });
         }
-        let u = validar_contra_bd(&estado.pool, &estado.jwt.validar(token)?).await?;
+        let u = validar_contra_bd(&estado.pool, &estado.jwt.validar(token)?, Uso::Peticion).await?;
         Ok(Self { cliente_id: u.cliente_id, rol: u.rol })
     }
 }
 
-/// Invalida todos los JWT emitidos hasta ahora para una persona.
+/// Invalida todos los JWT emitidos hasta ahora para una persona y cierra sus
+/// sesiones (un operador: `POST /operaciones/usuarios/{id}/revocar-sesiones`).
+/// Queda en su bitácora, sin la IP del operador.
 pub async fn revocar_sesiones(pool: &PgPool, cliente_id: Uuid) -> AppResult<()> {
-    let mut tx = db::begin(pool, Rol::Kyc).await?;
+    let mut tx = db::begin(pool, Rol::Auth).await?;
     let n = sqlx::query("UPDATE kyc.credenciales SET tokens_validos_desde = now() WHERE cliente_id = $1")
         .bind(cliente_id)
         .execute(&mut *tx)
@@ -247,7 +289,10 @@ pub async fn revocar_sesiones(pool: &PgPool, cliente_id: Uuid) -> AppResult<()> 
     if n == 0 {
         return Err(AppError::no_encontrado("persona no encontrada"));
     }
+    let revocadas = sesiones::revocar_vigentes(&mut tx, cliente_id, None, "OPERADOR").await?;
+    sesiones::registrar(&mut tx, &Evento::interno(cliente_id, "SESIONES_REVOCADAS").detalle(revocadas)).await?;
     tx.commit().await?;
+    tracing::info!(target: "auth", %cliente_id, revocadas, "sesiones revocadas por un operador");
     Ok(())
 }
 
@@ -260,19 +305,33 @@ const MINUTOS_BLOQUEO: i64 = 15;
 
 /// Cuenta un intento fallido (contraseña o código TOTP) y, al llegar a
 /// `MAX_INTENTOS` ($2), bloquea la cuenta `MINUTOS_BLOQUEO` ($3) minutos. Una
-/// ventana de bloqueo vencida empieza de nuevo en 1.
+/// ventana de bloqueo vencida empieza de nuevo en 1. Devuelve si este fallo
+/// bloqueó la cuenta (quien lo llama comprobó antes que no lo estaba).
 pub(crate) const SQL_REGISTRAR_FALLO: &str = "UPDATE kyc.credenciales SET \
        intentos_fallidos = CASE WHEN bloqueado_hasta IS NULL THEN intentos_fallidos + 1 ELSE 1 END, \
        bloqueado_hasta = CASE WHEN (CASE WHEN bloqueado_hasta IS NULL THEN intentos_fallidos + 1 ELSE 1 END) >= $2 \
                               THEN now() + make_interval(mins => $3) ELSE NULL END \
-     WHERE cliente_id = $1";
+     WHERE cliente_id = $1 RETURNING bloqueado_hasta IS NOT NULL";
 
+/// Cuenta el intento como fallido **antes** de verificar (ver
+/// [`iniciar_sesion`]); sin fila si la cuenta está bloqueada. Devuelve el hash
+/// y si este intento agotó el cupo.
+pub(crate) const SQL_RESERVAR_INTENTO: &str = "UPDATE kyc.credenciales SET \
+       intentos_fallidos = CASE WHEN bloqueado_hasta IS NULL THEN intentos_fallidos + 1 ELSE 1 END, \
+       bloqueado_hasta = CASE WHEN (CASE WHEN bloqueado_hasta IS NULL THEN intentos_fallidos + 1 ELSE 1 END) >= $2 \
+                              THEN now() + make_interval(mins => $3) ELSE NULL END \
+     WHERE cliente_id = $1 AND (bloqueado_hasta IS NULL OR bloqueado_hasta <= now()) \
+     RETURNING password_hash, bloqueado_hasta IS NOT NULL AS agota";
+
+/// Una sesión de acceso recién abierta.
 #[derive(Debug, Clone, Serialize)]
 pub struct Sesion {
     pub token: String,
     pub expira_en: DateTime<Utc>,
     pub cliente_id: Uuid,
     pub rol: RolUsuario,
+    /// La fila de `kyc.sesiones` (el `sid` del token).
+    pub sesion_id: Uuid,
 }
 
 /// Respuesta de `POST /auth/login` (y de los pasos que completan la sesión).
@@ -320,7 +379,18 @@ struct FilaLogin {
 ///    - cliente sin segundo factor: la sesión, y el contador vuelve a cero
 ///      (también si la propia reserva acababa de bloquear la cuenta: el intento
 ///      estaba dentro del cupo).
-pub async fn iniciar_sesion(estado: &AppState, email: &str, password_plano: &str) -> AppResult<ResultadoLogin> {
+///
+/// Cada contraseña incorrecta queda en la bitácora del cliente
+/// (`INICIO_FALLIDO`, con la IP y el dispositivo), y también el intento que
+/// bloquea la cuenta (`CUENTA_BLOQUEADA`); los intentos durante el bloqueo no
+/// se verifican ni se registran (la bitácora no crece sin límite). El correcto
+/// abre una sesión ([`sesiones::abrir`]).
+pub async fn iniciar_sesion(
+    estado: &AppState,
+    email: &str,
+    password_plano: &str,
+    origen: &Origen,
+) -> AppResult<ResultadoLogin> {
     let invalidas = || AppError::CredencialesInvalidas("email o contraseña incorrectos".into());
     let bloqueada =
         || AppError::Bloqueado("demasiados intentos fallidos; la cuenta está bloqueada temporalmente".into());
@@ -338,24 +408,18 @@ pub async fn iniciar_sesion(estado: &AppState, email: &str, password_plano: &str
         return Err(invalidas());
     };
     // Una ventana de bloqueo vencida empieza de nuevo en 1.
-    let reservado: Option<String> = sqlx::query_scalar(
-        "UPDATE kyc.credenciales SET \
-           intentos_fallidos = CASE WHEN bloqueado_hasta IS NULL THEN intentos_fallidos + 1 ELSE 1 END, \
-           bloqueado_hasta = CASE WHEN (CASE WHEN bloqueado_hasta IS NULL THEN intentos_fallidos + 1 ELSE 1 END) >= $2 \
-                                  THEN now() + make_interval(mins => $3) ELSE NULL END \
-         WHERE cliente_id = $1 AND (bloqueado_hasta IS NULL OR bloqueado_hasta <= now()) \
-         RETURNING password_hash",
-    )
-    .bind(cliente_id)
-    .bind(MAX_INTENTOS)
-    .bind(MINUTOS_BLOQUEO as i32)
-    .fetch_optional(&mut *tx)
-    .await?;
+    let reservado: Option<(String, bool)> = sqlx::query_as(SQL_RESERVAR_INTENTO)
+        .bind(cliente_id)
+        .bind(MAX_INTENTOS)
+        .bind(MINUTOS_BLOQUEO as i32)
+        .fetch_optional(&mut *tx)
+        .await?;
     tx.commit().await?;
-    let Some(password_hash) = reservado else { return Err(bloqueada()) };
+    let Some((password_hash, agota)) = reservado else { return Err(bloqueada()) };
 
     if !password::verificar(password_plano.to_owned(), password_hash).await? {
-        // El intento ya quedó contado en la reserva.
+        // El intento ya quedó contado en la reserva; falta la bitácora.
+        registrar_fallo(pool, cliente_id, "INICIO_FALLIDO", agota, origen, None).await?;
         return Err(invalidas());
     }
 
@@ -398,6 +462,33 @@ pub async fn iniciar_sesion(estado: &AppState, email: &str, password_plano: &str
             estado.jwt.emitir_desafio(fila.cliente_id, fila.rol, jwt::Desafio::Inscripcion)?;
         return Ok(ResultadoLogin::InscripcionRequerida { token_inscripcion, expira_en });
     }
-    let (token, expira_en) = estado.jwt.emitir(fila.cliente_id, fila.rol, false)?;
-    Ok(ResultadoLogin::Sesion(Sesion { token, expira_en, cliente_id: fila.cliente_id, rol: fila.rol }))
+    let sesion = sesiones::abrir(estado, fila.cliente_id, fila.rol, false, origen).await?;
+    Ok(ResultadoLogin::Sesion(sesion))
+}
+
+/// Registra un intento fallido ya contado (`evento`) y, si agotó el cupo,
+/// también el bloqueo de la cuenta. `sesion_id`: la sesión desde la que se
+/// intentó (un cambio de contraseña), si la hay.
+pub(crate) async fn registrar_fallo(
+    pool: &PgPool,
+    cliente_id: Uuid,
+    evento: &'static str,
+    agota: bool,
+    origen: &Origen,
+    sesion_id: Option<Uuid>,
+) -> AppResult<()> {
+    let mut tx = db::begin(pool, Rol::Auth).await?;
+    let eventos: &[&'static str] = if agota { &[evento, "CUENTA_BLOQUEADA"] } else { &[evento] };
+    for &nombre in eventos {
+        let mut e = Evento::de(cliente_id, nombre, origen);
+        if let Some(sid) = sesion_id {
+            e = e.sesion(sid);
+        }
+        sesiones::registrar(&mut tx, &e).await?;
+    }
+    tx.commit().await?;
+    if agota {
+        tracing::warn!(target: "auth", %cliente_id, "cuenta bloqueada por intentos fallidos");
+    }
+    Ok(())
 }

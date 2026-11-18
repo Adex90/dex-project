@@ -10,17 +10,20 @@
 //! - `confirmar` comprueba primero el token (barato) y solo entonces calcula
 //!   Argon2, así tokens al azar no consumen CPU. Luego cambia la contraseña y
 //!   anula el token en una sola sentencia (un solo uso, también en paralelo),
-//!   desbloquea la cuenta y **revoca todas las sesiones**. El segundo factor
-//!   sigue activo: el siguiente inicio de sesión vuelve a pedir el código.
-
-use std::net::IpAddr;
+//!   desbloquea la cuenta y **revoca todas las sesiones** (los tokens y sus
+//!   filas en `kyc.sesiones`). El segundo factor sigue activo: el siguiente
+//!   inicio de sesión vuelve a pedir el código.
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use rand::RngCore;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use super::{mfa::registrar_evento, password};
+use super::{
+    mfa::registrar_evento,
+    password,
+    sesiones::{self, Evento, Origen},
+};
 use crate::{
     db::{self, Rol},
     error::{AppError, AppResult},
@@ -45,7 +48,7 @@ fn token_invalido() -> AppError {
 
 /// Pide un enlace de restablecimiento para `email`. Siempre `Ok` si el email
 /// tiene forma de email (exista o no la cuenta).
-pub async fn solicitar(estado: &AppState, email: &str, ip: Option<IpAddr>) -> AppResult<()> {
+pub async fn solicitar(estado: &AppState, email: &str, origen: &Origen) -> AppResult<()> {
     let email = email.trim().to_lowercase();
     if email.is_empty() || email.len() > 254 || !email.contains('@') {
         return Err(AppError::validacion("email inválido"));
@@ -82,7 +85,7 @@ pub async fn solicitar(estado: &AppState, email: &str, ip: Option<IpAddr>) -> Ap
     .bind(MINUTOS_VIGENCIA as i32)
     .execute(&mut *tx)
     .await?;
-    registrar_evento(&mut tx, cliente_id, "RESTABLECIMIENTO_SOLICITADO", ip).await?;
+    registrar_evento(&mut tx, cliente_id, "RESTABLECIMIENTO_SOLICITADO", origen).await?;
     tx.commit().await?;
     let enlace = format!("{}/auth/reset-password#token={token}", estado.config.frontend_origin.trim_end_matches('/'));
     estado.correo.restablecimiento(cliente_id, &email, enlace);
@@ -90,7 +93,7 @@ pub async fn solicitar(estado: &AppState, email: &str, ip: Option<IpAddr>) -> Ap
 }
 
 /// Cambia la contraseña con el token del enlace.
-pub async fn confirmar(estado: &AppState, token: &str, password_nueva: &str, ip: Option<IpAddr>) -> AppResult<()> {
+pub async fn confirmar(estado: &AppState, token: &str, password_nueva: &str, origen: &Origen) -> AppResult<()> {
     password::validar_politica(password_nueva)?;
     let token = token.trim();
     if token.is_empty() || token.len() > 128 {
@@ -128,9 +131,10 @@ pub async fn confirmar(estado: &AppState, token: &str, password_nueva: &str, ip:
     let Some(cliente_id) = cliente_id else {
         return Err(token_invalido());
     };
-    registrar_evento(&mut tx, cliente_id, "CONTRASENA_RESTABLECIDA", ip).await?;
+    let revocadas = sesiones::revocar_vigentes(&mut tx, cliente_id, None, "CONTRASENA_RESTABLECIDA").await?;
+    sesiones::registrar(&mut tx, &Evento::de(cliente_id, "CONTRASENA_RESTABLECIDA", origen).detalle(revocadas)).await?;
     tx.commit().await?;
-    tracing::info!(target: "auth", %cliente_id, "contraseña restablecida; sesiones revocadas");
+    tracing::info!(target: "auth", %cliente_id, revocadas, "contraseña restablecida; sesiones revocadas");
     Ok(())
 }
 

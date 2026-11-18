@@ -88,8 +88,9 @@ fn con_tiempos(mut estado: AppState, tiempos: Tiempos) -> AppState {
     estado
 }
 
-fn token_cliente(estado: &AppState, cliente_id: Uuid) -> String {
-    estado.jwt.emitir(cliente_id, RolUsuario::Cliente, false).unwrap().0
+/// Token de una sesión real del cliente (su fila en `kyc.sesiones`).
+async fn token_cliente(estado: &AppState, cliente_id: Uuid) -> String {
+    token_de(estado, cliente_id, RolUsuario::Cliente, false).await
 }
 
 /// Como un navegador: el JWT viaja como entrada del subprotocolo.
@@ -337,7 +338,7 @@ async fn la_boveda_por_rest(pool: PgPool) {
     let app = routes::router(estado.clone());
     let ana = cliente(&pool, &cfg, "Ana").await;
     depositar(&pool, &cfg, ana.cuenta_ifpe.id, "1000").await;
-    let token = token_cliente(&estado, ana.cliente.id);
+    let token = token_cliente(&estado, ana.cliente.id).await;
 
     let (s, v) = llamar_json(&app, "GET", "/api/v1/vault", Some(&token), None).await;
     assert_eq!(s, StatusCode::OK, "{v}");
@@ -394,7 +395,7 @@ async fn la_boveda_por_rest(pool: PgPool) {
     assert_eq!((s, v["error"]["codigo"].as_str()), (StatusCode::UNAUTHORIZED, Some("NO_AUTENTICADO")));
     let (oficial_id, _) = oficial(&pool, "Olga").await;
     activar_mfa(&estado, oficial_id).await;
-    let token_oficial = estado.jwt.emitir(oficial_id, RolUsuario::Cumplimiento, true).unwrap().0;
+    let token_oficial = token_de(&estado, oficial_id, RolUsuario::Cumplimiento, true).await;
     let (s, _) = llamar_json(&app, "GET", "/api/v1/vault", Some(&token_oficial), None).await;
     assert_eq!(s, StatusCode::FORBIDDEN);
 }
@@ -412,7 +413,7 @@ async fn websocket_de_principio_a_fin(pool: PgPool) {
     let beto = cliente(&pool, &cfg, "Beto").await;
     let cuenta = ana.cuenta_ifpe.id;
     depositar(&pool, &cfg, cuenta, "1000").await;
-    let token = token_cliente(&srv.estado, ana.cliente.id);
+    let token = token_cliente(&srv.estado, ana.cliente.id).await;
 
     // 1. Foto inicial con la versión de la cuenta.
     let mut ws = abrir(srv.dir, &token).await.unwrap();
@@ -535,7 +536,7 @@ async fn todas_las_pestanas_del_cliente_reciben_el_cambio(pool: PgPool) {
     let cfg = preparar(&pool).await;
     let srv = arrancar(AppState::nuevo(pool.clone(), cfg.clone())).await;
     let ana = cliente(&pool, &cfg, "Ana").await;
-    let token = token_cliente(&srv.estado, ana.cliente.id);
+    let token = token_cliente(&srv.estado, ana.cliente.id).await;
     let mut pestanas = Vec::new();
     for _ in 0..2 {
         let mut ws = abrir(srv.dir, &token).await.unwrap();
@@ -565,7 +566,7 @@ async fn un_retiro_a_una_cuenta_vinculada_avisa_con_la_version_siguiente(pool: P
     let app = routes::router(srv.estado.clone());
     let ana = cliente(&pool, &cfg, "Ana").await;
     depositar(&pool, &cfg, ana.cuenta_ifpe.id, "1000").await;
-    let token = token_cliente(&srv.estado, ana.cliente.id);
+    let token = token_cliente(&srv.estado, ana.cliente.id).await;
     let mut ws = abrir(srv.dir, &token).await.unwrap();
     assert_eq!(recibir(&mut ws).await["seq"], 1);
     let oyente = tokio::spawn(central::escuchar(srv.estado.boveda.clone()));
@@ -593,7 +594,7 @@ async fn al_perder_listen_se_reconecta_y_resincroniza(pool: PgPool) {
     let cfg = preparar(&pool).await;
     let srv = arrancar(AppState::nuevo(pool.clone(), cfg.clone())).await;
     let ana = cliente(&pool, &cfg, "Ana").await;
-    let mut ws = abrir(srv.dir, &token_cliente(&srv.estado, ana.cliente.id)).await.unwrap();
+    let mut ws = abrir(srv.dir, &token_cliente(&srv.estado, ana.cliente.id).await).await.unwrap();
     assert_eq!(recibir(&mut ws).await["seq"], 0);
     let oyente = tokio::spawn(central::escuchar(srv.estado.boveda.clone()));
     assert_eq!(recibir(&mut ws).await["seq"], 0, "la foto al empezar a escuchar");
@@ -642,7 +643,7 @@ async fn el_handshake_exige_sesion_de_cliente_origen_y_subprotocolo(pool: PgPool
     let cfg = preparar(&pool).await;
     let srv = arrancar(AppState::nuevo(pool.clone(), cfg.clone())).await;
     let ana = cliente(&pool, &cfg, "Ana").await;
-    let token = token_cliente(&srv.estado, ana.cliente.id);
+    let token = token_cliente(&srv.estado, ana.cliente.id).await;
     let sp = |t: &str| format!("sc.vault.v1, bearer.{t}");
 
     assert_eq!(rechazo(abrir_con(srv.dir, "sc.vault.v1", Some(ORIGEN), None).await), (401, "NO_AUTENTICADO".into()));
@@ -663,11 +664,11 @@ async fn el_handshake_exige_sesion_de_cliente_origen_y_subprotocolo(pool: PgPool
     // La bóveda es solo de clientes.
     let (oficial_id, _) = oficial(&pool, "Olga").await;
     activar_mfa(&srv.estado, oficial_id).await;
-    let token_oficial = srv.estado.jwt.emitir(oficial_id, RolUsuario::Cumplimiento, true).unwrap().0;
+    let token_oficial = token_de(&srv.estado, oficial_id, RolUsuario::Cumplimiento, true).await;
     assert_eq!(rechazo(abrir_con(srv.dir, &sp(&token_oficial), Some(ORIGEN), None).await), (403, "PROHIBIDO".into()));
     // Una sesión revocada antes de abrir.
     let beto = cliente(&pool, &cfg, "Beto").await;
-    let token_beto = token_cliente(&srv.estado, beto.cliente.id);
+    let token_beto = token_cliente(&srv.estado, beto.cliente.id).await;
     tokio::time::sleep(Duration::from_millis(1100)).await; // la revocación cuenta en segundos
     auth::revocar_sesiones(&pool, beto.cliente.id).await.unwrap();
     assert_eq!(rechazo(abrir(srv.dir, &token_beto).await).0, 401);
@@ -688,7 +689,7 @@ async fn tope_de_sockets_por_cliente(pool: PgPool) {
     let srv = arrancar(AppState::nuevo(pool.clone(), cfg.clone())).await;
     let ana = cliente(&pool, &cfg, "Ana").await;
     let beto = cliente(&pool, &cfg, "Beto").await;
-    let token = token_cliente(&srv.estado, ana.cliente.id);
+    let token = token_cliente(&srv.estado, ana.cliente.id).await;
 
     let mut abiertos = Vec::new();
     for _ in 0..MAX_SOCKETS_POR_CLIENTE {
@@ -698,7 +699,7 @@ async fn tope_de_sockets_por_cliente(pool: PgPool) {
     }
     assert_eq!(rechazo(abrir(srv.dir, &token).await), (429, "DEMASIADAS_CONEXIONES".into()));
     // Otro cliente no comparte ese tope.
-    let mut de_beto = abrir(srv.dir, &token_cliente(&srv.estado, beto.cliente.id)).await.unwrap();
+    let mut de_beto = abrir(srv.dir, &token_cliente(&srv.estado, beto.cliente.id).await).await.unwrap();
     recibir(&mut de_beto).await;
 
     // Al cerrar una pestaña se libera su lugar.
@@ -728,13 +729,13 @@ async fn tope_de_sockets_por_tarea(pool: PgPool) {
     let mut abiertos = Vec::new();
     for nombre in ["Ana", "Beto"] {
         let r = cliente(&pool, &cfg, nombre).await;
-        let mut ws = abrir(srv.dir, &token_cliente(&srv.estado, r.cliente.id)).await.unwrap();
+        let mut ws = abrir(srv.dir, &token_cliente(&srv.estado, r.cliente.id).await).await.unwrap();
         recibir(&mut ws).await;
         abiertos.push(ws);
     }
     let carla = cliente(&pool, &cfg, "Carla").await;
     assert_eq!(
-        rechazo(abrir(srv.dir, &token_cliente(&srv.estado, carla.cliente.id)).await),
+        rechazo(abrir(srv.dir, &token_cliente(&srv.estado, carla.cliente.id).await).await),
         (503, "REINTENTAR".into())
     );
     // Las peticiones HTTP siguen atendiéndose con dos sockets abiertos.
@@ -752,7 +753,7 @@ async fn el_handshake_cuenta_en_el_limite_por_ip(pool: PgPool) {
     cfg.http.por_ip = LimitesPorIp { activo: true, api: Cuota { por_minuto: 1, rafaga: 2 }, ..LimitesPorIp::default() };
     let srv = arrancar(AppState::nuevo(pool.clone(), cfg.clone())).await;
     let ana = cliente(&pool, &cfg, "Ana").await;
-    let token = token_cliente(&srv.estado, ana.cliente.id);
+    let token = token_cliente(&srv.estado, ana.cliente.id).await;
     let mut primero = abrir(srv.dir, &token).await.unwrap();
     recibir(&mut primero).await;
     let mut segundo = abrir(srv.dir, &token).await.unwrap();
@@ -774,13 +775,37 @@ async fn una_sesion_revocada_cierra_el_socket(pool: PgPool) {
     let tiempos = Tiempos { revalidacion: Duration::from_millis(200), ..Tiempos::default() };
     let srv = arrancar(con_tiempos(AppState::nuevo(pool.clone(), cfg.clone()), tiempos)).await;
     let ana = cliente(&pool, &cfg, "Ana").await;
-    let mut ws = abrir(srv.dir, &token_cliente(&srv.estado, ana.cliente.id)).await.unwrap();
+    let mut ws = abrir(srv.dir, &token_cliente(&srv.estado, ana.cliente.id).await).await.unwrap();
     recibir(&mut ws).await;
     // Varias revalidaciones con la sesión vigente: sigue abierto. La
     // revocación cuenta en segundos: debe caer en un segundo posterior al token.
     nada_mas(&mut ws, Duration::from_millis(1100)).await;
     auth::revocar_sesiones(&pool, ana.cliente.id).await.unwrap();
     assert_eq!(cierre(&mut ws).await, (CIERRE_SESION, "sesión revocada".to_owned()));
+}
+
+/// Cerrar una sesión desde otro dispositivo (0019) cierra su socket en la
+/// siguiente revalidación, al instante (sin esperar al segundo siguiente); el
+/// socket de la sesión que la cerró sigue abierto.
+#[sqlx::test(migrations = "../migrations")]
+async fn cerrar_una_sesion_cierra_su_socket_y_no_el_de_las_demas(pool: PgPool) {
+    use synthetic_capital::auth::sesiones::{self, Origen};
+    let cfg = preparar(&pool).await;
+    let tiempos = Tiempos { revalidacion: Duration::from_millis(200), ..Tiempos::default() };
+    let srv = arrancar(con_tiempos(AppState::nuevo(pool.clone(), cfg.clone()), tiempos)).await;
+    let ana = cliente(&pool, &cfg, "Ana").await;
+    let t_mac = token_cliente(&srv.estado, ana.cliente.id).await;
+    let t_iphone = token_cliente(&srv.estado, ana.cliente.id).await;
+    let mut mac = abrir(srv.dir, &t_mac).await.unwrap();
+    recibir(&mut mac).await;
+    let mut iphone = abrir(srv.dir, &t_iphone).await.unwrap();
+    recibir(&mut iphone).await;
+
+    let (desde_el_mac, _) = auth::autenticar_token(&srv.estado, &t_mac).await.unwrap();
+    let sid_iphone = srv.estado.jwt.validar(&t_iphone).unwrap().sid.unwrap();
+    sesiones::revocar(&pool, &desde_el_mac, sid_iphone, &Origen::desconocido()).await.unwrap();
+    assert_eq!(cierre(&mut iphone).await, (CIERRE_SESION, "sesión revocada".to_owned()));
+    nada_mas(&mut mac, Duration::from_millis(600)).await;
 }
 
 /// Un navegador que pide `resync` sin parar no ocupa la base de datos: tras
@@ -792,7 +817,7 @@ async fn los_resync_seguidos_se_juntan_en_uno(pool: PgPool) {
     let tiempos = Tiempos { resync_minimo: Duration::from_millis(500), ..Tiempos::default() };
     let srv = arrancar(con_tiempos(AppState::nuevo(pool.clone(), cfg.clone()), tiempos)).await;
     let ana = cliente(&pool, &cfg, "Ana").await;
-    let mut ws = abrir(srv.dir, &token_cliente(&srv.estado, ana.cliente.id)).await.unwrap();
+    let mut ws = abrir(srv.dir, &token_cliente(&srv.estado, ana.cliente.id).await).await.unwrap();
     recibir(&mut ws).await;
 
     pedir_resync(&mut ws).await;
@@ -818,7 +843,7 @@ async fn el_latido_mantiene_al_que_responde_y_cierra_al_mudo(pool: PgPool) {
     };
     let srv = arrancar(con_tiempos(AppState::nuevo(pool.clone(), cfg.clone()), tiempos)).await;
     let ana = cliente(&pool, &cfg, "Ana").await;
-    let token = token_cliente(&srv.estado, ana.cliente.id);
+    let token = token_cliente(&srv.estado, ana.cliente.id).await;
     let mut vivo = abrir(srv.dir, &token).await.unwrap();
     recibir(&mut vivo).await;
     let mut mudo = abrir(srv.dir, &token).await.unwrap();
@@ -857,7 +882,7 @@ async fn una_orden_de_mercado_llega_por_el_socket(pool: PgPool) {
     let ana = cliente(&pool, &cfg, "Ana").await;
     let cuenta = ana.cuenta_ifpe.id;
     depositar(&pool, &cfg, cuenta, "20000").await;
-    let token = token_cliente(&srv.estado, ana.cliente.id);
+    let token = token_cliente(&srv.estado, ana.cliente.id).await;
 
     let mut ws = abrir(srv.dir, &token).await.unwrap();
     let foto = recibir(&mut ws).await;
@@ -923,7 +948,7 @@ async fn las_ordenes_pendientes_llegan_por_el_socket(pool: PgPool) {
     let ana = cliente(&pool, &cfg, "Ana").await;
     let cuenta = ana.cuenta_ifpe.id;
     depositar(&pool, &cfg, cuenta, "20000").await;
-    let token = token_cliente(&srv.estado, ana.cliente.id);
+    let token = token_cliente(&srv.estado, ana.cliente.id).await;
     let api = routes::router(srv.estado.clone());
     let ordenar = |cuerpo: Value| {
         let (api, token) = (api.clone(), token.clone());

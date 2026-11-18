@@ -13,11 +13,13 @@
 //! - **Verificación**: un código se acepta con ±1 paso de tolerancia y nunca dos
 //!   veces (`totp_ultimo_paso`). Los códigos incorrectos cuentan en el mismo
 //!   contador que las contraseñas: al quinto fallo la cuenta se bloquea 15 min.
-//! - Todo queda en `kyc.eventos_autenticacion` (inmutable), con la IP.
+//! - Todo queda en `kyc.eventos_autenticacion` (inmutable), con la IP y el
+//!   dispositivo. Verificar el código o activar el factor abre una sesión
+//!   ([`super::sesiones`]); activarlo cierra antes todas las demás.
 //!
 //! Solo el rol `sc_auth` lee o escribe los secretos.
 
-use std::{fmt::Write as _, net::IpAddr};
+use std::fmt::Write as _;
 
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use chrono::Utc;
@@ -29,7 +31,11 @@ use totp_rs::{Algorithm, TOTP};
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
-use super::{jwt::Desafio, ResultadoLogin, Sesion, SQL_REGISTRAR_FALLO};
+use super::{
+    jwt::Desafio,
+    sesiones::{self, Evento, Origen},
+    ResultadoLogin, SQL_REGISTRAR_FALLO,
+};
 use crate::{
     db::{self, Rol, Tx},
     error::{AppError, AppResult},
@@ -61,7 +67,7 @@ fn generar_secreto() -> Zeroizing<Vec<u8>> {
 }
 
 /// El código tal como lo teclea la persona: 6 dígitos, se toleran espacios.
-fn normalizar_codigo(codigo: &str) -> AppResult<String> {
+pub(crate) fn normalizar_codigo(codigo: &str) -> AppResult<String> {
     let limpio: String = codigo.chars().filter(|c| !c.is_whitespace()).collect();
     if limpio.len() != DIGITOS || !limpio.bytes().all(|b| b.is_ascii_digit()) {
         return Err(AppError::validacion("el código de verificación tiene 6 dígitos"));
@@ -122,18 +128,18 @@ pub struct ConfiguracionMfa {
     pub periodo_seg: u64,
 }
 
-/// Registra un evento de autenticación en la transacción `tx` (rol sc_auth).
-pub(crate) async fn registrar_evento(tx: &mut Tx, cliente_id: Uuid, evento: &str, ip: Option<IpAddr>) -> AppResult<()> {
-    sqlx::query("INSERT INTO kyc.eventos_autenticacion (cliente_id, evento, ip) VALUES ($1, $2, $3::inet)")
-        .bind(cliente_id)
-        .bind(evento)
-        .bind(ip.map(|i| i.to_string()))
-        .execute(&mut **tx)
-        .await?;
-    Ok(())
+/// Registra un evento de autenticación en la transacción `tx` (rol sc_auth),
+/// con la IP y el dispositivo de la petición.
+pub(crate) async fn registrar_evento(
+    tx: &mut Tx,
+    cliente_id: Uuid,
+    evento: &'static str,
+    origen: &Origen,
+) -> AppResult<()> {
+    sesiones::registrar(tx, &Evento::de(cliente_id, evento, origen)).await
 }
 
-fn descifrar(estado: &AppState, sobre: &str, cliente_id: Uuid) -> AppResult<Zeroizing<Vec<u8>>> {
+pub(crate) fn descifrar(estado: &AppState, sobre: &str, cliente_id: Uuid) -> AppResult<Zeroizing<Vec<u8>>> {
     estado.mfa.descifrar(sobre, &contexto(cliente_id)).map(|d| d.texto).map_err(|e| {
         AppError::Interno(anyhow::anyhow!(
             "no se pudo descifrar el secreto TOTP de {cliente_id} ({e}): revisa MFA_CLAVE_CIFRADO y MFA_CLAVE_CIFRADO_ANTERIOR"
@@ -141,12 +147,12 @@ fn descifrar(estado: &AppState, sobre: &str, cliente_id: Uuid) -> AppResult<Zero
     })
 }
 
-fn ahora_seg() -> u64 {
+pub(crate) fn ahora_seg() -> u64 {
     u64::try_from(Utc::now().timestamp()).unwrap_or(0)
 }
 
 /// Genera (o reemplaza, mientras no esté activo) el secreto TOTP de la persona.
-pub async fn configurar(estado: &AppState, cliente_id: Uuid, ip: Option<IpAddr>) -> AppResult<ConfiguracionMfa> {
+pub async fn configurar(estado: &AppState, cliente_id: Uuid, origen: &Origen) -> AppResult<ConfiguracionMfa> {
     let mut tx = db::begin(&estado.pool, Rol::Auth).await?;
     let fila: Option<(String, bool)> = sqlx::query_as(
         "SELECT c.email, cr.mfa_enabled FROM kyc.credenciales cr JOIN kyc.clientes c ON c.id = cr.cliente_id \
@@ -166,7 +172,7 @@ pub async fn configurar(estado: &AppState, cliente_id: Uuid, ip: Option<IpAddr>)
         .bind(&sobre)
         .execute(&mut *tx)
         .await?;
-    registrar_evento(&mut tx, cliente_id, "MFA_SECRETO_GENERADO", ip).await?;
+    registrar_evento(&mut tx, cliente_id, "MFA_SECRETO_GENERADO", origen).await?;
     tx.commit().await?;
 
     // Las apps separan emisor y cuenta con ':'; un email nunca lo lleva, pero por si acaso.
@@ -195,14 +201,10 @@ struct FilaMfa {
     bloqueada: bool,
 }
 
-/// Verifica el primer código y activa el segundo factor. Revoca las demás
-/// sesiones y devuelve una de acceso con el factor verificado.
-pub async fn activar(
-    estado: &AppState,
-    cliente_id: Uuid,
-    codigo: &str,
-    ip: Option<IpAddr>,
-) -> AppResult<ResultadoLogin> {
+/// Verifica el primer código y activa el segundo factor. Revoca todas las
+/// sesiones (también la de la petición, que no lo había verificado) y abre una
+/// nueva con el factor verificado, en la misma transacción.
+pub async fn activar(estado: &AppState, cliente_id: Uuid, codigo: &str, origen: &Origen) -> AppResult<ResultadoLogin> {
     let codigo = normalizar_codigo(codigo)?;
     let mut tx = db::begin(&estado.pool, Rol::Auth).await?;
     let fila: FilaMfa = sqlx::query_as(
@@ -224,7 +226,7 @@ pub async fn activar(
     };
     let secreto = descifrar(estado, &sobre, cliente_id)?;
     let Some(paso) = verificar_codigo(&secreto, &codigo, ahora_seg(), fila.totp_ultimo_paso) else {
-        return rechazar_codigo(tx, cliente_id, ip).await;
+        return rechazar_codigo(tx, cliente_id, origen).await;
     };
     let (rol, iat): (RolUsuario, i64) = sqlx::query_as(
         "UPDATE kyc.credenciales SET mfa_enabled = TRUE, totp_ultimo_paso = $2, intentos_fallidos = 0, \
@@ -235,12 +237,13 @@ pub async fn activar(
     .bind(paso)
     .fetch_one(&mut *tx)
     .await?;
-    registrar_evento(&mut tx, cliente_id, "MFA_ACTIVADO", ip).await?;
+    registrar_evento(&mut tx, cliente_id, "MFA_ACTIVADO", origen).await?;
+    sesiones::revocar_vigentes(&mut tx, cliente_id, None, "MFA_ACTIVADO").await?;
+    let sesion = sesiones::abrir_en(&mut tx, estado, cliente_id, rol, true, origen, Some(iat)).await?;
     tx.commit().await?;
     tracing::info!(target: "auth", %cliente_id, ?rol, "segundo factor activado");
-    let (token, expira_en) = estado.jwt.emitir_desde(cliente_id, rol, true, iat)?;
     debug_assert_eq!(rol, fila.rol);
-    Ok(ResultadoLogin::Sesion(Sesion { token, expira_en, cliente_id, rol }))
+    Ok(ResultadoLogin::Sesion(sesion))
 }
 
 #[derive(sqlx::FromRow)]
@@ -254,12 +257,13 @@ struct FilaDesafio {
     en_lista_bloqueadas: bool,
 }
 
-/// Segundo paso del inicio de sesión: el desafío de `POST /auth/login` y el código TOTP.
+/// Segundo paso del inicio de sesión: el desafío de `POST /auth/login` y el
+/// código TOTP. Abre la sesión en la misma transacción que acepta el código.
 pub async fn verificar_inicio(
     estado: &AppState,
     token_mfa: &str,
     codigo: &str,
-    ip: Option<IpAddr>,
+    origen: &Origen,
 ) -> AppResult<ResultadoLogin> {
     let desafio = estado.jwt.validar_desafio(token_mfa, Desafio::Mfa)?;
     let codigo = normalizar_codigo(codigo)?;
@@ -292,7 +296,7 @@ pub async fn verificar_inicio(
     let sobre = fila.totp_secret.ok_or(AppError::DesafioVencido)?;
     let secreto = descifrar(estado, &sobre, cliente_id)?;
     let Some(paso) = verificar_codigo(&secreto, &codigo, ahora_seg(), fila.totp_ultimo_paso) else {
-        return rechazar_codigo(tx, cliente_id, ip).await;
+        return rechazar_codigo(tx, cliente_id, origen).await;
     };
     // La fila está bloqueada (FOR UPDATE); la condición repite la regla anti-repetición.
     let n = sqlx::query(
@@ -306,25 +310,29 @@ pub async fn verificar_inicio(
     .await?
     .rows_affected();
     if n != 1 {
-        return rechazar_codigo(tx, cliente_id, ip).await;
+        return rechazar_codigo(tx, cliente_id, origen).await;
     }
-    registrar_evento(&mut tx, cliente_id, "MFA_VERIFICADO", ip).await?;
+    registrar_evento(&mut tx, cliente_id, "MFA_VERIFICADO", origen).await?;
+    let sesion = sesiones::abrir_en(&mut tx, estado, cliente_id, fila.rol, true, origen, None).await?;
     tx.commit().await?;
-    let (token, expira_en) = estado.jwt.emitir(cliente_id, fila.rol, true)?;
-    Ok(ResultadoLogin::Sesion(Sesion { token, expira_en, cliente_id, rol: fila.rol }))
+    Ok(ResultadoLogin::Sesion(sesion))
 }
 
-/// Código incorrecto: cuenta como intento fallido (bloquea al quinto) y queda registrado.
-async fn rechazar_codigo<T>(mut tx: Tx, cliente_id: Uuid, ip: Option<IpAddr>) -> AppResult<T> {
-    sqlx::query(SQL_REGISTRAR_FALLO)
+/// Código incorrecto: cuenta como intento fallido (bloquea al quinto) y queda
+/// registrado, con el bloqueo si este fallo lo causó.
+async fn rechazar_codigo<T>(mut tx: Tx, cliente_id: Uuid, origen: &Origen) -> AppResult<T> {
+    let bloquea: Option<bool> = sqlx::query_scalar(SQL_REGISTRAR_FALLO)
         .bind(cliente_id)
         .bind(super::MAX_INTENTOS)
         .bind(super::MINUTOS_BLOQUEO as i32)
-        .execute(&mut *tx)
+        .fetch_optional(&mut *tx)
         .await?;
-    registrar_evento(&mut tx, cliente_id, "MFA_CODIGO_RECHAZADO", ip).await?;
+    registrar_evento(&mut tx, cliente_id, "MFA_CODIGO_RECHAZADO", origen).await?;
+    if bloquea == Some(true) {
+        registrar_evento(&mut tx, cliente_id, "CUENTA_BLOQUEADA", origen).await?;
+    }
     tx.commit().await?;
-    tracing::warn!(target: "auth", %cliente_id, "código TOTP rechazado");
+    tracing::warn!(target: "auth", %cliente_id, bloquea = bloquea == Some(true), "código TOTP rechazado");
     Err(AppError::CodigoMfaInvalido)
 }
 

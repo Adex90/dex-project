@@ -121,7 +121,7 @@ impl Banco {
                 activar_mfa(&self.estado, id).await;
             }
         }
-        self.estado.jwt.emitir(id, rol, mfa).unwrap().0
+        token_de(&self.estado, id, rol, mfa).await
     }
 
     /// Petición autenticada a la API.
@@ -431,7 +431,7 @@ async fn transferencia_saliente_ciclo_completo(pool: PgPool) {
     let ana = cliente(&pool, &b.cfg, "Ana").await;
     depositar(&pool, &b.cfg, ana.cuenta_ifpe.id, "1000").await;
     b.pasarela.fijar_saldo_custodio(reserva_total(&pool).await);
-    let (token, _) = b.estado.jwt.emitir(ana.cliente.id, RolUsuario::Cliente, false).unwrap();
+    let token = token_de(&b.estado, ana.cliente.id, RolUsuario::Cliente, false).await;
     let cuerpo = json!({
         "clabe_destino": EXTERNA_A,
         "beneficiario_nombre": "Beto Núñez",

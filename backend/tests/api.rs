@@ -467,7 +467,7 @@ async fn entrada_invalida_es_400_no_500(pool: PgPool) {
 /// contador; eso solo lo puede provocar quien ya conoce la contraseña.)
 #[sqlx::test(migrations = "../migrations")]
 async fn rafaga_de_login_no_supera_el_cupo(pool: PgPool) {
-    use synthetic_capital::auth;
+    use synthetic_capital::auth::{self, sesiones::Origen};
     let cfg = preparar(&pool).await;
     let estado = AppState::nuevo(pool.clone(), cfg);
     let api = Api { app: routes::router(estado.clone()) };
@@ -481,7 +481,7 @@ async fn rafaga_de_login_no_supera_el_cupo(pool: PgPool) {
                 .map(|p| {
                     let estado = estado.clone();
                     tokio::spawn(async move {
-                        match auth::iniciar_sesion(&estado, "ana@example.mx", &p).await {
+                        match auth::iniciar_sesion(&estado, "ana@example.mx", &p, &Origen::desconocido()).await {
                             Ok(_) => "SESION".to_string(),
                             Err(e) => e.codigo().to_string(),
                         }
@@ -509,7 +509,9 @@ async fn rafaga_de_login_no_supera_el_cupo(pool: PgPool) {
     assert!(codigos.iter().all(|c| c == "BLOQUEADO"), "{codigos:?}");
 
     // Bloqueada: ni la contraseña correcta abre sesión hasta que venza la ventana.
-    let e = auth::iniciar_sesion(&estado, "ana@example.mx", "contraseña-segura-123").await.unwrap_err();
+    let e = auth::iniciar_sesion(&estado, "ana@example.mx", "contraseña-segura-123", &Origen::desconocido())
+        .await
+        .unwrap_err();
     assert_eq!(e.codigo(), "BLOQUEADO");
     sqlx::query("UPDATE kyc.credenciales SET bloqueado_hasta = now() - interval '1 second'")
         .execute(&pool)
@@ -517,10 +519,12 @@ async fn rafaga_de_login_no_supera_el_cupo(pool: PgPool) {
         .unwrap();
     // Ventana nueva: cuatro errores y luego la correcta abre sesión y reinicia el contador.
     for i in 0..4 {
-        let e = auth::iniciar_sesion(&estado, "ana@example.mx", &format!("otra-{i}")).await.unwrap_err();
+        let e = auth::iniciar_sesion(&estado, "ana@example.mx", &format!("otra-{i}"), &Origen::desconocido())
+            .await
+            .unwrap_err();
         assert_eq!(e.codigo(), "CREDENCIALES_INVALIDAS");
     }
-    auth::iniciar_sesion(&estado, "ana@example.mx", "contraseña-segura-123").await.unwrap();
+    auth::iniciar_sesion(&estado, "ana@example.mx", "contraseña-segura-123", &Origen::desconocido()).await.unwrap();
     let intentos: i32 =
         sqlx::query_scalar("SELECT intentos_fallidos FROM kyc.credenciales").fetch_one(&pool).await.unwrap();
     assert_eq!(intentos, 0);

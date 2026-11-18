@@ -910,9 +910,22 @@ pub async fn iniciar_sesion(
 /// Segundo factor activo por el flujo real (secreto cifrado y primer código),
 /// sin HTTP: para pruebas que emiten sus tokens directamente. Devuelve el secreto.
 pub async fn activar_mfa(estado: &synthetic_capital::AppState, cliente_id: Uuid) -> Vec<u8> {
-    use synthetic_capital::auth::mfa;
-    let conf = mfa::configurar(estado, cliente_id, None).await.unwrap();
+    use synthetic_capital::auth::{mfa, sesiones::Origen};
+    let conf = mfa::configurar(estado, cliente_id, &Origen::desconocido()).await.unwrap();
     let secreto = secreto_base32(&conf.secreto);
-    mfa::activar(estado, cliente_id, &codigo_totp(&secreto, paso_totp_actual()), None).await.unwrap();
+    mfa::activar(estado, cliente_id, &codigo_totp(&secreto, paso_totp_actual()), &Origen::desconocido()).await.unwrap();
     secreto
+}
+
+/// Token de acceso de una sesión real (su fila en `kyc.sesiones`, como la
+/// abre un inicio de sesión), sin HTTP. `mfa`: la sesión dice haber
+/// verificado el segundo factor; la validación lo contrasta con la base.
+pub async fn token_de(
+    estado: &synthetic_capital::AppState,
+    cliente_id: Uuid,
+    rol: synthetic_capital::models::kyc::RolUsuario,
+    mfa: bool,
+) -> String {
+    use synthetic_capital::auth::sesiones::{self, Origen};
+    sesiones::abrir(estado, cliente_id, rol, mfa, &Origen::desconocido()).await.unwrap().token
 }

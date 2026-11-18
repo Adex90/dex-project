@@ -183,7 +183,13 @@ fn clave_api() -> String {
 
 /// Oficial de cumplimiento como `Usuario` (para llamar a `aml::oficial` directamente).
 async fn usuario_oficial(pool: &PgPool, nombre: &str) -> Usuario {
-    Usuario { cliente_id: oficial(pool, nombre).await.0, rol: RolUsuario::Cumplimiento, mfa: true }
+    // Las funciones de la consola reciben el usuario ya validado; la sesión no se consulta.
+    Usuario {
+        cliente_id: oficial(pool, nombre).await.0,
+        rol: RolUsuario::Cumplimiento,
+        mfa: true,
+        sesion_id: Uuid::new_v4(),
+    }
 }
 
 /// Operador de mesa (capturas, correcciones, retenciones).
@@ -1994,6 +2000,10 @@ async fn sin_aviso_al_cliente(pool: PgPool) {
         "/api/v1/sofom/posicion",
         "/api/v1/spei/transferencias",
         "/api/v1/spei/recibidos",
+        // Centro de seguridad (0019): sesiones, bitácora y preferencias.
+        "/api/v1/auth/sessions",
+        "/api/v1/auth/security/events",
+        "/api/v1/auth/security/preferences",
     ] {
         let (s, cuerpo) = api.llamar_crudo("GET", ruta, Some(&tok_ana), None).await;
         assert_eq!(s, StatusCode::OK, "{ruta}");

@@ -32,8 +32,9 @@ impl Api {
         Self { app: routes::router(estado.clone()), estado }
     }
 
-    fn token(&self, cliente_id: Uuid) -> String {
-        self.estado.jwt.emitir(cliente_id, RolUsuario::Cliente, false).unwrap().0
+    /// Token de una sesión real del cliente (su fila en `kyc.sesiones`).
+    async fn token(&self, cliente_id: Uuid) -> String {
+        token_de(&self.estado, cliente_id, RolUsuario::Cliente, false).await
     }
 
     async fn cuentas(&self, token: &str) -> Value {
@@ -138,7 +139,7 @@ async fn la_cuenta_de_demostracion_esta_a_nombre_del_cliente(pool: PgPool) {
     let cfg = preparar(&pool).await;
     let api = Api::nueva(&pool, cfg.clone());
     let ana = cliente(&pool, &cfg, "Ana").await;
-    let token = api.token(ana.cliente.id);
+    let token = api.token(ana.cliente.id).await;
 
     let v = api.cuentas(&token).await;
     let c = &v["accounts"][0];
@@ -168,7 +169,7 @@ async fn la_cuenta_de_demostracion_esta_a_nombre_del_cliente(pool: PgPool) {
 
     // Dos consultas a la vez de un cliente nuevo vinculan una sola.
     let beto = cliente(&pool, &cfg, "Beto").await;
-    let token_b = api.token(beto.cliente.id);
+    let token_b = api.token(beto.cliente.id).await;
     let (a, b) = tokio::join!(api.cuentas(&token_b), api.cuentas(&token_b));
     assert_eq!(a, b);
     assert_eq!(vinculadas_de(&pool, beto.cliente.id).await, 1);
@@ -176,7 +177,7 @@ async fn la_cuenta_de_demostracion_esta_a_nombre_del_cliente(pool: PgPool) {
 
     // Sin KYC verificado no hay cuenta.
     let carla = cliente_sin_kyc(&pool, &cfg, "Carla").await;
-    assert_eq!(api.cuentas(&api.token(carla.cliente.id)).await, json!({ "accounts": [] }));
+    assert_eq!(api.cuentas(&api.token(carla.cliente.id).await).await, json!({ "accounts": [] }));
     assert_eq!(vinculadas_de(&pool, carla.cliente.id).await, 0);
 
     // Sin MODO_DEMO, nadie recibe una cuenta de demostración.
@@ -184,13 +185,13 @@ async fn la_cuenta_de_demostracion_esta_a_nombre_del_cliente(pool: PgPool) {
     real.modo_demo = false;
     let api_real = Api::nueva(&pool, real);
     let dani = cliente(&pool, &cfg, "Dani").await;
-    assert_eq!(api_real.cuentas(&api_real.token(dani.cliente.id)).await, json!({ "accounts": [] }));
+    assert_eq!(api_real.cuentas(&api_real.token(dani.cliente.id).await).await, json!({ "accounts": [] }));
     assert_eq!(vinculadas_de(&pool, dani.cliente.id).await, 0);
 
     // Solo el cliente.
     let (oficial_id, _) = oficial(&pool, "Olga").await;
     activar_mfa(&api.estado, oficial_id).await;
-    let token_oficial = api.estado.jwt.emitir(oficial_id, RolUsuario::Cumplimiento, true).unwrap().0;
+    let token_oficial = token_de(&api.estado, oficial_id, RolUsuario::Cumplimiento, true).await;
     let (s, _) = llamar_json(&api.app, "GET", "/api/v1/wealth/linked-accounts", Some(&token_oficial), None).await;
     assert_eq!(s, StatusCode::FORBIDDEN);
     let (s, _) = api.retirar(&token_oficial, retiro(c, "10.00", &clave_api())).await;
@@ -208,7 +209,7 @@ async fn un_retiro_descuenta_el_disponible_y_queda_en_proceso(pool: PgPool) {
     let cfg = preparar(&pool).await;
     let api = Api::nueva(&pool, cfg.clone());
     let ana = con_efectivo(&pool, &cfg, "Ana", "5000").await;
-    let token = api.token(ana.cliente.id);
+    let token = api.token(ana.cliente.id).await;
     let cuenta = api.primera(&token).await;
 
     let (s, r) = api.retirar(&token, retiro(&cuenta, "1250.50", "retiro-0001")).await;
@@ -285,7 +286,7 @@ async fn solo_se_retira_el_disponible_no_lo_comprometido_en_ordenes(pool: PgPool
     let cfg = preparar(&pool).await;
     let api = Api::nueva(&pool, cfg.clone());
     let ana = con_efectivo(&pool, &cfg, "Ana", "1000").await;
-    let token = api.token(ana.cliente.id);
+    let token = api.token(ana.cliente.id).await;
 
     // Una compra límite que espera compromete 600 (0015).
     let orden = json!({ "ticker": "AUG1", "side": "buy", "amount": "600.00", "order_type": "limit",
@@ -312,7 +313,7 @@ async fn la_lista_blanca_en_las_dos_rutas_de_retiro(pool: PgPool) {
     let api = Api::nueva(&pool, cfg.clone());
     let ana = con_efectivo(&pool, &cfg, "Ana", "5000").await;
     let beto = con_efectivo(&pool, &cfg, "Beto", "100").await;
-    let (ta, tb) = (api.token(ana.cliente.id), api.token(beto.cliente.id));
+    let (ta, tb) = (api.token(ana.cliente.id).await, api.token(beto.cliente.id).await);
     let cuenta_a = api.primera(&ta).await;
     let cuenta_b = api.primera(&tb).await;
     let no_vinculada = (StatusCode::UNPROCESSABLE_ENTITY, Some("CUENTA_NO_VINCULADA"));
@@ -378,7 +379,7 @@ async fn un_cliente_congelado_recibe_la_respuesta_de_siempre(pool: PgPool) {
     let cfg = preparar(&pool).await;
     let api = Api::nueva(&pool, cfg.clone());
     let ana = con_efectivo(&pool, &cfg, "Ana", "1000").await;
-    let token = api.token(ana.cliente.id);
+    let token = api.token(ana.cliente.id).await;
     let cuenta = api.primera(&token).await;
     // Estructuración: PLD congela al cliente (CONGELADO_PREVENTIVO). Lo que ya
     // tenía sigue disponible: el rechazo no es por saldo.
@@ -410,7 +411,7 @@ async fn sin_kyc_vigente_o_con_entrada_invalida_no_hay_retiro(pool: PgPool) {
     let cfg = preparar(&pool).await;
     let api = Api::nueva(&pool, cfg.clone());
     let ana = con_efectivo(&pool, &cfg, "Ana", "1000").await;
-    let token = api.token(ana.cliente.id);
+    let token = api.token(ana.cliente.id).await;
     let cuenta = api.primera(&token).await;
 
     let id = cuenta["id"].clone();

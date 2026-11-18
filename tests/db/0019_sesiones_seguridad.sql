@@ -213,6 +213,12 @@ SELECT pg_temp.debe_fallar('una revocación es definitiva: la sesión no revive'
   $q$UPDATE kyc.sesiones SET revocada_en = NULL, motivo_revocacion = NULL
       WHERE id = '5e000000-0000-0000-0000-000000000002'$q$
 ], 'SC_SESION_INMUTABLE');
+SELECT pg_temp.debe_pasar('una sesión abandonada se revoca por inactividad', ARRAY[
+  'SET LOCAL ROLE sc_auth',
+  $q$UPDATE kyc.sesiones SET revocada_en = now(), motivo_revocacion = 'INACTIVIDAD'
+      WHERE id = '5e000000-0000-0000-0000-000000000003'$q$,
+  'RESET ROLE'
+]);
 SELECT pg_temp.debe_fallar('ni cambia su motivo', ARRAY[
   $q$UPDATE kyc.sesiones SET motivo_revocacion = 'OPERADOR' WHERE id = '5e000000-0000-0000-0000-000000000002'$q$
 ], 'SC_SESION_INMUTABLE');

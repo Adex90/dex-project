@@ -34,8 +34,9 @@ impl Mercado {
         Self { app: routes::router(estado.clone()), estado }
     }
 
-    fn token(&self, cliente_id: Uuid) -> String {
-        self.estado.jwt.emitir(cliente_id, RolUsuario::Cliente, false).unwrap().0
+    /// Token de una sesión real del cliente (su fila en `kyc.sesiones`).
+    async fn token(&self, cliente_id: Uuid) -> String {
+        token_de(&self.estado, cliente_id, RolUsuario::Cliente, false).await
     }
 
     async fn catalogo(&self, token: &str) -> (StatusCode, Value) {
@@ -87,7 +88,7 @@ async fn catalogo_por_la_api(pool: PgPool) {
     let cfg = preparar(&pool).await;
     let m = Mercado::nuevo(&pool, cfg.clone());
     let ana = cliente(&pool, &cfg, "Ana").await;
-    let token = m.token(ana.cliente.id);
+    let token = m.token(ana.cliente.id).await;
 
     let (s, c) = m.catalogo(&token).await;
     assert_eq!(s, StatusCode::OK, "{c}");
@@ -149,7 +150,7 @@ async fn lo_que_lista_el_catalogo_se_opera(pool: PgPool) {
     let cfg = preparar(&pool).await;
     let m = Mercado::nuevo(&pool, cfg.clone());
     let ana = con_efectivo(&pool, &cfg, "Ana", "10000").await;
-    let token = m.token(ana.cliente.id);
+    let token = m.token(ana.cliente.id).await;
 
     // Fracciones de una acción: 1 000 a 4 415.30 son 0.2264 por 999.62.
     let (s, r) = m.ordenar(&token, orden("STSLA", "buy", "1000.00", "stsla")).await;
@@ -170,7 +171,7 @@ async fn sin_modo_demo_el_catalogo_solo_lista_precios_reales(pool: PgPool) {
     let ana = cliente(&pool, &cfg, "Ana").await;
     cfg.modo_demo = false;
     let m = Mercado::nuevo(&pool, cfg.clone());
-    let token = m.token(ana.cliente.id);
+    let token = m.token(ana.cliente.id).await;
 
     // Todo es simulado: el mercado no ha abierto, como en la cotización.
     let (s, e) = m.catalogo(&token).await;
@@ -200,7 +201,7 @@ async fn cotizacion_por_la_api(pool: PgPool) {
     let cfg = preparar(&pool).await;
     let m = Mercado::nuevo(&pool, cfg.clone());
     let ana = cliente(&pool, &cfg, "Ana").await;
-    let token = m.token(ana.cliente.id);
+    let token = m.token(ana.cliente.id).await;
 
     let (s, q) = m.cotizar(&token, "AUG1").await;
     assert_eq!(s, StatusCode::OK, "{q}");
@@ -257,7 +258,7 @@ async fn sin_modo_demo_un_precio_simulado_no_se_cotiza_ni_se_opera(pool: PgPool)
     let ana = con_efectivo(&pool, &cfg, "Ana", "5000").await;
     cfg.modo_demo = false;
     let m = Mercado::nuevo(&pool, cfg.clone());
-    let token = m.token(ana.cliente.id);
+    let token = m.token(ana.cliente.id).await;
 
     let (s, e) = m.cotizar(&token, "AUG1").await;
     assert_eq!((s, &e["error"]["codigo"]), (StatusCode::SERVICE_UNAVAILABLE, &json!("MERCADO_NO_DISPONIBLE")), "{e}");
@@ -288,7 +289,7 @@ async fn compra_y_venta_por_la_api(pool: PgPool) {
     let m = Mercado::nuevo(&pool, cfg.clone());
     let ana = con_efectivo(&pool, &cfg, "Ana", "20000").await;
     let cuenta = ana.cuenta_ifpe.id;
-    let token = m.token(ana.cliente.id);
+    let token = m.token(ana.cliente.id).await;
 
     // Compra: 1 250 MXN de oro a 1 612.40 son 0.7752 g por 1 249.93; el
     // resto (0.07) se queda en efectivo. Sin comisión.
@@ -397,7 +398,7 @@ async fn la_misma_clave_devuelve_el_mismo_recibo(pool: PgPool) {
     let cfg = preparar(&pool).await;
     let m = Mercado::nuevo(&pool, cfg.clone());
     let ana = con_efectivo(&pool, &cfg, "Ana", "5000").await;
-    let token = m.token(ana.cliente.id);
+    let token = m.token(ana.cliente.id).await;
 
     let (s, primera) = m.ordenar(&token, orden("AUG1", "buy", "1000.00", "una-vez")).await;
     assert_eq!(s, StatusCode::CREATED, "{primera}");
@@ -429,7 +430,7 @@ async fn la_misma_clave_devuelve_el_mismo_recibo(pool: PgPool) {
     let (s, codigo) = m.rechazada(&token, orden("AUG1", "buy", "100.00", "ya-usada")).await;
     assert_eq!((s, codigo.as_str()), (StatusCode::CONFLICT, "CLAVE_IDEMPOTENCIA_REUTILIZADA"));
     // Dos clientes pueden usar la misma clave: cada una se acota al suyo.
-    let beto_token = m.token(beto.cliente.id);
+    let beto_token = m.token(beto.cliente.id).await;
     depositar(&pool, &cfg, beto.cuenta_ifpe.id, "2000").await;
     let (s, r) = m.ordenar(&beto_token, orden("AUG1", "buy", "1000.00", "una-vez")).await;
     assert_eq!(s, StatusCode::CREATED, "{r}");
@@ -446,7 +447,7 @@ async fn reglas_de_una_orden(pool: PgPool) {
     let cfg = preparar(&pool).await;
     let m = Mercado::nuevo(&pool, cfg.clone());
     let ana = con_efectivo(&pool, &cfg, "Ana", "1000").await;
-    let token = m.token(ana.cliente.id);
+    let token = m.token(ana.cliente.id).await;
 
     let casos: Vec<(Value, StatusCode, &str)> = vec![
         // Más que el efectivo disponible.
@@ -508,12 +509,12 @@ async fn solo_un_cliente_con_kyc_coloca_ordenes(pool: PgPool) {
 
     // Sin KYC verificado: 422 KYC_NO_VERIFICADO (también lo impide la base de datos).
     let carla = cliente_sin_kyc(&pool, &cfg, "Carla").await;
-    let (s, codigo) = m.rechazada(&m.token(carla.cliente.id), orden("AUG1", "buy", "100.00", "sin-kyc")).await;
+    let (s, codigo) = m.rechazada(&m.token(carla.cliente.id).await, orden("AUG1", "buy", "100.00", "sin-kyc")).await;
     assert_eq!((s, codigo.as_str()), (StatusCode::UNPROCESSABLE_ENTITY, "KYC_NO_VERIFICADO"));
 
     // KYC revocado después de comprar: ya no compra ni vende.
     let ana = con_efectivo(&pool, &cfg, "Ana", "1000").await;
-    let token = m.token(ana.cliente.id);
+    let token = m.token(ana.cliente.id).await;
     let (s, r) = m.ordenar(&token, orden("AUG1", "buy", "100.00", "antes")).await;
     assert_eq!(s, StatusCode::CREATED, "{r}");
     revocar_kyc(&pool, ana.cliente.id).await;
@@ -529,7 +530,7 @@ async fn solo_un_cliente_con_kyc_coloca_ordenes(pool: PgPool) {
         .await
         .unwrap();
     activar_mfa(&m.estado, operador).await;
-    let token_operador = m.estado.jwt.emitir(operador, RolUsuario::Operador, true).unwrap().0;
+    let token_operador = token_de(&m.estado, operador, RolUsuario::Operador, true).await;
     let (s, codigo) = m.rechazada(&token_operador, orden("AUG1", "buy", "100.00", "operador")).await;
     assert_eq!((s, codigo.as_str()), (StatusCode::FORBIDDEN, "PROHIBIDO"));
     let (s, _) = m.cotizar(&token_operador, "AUG1").await;
@@ -548,7 +549,7 @@ async fn un_cliente_congelado_no_compra_ni_vende(pool: PgPool) {
     let cfg = preparar(&pool).await;
     let m = Mercado::nuevo(&pool, cfg.clone());
     let ana = con_efectivo(&pool, &cfg, "Ana", "5000").await;
-    let token = m.token(ana.cliente.id);
+    let token = m.token(ana.cliente.id).await;
     let (s, r) = m.ordenar(&token, orden("AUG1", "buy", "1000.00", "antes")).await;
     assert_eq!(s, StatusCode::CREATED, "{r}");
 

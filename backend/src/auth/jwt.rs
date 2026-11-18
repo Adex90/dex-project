@@ -5,8 +5,9 @@
 //! token de acceso aunque fallara la comprobación de audiencia):
 //!
 //! - **Acceso** (`aud` = [`AUD_ACCESO`]): autoriza la API. El claim `mfa` dice
-//!   si la sesión verificó el segundo factor. Vida: `JWT_TTL_MINUTOS`; el
-//!   personal interno, como mucho `JWT_TTL_PERSONAL_MINUTOS`.
+//!   si la sesión verificó el segundo factor y `sid`, a qué sesión de
+//!   `kyc.sesiones` pertenece (migración 0019; ver [`super::sesiones`]). Vida:
+//!   `JWT_TTL_MINUTOS`; el personal interno, como mucho `JWT_TTL_PERSONAL_MINUTOS`.
 //! - **Desafío MFA** ([`Desafio::Mfa`]): la contraseña fue correcta y falta el
 //!   código TOTP. Solo lo acepta `POST /auth/verify-mfa`. 5 minutos.
 //! - **Inscripción** ([`Desafio::Inscripcion`]): personal interno sin segundo
@@ -40,6 +41,11 @@ pub struct Claims {
     pub jti: Uuid,
     /// La sesión verificó el segundo factor (siempre `false` en un desafío).
     pub mfa: bool,
+    /// Sesión (`kyc.sesiones.id`) del token de acceso; un desafío no tiene.
+    /// Opcional al leer: un token emitido antes de 0019 se decodifica, y la
+    /// validación contra la base de datos lo rechaza por no tener sesión.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sid: Option<Uuid>,
 }
 
 /// Token parcial: la persona está a medio autenticar.
@@ -117,9 +123,16 @@ impl ClavesJwt {
         }
     }
 
-    /// Token de acceso emitido ahora.
-    pub fn emitir(&self, cliente_id: Uuid, rol: RolUsuario, mfa: bool) -> Result<(String, DateTime<Utc>), AppError> {
-        self.emitir_desde(cliente_id, rol, mfa, Utc::now().timestamp())
+    /// Token de acceso de la sesión `sid`, emitido ahora. Solo lo llama
+    /// [`super::sesiones`], que registra la sesión: un token sin su fila no vale.
+    pub fn emitir(
+        &self,
+        cliente_id: Uuid,
+        rol: RolUsuario,
+        mfa: bool,
+        sid: Uuid,
+    ) -> Result<(String, DateTime<Utc>), AppError> {
+        self.emitir_desde(cliente_id, rol, mfa, sid, Utc::now().timestamp())
     }
 
     /// Token de acceso con `iat` dado: tras revocar las sesiones con el reloj de
@@ -130,6 +143,7 @@ impl ClavesJwt {
         cliente_id: Uuid,
         rol: RolUsuario,
         mfa: bool,
+        sid: Uuid,
         iat: i64,
     ) -> Result<(String, DateTime<Utc>), AppError> {
         let iat = iat.max(Utc::now().timestamp());
@@ -143,6 +157,7 @@ impl ClavesJwt {
             exp: expira.timestamp(),
             jti: Uuid::new_v4(),
             mfa,
+            sid: Some(sid),
         };
         firmar(&claims, &self.acceso).map(|t| (t, expira))
     }
@@ -164,6 +179,7 @@ impl ClavesJwt {
             exp: expira.timestamp(),
             jti: Uuid::new_v4(),
             mfa: false,
+            sid: None,
         };
         firmar(&claims, &self.desafios).map(|t| (t, expira))
     }
@@ -198,12 +214,14 @@ mod pruebas {
     fn emite_y_valida() {
         let claves = ClavesJwt::nuevas(SECRETO, 5, 5);
         let id = Uuid::new_v4();
-        let (token, _) = claves.emitir(id, RolUsuario::Cliente, false).unwrap();
+        let sid = Uuid::new_v4();
+        let (token, _) = claves.emitir(id, RolUsuario::Cliente, false, sid).unwrap();
         let c = claves.validar(&token).unwrap();
         assert_eq!(c.sub, id);
         assert_eq!(c.rol, RolUsuario::Cliente);
         assert!(!c.mfa);
-        let (token, _) = claves.emitir(id, RolUsuario::Cumplimiento, true).unwrap();
+        assert_eq!(c.sid, Some(sid), "el token lleva su sesión");
+        let (token, _) = claves.emitir(id, RolUsuario::Cumplimiento, true, Uuid::new_v4()).unwrap();
         assert!(claves.validar(&token).unwrap().mfa);
     }
 
@@ -211,7 +229,7 @@ mod pruebas {
     fn rechaza_firma_ajena_y_alg_none() {
         let a = ClavesJwt::nuevas("secreto-a-secreto-a-secreto-a-secreto-a", 5, 5);
         let b = ClavesJwt::nuevas("secreto-b-secreto-b-secreto-b-secreto-b", 5, 5);
-        let (token, _) = a.emitir(Uuid::new_v4(), RolUsuario::Operador, true).unwrap();
+        let (token, _) = a.emitir(Uuid::new_v4(), RolUsuario::Operador, true, Uuid::new_v4()).unwrap();
         assert!(b.validar(&token).is_err());
         // Token sin firma (alg=none) con rol OPERADOR.
         let partes: Vec<&str> = token.split('.').collect();
@@ -222,7 +240,7 @@ mod pruebas {
     #[test]
     fn rechaza_token_expirado() {
         let claves = ClavesJwt::nuevas(SECRETO, -10, -10);
-        let (token, _) = claves.emitir(Uuid::new_v4(), RolUsuario::Cliente, false).unwrap();
+        let (token, _) = claves.emitir(Uuid::new_v4(), RolUsuario::Cliente, false, Uuid::new_v4()).unwrap();
         assert!(claves.validar(&token).is_err());
     }
 
@@ -232,7 +250,7 @@ mod pruebas {
         let id = Uuid::new_v4();
         let (mfa, _) = claves.emitir_desafio(id, RolUsuario::Cumplimiento, Desafio::Mfa).unwrap();
         let (inscripcion, _) = claves.emitir_desafio(id, RolUsuario::Cumplimiento, Desafio::Inscripcion).unwrap();
-        let (acceso, _) = claves.emitir(id, RolUsuario::Cliente, false).unwrap();
+        let (acceso, _) = claves.emitir(id, RolUsuario::Cliente, false, Uuid::new_v4()).unwrap();
         assert!(matches!(claves.validar(&mfa), Err(AppError::NoAutenticado)));
         assert!(matches!(claves.validar(&inscripcion), Err(AppError::NoAutenticado)));
         assert!(claves.validar_desafio(&mfa, Desafio::Mfa).is_ok());
@@ -240,6 +258,22 @@ mod pruebas {
         assert!(claves.validar_desafio(&inscripcion, Desafio::Mfa).is_err());
         assert!(claves.validar_desafio(&acceso, Desafio::Mfa).is_err());
         assert!(claves.validar_desafio(&acceso, Desafio::Inscripcion).is_err());
+        // Un desafío no pertenece a ninguna sesión.
+        assert_eq!(claves.validar_desafio(&mfa, Desafio::Mfa).unwrap().sid, None);
+    }
+
+    #[test]
+    fn un_token_anterior_a_las_sesiones_se_lee_sin_sid() {
+        // Firmado como antes de 0019 (sin `sid`): se decodifica, y la
+        // validación contra la base de datos lo rechaza (ver auth::validar_contra_bd).
+        let claves = ClavesJwt::nuevas(SECRETO, 60, 30);
+        let ahora = Utc::now().timestamp();
+        let viejo = serde_json::json!({
+            "sub": Uuid::new_v4(), "rol": "CLIENTE", "iss": EMISOR, "aud": AUD_ACCESO,
+            "iat": ahora, "exp": ahora + 600, "jti": Uuid::new_v4(), "mfa": false
+        });
+        let token = encode(&Header::new(Algorithm::HS256), &viejo, &claves.acceso.codificar).unwrap();
+        assert_eq!(claves.validar(&token).unwrap().sid, None);
     }
 
     #[test]

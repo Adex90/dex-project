@@ -476,7 +476,8 @@ impl Config {
             max_conexiones: var_o("DB_MAX_CONEXIONES", 20)?,
             bind_addr: direccion_de_escucha()?,
             jwt_secret,
-            jwt_ttl_minutos: var_o("JWT_TTL_MINUTOS", 60)?,
+            // Una sesión vence después de abrirse (kyc.sesiones, 0019): al menos un minuto.
+            jwt_ttl_minutos: var_o("JWT_TTL_MINUTOS", 60_i64)?.max(1),
             jwt_ttl_personal_minutos: var_o("JWT_TTL_PERSONAL_MINUTOS", 30_i64)?.max(1),
             mfa: {
                 let leer_clave = |nombre: &str| -> anyhow::Result<Option<Clave>> {
