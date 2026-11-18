@@ -345,10 +345,11 @@ impl<C: Chain> Vault<C> {
             if state.nonces.halted().is_some() {
                 continue;
             }
-            let result = self.read_chain(chain, &mut state.nonces).await;
-            let failure = match result {
+            let failure = match self.read_chain(chain, &mut state.nonces).await {
+                Ok(()) => None,
                 Err(("chain", message)) => Some(message),
-                _ => None,
+                // A halt is logged where it happens (an ALERT line); nothing about the chain's health to add.
+                Err(_) => continue,
             };
             if failure != state.watch_error {
                 match &failure {
