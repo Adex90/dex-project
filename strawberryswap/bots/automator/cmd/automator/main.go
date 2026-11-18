@@ -67,20 +67,25 @@ type fileConfig struct {
 	Listen      string `json:"listen"`      // unix:/run/automator/intents.sock  or 127.0.0.1:8080
 	TorSocks    string `json:"torSocks"`    // 127.0.0.1:9050
 	RPCURL      string `json:"rpcUrl"`      // chain JSON-RPC (reached through Tor)
-	SignerURL   string `json:"signerUrl"`   // MPC/TSS gateway (reached through Tor)
+	SignerURL   string `json:"signerUrl"`   // MPC/TSS gateway (reached through Tor); or:
 	SignerToken string `json:"signerToken"` // prefer env AUTOMATOR_SIGNER_TOKEN
-	ChainID     uint64 `json:"chainId"`
-	Pool        string `json:"pool"`
-	DeployBlock uint64 `json:"deployBlock"`
-	N           int    `json:"batchSize"`
-	MinSwaps    int    `json:"minSwaps"`
-	IntervalSec int    `json:"intervalSeconds"`
-	JitterSec   int    `json:"jitterSeconds"`
-	GasLimit    uint64 `json:"gasLimit"`
-	Snarkjs     string `json:"snarkjs"`
-	Wasm        string `json:"wasm"`
-	Zkey        string `json:"zkey"`
-	ProverTmp   string `json:"proverTmpDir"`
+	// vaultSocket: the automator vault (vaults/threshold-signer --role automator), local, which holds the automator's
+	// key in AWS KMS and signs DarkPool.settleBatch only. The testnet's signer; exclusive with signerUrl.
+	VaultSocket       string `json:"vaultSocket"`
+	MaxFeeWei         uint64 `json:"maxFeeWei"`         // vault signer: max fee per gas cap (default 2 gwei)
+	MaxPriorityFeeWei uint64 `json:"maxPriorityFeeWei"` // vault signer: priority fee cap (default 0.1 gwei)
+	ChainID           uint64 `json:"chainId"`
+	Pool              string `json:"pool"`
+	DeployBlock       uint64 `json:"deployBlock"`
+	N                 int    `json:"batchSize"`
+	MinSwaps          int    `json:"minSwaps"`
+	IntervalSec       int    `json:"intervalSeconds"`
+	JitterSec         int    `json:"jitterSeconds"`
+	GasLimit          uint64 `json:"gasLimit"`
+	Snarkjs           string `json:"snarkjs"`
+	Wasm              string `json:"wasm"`
+	Zkey              string `json:"zkey"`
+	ProverTmp         string `json:"proverTmpDir"`
 	// valueMarginBps: plan batches to survive this much oracle movement while proving (default 0; every batch is
 	// re-checked against the live oracle before submission anyway).
 	ValueMarginBps int64 `json:"valueMarginBps"`
@@ -143,8 +148,26 @@ func serve(args []string) error {
 		rpcHTTP, signerHTTP = &http.Client{Transport: t1, Timeout: 120 * time.Second}, &http.Client{Transport: t2, Timeout: 120 * time.Second}
 	}
 
-	rpc := &chain.RPC{URL: c.RPCURL, Pool_: c.Pool, HTTP: rpcHTTP, GasLimit: c.GasLimit,
-		Signer: &chain.HTTPSigner{URL: c.SignerURL, Token: c.SignerToken, ChainID: c.ChainID, HTTP: signerHTTP}}
+	rpc := &chain.RPC{URL: c.RPCURL, Pool_: c.Pool, HTTP: rpcHTTP, GasLimit: c.GasLimit}
+	switch {
+	case c.VaultSocket != "" && c.SignerURL != "":
+		return errors.New("vaultSocket and signerUrl: one signer only")
+	case c.VaultSocket != "":
+		// The vault is a local Unix socket (no network egress); the nonce, fees and broadcast go through the RPC.
+		vault := &chain.VaultSigner{Socket: c.VaultSocket, Timeout: 30 * time.Second, RPC: rpc, ChainID: c.ChainID,
+			MaxFeeWei:         new(big.Int).SetUint64(orDefaultU64(c.MaxFeeWei, 2_000_000_000)),
+			MaxPriorityFeeWei: new(big.Int).SetUint64(orDefaultU64(c.MaxPriorityFeeWei, 100_000_000))}
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		err := vault.Connect(ctx, c.Pool, c.GasLimit)
+		cancel()
+		if err != nil {
+			return fmt.Errorf("automator vault: %w", err)
+		}
+		log.Info("signing through the automator vault", "address", vault.Address(), "socket", c.VaultSocket)
+		rpc.Signer = vault
+	default:
+		rpc.Signer = &chain.HTTPSigner{URL: c.SignerURL, Token: c.SignerToken, ChainID: c.ChainID, HTTP: signerHTTP}
+	}
 	prv := &prover.SnarkJS{Bin: c.Snarkjs, Wasm: c.Wasm, Zkey: c.Zkey, TmpDir: orDefault(c.ProverTmp, "/dev/shm"), Timeout: 10 * time.Minute}
 	svc := service.New(service.Config{
 		N: c.N, MinSwaps: c.MinSwaps, Interval: time.Duration(c.IntervalSec) * time.Second, Jitter: time.Duration(c.JitterSec) * time.Second,
@@ -166,6 +189,13 @@ func serve(args []string) error {
 		return err
 	}
 	return nil // intents live in memory only and vanish here by design
+}
+
+func orDefaultU64(v, d uint64) uint64 {
+	if v == 0 {
+		return d
+	}
+	return v
 }
 
 func orDefault(s, d string) string {

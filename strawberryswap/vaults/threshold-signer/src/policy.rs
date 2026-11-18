@@ -700,6 +700,43 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn the_automators_go_encoding_is_alloys_and_the_automator_role_signs_it() {
+        // bots/automator/testdata/eip1559.vault.json: the Go encoder (internal/chain/eip1559.go) produces this payload
+        // for this transaction; alloy must produce the same bytes, and the automator role must sign them.
+        let vector: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../bots/automator/testdata/eip1559.vault.json"
+        ))
+        .unwrap();
+        let calldata = include_str!("../../../bots/automator/testdata/settleBatch.calldata.hex");
+        let number = |key: &str| vector[key].as_u64().unwrap();
+        let fee = |key: &str| vector[key].as_str().unwrap().parse::<u128>().unwrap();
+        let tx = TxEip1559 {
+            chain_id: number("chainId"),
+            nonce: number("nonce"),
+            gas_limit: number("gasLimit"),
+            max_fee_per_gas: fee("maxFeePerGas"),
+            max_priority_fee_per_gas: fee("maxPriorityFeePerGas"),
+            to: TxKind::Call(vector["to"].as_str().unwrap().parse().unwrap()),
+            value: U256::ZERO,
+            access_list: AccessList::default(),
+            input: hex::decode(calldata.trim()).unwrap().into(),
+        };
+        assert_eq!(
+            hex::encode_prefixed(raw(&tx)),
+            vector["payload"].as_str().unwrap()
+        );
+        let policy = Policy {
+            chain_id: 421_614,
+            to: vector["to"].as_str().unwrap().parse().unwrap(),
+            max_gas: 5_000_000,
+            max_fee_per_gas: 2_000_000_000,
+            calls: Calls::SettleBatch { max_notes: 64 },
+        };
+        let payload = hex::decode(vector["payload"].as_str().unwrap()).unwrap();
+        assert_eq!(policy.check(&payload).map(|(signed, _)| signed), Ok(tx));
+    }
+
+    #[test]
     fn a_role_never_signs_another_roles_function() {
         let cases = [
             (operator(), submit_tx(), Role::Relayer),
