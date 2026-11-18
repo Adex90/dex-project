@@ -184,7 +184,10 @@ export const api = {
         corte_id: proof.corte.id,
         hoja: proof.hoja,
         ruta: proof.ruta,
-        posiciones: (proof.posiciones ?? []).map((p) => ({ hoja: p.hoja, ruta: p.ruta })),
+        // Only with positions: a backend from before migration 0018 refuses unknown fields.
+        ...(proof.posiciones?.length
+          ? { posiciones: proof.posiciones.map((p) => ({ hoja: p.hoja, ruta: p.ruta })) }
+          : {}),
       },
     }),
 

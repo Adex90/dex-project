@@ -365,10 +365,44 @@ what the module waits on. They do not change its scope.
   - W-8BEN applies only to US securities held through a US broker or
     custodian.
 - [ ] **27. Corporate Actions UI** (Proxy voting, DRIP elections)
-- [ ] **28. Cryptographic Solvency Explorer** (Merkle tree leaf node auditor)
-  - Foundation: the Reserve tab rebuilds the client's Merkle proof in the
-    browser (`lib/merkle.ts`). The published cuts are public
-    (`/api/v1/reserva/cortes`).
+- [x] **28. Cryptographic Solvency Explorer** (Merkle tree leaf node auditor)
+  - The Reserve tab (`components/reserve/`), in three parts. The published
+    snapshot, for everyone: the reserve root with Copy root, its time, the
+    reserve ratio (custody over client liabilities, rounded down so a cent
+    short never reads 100.00%), both totals, the cash and market ledger
+    anchors, and each asset's root with the units owed to clients. The leaf
+    node auditor: the client's leaf hash, what it commits to (cash line by
+    line, funds on hold in the neutral copy, and each position at the
+    snapshot next to now), a JSON download and the gold "Verify My
+    Inclusion". The step-by-step trace, one per tree: every level's two
+    children in hashing order with their sums and the node they give, to the
+    computed root beside the published one, under the match seal.
+  - The backend already served the cash proof
+    (`GET /api/v1/reserva/prueba`) and public cuts. Migration 0018 adds the
+    positions the request asked to see as included: one Merkle sum tree per
+    asset, published with the cut and checked by the database at commit
+    (exactly the live open positions, sums, indices, leaf hashes recomputed
+    in SQL), plus the market ledger anchor and each cash leaf's breakdown.
+    The cash tree and its root are unchanged. README "Proof of Reserve:
+    positions and the Solvency Explorer".
+  - The verifier, `lib/merkle-verifier.ts` (the former `lib/merkle.ts`):
+    WebCrypto SHA-256 with a pure-JS fallback, no dependencies. It
+    recomputes every path on a freshly fetched proof, checks the turns
+    against the leaf's index, and bounds every sum. The verdict also requires
+    the client's own account and the snapshot, asset roots included, equal
+    to its public copy. Reference vectors computed separately from the spec
+    pin the same hashes in Rust, TypeScript and SQL.
+  - Tests: `tests/db/0018_reserva_posiciones.sql`, `backend/tests/reserva.rs`
+    and the vectors in `crypto/merkle.rs`, `lib/merkle-verifier.test.ts`,
+    `lib/proof-verdict.test.ts`, `lib/solvency.test.ts`, smoke e2e (the
+    explorer on fresh snapshots, every position on a phone, a private root
+    and another client's leaf refused) and the AML e2e (a frozen client's
+    leaf with funds on hold: neutral copy, still verifies).
+  - Left: custody attestations for the underlying assets, so an asset's
+    root total can be compared with what the custodian holds (today a root
+    proves inclusion, not backing); splitting large balances over several
+    leaves, so a sibling's sum cannot reveal one client's exact amount; and
+    a downloadable standalone verifier page for auditors.
 - [ ] **29. Collateral Health Alerts** (Margin monitors and Margin Call countdowns)
   - Gated by module 19 and the margin decision above.
 

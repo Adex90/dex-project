@@ -38,8 +38,11 @@ Integrity checks (migration `0004` and the backend):
   every anchor, replays every balance and checks the IFPE<->SOFOM mirror
   entries and each mutuum's terms hash.
 - **Proofs are checked in the browser.** The dashboard verdict requires that
-  the leaf is the customer's own account and that the cut matches the public,
-  unauthenticated copy (`GET /reserva/cortes/{id}`).
+  the leaf is the customer's own account, that every path turns where the
+  leaf's index dictates, and that the cut, asset roots included, matches the
+  public, unauthenticated copy (`GET /reserva/cortes/{id}`). Asset positions
+  have their own trees in the same cut (migration `0018`, "Proof of Reserve:
+  positions and the Solvency Explorer").
 
 ## SPEI (interbank transfers, migrations `0005` and `0008`)
 
@@ -1219,6 +1222,71 @@ client's own name: the AML whitelist.
   `MODO_DEMO` no account is linked yet, so withdrawals need that flow
   first (`docs/FRONTEND_ROADMAP.md`, module 16).
 
+## Proof of Reserve: positions and the Solvency Explorer (migration `0018`)
+
+A Proof of Reserve cut (`backend/src/reserva.rs`) commits to every client's
+cash in a Merkle sum tree (`backend/src/crypto/merkle.rs`, "SHA-256
+merkle-sum v1") anchored to the ledger head, and the database refuses a cut
+that does not match the live balances (above). Migration `0018` extends the
+cut without touching that tree: same encoding, same root.
+
+- **Positions.** Every open market position is a leaf in its asset's own
+  Merkle sum tree:
+  `SHA256("SC-POR-v1:posicion" 0x00 || ticker || 0x00 || account_id[16] || quantity_u128_be[16] || salt[32])`,
+  the quantity in 10^-8 units, with a fresh salt per leaf and cut and a
+  shuffled order, like the cash leaves. Nodes use the cash tree's encoding.
+  The domain and the ticker keep a leaf from moving between trees or passing
+  for a cash leaf, and the leaf's account is the client's IFPE account, the
+  same as their cash leaf. The cut publishes each tree in `activos`
+  (ticker, root, leaves, units owed to clients).
+- **No custody record for assets yet.** An asset's root proves that the
+  positions are included and counted, not that they are backed
+  (DEPLOYMENT §12).
+- **Market anchor.** The cut also anchors the market ledger head
+  (`secuencia_mercado`, `hash_mercado`). It never moves back.
+- **Cash breakdown.** Each cash leaf stores its available, on-hold and
+  held-for-orders parts, outside the hash: the leaf still commits to the
+  total.
+- **Checked at commit,** in the generator's own snapshot, by a deferred
+  trigger:
+  - the market anchor is the head;
+  - the position leaves are exactly the live open positions, in one declared
+    tree per asset and none extra;
+  - indices are contiguous, counts and sums are the declared ones, and every
+    leaf hash is recomputed in SQL;
+  - each cash breakdown is its account's.
+
+  The backend rebuilds every asset root whenever it loads a cut, as it does
+  the cash root.
+- **API.**
+  - `GET /api/v1/reserva/prueba` adds `desglose` and `posiciones` (each
+    position's leaf and path).
+  - The public cuts carry `activos` and the market anchor.
+  - `POST /api/v1/reserva/verificar` accepts `posiciones`.
+
+**The Solvency Explorer** (the Reserve tab, `frontend/src/components/reserve/`):
+
+- the latest public snapshot: the reserve root with Copy root, when it was
+  taken, the reserve ratio (custody over client liabilities, rounded down,
+  so a cent short never reads 100.00%), both totals, both ledger anchors and
+  the asset roots;
+- the leaf node auditor: the client's leaf hash and what it commits to (cash
+  line by line, funds on hold in the neutral copy every client screen uses,
+  each position at the snapshot next to what the client holds now), a JSON
+  download, and **Verify My Inclusion**;
+- the step-by-step trace, one per tree: from the leaf, each level's two
+  children in hashing order with their sums and the node their SHA-256
+  gives, to the computed root beside the published one, under a match seal.
+
+Verifying fetches a fresh proof and recomputes every path in the browser
+(`frontend/src/lib/merkle-verifier.ts`: WebCrypto SHA-256 with a pure-JS
+fallback, no dependencies). The verdict (`lib/proof-verdict.ts`) also
+requires the client's own account, the turns the leaf's index dictates, and
+the snapshot, asset roots included, equal to the copy fetched without
+credentials. The server's check is shown as a second opinion only.
+Reference vectors computed separately from the spec pin the same hashes in
+Rust, TypeScript and SQL.
+
 ## Layout
 
 ```
@@ -1226,7 +1294,7 @@ migrations/   SQL schema (sqlx-cli); 0001 approved and immutable
 backend/      Rust: axum + sqlx + tokio
   src/db.rs              role-scoped transactions (the only place that calls begin())
   src/ledger/            IFPE engine + SHA-256 hash-chain verifier
-  src/crypto/merkle.rs   Merkle sum tree (Proof of Reserve)
+  src/crypto/merkle.rs   Merkle sum trees (Proof of Reserve: cash and asset positions)
   src/reserva.rs         reserve cuts and per-client inclusion proofs
   src/sofom/             IFPE -> mutuum bridge, maturity liquidation, loans
   src/kyc/               onboarding: CURP/RFC/INE/MRZ validation, biometric provider, verdicts
@@ -1276,6 +1344,7 @@ psql "$EMPTY_DATABASE_URL" -f tests/db/0013_mercado_valores.sql
 psql "$EMPTY_DATABASE_URL" -f tests/db/0015_ordenes_avanzadas.sql
 psql "$EMPTY_DATABASE_URL" -f tests/db/0016_cuentas_vinculadas.sql
 psql "$EMPTY_DATABASE_URL" -f tests/db/0017_kyc_declaraciones.sql
+psql "$EMPTY_DATABASE_URL" -f tests/db/0018_reserva_posiciones.sql
 cd frontend && npm test && npm run build
 FRONTEND_URL=http://localhost:3000 node e2e/smoke.mjs   # needs backend (MODO_DEMO=true) + next start
 # AML/PLD console against the real stack (structuring -> freeze -> four-eyes unfreeze, roles, no tipping off):
@@ -1469,9 +1538,9 @@ the password is hashed, so a parallel burst cannot test more than 5 passwords.
 | POST | `/api/v1/sofom/mutuos` | client: **IFPE -> SOFOM bridge** |
 | POST | `/api/v1/sofom/mutuos/{id}/liquidar` | owning client or operator (on maturity) |
 | GET | `/api/v1/reserva/estado`, `/api/v1/reserva/cortes/ultimo` | public |
-| GET | `/api/v1/reserva/cortes?antes=&limite=`, `/api/v1/reserva/cortes/{id}` | public: history of published anchors (root, totals, ledger sequence and hash) |
-| GET | `/api/v1/reserva/prueba` | client: Merkle proof for their account |
-| POST | `/api/v1/reserva/verificar` | public: verify a proof against the published root |
+| GET | `/api/v1/reserva/cortes?antes=&limite=`, `/api/v1/reserva/cortes/{id}` | public: history of published anchors (root, totals, ledger and market anchors, asset roots) |
+| GET | `/api/v1/reserva/prueba` | client: inclusion proofs for their account: the cash leaf with its breakdown, and each open position in its asset's tree |
+| POST | `/api/v1/reserva/verificar` | public: verify a proof, positions included, against the published roots |
 | GET | `/api/v1/auditoria/ledger/{ifpe,sofom,mercado}` | operator / auditor |
 | POST | `/api/v1/operaciones/depositos` | operator: manual entry of an incoming SPEI (5-digit `banco_emisor`, `fecha_operacion`, `clave_rastreo`); same path and same identity as the webhook, so a payment entered by hand and notified by the provider is credited once |
 | POST | `/api/v1/operaciones/creditos`, `.../{id}/pagos`, `.../{id}/castigo` | operator: loans, collections, write-offs (losses absorbed by SOFOM capital) |

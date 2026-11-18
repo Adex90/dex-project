@@ -103,6 +103,7 @@ internet -> host 80/443 (UFW, fail2ban) -> nginx (edge network)
 | A pending limit or stop order's cash or units cannot be spent twice, and holding them never breaks the 100 % reserve | Same code on both: a buy's cash moves to `saldo_comprometido` by a hash-chained IFPE movement (`COMPROMISO_ORDEN`, back by `LIBERACION_ORDEN`) inside the account, never out of custody; a sell's units to `cantidad_comprometida`, which market sales cannot sell. At COMMIT the database requires held cash and units to equal the pending orders, every hold and release to be paired with its order, held cash to replay from the ledger, and each fill to meet its order's limit or stop and sell exactly its held units. Liabilities, Merkle leaves and the reserve cut count held cash. Terms are immutable; `sc_mercado` may only close an order | Same | `tests/ordenes_avanzadas.rs`, `tests/db/0015_ordenes_avanzadas.sql` |
 | Money leaves the vault only to a bank account in the client's own name (AML whitelist), and the check never discloses an AML hold | Same code on both: every own-account withdrawal goes only to an active linked account (`ifpe.cuentas_vinculadas`) whose holder is the client's KYC name, never a CLABE of ours and active for one client only. The order records its account, and a trigger re-checks it (client, state, CLABE, holder). The whitelist runs after the AML evaluation, so a frozen client gets the neutral refusal. Linked accounts are never deleted, only retired; clients read only their own. Payments to someone else's account (`/api/v1/spei/transfer`) are refused unless `SPEI_TRANSFERENCIAS_TERCEROS=true` | Same | `tests/patrimonio.rs`, `tests/db/0016_cuentas_vinculadas.sql` |
 | A client is verified only with the declarations AML/CFT rules ask for and the agreements in force, and a declared politically exposed person only by a person | Same code on both: the database refuses a KYC submission without occupation, source of funds and the PEP answer, or without the agreements' version in force (`kyc.parametros.contratos_version`); it stamps the acceptance time itself and freezes the answers with the identity. It refuses `VERIFICADO` for a declared PEP unless an operator decides, and then marks the client PEP with risk `ALTO` | Same | `tests/kyc.rs`, `tests/db/0017_kyc_declaraciones.sql` |
+| Every open market position is in the published reserve cut, and a cut cannot omit or alter one | Same code on both: one Merkle sum tree per asset in each cut (migration `0018`). At commit, in the cut's own snapshot, the database requires the position leaves to be exactly the live open positions, one declared tree per asset and none extra, contiguous indices, the declared counts and sums, every leaf hash recomputed in SQL, the market ledger anchor equal to its head and never moving back, and each cash leaf's breakdown equal to its account. Trees and leaves are immutable; the backend rebuilds every root when it loads a cut | Same | `tests/reserva.rs`, `tests/db/0018_reserva_posiciones.sql` |
 | No request field outside the API contract is accepted | Same code on both: `deny_unknown_fields` on every body and query type (400 `VALIDACION`) | Same | `tests/entrada.rs` (source scan and HTTP) |
 | Least-privilege database identities | Service holds only `sc_app` (NOINHERIT, no owner rights); owner credentials only in the migrate task and with DBAs holding the `dba-tunnel` policy | Same, plus the schema owner is **not** a superuser (`deploy/postgres/10-schema-owner.sh`); the `postgres` superuser is break-glass only | `pg_authid` query in Appendix C |
 | Containers non-root, read-only, least capability, resource-limited | uid 65532, read-only rootfs, `drop ALL`, task CPU/memory | uid 65532 / 70 / 101, `read_only`, `cap_drop: ALL`, `no-new-privileges`, CPU/memory/PID limits | `docker inspect` in Appendix C |
@@ -1115,6 +1116,25 @@ following to operations.
     and raise `kyc.parametros.contratos_version` in a migration. A wizard
     opened before the release gets `KYC_CONTRATOS_DESACTUALIZADOS`, reloads
     the version and asks the client to accept again.
+- **Migration `0018`** (asset positions in the Proof of Reserve) adds two
+  tables for the asset trees and their leaves, nullable columns for the
+  market anchor (on the cut) and each cash leaf's breakdown, and a deferred
+  trigger on new cuts. The breakdown's constraint is added `NOT VALID`, so
+  the large leaves table is not scanned (existing rows keep NULL). No table
+  is rewritten, and published cuts and their proofs do not change.
+
+  Publishing a cut is not backward compatible. From the migration on, a cut
+  needs the market anchor, the breakdown and the asset trees, which only the
+  new backend writes. An old binary on a migrated database fails closed
+  (`SC_CORTE_INVALIDO`, nothing published); proofs keep coming from the last
+  published cut, and a brand-new account's first proof answers an error
+  until the new backend serves. Deploy migrate, then the backend, then the
+  frontend or with it. The new frontend also works against an older
+  backend, without the positions.
+  - The auditor role now reads `mercado.posiciones` and
+    `mercado.ledger_cabeza` to build the cut.
+  - An open position whose client has no IFPE account blocks every cut
+    (fail closed) until it is fixed: its leaf would have no identity.
 
 ---
 
@@ -1171,6 +1191,7 @@ to the specific provisions.
 | 22 | Dependency audit exception: RUSTSEC-2023-0071 (`rsa`, no fixed version); six moderate npm findings in lint tooling (minimatch, GHSA-g3hv-75wg-m249) | none: `rsa` is in Cargo.lock only through sqlx's unused MySQL driver, and the npm findings are in dev-only tooling, below the gate's threshold | the backend build fails if `rsa` enters the build graph; dev tooling never reaches an image | review the `rsa` exception when sqlx moves to 0.9; take the eslint update Dependabot proposes |
 | 23 | The onboarding agreements are shown as summaries: the full legal texts are not served, and the client gets no signed copy | a client accepts a summary of the account and custody agreement | the version accepted and the time are recorded with the submission's IP and browser; the full privacy notice is available on request (compliance address) | publish the full texts under their version, and a downloadable signed copy (legal, frontend) — **launch blocker** |
 | 24 | Clients verified before migration `0017` have no declarations on file (occupation, source of funds, PEP) | their KYC file lacks answers that newer clients give | the AML engine still applies its risk matrix, and an operator can raise a client's risk level | collect the declarations from those clients (compliance, frontend) |
+| 25 | Asset positions are committed in the reserve cut, but no custody attestation of the underlying assets is published | a client can prove that their position is included and counted, not that the asset behind it is held | the market trades only with `MODO_DEMO` (simulated prices); each asset root publishes the units owed to clients, and the Reserve tab says inclusion, not backing | publish a custodian attestation per asset and compare it with each root's total before the market trades for real (treasury, backend) — **blocker for live trading** |
 
 ---
 
