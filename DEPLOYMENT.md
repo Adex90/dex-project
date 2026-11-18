@@ -203,7 +203,9 @@ guarantee the same bytes.
     e2e runs (smoke and AML).
   - **Images:** hadolint, then the build. Each build includes a dependency audit
     stage that fails it on a known vulnerability: `cargo audit` (RustSec), and
-    `npm audit` (moderate or worse in runtime dependencies, high or worse anywhere).
+    `npm audit` (moderate or worse in runtime dependencies, with no exceptions; high
+    or worse anywhere, less the dated dev-tooling exceptions in
+    `frontend/audit-exceptions.json`).
     The Trivy scan fails on any fixable CRITICAL finding and reports HIGH.
   - **Infrastructure and scripts:** Terraform fmt, validate and tflint; Trivy
     misconfiguration and secret scans; ShellCheck; actionlint.
@@ -983,7 +985,7 @@ aid for the compliance team and the auditors, not a certification.
 | Authentication secrets | information security | 5.17 | CC6.1 | Secrets Manager / Docker secrets; SCRAM-SHA-256 everywhere; rotation (§8) | §8; rotation records |
 | Cryptography | information security | 8.24 | CC6.1, CC6.7 | TLS 1.3 at the edge; TLS to RDS (`verify-full` to the proxy); KMS CMKs | ALB/nginx config; KMS key policies |
 | Logging and monitoring | operation records; AML audit trail | 8.15, 8.16 | CC7.2, CC7.3 | ALB/WAF/flow logs; container logs; fail2ban; tamper-evident AML audit log (`aml.verificar_bitacora`) | log groups; SIEM |
-| Vulnerability management | information security | 8.8 | CC7.1 | Trivy gates (images, lockfiles, IaC, third-party images); `cargo audit` and `npm audit` in every image build; Dependabot; digest pins | CI history; `.github/trivyignore.yaml`; `backend/.cargo/audit.toml` |
+| Vulnerability management | information security | 8.8 | CC7.1 | Trivy gates (images, lockfiles, IaC, third-party images); `cargo audit` and `npm audit` in every image build; Dependabot; digest pins | CI history; `.github/trivyignore.yaml`; `backend/.cargo/audit.toml`; `frontend/audit-exceptions.json` |
 | Secure development and change | change management | 8.25, 8.28, 8.29, 8.32 | CC8.1 | protected `main`; required checks; migration procedure (§6) | PRs; CI; release tickets |
 | Backup and recovery | business continuity | 8.13, 8.14 | A1.2, A1.3 | RDS 35-day point-in-time recovery, Multi-AZ; tested dump and restore (§5.9) | restore drill records |
 | Configuration hardening | information security | 8.9 | CC6.8, CC7.1 | `hardening.sh`; read-only, non-root containers; distroless images | §5.2 output; `docker inspect` |
@@ -1020,7 +1022,7 @@ to the specific provisions.
 | 19 | The `dba-tunnel` policy restricts DBAs, not account administrators: a principal allowed `ssm:StartSession` on every instance could open a shell on the bastion | a shell inside the VPC with a path to the database port, still without the owner password | the instance role holds only `AmazonSSMManagedInstanceCore`, and the bastion holds no secret | an SCP that denies shell sessions on instances tagged `Component = dba-access` (account baseline) |
 | 20 | The backend's per-IP limits count in each process | with N tasks behind the ALB, an address can make up to N times the quota | the WAF's rate-based rules are global per IP; nginx counts once on a single host | a shared store (for example ElastiCache) if exact global limits are needed in the backend |
 | 21 | RLS keys on a transaction-local setting that the backend writes | SQL injection inside a client transaction could rewrite `sc.cliente_actual` | every query is parameterized (sqlx binds); `sc_cliente` only reads; the policies stop wrong-id and missing-`WHERE` bugs | none planned: per-client database roles do not scale |
-| 22 | Dependency audit exceptions: RUSTSEC-2023-0071 (`rsa`, no fixed version) and RUSTSEC-2026-0459 (`libsqlite3-sys` 0.30.1, fixed in 0.39.0 only with sqlx 0.9); six moderate npm findings in lint tooling (minimatch, GHSA-g3hv-75wg-m249) | none: `rsa` and `libsqlite3-sys` are in Cargo.lock only through sqlx's unused MySQL and SQLite drivers, and the npm findings are in dev-only tooling, below the gate's threshold | the backend build fails if `rsa` or `libsqlite3-sys` enters the build graph; dev tooling never reaches an image | move to sqlx 0.9, which retires both Rust exceptions (the SQLite one expires on 2027-02-10 at the latest); take the eslint update Dependabot proposes |
+| 22 | Dependency audit exceptions: RUSTSEC-2023-0071 (`rsa`, no fixed version) and RUSTSEC-2026-0459 (`libsqlite3-sys` 0.30.1, fixed in 0.39.0 only with sqlx 0.9); six moderate npm findings in lint tooling (minimatch, GHSA-g3hv-75wg-m249); GHSA-fc5q-39xc-vjpf (`picomatch` ReDoS, high, no fixed release) in the lint toolchain | none: `rsa` and `libsqlite3-sys` are in Cargo.lock only through sqlx's unused MySQL and SQLite drivers, and the npm findings are in dev-only tooling (the moderate ones below the gate's threshold; `picomatch` only matches the repository's own glob patterns) | the backend build fails if `rsa` or `libsqlite3-sys` enters the build graph; dev tooling never reaches an image; the `picomatch` exception holds only while every copy is a dev dependency in `package-lock.json` and lapses at any newer `picomatch` release | move to sqlx 0.9, which retires both Rust exceptions (the SQLite one expires on 2027-02-10 at the latest); take the eslint update Dependabot proposes; the `picomatch` exception expires on 2026-12-31 at the latest |
 
 ---
 

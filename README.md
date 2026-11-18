@@ -662,9 +662,9 @@ advisory published after the lockfile last changed. Locally:
 # Rust: Cargo.lock against the RustSec database (cargo install cargo-audit --locked).
 # Policy in backend/.cargo/audit.toml: vulnerabilities, unsound and yanked crates fail.
 cd backend && cargo audit
-# Node: runtime dependencies fail from "moderate", the whole tree (build tools
-# included) from "high".
-cd frontend && npm audit --omit=dev --audit-level=moderate && npm audit --audit-level=high
+# Node: runtime dependencies fail from "moderate", with no exceptions; the whole
+# tree (build tools included) from "high", less frontend/audit-exceptions.json.
+cd frontend && npm audit --omit=dev --audit-level=moderate && node scripts/audit.mjs
 ```
 
 - **Fix first.** Update the dependency (`cargo update -p <crate>`, `npm update
@@ -676,7 +676,16 @@ cd frontend && npm audit --omit=dev --audit-level=moderate && npm audit --audit-
   (`libsqlite3-sys`), only through its optional SQLite driver (fixed upstream in
   sqlx 0.9; expires 2027-02-10). The backend build fails if either crate enters
   the build graph.
-- **npm** has no exception file. A finding with no fixed version is pinned
+- **npm exceptions** go in `frontend/audit-exceptions.json`, for dev and build
+  tooling only, each with its statement, approval and expiry date. Runtime
+  dependencies take none: their gate runs first and has no exception file.
+  `scripts/audit.mjs` honours an exception only while npm reports the advisory
+  with the approved range, the package has no release newer than the approved
+  one (any may be the fix), the date has not passed, and every vulnerable copy
+  in `package-lock.json` is a dev dependency. Today there is one:
+  GHSA-fc5q-39xc-vjpf (`picomatch`, ReDoS, no fixed release), reached only by
+  the lint toolchain; it expires on 2026-12-31 or at an upstream release,
+  whichever comes first. Otherwise a finding with no fixed version is pinned
   through `overrides` or removed.
 
 ### Production database users

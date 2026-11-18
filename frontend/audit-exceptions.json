@@ -1,0 +1,15 @@
+{
+  "_comment": "High or critical advisories the whole-tree dependency gate (scripts/audit.mjs) lets through, for dev and build tooling only. An exception holds while npm reports the advisory with exactly `range`, the package has no release newer than `newestRelease` (any later release may be the fix, a backport included), today (UTC) is no later than `expires`, and every vulnerable copy in package-lock.json is a dev dependency. It lapses on its own at an upstream fix or on its date, whichever comes first. Runtime dependencies take no exceptions: the Dockerfile's audit stage gates them first with `npm audit --omit=dev --audit-level=moderate`. Prefer fixing: update the package, or drop the dependency.",
+  "exceptions": [
+    {
+      "id": "GHSA-fc5q-39xc-vjpf",
+      "package": "picomatch",
+      "range": "<=4.0.7",
+      "newestRelease": "4.0.7",
+      "scope": "dev and build tooling only",
+      "statement": "ReDoS on an attacker-controlled extglob pattern, in every picomatch release (<= 4.0.7, the newest, published 2026-08-24): no fixed version exists. Here picomatch (2.3.2 and 4.0.7, both dev-only in package-lock.json) is reached only by the lint and build toolchain (eslint-config-next, typescript-eslint, fast-glob, tinyglobby), which matches the repository's own glob patterns: no request, user input or runtime path reaches it, and the runtime dependency audit is clean.",
+      "approved": "Approved by the project owner on 2026-11-18 (Phase 3 review), strictly for dev/build tooling, until 2026-12-31 or an upstream fix release, whichever comes first.",
+      "expires": "2026-12-31"
+    }
+  ]
+}
