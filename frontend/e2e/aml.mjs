@@ -549,6 +549,32 @@ try {
   const reserveHits = await tipOffWords(cp);
   check(reserveHits.length === 0, `the Reserve tab has no tipping-off words (${reserveHits.join(", ") || "none"})`, reserveHits);
   await shot(cp, "client-reserve-held");
+  // The Security tab (migration 0019): the devices, the credentials and the
+  // security log tell a client under review nothing either, on screen or in
+  // what the API answers.
+  await openTab(cp, "Security");
+  await cp.getByTestId("session-row").first().waitFor();
+  await cp.getByTestId("security-event").first().waitFor();
+  const securityReads = await Promise.all(
+    ["/api/v1/auth/sessions", "/api/v1/auth/security/events", "/api/v1/auth/security/preferences"].map((path) =>
+      pageFetch(cp, "GET", path),
+    ),
+  );
+  check(
+    securityReads.every((r) => r.status === 200) &&
+      !/aml|pld|congel|alerta|cumplimiento|nivel_riesgo|es_pep|retenido|sospech|uif|preventiv/i.test(
+        JSON.stringify(securityReads.map((r) => r.body)),
+      ),
+    "the client's sessions, security log and preferences carry no AML wording",
+    securityReads.map((r) => r.body),
+  );
+  check(
+    await cp.getByTestId("session-row").first().getByTestId("current-device-badge").isVisible(),
+    "a client with funds on hold still sees their devices, this one marked current",
+  );
+  const securityHits = await tipOffWords(cp);
+  check(securityHits.length === 0, `the Security tab has no tipping-off words (${securityHits.join(", ") || "none"})`, securityHits);
+  await shot(cp, "client-security-frozen");
   // The Vault home (balance, reserve seal, deposit card, chart) must not tip off either.
   await openTab(cp, "Vault");
   await cp.getByTestId("vault-total").waitFor();

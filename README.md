@@ -581,7 +581,8 @@ into `aml.alertas` and `GET /api/v1/operaciones/alertas` was removed.
     email provider (DEPLOYMENT.md).
 - **Sessions.** Staff sessions last `JWT_TTL_PERSONAL_MINUTOS` (default 30).
   Turning on two-step verification or resetting the password revokes every
-  other session.
+  other session. Since migration `0019` each session is a row of its own
+  (below, "Security Center: per-device sessions").
 - **Key rotation.** Set the old key as `MFA_CLAVE_CIFRADO_ANTERIOR` and the new
   one as `MFA_CLAVE_CIFRADO`, then run `synthetic-capital migrar`: it
   re-encrypts every secret with the new key. Then remove the old one.
@@ -1287,6 +1288,58 @@ credentials. The server's check is shown as a second opinion only.
 Reference vectors computed separately from the spec pin the same hashes in
 Rust, TypeScript and SQL.
 
+## Security Center: per-device sessions (migration `0019`)
+
+Until `0019` an access token had no record of its own: the only revocation
+was all of a person's tokens at once (`tokens_validos_desde`, operators
+only). Now every sign-in is a row in `kyc.sesiones` and the token carries its
+id (`sid`).
+
+- **Opening.** Sign-in, the authenticator code, sign-up and turning on
+  two-step verification each open a session: its expiry (the token's `exp`),
+  whether it verified the code, the device summarized from the User-Agent by
+  the server ("Chrome on macOS", never the raw string) and the sign-in IP.
+  The database stamps the times; `sc_auth` cannot choose them.
+- **Every request** (the `Usuario` extractor, `backend/src/auth/mod.rs`)
+  checks, besides role, blocklist and two-step verification, that the
+  token's session exists, is the person's, is not revoked, has not expired
+  and was used within the client's inactivity timeout (5, 15, 30 or 60
+  minutes; 30 by default). Requests mark last use at most once a minute; the
+  vault socket's periodic revalidation does not, so an open tab with no
+  requests also ends. A token without a session is refused: **deploying
+  `0019` signs everyone out once** (DEPLOYMENT.md).
+- **Closing.** A revocation is final and records why: signed out, revoked
+  from another device, "all other devices", password changed or reset,
+  two-step verification turned on, timeout changed (sessions already idle
+  under the old timeout are closed, so a longer one revives nothing), the
+  tries exhausted while changing the password, or an operator. Rows are
+  never deleted, and only last use moves, forward.
+- **Password change.** `POST /api/v1/auth/password/change` takes the current
+  password and, with two-step verification on, the code. Each try counts in
+  the sign-in lockout before anything is verified. The new password follows
+  the policy and must differ. Success signs out every other session and
+  voids a pending reset link; the session that exhausts the tries is signed
+  out.
+- **Security log.** Sign-ins, failed tries, lockouts, sign-outs and
+  revocations, password changes and refusals and timeout changes join the
+  two-step events in `kyc.eventos_autenticacion`, with the acting session,
+  the device and a numeric detail (how many sessions, how many minutes). It
+  stays append-only. Tries during a lockout are not logged, so the log
+  cannot be flooded.
+- **Roles.** `sc_auth` writes; `sc_kyc` reads only what per-request
+  validation needs; a client reads their own sessions, log and preference
+  through `sc_cliente` and row-level security, and writes nothing directly.
+  `tests/db/0019_sesiones_seguridad.sql` checks all of it in the database.
+
+**The Security page** (`/dashboard/security`,
+`frontend/src/components/security/`): active devices, this one marked
+"Current device", with Revoke and "Sign out all other devices"; the
+password change; the inactivity timeout; two-step verification's status,
+with a way to turn it on; passkey readiness (status only); and the log in
+words. Signing out ends the session on the server too, and an unattended
+tab signs itself out after the timeout, here and on the server, saying why
+on the sign-in page.
+
 ## Layout
 
 ```
@@ -1513,6 +1566,12 @@ the password is hashed, so a parallel burst cannot test more than 5 passwords.
 | POST | `/api/v1/auth/registro`, `/api/v1/auth/login` | public (sign-up starts with KYC `PENDIENTE`; staff sign-in needs the second step) |
 | POST | `/api/v1/auth/verify-mfa`, `/api/v1/auth/mfa/setup`, `/api/v1/auth/mfa/enable` | two-step verification (see above) |
 | POST | `/api/v1/auth/password/forgot`, `/api/v1/auth/password/reset` | public: password reset by single-use link |
+| POST | `/api/v1/auth/logout` | any session: ends this session on the server (204) |
+| GET | `/api/v1/auth/sessions` | any session: its person's active sessions (device, sign-in IP, times, `actual`) and the inactivity timeout |
+| POST | `/api/v1/auth/sessions/{id}/revoke`, `/api/v1/auth/sessions/revoke-others` | any session: sign out one session of its person (404 if not theirs or already ended), or every other |
+| POST | `/api/v1/auth/password/change` | any session: current password (+ TOTP code if on); counts toward the sign-in lockout; signs out the other sessions |
+| GET | `/api/v1/auth/security/events` | any session: its person's security log, newest first (`limite`, 1–100, default 50) |
+| GET, POST | `/api/v1/auth/security/preferences` | any session: inactivity timeout (5, 15, 30, 60) and two-step verification status |
 | GET | `/api/v1/kyc/expediente` | client: onboarding state, attempts, last biometric result, own declarations and the agreements' version in force |
 | POST | `/api/v1/kyc/perfil` | client: step 1, personal data, CURP, RFC and address |
 | POST | `/api/v1/kyc/verificar` | client: the wizard's submission, INE images and data + liveness frames + consent + declarations + accepted agreements (up to 12 MB) |

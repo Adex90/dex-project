@@ -343,13 +343,58 @@ what the module waits on. They do not change its scope.
     none on file.
 - [ ] **19. Investor Profiling & Quizzes** (Gatekeeping Margin/Options tiers)
   - Gates modules 5 and 29.
-- [ ] **20. Security Center** (FaceID/TouchID, PIN reset)
-  - On the web, Face ID and Touch ID mean WebAuthn passkeys. TOTP two-step
-    verification exists (`/auth/mfa-setup`) but is not linked from the
-    dashboard.
-- [ ] **21. Advanced Session Management** (Active devices, remote logout)
-  - Today the backend can only revoke all of a person's sessions at once
-    (operators only). A device list needs per-session records.
+- [x] **20. Security Center** (FaceID/TouchID, PIN reset)
+  - The Security page, `/dashboard/security` (`components/security/`): in
+    the sidebar's Account group, gold when current, and on phones behind the
+    header's lock button (the tab bar keeps five tabs). Besides the devices
+    of module 21: a password change (current password, new one with a live
+    checklist of the server's rules, and the authenticator code when
+    two-step verification is on); the inactivity timeout (5, 15, 30 or 60
+    minutes, saved on pick); two-step verification's status, with a way to
+    turn it on that reuses `/auth/mfa-setup` outside the dashboard; passkey
+    readiness for Face ID, Touch ID or Windows Hello, read from the browser
+    (status only); and the security log in words.
+  - The contract (migration 0019, README "Security Center: per-device
+    sessions"): `POST /api/v1/auth/password/change` counts every try toward
+    the sign-in lockout before verifying, requires the new password to
+    differ, signs out every other device, voids a pending reset link, and
+    ends the session that exhausts the tries. `GET`/`POST
+    /api/v1/auth/security/preferences` and `GET /api/v1/auth/security/events`.
+    Every change goes to the append-only `kyc.eventos_autenticacion`.
+  - Tests: `tests/db/0019_sesiones_seguridad.sql`, `backend/tests/sesiones.rs`,
+    `lib/security.test.ts`, smoke e2e (the password change and its refused
+    try, the timeout surviving a reload, two-step verification turned on
+    from Security on a phone, the inactivity sign-out on a fake clock) and
+    the AML e2e (a frozen client's Security tab and its API reads carry no
+    tipping-off words).
+  - Left: registering and signing in with passkeys (WebAuthn: the backend
+    has no credential storage yet), moving two-step verification to a new
+    phone without support, and recovery codes. The card PIN lives with the
+    card preview (module 14).
+- [x] **21. Advanced Session Management** (Active devices, remote logout)
+  - Every sign-in is now a row in `kyc.sesiones` and its token carries the
+    row's id; each request checks the row is not revoked, not expired and
+    used within the client's inactivity timeout. Tokens issued before 0019
+    are refused, so deploying it signs everyone out once.
+  - The Active devices panel: every session, this one first with the gold
+    "Current device" badge, its device (summarized from the User-Agent by
+    the server, never stored raw), sign-in IP, sign-in time, last activity
+    and end. Revoke signs one device out; "Sign out all other devices" asks
+    once, with the count. A revoked device's next request fails, and its
+    live vault connection closes within a minute. Signing out ends the
+    session on the server too, and an unattended tab signs itself out after
+    the timeout, with a notice saying why.
+  - Endpoints: `GET /api/v1/auth/sessions`,
+    `POST /api/v1/auth/sessions/{id}/revoke`,
+    `POST /api/v1/auth/sessions/revoke-others`, `POST /api/v1/auth/logout`.
+    A password reset, turning two-step verification on and an operator's
+    revocation also close the rows.
+  - Tests: as module 20, plus the vault socket closing for one revoked
+    session while another stays (`backend/tests/boveda.rs`), and in the
+    smoke e2e Revoke and the panic button checked against the tokens.
+  - Left: approximate location from the IP (needs a GeoIP source and a
+    privacy review), notifying the client by email of a new device, and
+    showing the user agent's version.
 - [ ] **22. Step-Up Authentication** (Forced biometrics on anomalous withdrawals)
   - Builds on modules 20 and 16. The anomaly signal comes from the backend's
     AML engine.

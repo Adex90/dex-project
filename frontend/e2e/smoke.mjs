@@ -16,7 +16,10 @@
  * (the Sovereign Yield counter, the debit card), a withdrawal to the linked
  * bank account, Proof of Reserve, ledger,
  * moving between the dashboard's tabs (Vault, Discover, Account, Invest,
- * Reserve). It ends on asset pages opened by their address (AUG1, an unknown
+ * Reserve) and the Security page (devices signed in, Revoke and "Sign out all
+ * other devices", the inactivity timeout, a password change, the security
+ * log; then, for a client of its own on a phone, two-step verification turned
+ * on from there and the inactivity sign-out on a fake clock). It ends on asset pages opened by their address (AUG1, an unknown
  * ticker, an address that is not a ticker, a market without live prices) and
  * on Discover: the catalog, its top movers and collections, its search and
  * its screener (a collection presets it, toggles narrow it), and a first buy
@@ -38,6 +41,7 @@
  * browser's preferred color scheme, which must not change it.
  */
 import { createRequire } from "node:module";
+import { createHmac } from "node:crypto";
 import { mkdirSync } from "node:fs";
 
 // Node >= 22.18 strips TypeScript types, so the app's own (framework-free)
@@ -59,7 +63,8 @@ mkdirSync(OUT, { recursive: true });
 
 const runId = Date.now();
 const email = `e2e-${runId}@example.mx`;
-const password = "austrian-school-1926";
+// Changed on the Security page at the end of the first pass: later sign-ins use the new one.
+let password = "austrian-school-1926";
 // CURP, RFC and voter key must be unique among verified files (IDENTIDAD_EN_USO),
 // so every run uses a different identity. Seeds wrap at SAMPLE_IDENTITY_SPACE
 // (~10^7): distinct for runs started more than a millisecond apart within ~2.7 h,
@@ -73,11 +78,11 @@ function check(condition, message) {
   console.log(`ok - ${message}`);
 }
 
-/** Signs in through the API, as another device would: a session of its own. */
-async function apiLogin(emailAddress, secret) {
+/** Signs in through the API, as another device would: a session of its own (named after `userAgent`). */
+async function apiLogin(emailAddress, secret, userAgent) {
   const response = await fetch(`${API}/api/v1/auth/login`, {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: { "content-type": "application/json", ...(userAgent ? { "user-agent": userAgent } : {}) },
     body: JSON.stringify({ email: emailAddress, password: secret }),
   });
   const body = await response.json();
@@ -97,6 +102,61 @@ async function freshCut(emailAddress, secret) {
   });
   if (proof.status !== 200) throw new Error(`the new client's proof answered ${proof.status}`);
   return (await fetch(`${API}/api/v1/reserva/cortes/ultimo`)).json();
+}
+
+/** The HTTP status of an authenticated GET: 200 while `token`'s session lives, 401 once it ended. */
+async function apiStatus(path, token) {
+  return (await fetch(`${API}${path}`, { headers: { authorization: `Bearer ${token}` } })).status;
+}
+
+/** Devices that sign in through the API on the Security page's tests. */
+const IPHONE_UA =
+  "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1";
+const WINDOWS_UA =
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36 Edg/126.0.2592.68";
+
+/** A computed style once the element's CSS transitions (hover, current) have finished. */
+async function settledStyle(locator, property) {
+  return locator.evaluate(async (el, name) => {
+    await Promise.all(el.getAnimations().map((a) => a.finished.catch(() => undefined)));
+    return getComputedStyle(el)[name];
+  }, property);
+}
+
+/** The session token this page holds (sessionStorage), and the session id (`sid`) it carries. */
+async function pageToken(page) {
+  return page.evaluate(() => JSON.parse(sessionStorage.getItem("synthetic-capital-session")).state.token);
+}
+function sidOf(token) {
+  return JSON.parse(Buffer.from(token.split(".")[1], "base64url").toString()).sid;
+}
+
+/** RFC 4648 base32 (the authenticator key the setup page shows, spaces allowed). */
+function base32Decode(text) {
+  const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+  let bits = 0;
+  let value = 0;
+  const bytes = [];
+  for (const ch of text.replace(/[\s=]/g, "").toUpperCase()) {
+    const v = alphabet.indexOf(ch);
+    if (v < 0) throw new Error(`not base32: ${ch}`);
+    value = (value << 5) | v;
+    bits += 5;
+    if (bits >= 8) {
+      bytes.push((value >>> (bits - 8)) & 0xff);
+      bits -= 8;
+    }
+  }
+  return Buffer.from(bytes);
+}
+
+/** The 6-digit TOTP code (RFC 6238: SHA-1, 30 s) of `secret` at time step `step`, as an authenticator app shows it. */
+function totpCode(secret, step) {
+  const counter = Buffer.alloc(8);
+  counter.writeBigUInt64BE(BigInt(step));
+  const h = createHmac("sha1", secret).update(counter).digest();
+  const offset = h[h.length - 1] & 0xf;
+  return String((h.readUInt32BE(offset) & 0x7fffffff) % 1_000_000).padStart(6, "0");
 }
 
 /** Registers a client through the API: a new account, still without KYC, holding nothing. */
@@ -2018,8 +2078,222 @@ try {
     await page.getByTestId("vault-available").filter({ hasText: "15,000.00" }).waitFor();
     check(true, "buying and selling all of it at the same price returns exactly the cash paid (15,000.00)");
 
+    // ---------------------------------------------------------------------
+    // Security (roadmap items 20 and 21): devices, the password, the log
+    // ---------------------------------------------------------------------
+    // A phone and a work laptop sign in through the API: sessions of their own.
+    const phoneToken = await apiLogin(email, password, IPHONE_UA);
+    const laptopToken = await apiLogin(email, password, WINDOWS_UA);
+    await openTab(page, "Security");
+    const securityLink = mainNav(page).getByRole("link", { name: "Security", exact: true });
+    check(
+      (await settledStyle(securityLink, "color")) === "rgb(234, 179, 8)",
+      "Security sits in the sidebar's Account group, Sovereign Gold while current",
+    );
+    const sessionRows = page.getByTestId("session-row");
+    const listed = await (
+      await fetch(`${API}/api/v1/auth/sessions`, { headers: { authorization: `Bearer ${laptopToken}` } })
+    ).json();
+    await sessionRows.nth(listed.sesiones.length - 1).waitFor();
+    const devices = await sessionRows.getByTestId("session-device").allInnerTexts();
+    const badge = await page
+      .getByTestId("current-device-badge")
+      .evaluate((el) => ({ background: getComputedStyle(el).backgroundColor, radius: getComputedStyle(el).borderRadius }));
+    check(
+      (await sessionRows.count()) === listed.sesiones.length &&
+        (await sessionRows.first().getAttribute("data-session-id")) === sidOf(await pageToken(page)) &&
+        (await page.getByTestId("current-device-badge").count()) === 1 &&
+        (await sessionRows.first().getByTestId("current-device-badge").isVisible()) &&
+        badge.background === "rgb(234, 179, 8)" &&
+        badge.radius === "0px" &&
+        devices.includes("Safari on iPhone") &&
+        devices.includes("Edge on Windows"),
+      `Security lists all ${listed.sesiones.length} sessions: this browser first, with the only gold, square "Current device" badge; the phone and the laptop by name`,
+    );
+    check(
+      await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth),
+      "the Security page fits the desktop width",
+    );
+    await page.mouse.move(0, 0);
+    await shot(page, "security-desktop");
+
+    // Revoke: the phone is out at once, the laptop stays.
+    await sessionRows.filter({ hasText: "Safari on iPhone" }).getByTestId("revoke-session").click();
+    await page.getByTestId("sessions-status").filter({ hasText: "Safari on iPhone was signed out." }).waitFor();
+    check(
+      (await apiStatus("/api/v1/yo", phoneToken)) === 401 &&
+        (await apiStatus("/api/v1/yo", laptopToken)) === 200 &&
+        !(await sessionRows.getByTestId("session-device").allInnerTexts()).includes("Safari on iPhone"),
+      "Revoke signs the phone out at once (its token answers 401) and leaves the laptop signed in",
+    );
+
+    // The panic button: one confirmation, with the count, then every other device is out.
+    const others = (await sessionRows.count()) - 1;
+    const othersText = others === 1 ? "1 other device" : `${others} other devices`;
+    await page.getByTestId("panic-button").click();
+    check(
+      (await page.getByTestId("panic-confirm-text").innerText()) === `Sign out ${othersText} now?`,
+      `"Sign out all other devices" asks once before acting: "Sign out ${othersText} now?"`,
+    );
+    await page.getByTestId("panic-zone").scrollIntoViewIfNeeded();
+    await shot(page, "security-panic-confirm", { fullPage: false });
+    await page.getByTestId("panic-confirm").click();
+    await page.getByTestId("no-other-devices").waitFor();
+    check(
+      (await sessionRows.count()) === 1 &&
+        (await page.getByTestId("sessions-status").innerText()).startsWith(
+          others === 1 ? "1 other device was signed out." : `${others} other devices were signed out.`,
+        ) &&
+        (await apiStatus("/api/v1/yo", laptopToken)) === 401 &&
+        (await page.getByTestId("panic-button").isDisabled()),
+      `the other ${othersText} are signed out (the laptop's token answers 401); only this browser remains`,
+    );
+
+    // The inactivity timeout: saved on the server as soon as it is picked.
+    const timeoutControl = page.getByTestId("timeout-control");
+    const chosenTimeout = () => timeoutControl.locator("input:checked").getAttribute("value");
+    check((await chosenTimeout()) === "30", "the inactivity timeout starts at 30 minutes");
+    await timeoutControl.getByText("15 min", { exact: true }).click();
+    await page
+      .getByTestId("timeout-status")
+      .filter({ hasText: "Saved: sessions now end after 15 min without activity." })
+      .waitFor();
+    await page.reload();
+    await timeoutControl.waitFor();
+    check((await chosenTimeout()) === "15", "15 minutes is saved on the server: it survives a reload");
+    await timeoutControl.getByText("30 min", { exact: true }).click();
+    await page.getByTestId("timeout-status").filter({ hasText: "after 30 min" }).waitFor();
+
+    // The password: a wrong current one is refused (and counted); then the change.
+    const newPassword = "hayek-road-to-serfdom-1944";
+    expectFailure("/api/v1/auth/password/change");
+    await page.fill("#current-password", "not-my-password-1926");
+    await page.fill("#new-password", newPassword);
+    await page.fill("#confirm-password", newPassword);
+    check(
+      JSON.stringify(await page.getByTestId("password-rule").evaluateAll((rules) => rules.map((r) => r.dataset.met))) ===
+        JSON.stringify(["true", "true", "true"]),
+      "the checklist shows the new password meets the rules: length, different, confirmed",
+    );
+    await page.getByTestId("password-submit").click();
+    await page.getByTestId("password-error").filter({ hasText: "Your current password is not correct." }).waitFor();
+    check(
+      (await page.inputValue("#current-password")) === "" && (await page.inputValue("#new-password")) === newPassword,
+      "a wrong current password is refused, and only that field clears",
+    );
+    await page.fill("#current-password", password);
+    await page.getByTestId("password-submit").click();
+    await page
+      .getByTestId("password-status")
+      .filter({ hasText: "Password changed. No other device was signed in." })
+      .waitFor();
+    const formerPassword = password;
+    password = newPassword;
+    const oldSignIn = await fetch(`${API}/api/v1/auth/login`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ email, password: formerPassword }),
+    });
+    check(
+      oldSignIn.status === 401 && (await apiStatus("/api/v1/yo", await apiLogin(email, password))) === 200,
+      "after the change the old password no longer signs in, and the new one does",
+    );
+
+    // The log: what just happened, newest first, from this device.
+    const logTitles = await page.getByTestId("security-event-title").allInnerTexts();
+    check(
+      [
+        "Password changed",
+        "Password change refused",
+        "Inactivity timeout changed",
+        "Signed out all other devices",
+        "Device signed out",
+        "Signed in",
+      ].every((title) => logTitles.includes(title)) && logTitles[0] === "Password changed",
+      "the security log shows the change, the refused try, the timeout, both sign-outs and the sign-ins, newest first",
+    );
+    await page.mouse.move(0, 0);
+    await shot(page, "security-after-changes");
+
+    // Two-step verification from Security, and the inactivity sign-out, on a
+    // phone, for a client of its own. A clock the test can move: the timeout
+    // passes without waiting for it.
+    const guarded = `e2e-${runId}-2fa@example.mx`;
+    check((await apiRegister(guarded, password)) === 201, "another client registers through the API");
+    const phoneContext = await browser.newContext({ viewport: { width: 390, height: 844 }, colorScheme });
+    const phonePage = await phoneContext.newPage();
+    // After the inactivity sign-out, a request already on its way may still meet the ended session (401).
+    let idleSignedOut = false;
+    phonePage.on("console", (m) => {
+      if (m.type() !== "error" || (idleSignedOut && /status of 401/.test(m.text()))) return;
+      errors.push(`[${colorScheme} phone] ${m.text()} (${m.location().url || "no url"})`);
+    });
+    phonePage.on("pageerror", (e) => errors.push(`[${colorScheme} phone] ${e.message}`));
+    await phonePage.clock.install();
+    await phonePage.goto(`${BASE}/auth/login`);
+    await phonePage.fill("#email", guarded);
+    await phonePage.fill("#password", password);
+    await phonePage.click("button[type=submit]");
+    await phonePage.waitForURL("**/dashboard/verify");
+    const lockButton = phonePage.getByTestId("header-security");
+    await lockButton.click();
+    await phonePage.waitForURL("**/dashboard/security");
+    await phonePage.getByTestId("session-row").first().waitFor();
+    check(
+      (await lockButton.getAttribute("aria-current")) === "page" &&
+        (await settledStyle(lockButton, "backgroundColor")) === "rgb(234, 179, 8)" &&
+        (await mainNav(phonePage).getByRole("link").count()) === 5 &&
+        (await mainNav(phonePage).getByRole("link", { name: "Security" }).count()) === 0,
+      "on a phone, Security opens from the header's lock (gold while current); the tab bar keeps its five tabs",
+    );
+    check(
+      await phonePage.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth),
+      "the Security page fits a phone's width",
+    );
+    await shot(phonePage, "security-mobile");
+
+    await phonePage.getByTestId("two-step-setup").click();
+    await phonePage.waitForURL("**/auth/mfa-setup");
+    const authenticatorKey = base32Decode(await phonePage.getByTestId("mfa-secret").innerText());
+    const enrolledStep = Math.floor(Date.now() / 30_000);
+    await phonePage.fill("#totp-code", totpCode(authenticatorKey, enrolledStep));
+    await phonePage.getByRole("button", { name: "Turn on two-step verification" }).click();
+    await phonePage.waitForURL("**/dashboard/security");
+    await phonePage.getByText("Every sign-in now asks for a code from your authenticator app.").waitFor();
+    await phonePage.locator("#password-code").waitFor();
+    check(
+      (await phonePage.getByTestId("two-step-status").getByText("On", { exact: true }).isVisible()) &&
+        /two-step/i.test(await phonePage.getByTestId("session-row").first().innerText()) &&
+        (await phonePage.getByTestId("session-row").count()) === 1,
+      "two-step verification turned on from Security: back there, On, a new session that verified the code, and the password form asks for it",
+    );
+
+    await phonePage.getByTestId("timeout-control").getByText("5 min", { exact: true }).click();
+    await phonePage.getByTestId("timeout-status").filter({ hasText: "after 5 min" }).waitFor();
+    const guardedToken = await pageToken(phonePage);
+    await phonePage.clock.fastForward("04:00");
+    check(
+      new URL(phonePage.url()).pathname === "/dashboard/security",
+      "four minutes without a tap: still signed in",
+    );
+    idleSignedOut = true;
+    await phonePage.clock.fastForward("02:00");
+    await phonePage.waitForURL("**/auth/login?expired=idle");
+    await phonePage.getByText("Signed out after inactivity").waitFor();
+    let guardedStatus = 0;
+    for (let i = 0; i < 20 && guardedStatus !== 401; i++) {
+      guardedStatus = await apiStatus("/api/v1/yo", guardedToken);
+      if (guardedStatus !== 401) await new Promise((resolve) => setTimeout(resolve, 250));
+    }
+    check(
+      guardedStatus === 401,
+      "six minutes without a tap at a 5-minute timeout: signed out here and on the server, and the sign-in page says why",
+    );
+    await shot(phonePage, "security-idle-signed-out", { fullPage: false });
+    await phoneContext.close();
+
     // Sign out.
-    await page.getByRole("button", { name: /Sign out/ }).click();
+    await page.getByRole("button", { name: "Sign out", exact: true }).click();
     await page.waitForURL("**/auth/login");
     check(true, "sign out returns to login");
     await context.close();

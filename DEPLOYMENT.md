@@ -104,6 +104,7 @@ internet -> host 80/443 (UFW, fail2ban) -> nginx (edge network)
 | Money leaves the vault only to a bank account in the client's own name (AML whitelist), and the check never discloses an AML hold | Same code on both: every own-account withdrawal goes only to an active linked account (`ifpe.cuentas_vinculadas`) whose holder is the client's KYC name, never a CLABE of ours and active for one client only. The order records its account, and a trigger re-checks it (client, state, CLABE, holder). The whitelist runs after the AML evaluation, so a frozen client gets the neutral refusal. Linked accounts are never deleted, only retired; clients read only their own. Payments to someone else's account (`/api/v1/spei/transfer`) are refused unless `SPEI_TRANSFERENCIAS_TERCEROS=true` | Same | `tests/patrimonio.rs`, `tests/db/0016_cuentas_vinculadas.sql` |
 | A client is verified only with the declarations AML/CFT rules ask for and the agreements in force, and a declared politically exposed person only by a person | Same code on both: the database refuses a KYC submission without occupation, source of funds and the PEP answer, or without the agreements' version in force (`kyc.parametros.contratos_version`); it stamps the acceptance time itself and freezes the answers with the identity. It refuses `VERIFICADO` for a declared PEP unless an operator decides, and then marks the client PEP with risk `ALTO` | Same | `tests/kyc.rs`, `tests/db/0017_kyc_declaraciones.sql` |
 | Every open market position is in the published reserve cut, and a cut cannot omit or alter one | Same code on both: one Merkle sum tree per asset in each cut (migration `0018`). At commit, in the cut's own snapshot, the database requires the position leaves to be exactly the live open positions, one declared tree per asset and none extra, contiguous indices, the declared counts and sums, every leaf hash recomputed in SQL, the market ledger anchor equal to its head and never moving back, and each cash leaf's breakdown equal to its account. Trees and leaves are immutable; the backend rebuilds every root when it loads a cut | Same | `tests/reserva.rs`, `tests/db/0018_reserva_posiciones.sql` |
+| A session stops working the moment it is signed out, revoked or left idle, and changing the password needs the current one (and the code) | Same code on both: every access token names its row in `kyc.sesiones` (migration `0019`), and every request (and the vault channel every 60 s) checks that row is not revoked, not expired and used within the client's inactivity timeout; a token without a row is refused. Revocations are final and the rows immutable apart from last use. A password change counts toward the sign-in lockout before anything is verified, needs the TOTP code when two-step verification is on, and signs out every other session; the session that exhausts the tries is signed out. Every sign-in, failure, lockout, revocation and change goes to the append-only `kyc.eventos_autenticacion`. Clients read their own sessions and log under RLS and write nothing directly | Same | `tests/sesiones.rs`, `tests/db/0019_sesiones_seguridad.sql`, smoke e2e (Appendix C) |
 | No request field outside the API contract is accepted | Same code on both: `deny_unknown_fields` on every body and query type (400 `VALIDACION`) | Same | `tests/entrada.rs` (source scan and HTTP) |
 | Least-privilege database identities | Service holds only `sc_app` (NOINHERIT, no owner rights); owner credentials only in the migrate task and with DBAs holding the `dba-tunnel` policy | Same, plus the schema owner is **not** a superuser (`deploy/postgres/10-schema-owner.sh`); the `postgres` superuser is break-glass only | `pg_authid` query in Appendix C |
 | Containers non-root, read-only, least capability, resource-limited | uid 65532, read-only rootfs, `drop ALL`, task CPU/memory | uid 65532 / 70 / 101, `read_only`, `cap_drop: ALL`, `no-new-privileges`, CPU/memory/PID limits | `docker inspect` in Appendix C |
@@ -1135,6 +1136,26 @@ following to operations.
     `mercado.ledger_cabeza` to build the cut.
   - An open position whose client has no IFPE account blocks every cut
     (fail closed) until it is fixed: its leaf would have no identity.
+- **Migration `0019`** (per-device sessions and the Security Center) adds
+  `kyc.sesiones` and `kyc.preferencias_seguridad`, three nullable columns on
+  `kyc.eventos_autenticacion` with a wider event catalog (its CHECK is
+  replaced, which reads that small table once), and row-level security on
+  the three tables. No table is rewritten.
+
+  **Deploying it signs everyone out once**, clients and staff alike: the new
+  backend refuses every access token issued before it (they name no
+  session). Announce it, and switch the backend at a quiet hour. Order:
+  migrate, then the backend, then the frontend (or with it).
+  - An old backend on a migrated database keeps working: it never reads the
+    new tables, and its event inserts still fit.
+  - A new backend needs the migration (it opens a row per sign-in).
+  - The new frontend against an old backend: the Security page cannot load,
+    and signing out stays local to the browser; nothing else changes.
+  - `JWT_TTL_MINUTOS` is now at least 1 (a session must end after it
+    starts).
+  - Operators revoking a person's sessions
+    (`POST /operaciones/usuarios/{id}/revocar-sesiones`) now also close the
+    rows, and the person's security log shows it, without the operator's IP.
 
 ---
 
@@ -1168,7 +1189,7 @@ to the specific provisions.
 | # | Item | Impact | Mitigation now | Next step (owner) |
 |---|---|---|---|---|
 | 1 | **Password-reset email is simulated** (no email provider integrated): outside `MODO_DEMO` the link is neither sent nor logged | people who forget their password need support | support resets passwords through the DBA; the flow itself (hashed single-use token, 30 minutes, every session revoked, same answer for unknown emails) is implemented and tested | connect an email provider in the residency region to `backend/src/auth/correo.rs` (backend) — **launch blocker** |
-| 2 | Two-step verification is TOTP only: no recovery codes, no WebAuthn/passkeys | a lost phone needs a DBA reset (identity check, second approver); a TOTP code can be phished in real time | replay protection, account lock after 5 failed codes or passwords, staff sessions of at most 30 minutes, every enrollment, code and reset in the immutable audit table | recovery codes and WebAuthn for staff (product, security) |
+| 2 | Two-step verification is TOTP only: no recovery codes, no WebAuthn/passkeys (the Security page only reports whether a device could use a passkey) | a lost phone needs a DBA reset (identity check, second approver); a TOTP code can be phished in real time | replay protection, account lock after 5 failed codes or passwords, staff sessions of at most 30 minutes, every enrollment, code and reset in the immutable audit table; a client can sign out any device at once from the Security page | recovery codes and WebAuthn registration and sign-in (product, security, backend) |
 | 3 | The first enrollment trusts whoever holds the password | someone with a new staff member's initial password could bind their own authenticator | promotion and enrollment in the same ticket (§10.3); the audit table records each enrollment's IP | deliver initial credentials out of band; check the `MFA_ACTIVADO` event |
 | 4 | PostgreSQL logs DDL but not the data changes a DBA makes through the tunnel (for example a role change) | the database itself keeps no record of who changed what | CloudTrail and the connection log show who connected and when (§4.1); the ticket holds each statement and its output | pgaudit for the master user (database) |
 | 5 | Single-host topology: no high availability; recovery point = backup interval | an outage, or data loss since the last dump | encrypted daily dumps, off-site copies, tested restore | use AWS for production; WAL archiving (e.g. pgBackRest) if the single host must carry production |
@@ -1192,6 +1213,8 @@ to the specific provisions.
 | 23 | The onboarding agreements are shown as summaries: the full legal texts are not served, and the client gets no signed copy | a client accepts a summary of the account and custody agreement | the version accepted and the time are recorded with the submission's IP and browser; the full privacy notice is available on request (compliance address) | publish the full texts under their version, and a downloadable signed copy (legal, frontend) — **launch blocker** |
 | 24 | Clients verified before migration `0017` have no declarations on file (occupation, source of funds, PEP) | their KYC file lacks answers that newer clients give | the AML engine still applies its risk matrix, and an operator can raise a client's risk level | collect the declarations from those clients (compliance, frontend) |
 | 25 | Asset positions are committed in the reserve cut, but no custody attestation of the underlying assets is published | a client can prove that their position is included and counted, not that the asset behind it is held | the market trades only with `MODO_DEMO` (simulated prices); each asset root publishes the units owed to clients, and the Reserve tab says inclusion, not backing | publish a custodian attestation per asset and compare it with each root's total before the market trades for real (treasury, backend) — **blocker for live trading** |
+| 26 | `kyc.sesiones` keeps every session ever opened (rows are never deleted: they are the audit trail of each sign-in) | the table grows by one row per sign-in | small rows, indexed by client and time; per-request checks read by primary key | a retention policy (for example monthly partitions archived after the legal retention period) once volumes justify it (database, compliance) |
+| 27 | A session's device name and IP are what the request reports: the server summarizes the User-Agent, which a client can set, and takes the IP by the rate limiter's rule (`X-Forwarded-For` only behind our own proxy) | a device name or IP in the Security page or the log is a hint, not evidence | neither is used to authorize anything; the session itself (its token) is what is checked and revoked | none planned; a risk signal (new device, new country) would build on them (security) |
 
 ---
 
