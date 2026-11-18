@@ -208,8 +208,10 @@ impl Drop for TempDir {
     }
 }
 
-/// Starts the vault with the test key on `dir`'s socket, and deletes the key file as soon as it listens: from then on
-/// the key exists only in the vault's memory.
+/// Starts an operator vault with the test key on `dir`'s socket, and deletes the key file as soon as it listens: from
+/// then on the key exists only in the vault's memory. No chain (the engine's chain is a mock here): the vault's nonce
+/// rule follows its own signatures, and its caps are set far above what these tests sign (the vault's own tests cover
+/// them).
 pub fn spawn_vault(dir: &TempDir, chain_id: u64, executor: Address, extra: &[&str]) -> Proc {
     let key_file = dir.0.join("test.key");
     let mut file = OpenOptions::new()
@@ -224,10 +226,18 @@ pub fn spawn_vault(dir: &TempDir, chain_id: u64, executor: Address, extra: &[&st
         "vault",
         Command::new(vault_binary())
             .args([
+                "--role",
+                "operator",
                 "--chain-id",
                 &chain_id.to_string(),
                 "--executor",
                 &executor.to_string(),
+                "--max-fee-eth-per-window",
+                "1000",
+                "--max-volume0-per-window",
+                "1e40",
+                "--max-volume1-per-window",
+                "1e40",
                 "--socket",
             ])
             .arg(dir.socket())
@@ -275,7 +285,11 @@ pub fn summary(stdout: &str) -> BTreeMap<String, f64> {
 /// The key as it could sit in memory: its 32 bytes in either order (k256 keeps a scalar in little-endian limbs), and
 /// its hex text in either case.
 pub fn key_encodings() -> Vec<(&'static str, Vec<u8>)> {
-    let key = keccak256(TEST_KEY_PHRASE);
+    key_encodings_of(keccak256(TEST_KEY_PHRASE))
+}
+
+/// The four encodings of a 32-byte key the memory scans look for.
+pub fn key_encodings_of(key: alloy::primitives::B256) -> Vec<(&'static str, Vec<u8>)> {
     let mut reversed = key.to_vec();
     reversed.reverse();
     vec![

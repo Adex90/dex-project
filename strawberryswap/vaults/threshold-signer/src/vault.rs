@@ -288,7 +288,7 @@ impl<C: Chain> Vault<C> {
         let function = self.policy.role().function();
         let name = function.split('(').next().unwrap_or(function);
         eprintln!(
-            "audit: signed {name} nonce {nonce} gas {gas_limit} max fee {max_fee} tx {tx_hash}"
+            "audit: signed {name} nonce {nonce} gas {gas_limit} tx {tx_hash} max fee {max_fee}"
         );
         Ok(json!({
             "r": B256::from(signature.r()).to_string(),

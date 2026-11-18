@@ -63,11 +63,13 @@ pub(crate) trait TxSigner {
     async fn sign(&mut self, tx: &TxEip1559) -> Result<SignedTx, VaultError>;
 }
 
-/// What the vault signs (its `policy` method): the chain, the destination and the caps.
+/// What the vault signs (its `policy` method): the chain, the destination and the caps. Only an operator vault's
+/// policy is accepted: a vault holds one role's key, and the engine needs the operator's.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct VaultPolicy {
     pub chain_id: u64,
-    pub executor: Address,
+    /// The one contract the vault signs calls to: for the operator, the SearcherExecutor.
+    pub to: Address,
     pub max_gas: u64,
     pub max_fee_per_gas: u128,
 }
@@ -81,10 +83,10 @@ impl VaultPolicy {
                 self.chain_id, cfg.chain_id
             ));
         }
-        if cfg.executor != self.executor {
+        if cfg.executor != self.to {
             return Some(format!(
                 "the vault signs calls to {}, the engine calls {}",
-                self.executor, cfg.executor
+                self.to, cfg.executor
             ));
         }
         if cfg.gas_limit > self.max_gas {
@@ -136,17 +138,24 @@ impl VaultClient {
         Ok(address)
     }
 
-    /// Asks the vault what it signs.
+    /// Asks the vault what it signs. A vault of another role (the relayer's, the automator's) is refused: its key is
+    /// not the operator, and its policy signs another function.
     pub async fn fetch_policy(&mut self) -> Result<VaultPolicy, VaultError> {
         let result = self.call("policy", None).await?;
         let bad =
             |field: &str| VaultError::Protocol(format!("policy reply without a valid {field}"));
+        let role = result["role"].as_str().ok_or_else(|| bad("role"))?;
+        if role != "operator" {
+            return Err(VaultError::Protocol(format!(
+                "this vault holds the {role} key: the engine signs with the operator's (its own vault and socket)"
+            )));
+        }
         Ok(VaultPolicy {
             chain_id: result["chain_id"].as_u64().ok_or_else(|| bad("chain_id"))?,
-            executor: result["executor"]
+            to: result["to"]
                 .as_str()
                 .and_then(|a| a.parse().ok())
-                .ok_or_else(|| bad("executor"))?,
+                .ok_or_else(|| bad("to"))?,
             max_gas: result["max_gas"].as_u64().ok_or_else(|| bad("max_gas"))?,
             max_fee_per_gas: result["max_fee_per_gas"]
                 .as_str()
@@ -372,8 +381,11 @@ mod tests {
                 json!({ "id": id, "result": { "address": fixtures::VAULT_ADDRESS.to_string() } })
             }
             Some("policy") => json!({ "id": id, "result": {
+                "role": "operator",
                 "chain_id": 31_337,
-                "executor": fixtures::EXECUTOR.to_string(),
+                "to": fixtures::EXECUTOR.to_string(),
+                "contract": "SearcherExecutor",
+                "function": "rebalance(uint256,uint256,uint256,uint256,uint256)",
                 "max_gas": 1_000_000,
                 "max_fee_per_gas": "500000000000",
                 "max_signs_per_sec": 20.0,
@@ -419,7 +431,7 @@ mod tests {
             policy,
             VaultPolicy {
                 chain_id: 31_337,
-                executor: fixtures::EXECUTOR,
+                to: fixtures::EXECUTOR,
                 max_gas: 1_000_000,
                 max_fee_per_gas: 500_000_000_000,
             }
@@ -459,6 +471,26 @@ mod tests {
             assert!(refusal.contains(why), "{refusal}");
         }
         server.abort();
+    }
+
+    /// A vault holds one role's key: the relayer's or the automator's vault is not the engine's signer.
+    #[tokio::test]
+    async fn a_vault_of_another_role_is_refused() {
+        for role in ["relayer", "automator"] {
+            let path = socket(role);
+            let server = fake_vault(&path.path(), move |request| {
+                let mut reply = honest(request)?;
+                if reply["result"]["role"].is_string() {
+                    reply["result"]["role"] = json!(role);
+                }
+                Some(reply)
+            })
+            .await;
+            let mut client = VaultClient::new(path.path(), Duration::from_millis(500));
+            let refused = client.fetch_policy().await.unwrap_err().to_string();
+            assert!(refused.contains(&format!("the {role} key")), "{refused}");
+            server.abort();
+        }
     }
 
     #[tokio::test]
