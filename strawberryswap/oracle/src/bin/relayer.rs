@@ -1,5 +1,6 @@
-//! The relayer: every ~15 s, a notarized body, its Groth16 proof and a push to ZkPriceFeed, signed by the relayer's
-//! KMS key. See zk_oracle::relayer and docs/ORACLE.md.
+//! The relayer: every ~15 s, a notarized body, its Groth16 proof and a push to ZkPriceFeed, signed by the relayer
+//! vault (the relayer's key in KMS, behind the vault's policy). The relayer holds no key. See zk_oracle::relayer and
+//! docs/ORACLE.md.
 
 #![forbid(unsafe_code)]
 
@@ -7,31 +8,31 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
 
+use alloy::network::TxSigner;
 use alloy::primitives::{Address, U256};
-use alloy::signers::Signer;
 use zk_oracle::chain::{FeeCaps, RpcFeed};
 use zk_oracle::cli::{self, Flags, TRUSTED_BOOTSTRAP};
-use zk_oracle::kms::{self, KmsConfig};
 use zk_oracle::prover::Prover;
 use zk_oracle::relayer::{self, RelayerConfig};
+use zk_oracle::vault::VaultSigner;
 
 const USAGE: &str = "usage: relayer --rpc-url URL --chain-id ID --feed ADDRESS --notary-url URL --salt-file PATH
-               --kms-key-id KEY [--symbol SYMBOL] [--kms-region REGION] [--kms-endpoint URL]
+               --vault-socket PATH [--vault-timeout-ms MS] [--symbol SYMBOL]
                [--interval-ms MS] [--max-cycles N] [--zk-dir DIR] [--node PATH] [--prover-script PATH]
                [--prove-timeout-secs S] [--notary-timeout-ms MS] [--max-fee-wei WEI]
                [--max-priority-fee-wei WEI] [--gas-limit GAS]
 
 Keeps ZkPriceFeed fresh: every interval, a notarized body from the notary, a Groth16 proof of it, a preflight and a
-push signed by the relayer's AWS KMS key. Relaying is permissionless: the relayer is trusted for nothing.
+push signed by the relayer vault (vaults/threshold-signer --role relayer), which holds the relayer's key in AWS KMS
+and signs ZkPriceFeed.submit only. The relayer holds no key. Relaying is permissionless: it is trusted for nothing.
 
   --rpc-url URL               the chain's JSON-RPC URL (required; never printed: it may hold an API key)
   --chain-id ID               the chain id, e.g. 421614 for Arbitrum Sepolia (required)
   --feed ADDRESS              the ZkPriceFeed contract (required)
   --notary-url URL            the notary's base URL (required)
   --salt-file PATH            the query salt, a field element, in a file only its owner can read (required)
-  --kms-key-id KEY            the relayer's gas key in KMS (ECC_SECG_P256K1, SIGN_VERIFY) (required)
-  --kms-region REGION         default: the standard AWS configuration
-  --kms-endpoint URL          a KMS endpoint other than the region's default (a VPC endpoint)
+  --vault-socket PATH         the relayer vault's socket (required)
+  --vault-timeout-ms MS       deadline of each request to the vault (default 5000)
   --symbol SYMBOL             default ETHUSD
   --interval-ms MS            one cycle per interval (default 15000)
   --max-cycles N              stop after N cycles (default: run until SIGTERM)
@@ -50,9 +51,8 @@ const VALUED: &[&str] = &[
     "--feed",
     "--notary-url",
     "--salt-file",
-    "--kms-key-id",
-    "--kms-region",
-    "--kms-endpoint",
+    "--vault-socket",
+    "--vault-timeout-ms",
     "--symbol",
     "--interval-ms",
     "--max-cycles",
@@ -71,7 +71,8 @@ struct Args {
     chain_id: u64,
     feed: Address,
     relayer: RelayerConfig,
-    kms: KmsConfig,
+    vault_socket: PathBuf,
+    vault_timeout: Duration,
     prover: Prover,
     caps: FeeCaps,
     max_cycles: Option<u64>,
@@ -98,12 +99,8 @@ fn parse(flags: &Flags) -> Result<Args, String> {
         notary_timeout: Duration::from_millis(flags.parsed_or("--notary-timeout-ms", 5_000)?),
         interval: Duration::from_millis(interval_ms),
     };
-    let kms = KmsConfig {
-        key_id: flags.required("--kms-key-id", "the relayer's KMS key")?.to_string(),
-        endpoint: flags.get("--kms-endpoint").map(str::to_string),
-        region: flags.get("--kms-region").map(str::to_string),
-        static_credentials: None,
-    };
+    let vault_socket = PathBuf::from(flags.required("--vault-socket", "the relayer vault's socket")?);
+    let vault_timeout = Duration::from_millis(flags.parsed_or("--vault-timeout-ms", 5_000)?);
     let zk_dir = PathBuf::from(flags.get("--zk-dir").unwrap_or("zk"));
     let prover = Prover::new(
         PathBuf::from(flags.get("--node").unwrap_or("node")),
@@ -127,7 +124,8 @@ fn parse(flags: &Flags) -> Result<Args, String> {
         chain_id,
         feed,
         relayer,
-        kms,
+        vault_socket,
+        vault_timeout,
         prover,
         caps,
         max_cycles: flags.parsed("--max-cycles")?,
@@ -148,14 +146,19 @@ async fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let signer = match kms::signer(&args.kms, Some(args.chain_id)).await {
+    // The vault must hold the relayer's key, sign for this chain and feed, and allow the relayer's caps.
+    let signer = match VaultSigner::connect(&args.vault_socket, args.vault_timeout).await {
         Ok(signer) => signer,
         Err(e) => {
             eprintln!("error: {e}");
             return ExitCode::FAILURE;
         }
     };
-    let address = signer.address();
+    if let Some(refusal) = signer.refuses(args.chain_id, args.feed, &args.caps) {
+        eprintln!("error: the vault would refuse every push: {refusal}");
+        return ExitCode::FAILURE;
+    }
+    let address = TxSigner::address(&signer);
     let chain = match RpcFeed::connect(&args.rpc_url, args.feed, signer, args.chain_id, args.caps).await {
         Ok(chain) => chain,
         Err(e) => {
@@ -180,8 +183,8 @@ async fn main() -> ExitCode {
     let balance = chain.balance().await.unwrap_or(U256::ZERO);
     eprintln!("{TRUSTED_BOOTSTRAP}");
     eprintln!(
-        "relayer {address} (KMS key {}, balance {balance} wei) on chain {}: feed {}, provider {}, notary {}, every {} ms",
-        args.kms.key_id,
+        "relayer {address} (signed by the relayer vault at {}, balance {balance} wei) on chain {}: feed {}, provider {}, notary {}, every {} ms",
+        args.vault_socket.display(),
         args.chain_id,
         args.feed,
         setup.provider_id,

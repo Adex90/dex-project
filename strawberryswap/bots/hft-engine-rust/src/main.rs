@@ -63,8 +63,11 @@ use crate::vault::{SignedTx, TxSigner, VaultClient, VaultError};
 pub(crate) const TICK: Duration = Duration::from_millis(100);
 /// Budget of a tick's reads, of a simulation and of a broadcast. A late read skips the tick.
 pub(crate) const FETCH_BUDGET: Duration = Duration::from_millis(80);
-/// Default deadline of a signature: the vault is local, so a round trip takes well under a millisecond.
-const VAULT_TIMEOUT: Duration = Duration::from_millis(15);
+/// Default deadline of a signature: the tick's budget, so that a slow or silent vault never slows the 100 ms loop. The
+/// vault is local, but its key is in AWS KMS (a Sign call takes 10 to 20 ms in-region) and, for a new nonce, it reads
+/// the chain first (its nonce rule): 20 to 60 ms in all with a node nearby. A late signature withdraws the rebalance,
+/// which the next tick plans again.
+const VAULT_TIMEOUT: Duration = FETCH_BUDGET;
 /// A transaction that the node still does not know this long after its broadcast never arrived, or was dropped.
 const DROP_GRACE: Duration = Duration::from_secs(3);
 /// A transaction waiting this long for its receipt raises `tx_stuck`.
@@ -959,9 +962,11 @@ a time.
   --rpc-url URL           the chain's JSON-RPC (LIVE mode; never printed: it may hold a key). Without
                           it, the chain is a MOCK
   --feed ADDRESS          live: the ZkPriceFeed the pool must read (checked at start)
-  --vault-socket PATH     the vault's socket (default: the vault's own default,
-                          $XDG_RUNTIME_DIR/strawberryswap-vault/vault.sock)
-  --vault-timeout-ms MS   deadline of each signature (default: 15)
+  --vault-socket PATH     the operator vault's socket (default: the vault's own default,
+                          $XDG_RUNTIME_DIR/strawberryswap-vault/operator.sock)
+  --vault-timeout-ms MS   deadline of each signature: a KMS call, and a chain read by the vault
+                          for a new nonce (default: 80, the tick's budget; longer slows the loop
+                          when the vault is slow)
   --chain-id ID           chain id of the transactions (default: 31337)
   --executor ADDRESS      the SearcherExecutor contract (default: 0x5FbDB2315678afecb367f032d93F642f64180aa3)
   --target-token0 TOKENS  the executor's token0 target; the model's inventory is the balance minus it
@@ -1140,19 +1145,19 @@ impl Args {
     }
 }
 
-/// The vault's default socket (vaults/threshold-signer, `default_socket`): `$XDG_RUNTIME_DIR/strawberryswap-vault/
-/// vault.sock`, or `<tmp>/strawberryswap-vault-<uid>/vault.sock`.
+/// The operator vault's default socket (vaults/threshold-signer, `default_socket`):
+/// `$XDG_RUNTIME_DIR/strawberryswap-vault/operator.sock`, or `<tmp>/strawberryswap-vault-<uid>/operator.sock`.
 fn default_vault_socket() -> PathBuf {
     match std::env::var_os("XDG_RUNTIME_DIR") {
         Some(dir) if !dir.is_empty() => PathBuf::from(dir)
             .join("strawberryswap-vault")
-            .join("vault.sock"),
+            .join("operator.sock"),
         _ => {
             // The uid owns /proc/self (Linux; no libc call, so no unsafe code).
             let uid = std::fs::metadata("/proc/self").map_or(0, |m| m.uid());
             std::env::temp_dir()
                 .join(format!("strawberryswap-vault-{uid}"))
-                .join("vault.sock")
+                .join("operator.sock")
         }
     }
 }

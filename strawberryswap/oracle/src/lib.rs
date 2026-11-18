@@ -3,7 +3,7 @@
 //!
 //! ```text
 //! exchanges ─► price-endpoint ─TLS─► notary (KMS signs the body's commitment) ─► relayer: Groth16 proof,
-//!                                                                                 ZkPriceFeed.submit every ~15 s
+//!                                     ZkPriceFeed.submit every ~15 s, signed by the relayer vault (its key in KMS)
 //! ```
 
 #![forbid(unsafe_code)]
@@ -19,6 +19,7 @@ pub mod notary_service;
 pub mod prover;
 pub mod relayer;
 pub mod sources;
+pub mod vault;
 
 /// An error with its causes, `outer: inner: root` (an HTTP client's top-level message rarely names the cause).
 pub fn error_chain(error: &(dyn std::error::Error + 'static)) -> String {

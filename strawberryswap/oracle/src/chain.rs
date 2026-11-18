@@ -1,17 +1,15 @@
 //! The relayer's view of the chain: `ZkPriceFeed`'s configuration and latest observation, a preflight of `submit`
-//! (`eth_call` from the relayer's address), and the push itself, an EIP-1559 transaction signed by the relayer's KMS
-//! key, with capped fees and gas.
+//! (`eth_call` from the relayer's address), and the push itself, an EIP-1559 transaction signed by the relayer vault
+//! (the relayer's key in KMS, behind the vault's policy), with capped fees and gas.
 
 use std::fmt;
 use std::future::Future;
 use std::time::Duration;
 
 use alloy::contract::Error as ContractError;
-use alloy::network::EthereumWallet;
-use alloy::primitives::{Address, B256, Bytes, U256};
+use alloy::network::{EthereumWallet, TxSigner};
+use alloy::primitives::{Address, B256, Bytes, Signature, U256};
 use alloy::providers::{DynProvider, Provider, ProviderBuilder};
-use alloy::signers::Signer;
-use alloy::signers::aws::AwsSigner;
 
 alloy::sol! {
     #[sol(rpc)]
@@ -136,7 +134,7 @@ impl FeeCaps {
         Self { max_fee_per_gas: 2_000_000_000, max_priority_fee_per_gas: 100_000_000, gas_limit: 2_000_000 };
 }
 
-/// The feed over JSON-RPC, pushing with the relayer's KMS key.
+/// The feed over JSON-RPC, pushing with the relayer's signer (the relayer vault).
 pub struct RpcFeed {
     provider: DynProvider,
     feed: Address,
@@ -175,15 +173,18 @@ fn redact(error: ChainError, secrets: &[String]) -> ChainError {
 }
 
 impl RpcFeed {
-    /// Connects and checks the chain id (the signer refuses a transaction for another chain as well).
-    pub async fn connect(
+    /// Connects and checks the chain id (the vault refuses a transaction for another chain as well).
+    pub async fn connect<S>(
         rpc_url: &str,
         feed: Address,
-        signer: AwsSigner,
+        signer: S,
         chain_id: u64,
         caps: FeeCaps,
-    ) -> Result<Self, ChainError> {
-        let relayer = signer.address();
+    ) -> Result<Self, ChainError>
+    where
+        S: TxSigner<Signature> + Send + Sync + 'static,
+    {
+        let relayer = TxSigner::address(&signer);
         let url: reqwest::Url = rpc_url
             .parse()
             .map_err(|_| ChainError::Rpc("the RPC URL does not parse (not shown: it may hold a key)".into()))?;

@@ -1,22 +1,26 @@
-//! End to end on a live chain (anvil), with the real contracts, the oracle pipeline, the vault and the engine:
+//! End to end on a live chain (anvil), with the real contracts, the oracle pipeline, two vaults and the engine:
 //!
 //! ```text
-//! stand-in exchanges ─► price-endpoint ─► notary (KMS) ─► relayer: Groth16 proof, KMS-signed push, every 2 s
+//! stand-in exchanges ─► price-endpoint ─► notary (KMS) ─► relayer: Groth16 proof, a push every 2 s
+//!                                                            └─► relayer vault (KMS key; ZkPriceFeed.submit only)
 //!                                                                    │
 //!                                                                    ▼
 //!  engine ── one batched read per tick ──► anvil: ZkPriceFeed ◄─ ZkDecoOracle ◄─ dev Groth16 verifier
-//!    │ └── eth_call simulation                  DarkPool (WETH/tUSD) ◄── SearcherExecutor (operator: the vault)
-//!    └── unsigned EIP-1559 ──► vault (Unix socket; INSECURE test key) ──► signed ──► eth_sendRawTransaction
+//!    │ └── eth_call simulation                  DarkPool (WETH/tUSD) ◄── SearcherExecutor (operator: the KMS key)
+//!    └── unsigned EIP-1559 ──► operator vault (KMS key; rebalance only) ──► signed ──► eth_sendRawTransaction
 //! ```
 //!
-//! The market moves from 3,456.78 to 3,500: the relayer proves and pushes the new price, the pool is now 1.25 % below
-//! it, and the engine rebalances it through the vault. The test checks the rebalance on chain (the vault signed it, the
-//! pool moved toward the oracle, the Treasury was paid), that nothing reverted, and scans the engine's memory for the
-//! vault's key while it trades.
+//! Every key is in the stand-in KMS (the oracle crate's, speaking AWS's wire protocol): the notary's, the relayer's and
+//! the operator's, each its own. The vaults check their keys against the chain at start, and refuse each other's
+//! functions. The market moves from 3,456.78 to 3,500: the relayer proves and pushes the new price through its vault,
+//! the pool is now 1.25 % below it, and the engine rebalances it through the operator vault. The test checks the
+//! rebalance on chain (the operator key signed it, the pool moved toward the oracle, the Treasury was paid), that
+//! nothing reverted, the vaults' windows and audit logs, and scans memory for the operator key while the engine trades:
+//! it is in the KMS stand-in (the positive control), and in neither the vault nor the engine.
 //!
 //! CI only (`--ignored`): it needs anvil (ANVIL, default `anvil`), the contracts' forge build (contracts/out), node with
 //! circuits/node_modules (the relayer's prover), the oracle crate's binaries and its `stand_ins` example
-//! (ORACLE_BIN_DIR, e.g. oracle/target/debug) and the vault built with insecure-test-key (THRESHOLD_SIGNER_BIN).
+//! (ORACLE_BIN_DIR, e.g. oracle/target/debug) and the vault (THRESHOLD_SIGNER_BIN).
 
 mod common;
 
@@ -28,15 +32,15 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
+use alloy::consensus::{SignableTransaction, TxEip1559};
 use alloy::network::TransactionBuilder;
-use alloy::primitives::{Address, B256, U256, b256, keccak256};
+use alloy::primitives::{Address, B256, TxKind, U256, b256, hex, keccak256};
 use alloy::providers::{DynProvider, Provider, ProviderBuilder};
 use alloy::rpc::types::{Filter, TransactionRequest};
 use alloy::sol;
 use alloy::sol_types::{SolCall, SolConstructor, SolEvent};
 use common::{
-    Proc, STARTUP, TempDir, VAULT_ADDRESS, VAULT_TIMEOUT_MS, key_encodings, scan_memory,
-    spawn_vault, summary,
+    Proc, STARTUP, TempDir, VAULT_TIMEOUT_MS, key_encodings_of, scan_memory, summary, vault_binary,
 };
 use serde_json::Value;
 
@@ -225,6 +229,69 @@ fn events(stdout: &str, kind: &str) -> Vec<Value> {
         .collect()
 }
 
+/// A vault of `role` with its key in the stand-in KMS, on `socket`. Returns once it listens, after its start-up
+/// checks against the chain.
+fn spawn_kms_vault(
+    role: &'static str,
+    key_id: &str,
+    kms: &str,
+    socket: &Path,
+    args: &[&str],
+) -> Proc {
+    let mut command = service(vault_binary().to_path_buf());
+    command
+        .args([
+            "--role",
+            role,
+            "--chain-id",
+            &CHAIN_ID.to_string(),
+            "--kms-key-id",
+            key_id,
+            "--kms-endpoint",
+            kms,
+            "--kms-region",
+            "us-east-1",
+            "--socket",
+        ])
+        .arg(socket)
+        .args(args);
+    let vault = Proc::spawn(role, &mut command);
+    let banner = vault.wait_for(STARTUP, |l| l.starts_with("threshold-signer:"));
+    assert!(
+        banner.contains(&format!("role {role}")) && banner.contains(&format!("KMS key {key_id}")),
+        "{banner}"
+    );
+    vault.wait_for(STARTUP, |l| l.starts_with("listening on"));
+    vault
+}
+
+/// One request to a vault, one reply.
+fn ask(socket: &Path, request: &Value) -> Value {
+    use std::io::{BufRead, BufReader, Write};
+    let mut stream = std::os::unix::net::UnixStream::connect(socket).unwrap();
+    writeln!(stream, "{request}").unwrap();
+    let mut reply = String::new();
+    BufReader::new(stream).read_line(&mut reply).unwrap();
+    serde_json::from_str(&reply).unwrap()
+}
+
+/// A request to sign `input` to `to`: what a client of another role would send.
+fn sign_request(to: Address, input: Vec<u8>) -> Value {
+    let tx = TxEip1559 {
+        chain_id: CHAIN_ID,
+        nonce: 0,
+        gas_limit: 300_000,
+        max_fee_per_gas: 30_000_000_000,
+        max_priority_fee_per_gas: 1_000_000_000,
+        to: TxKind::Call(to),
+        input: input.into(),
+        ..TxEip1559::default()
+    };
+    let mut payload = Vec::new();
+    tx.encode_for_signing(&mut payload);
+    serde_json::json!({ "id": 1, "method": "sign_transaction", "params": { "tx": hex::encode_prefixed(payload) } })
+}
+
 #[tokio::test]
 #[ignore = "needs anvil, the forge build, node, the oracle binaries and the vault: CI runs it with --ignored"]
 async fn the_engine_rebalances_the_live_pool_through_the_vault() {
@@ -256,7 +323,7 @@ async fn the_engine_rebalances_the_live_pool_through_the_vault() {
     }
     let deployer = provider.get_accounts().await.unwrap()[0];
 
-    // ---- the stand-ins: KMS (the notary's and the relayer's keys) and the exchanges at 3456.78
+    // ---- the stand-ins: KMS (the notary's, the relayer's and the operator's keys) and the exchanges at 3456.78
     let stand_ins = Proc::spawn(
         "stand-ins",
         Command::new(oracle_bin("stand_ins")).args([
@@ -266,6 +333,8 @@ async fn the_engine_rebalances_the_live_pool_through_the_vault() {
             "notary-key=e2e: notary",
             "--key",
             "relayer-key=e2e: relayer",
+            "--key",
+            "operator-key=e2e: operator",
         ]),
     );
     let notary_line = stand_ins.wait_for(STARTUP, |l| l.starts_with("KEY notary-key "));
@@ -277,6 +346,13 @@ async fn the_engine_rebalances_the_live_pool_through_the_vault() {
         .unwrap();
     let relayer_line = stand_ins.wait_for(STARTUP, |l| l.starts_with("KEY relayer-key "));
     let relayer: Address = relayer_line
+        .split_whitespace()
+        .nth(2)
+        .unwrap()
+        .parse()
+        .unwrap();
+    let operator_line = stand_ins.wait_for(STARTUP, |l| l.starts_with("KEY operator-key "));
+    let operator: Address = operator_line
         .split_whitespace()
         .nth(2)
         .unwrap()
@@ -390,7 +466,7 @@ async fn the_engine_rebalances_the_live_pool_through_the_vault() {
     )
     .await;
     let args = SearcherExecutor::constructorCall {
-        operator_: VAULT_ADDRESS,
+        operator_: operator,
         pool_: pool,
     };
     let executor = deploy(
@@ -433,7 +509,7 @@ async fn the_engine_rebalances_the_live_pool_through_the_vault() {
         to: deployer,
     };
     transact(&provider, deployer, pool, add.abi_encode()).await;
-    // The executor's inventory: 20 WETH and 100,000 tUSD. Gas for the vault's and the relayer's addresses.
+    // The executor's inventory: 20 WETH and 100,000 tUSD. Gas for the operator's and the relayer's addresses.
     transact(
         &provider,
         deployer,
@@ -456,7 +532,7 @@ async fn the_engine_rebalances_the_live_pool_through_the_vault() {
         .abi_encode(),
     )
     .await;
-    for account in [VAULT_ADDRESS, relayer] {
+    for account in [operator, relayer] {
         let _: Value = provider
             .raw_request("anvil_setBalance".into(), (account, wad(10)))
             .await
@@ -518,6 +594,24 @@ async fn the_engine_rebalances_the_live_pool_through_the_vault() {
         .unwrap();
     writeln!(file, "{salt:#x}").unwrap();
     drop(file);
+    // The relayer vault: the relayer's key, ZkPriceFeed.submit only; its key must not be the executor's operator.
+    let relayer_socket = dir.0.join("relayer.sock");
+    let mut relayer_vault = spawn_kms_vault(
+        "relayer",
+        "relayer-key",
+        &kms,
+        &relayer_socket,
+        &[
+            "--rpc-url",
+            &rpc,
+            "--feed",
+            &feed.to_string(),
+            "--executor",
+            &executor.to_string(),
+            "--max-fee-eth-per-window",
+            "1000",
+        ],
+    );
     let oracle_dir = repo().join("oracle");
     let mut command = service(oracle_bin("relayer"));
     command.args([
@@ -531,12 +625,8 @@ async fn the_engine_rebalances_the_live_pool_through_the_vault() {
         &notary_url,
         "--salt-file",
         salt_file.to_str().unwrap(),
-        "--kms-key-id",
-        "relayer-key",
-        "--kms-endpoint",
-        &kms,
-        "--kms-region",
-        "us-east-1",
+        "--vault-socket",
+        relayer_socket.to_str().unwrap(),
         "--zk-dir",
         oracle_dir.join("zk").to_str().unwrap(),
         "--prover-script",
@@ -552,13 +642,88 @@ async fn the_engine_rebalances_the_live_pool_through_the_vault() {
     let relayer_proc = Proc::spawn("relayer", &mut command);
     relayer_proc.wait_for(Duration::from_secs(120), |l| l.starts_with("PUSHED "));
 
-    // ---- the vault (operator) and the engine, live
-    let mut vault = spawn_vault(&dir, CHAIN_ID, executor, &[]);
+    // ---- the operator vault (the operator's key, rebalance only) and the engine, live
+    let operator_socket = dir.0.join("operator.sock");
+    let mut vault = spawn_kms_vault(
+        "operator",
+        "operator-key",
+        &kms,
+        &operator_socket,
+        &[
+            "--rpc-url",
+            &rpc,
+            "--executor",
+            &executor.to_string(),
+            "--max-fee-eth-per-window",
+            "1000",
+            "--max-volume0-per-window",
+            "1000e18",
+            "--max-volume1-per-window",
+            "10000000e18",
+        ],
+    );
+    // Strict separation, live: each vault refuses the other role's function, and their keys differ.
+    let selector = |signature: &str| keccak256(signature)[..4].to_vec();
+    let submit = [
+        selector("submit((bytes32,bytes32,uint256,uint64),bytes)"),
+        vec![0u8; 64],
+    ]
+    .concat();
+    let refused = ask(&operator_socket, &sign_request(feed, submit));
+    assert_eq!(refused["error"]["code"], "policy", "{refused}");
+    assert!(
+        refused["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("relayer role's function"),
+        "{refused}"
+    );
+    let rebalance = [
+        selector("rebalance(uint256,uint256,uint256,uint256,uint256)"),
+        vec![0u8; 160],
+    ]
+    .concat();
+    let refused = ask(&relayer_socket, &sign_request(executor, rebalance));
+    assert!(
+        refused["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("operator role's function"),
+        "{refused}"
+    );
+    let (operator_policy, relayer_policy) = (
+        ask(
+            &operator_socket,
+            &serde_json::json!({ "id": 2, "method": "policy" }),
+        )["result"]
+            .clone(),
+        ask(
+            &relayer_socket,
+            &serde_json::json!({ "id": 3, "method": "policy" }),
+        )["result"]
+            .clone(),
+    );
+    assert_eq!(
+        (
+            operator_policy["role"].as_str(),
+            relayer_policy["role"].as_str()
+        ),
+        (Some("operator"), Some("relayer"))
+    );
+    assert_eq!(operator_policy["address"], operator.to_string());
+    assert_eq!(relayer_policy["address"], relayer.to_string());
+    assert_eq!(
+        (
+            operator_policy["key"].as_str(),
+            relayer_policy["key"].as_str()
+        ),
+        (Some("aws-kms"), Some("aws-kms"))
+    );
     let mut engine = Proc::spawn(
         "engine",
         Command::new(env!("CARGO_BIN_EXE_hft-engine"))
             .arg("--vault-socket")
-            .arg(dir.socket())
+            .arg(&operator_socket)
             .args([
                 "--vault-timeout-ms",
                 VAULT_TIMEOUT_MS,
@@ -620,16 +785,21 @@ async fn the_engine_rebalances_the_live_pool_through_the_vault() {
     assert_eq!(mined["status"], "success", "{mined}");
     assert_eq!(
         mined["from"].as_str().unwrap().parse::<Address>().unwrap(),
-        VAULT_ADDRESS
+        operator
     );
     let tx: B256 = mined["tx"].as_str().unwrap().parse().unwrap();
 
-    // ---- while it trades: the key is in the vault's memory, nowhere in the engine's
-    let needles = key_encodings();
+    // ---- while it trades: the operator key is in KMS (the stand-in's memory), in neither the vault's nor the engine's
+    let needles = key_encodings_of(keccak256("e2e: operator"));
+    let in_kms = scan_memory(stand_ins.pid(), &needles);
+    assert!(
+        !in_kms.found.is_empty(),
+        "positive control: the scan finds the key in the KMS stand-in: {in_kms:?}"
+    );
     let in_vault = scan_memory(vault.pid(), &needles);
     assert!(
-        !in_vault.found.is_empty(),
-        "positive control: the scan finds the key in the vault: {in_vault:?}"
+        in_vault.bytes > 1 << 20 && in_vault.found.is_empty(),
+        "the operator key is in the vault's memory: {in_vault:?}"
     );
     let in_engine = scan_memory(engine.pid(), &needles);
     assert!(
@@ -642,7 +812,9 @@ async fn the_engine_rebalances_the_live_pool_through_the_vault() {
         in_engine.found
     );
     eprintln!(
-        "memory scan (live): vault key found as {:?}; engine {} MiB in {} mappings, key found as {:?}",
+        "memory scan (live): operator key found in the KMS stand-in as {:?}; vault {} MiB, found as {:?}; engine {} MiB in {} mappings, found as {:?}",
+        in_kms.found,
+        in_vault.bytes >> 20,
         in_vault.found,
         in_engine.bytes >> 20,
         in_engine.mappings,
@@ -656,7 +828,7 @@ async fn the_engine_rebalances_the_live_pool_through_the_vault() {
         .unwrap()
         .expect("the rebalance's receipt");
     assert!(receipt.status());
-    assert_eq!((receipt.from, receipt.to), (VAULT_ADDRESS, Some(executor)));
+    assert_eq!((receipt.from, receipt.to), (operator, Some(executor)));
     let rebalanced = provider
         .get_logs(
             &Filter::new()
@@ -713,9 +885,46 @@ async fn the_engine_rebalances_the_live_pool_through_the_vault() {
         "live engine: {} sent, {} mined, {} beaten; spot {spot_before} → {spot_after}; treasury paid {paid}",
         s["sent"], s["mined"], s["beaten"]
     );
+    // The operator vault counted the rebalance in its window. Its nonce view is its last chain read, made at the next
+    // signature or by its idle check (every 10 s): once that read sees the rebalance mined, it has verified the spent
+    // nonce against the rebalance's receipt (its own transaction), and nothing stopped it.
+    let policy = |id: u64| {
+        ask(
+            &operator_socket,
+            &serde_json::json!({ "id": id, "method": "policy" }),
+        )["result"]
+            .clone()
+    };
+    assert!(
+        policy(4)["window"]["used"]["signatures"].as_u64().unwrap() >= 1,
+        "{}",
+        policy(5)
+    );
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let verified = loop {
+        let now = policy(6);
+        if now["nonce"]["next"].as_u64().unwrap() >= 1 {
+            break now;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the vault never read its spent nonce: {now}"
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    };
+    assert_eq!(verified["nonce"]["halted"], Value::Null, "{verified}");
     assert!(vault.terminate(Duration::from_secs(10)).success());
     assert!(
         vault.stderr().contains(&format!("tx {tx}")),
         "the vault's audit log has the rebalance"
+    );
+    // The relayer vault signed every push, and only pushes.
+    assert!(relayer_vault.terminate(Duration::from_secs(10)).success());
+    let audit = relayer_vault.stderr();
+    assert!(audit.contains("audit: signed submit nonce 0"), "{audit}");
+    assert!(!audit.contains("audit: signed rebalance"), "{audit}");
+    eprintln!(
+        "relayer vault: {} pushes signed",
+        audit.matches("audit: signed submit").count()
     );
 }

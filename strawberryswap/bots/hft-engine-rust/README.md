@@ -19,23 +19,25 @@ With `--rpc-url` the chain is live. Without it, the chain is a **mock**: the C++
 transaction boundary. It accepts only signed EIP-1559 transactions, recovers the sender and enforces the operator.
 
 ```bash
-# the vault (a mock in-memory key; see its README), for the chain and the executor it signs for
-cargo run --manifest-path ../../vaults/threshold-signer/Cargo.toml -- --chain-id 421614 --executor 0x<SearcherExecutor>
+# the operator vault: the operator key in AWS KMS, rebalance only (see its README)
+cargo run --release --manifest-path ../../vaults/threshold-signer/Cargo.toml -- --role operator --chain-id 421614 \
+  --rpc-url <RPC> --kms-key-id <operator key ARN> --executor 0x<SearcherExecutor> \
+  --max-fee-eth-per-window 0.5 --max-volume0-per-window 50e18 --max-volume1-per-window 175000e18
 # the engine, live (the RPC URL is never printed: it may hold an API key)
 cargo run --release -- --rpc-url <RPC> --chain-id 421614 --executor 0x<SearcherExecutor> --feed 0x<ZkPriceFeed> --json
 # or on the mock chain
 cargo run --release -- --ticks 300 --log-txs
 
-cargo test                    # 56 unit tests and 4 end-to-end tests with the vault binary
-cargo test --test live_e2e -- --ignored   # the live end to end: anvil, contracts, oracle pipeline, vault (CI runs it)
+cargo test                    # 57 unit tests and 4 end-to-end tests with the vault binary
+cargo test --test live_e2e -- --ignored   # the live end to end: anvil, contracts, oracle pipeline, two vaults (CI runs it)
 ```
 
 | flag | meaning |
 |---|---|
 | `--rpc-url URL` | the chain's JSON-RPC: live mode. Never printed, and redacted from every error |
 | `--feed ADDRESS` | live: the ZkPriceFeed the pool must read, checked at start |
-| `--vault-socket PATH` | the vault's socket. Default: the vault's own default, `$XDG_RUNTIME_DIR/strawberryswap-vault/vault.sock` |
-| `--vault-timeout-ms MS` | deadline of each signature, from connecting to the checked reply. Default 15 |
+| `--vault-socket PATH` | the operator vault's socket. Default: the vault's own default, `$XDG_RUNTIME_DIR/strawberryswap-vault/operator.sock` |
+| `--vault-timeout-ms MS` | deadline of each signature, from connecting to the checked reply. Default 80, the tick's budget: a KMS signature (10 to 20 ms in-region) and, for a new nonce, the vault's chain read. Longer slows the loop when the vault is slow |
 | `--chain-id ID` | chain id of the transactions. Default 31337 |
 | `--executor ADDRESS` | the SearcherExecutor. Default `0x5FbDB2315678afecb367f032d93F642f64180aa3` |
 | `--target-token0 TOKENS` | the executor's token0 target; the model's inventory q is the balance minus it. Default 20000 |
@@ -125,7 +127,8 @@ The lens's creation code is pinned in `src/lens.hex`, and CI checks the pin agai
 **At start** the engine refuses to run unless all of these hold:
 
 * the vault answers;
-* the vault's `policy` covers the engine's chain, executor, gas limit and max fee;
+* the vault's `policy` is an **operator** vault's (a relayer's or an automator's vault holds another key and signs
+  another function), and covers the engine's chain, executor, gas limit and max fee;
 * the RPC's chain id is `--chain-id`;
 * there is a contract at the executor, and its `operator()` is the vault's address (otherwise every rebalance would
   revert `NotOperator`);
@@ -211,7 +214,7 @@ public phrase, whose address viem computed independently. The key file is delete
 | `without_the_vault_nothing_is_broadcast` | With no vault, 200 ticks: every rebalance is withdrawn and nothing is sent. |
 | `a_vault_that_refuses_the_transactions_gets_them_withdrawn` | A vault whose policy refuses the engine's fee: every rebalance is withdrawn, and the refusal is in the vault's audit log. |
 | `no_crate_that_can_hold_a_wallet_key_is_in_the_engines_graph` | The engine's `Cargo.lock` has no local, hardware or cloud signer, keystore or mnemonic crate. The same parser finds `alloy-signer-local` in the vault's lock. |
-| `live_e2e::the_engine_rebalances_the_live_pool_through_the_vault` (CI, `--ignored`) | **The live path end to end on anvil.** The contracts are real: DarkPool, SearcherExecutor with the vault as operator, ZkPriceFeed, ZkDecoOracle and the dev verifier. The oracle pipeline pushes proven, KMS-signed prices every 2 s. The engine runs live. When the market moves 1.25 %, the engine rebalances the pool through the vault. The rebalance is mined from the vault's address, the pool moves toward the oracle, the Treasury is paid, nothing reverts, and every broadcast was simulated first. While it trades, the engine's memory holds no encoding of the key; the vault's does. |
+| `live_e2e::the_engine_rebalances_the_live_pool_through_the_vault` (CI, `--ignored`) | **The live path end to end on anvil, with two vaults (Phase 4).** The contracts are real: DarkPool, SearcherExecutor whose operator is the operator key, ZkPriceFeed, ZkDecoOracle and the dev verifier. Every key is in the stand-in KMS. The relayer pushes proven prices every 2 s through the relayer vault, and the engine signs through the operator vault. Each vault refuses the other's function, live. When the market moves 1.25 %, the engine rebalances the pool: the rebalance is mined from the operator key's address, the pool moves toward the oracle, the Treasury is paid, nothing reverts, and every broadcast was simulated first. The operator vault's window counts it and its nonce moves on. While the engine trades, the operator key is found in the KMS stand-in's memory (the positive control), and in neither the vault's nor the engine's. |
 
 **Mutation check.** I ran a build of the engine that keeps the key in memory. The memory test fails with `the key is in
 the engine's memory as {"big-endian bytes"}`.

@@ -38,12 +38,14 @@ relayer: Groth16 proof of circuits/zkdeco_oracle ──submit──► ZkPriceFe
 
 ## The off-chain pipeline (Phase 2)
 
-`oracle/` is one Rust crate, `zk-oracle`, with three services. The notary's key and the relayer's gas key live in
-AWS KMS: the processes hold a key id, never key material.
+`oracle/` is one Rust crate, `zk-oracle`, with three services. The notary's key lives in AWS KMS: the notary holds a
+key id, never key material. The relayer's gas key lives in KMS too, behind the relayer vault
+(`vaults/threshold-signer --role relayer`, Phase 4). The vault signs `ZkPriceFeed.submit` only, and the relayer holds no
+key and no KMS permission.
 
 ```text
 Coinbase ┐
-Kraken   ├─► price-endpoint ──HTTPS──► notary ──► relayer ──EIP-1559, KMS-signed──► ZkPriceFeed.submit
+Kraken   ├─► price-endpoint ──HTTPS──► notary ──► relayer ──EIP-1559, signed by the relayer vault (KMS)──► ZkPriceFeed.submit
 Bitstamp ┘   GET /v1/ETHUSD           POST /v1/attest    Groth16 proof (snarkjs)
              (fail closed)            KMS signs the       preflight eth_call
                                       body's commitment   every ~15 s
@@ -117,7 +119,7 @@ Each cycle prints one line: `PUSHED`, `NOTHING_NEW`, `REFUSED` or `FAILED`.
 | key | where | permissions | what a compromise allows |
 |---|---|---|---|
 | notary | KMS, `ECC_SECG_P256K1`, `SIGN_VERIFY` | the notary's role: `kms:GetPublicKey`, `kms:Sign` on this key only | attesting any price within the feed's bounds, until a new oracle and feed are deployed (the registry is immutable) |
-| relayer gas key | KMS, same spec | the relayer's role, on its key only | spending its gas balance; it cannot push anything the feed would refuse |
+| relayer gas key | KMS, same spec, behind the relayer vault | the relayer vault's principal, on this key only; the relayer itself has none | through the relayer: only what the vault's policy allows, submits of this feed's own attestations within the window's caps; through the vault's principal: spending its gas balance. Neither can push anything the feed would refuse |
 | query salt | a file, mode 0600 | read by the relayer | revealing the instrument behind `queryCommitment` |
 
 * **Low s.** KMS returns DER signatures, which may have a high s. alloy's `AwsSigner` normalizes them to low s and
@@ -147,10 +149,13 @@ price-endpoint --listen 127.0.0.1:8080
 notary --provider-url https://<endpoint host>/v1/ETHUSD --provider-id 0x<providerId> \
        --kms-key-id <notary key ARN> --kms-region <region>
 
-# On the relayer's host
+# On the relayer's host: the relayer vault (its own user; AWS credentials for the relayer key only), then the relayer
+threshold-signer --role relayer --chain-id 421614 --rpc-url <Arbitrum Sepolia RPC> --kms-key-id <relayer key ARN> \
+        --feed 0x<ZkPriceFeed> --executor 0x<SearcherExecutor> --max-fee-eth-per-window 1 \
+        --socket /run/strawberryswap-vault/relayer.sock --allow-uid <relayer uid>
 relayer --rpc-url <Arbitrum Sepolia RPC> --chain-id 421614 --feed 0x<ZkPriceFeed> \
         --notary-url https://<notary host> --salt-file /etc/zk-oracle/ethusd.salt \
-        --kms-key-id <relayer key ARN> --kms-region <region>
+        --vault-socket /run/strawberryswap-vault/relayer.sock
 ```
 
 Each binary documents its flags with `--help` and prints the trusted-bootstrap disclosure when it starts.
@@ -236,12 +241,13 @@ The pipeline's suites (`oracle/`, CI job "Oracle pipeline"):
 | suite | what it shows |
 |---|---|
 | unit (`src/`) | **The circuit's grammar.** The canonical body matches the fixture generator. Poseidon commitments match circomlibjs on the ETHUSD and XAUUSD fixtures. The notary digest matches the contract's. **Aggregation.** The median, outlier and quorum rule. **The command line.** Flags, and the salt file's mode. |
-| `tests/kms.rs` | **AWS KMS, through the production code path.** A stand-in speaks KMS's wire protocol and signs with a test key, so alloy's `AwsSigner` runs as in production. Signatures come out low s even when KMS answers high s. Transactions are signed for the relayer's chain only. |
+| `tests/kms.rs` | **AWS KMS, through the production code path.** A stand-in speaks KMS's wire protocol and signs with a test key, so alloy's `AwsSigner` runs as in production. Signatures come out low s even when KMS answers high s. Transactions are signed for the configured chain only. |
+| `src/vault.rs` (unit) | **The relayer's vault signer.** The relayer signs through the vault as an alloy `TxSigner`: only a relayer vault is accepted, one whose chain, feed or caps would refuse every push is named at start, and a signature that does not recover to the vault is rejected. |
 | `tests/endpoint.rs` | **The endpoint over stand-in exchanges.** The median, two of three, an outlier dropped. It fails closed with one source, a split, or malformed tickers, and recovers. |
 | `tests/notary.rs` | **The notary over KMS.** It signs only a fresh canonical body of its instrument. It refuses stale or future stamps, another symbol, padding, a non-canonical price, reordered keys, oversize bodies, errors and redirects, and KMS sees none of these. It signs at most once a second under load, and it needs https. |
 | `tests/relayer.rs` | **The relayer with the real notary and the real prover.** The pushed attestation and 353-byte proof are exactly what the feed checks. It refuses an unregistered notary, a wrong salt, and a feed preflight refusal, all without a transaction. It waits for a lagging chain clock. It runs on its heartbeat and stops on shutdown. Its errors never show the RPC URL's key. The prover rejects other public signals, a bad witness and a missed deadline. |
 | `tests/zk_artifacts.rs` | **The committed verification key is the deployed verifier's.** All 26 constants. |
-| `tests/e2e_anvil.rs` | **End to end, in CI.** The three binaries run as processes against stand-in exchanges and KMS. The dev verifier, `ZkDecoOracle` and `ZkPriceFeed` are deployed on anvil. Four cycles push proven, KMS-signed prices, and when the market moves to 3,500 the feed follows. Every `PriceUpdated` comes from the relayer's KMS address. A relayer with the wrong salt refuses to start. |
+| `tests/e2e_anvil.rs` | **End to end, in CI.** The three binaries and the relayer vault run as processes against stand-in exchanges and KMS. The dev verifier, `ZkDecoOracle` and `ZkPriceFeed` are deployed on anvil. Four cycles push proven prices, signed by the relayer vault, and when the market moves to 3,500 the feed follows. Every `PriceUpdated` comes from the relayer's KMS address, and KMS signs exactly one digest per push. A relayer with the wrong salt refuses to start. |
 
 ## Not done yet
 
