@@ -885,18 +885,34 @@ async fn the_engine_rebalances_the_live_pool_through_the_vault() {
         "live engine: {} sent, {} mined, {} beaten; spot {spot_before} → {spot_after}; treasury paid {paid}",
         s["sent"], s["mined"], s["beaten"]
     );
-    // The operator vault counted the rebalance in its window and followed its nonce; nothing stopped it.
-    let policy = ask(
-        &operator_socket,
-        &serde_json::json!({ "id": 4, "method": "policy" }),
-    )["result"]
-        .clone();
+    // The operator vault counted the rebalance in its window. Its nonce view is its last chain read, made at the next
+    // signature or by its idle check (every 10 s): once that read sees the rebalance mined, it has verified the spent
+    // nonce against the rebalance's receipt (its own transaction), and nothing stopped it.
+    let policy = |id: u64| {
+        ask(
+            &operator_socket,
+            &serde_json::json!({ "id": id, "method": "policy" }),
+        )["result"]
+            .clone()
+    };
     assert!(
-        policy["window"]["used"]["signatures"].as_u64().unwrap() >= 1,
-        "{policy}"
+        policy(4)["window"]["used"]["signatures"].as_u64().unwrap() >= 1,
+        "{}",
+        policy(5)
     );
-    assert!(policy["nonce"]["next"].as_u64().unwrap() >= 1, "{policy}");
-    assert_eq!(policy["nonce"]["halted"], Value::Null, "{policy}");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let verified = loop {
+        let now = policy(6);
+        if now["nonce"]["next"].as_u64().unwrap() >= 1 {
+            break now;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the vault never read its spent nonce: {now}"
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    };
+    assert_eq!(verified["nonce"]["halted"], Value::Null, "{verified}");
     assert!(vault.terminate(Duration::from_secs(10)).success());
     assert!(
         vault.stderr().contains(&format!("tx {tx}")),
