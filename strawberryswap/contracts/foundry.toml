@@ -10,7 +10,8 @@ optimizer = true
 optimizer_runs = 200
 via_ir = true
 bytecode_hash = "none"     # reproducible builds (verifiable against IPFS-published artifacts)
-fs_permissions = [{ access = "read", path = "./test/fixtures" }]
+# Read: the fixtures. Read-write: the testnet deployment manifests (script/DeployTestnet.s.sol, CheckTestnet).
+fs_permissions = [{ access = "read", path = "./test/fixtures" }, { access = "read-write", path = "./deployments" }]
 
 [fuzz]
 runs = 1000                # per fuzz test; raise in CI (e.g. FOUNDRY_FUZZ_RUNS=10000)
@@ -24,3 +25,10 @@ show_metrics = true
 
 [fmt]
 line_length = 110
+
+[rpc_endpoints]
+arbitrum_sepolia = "${ARBITRUM_SEPOLIA_RPC_URL}"
+
+[etherscan]
+# Etherscan's v2 API covers Arbitrum Sepolia (chain 421614) with one key: forge script --verify, forge verify-contract.
+arbitrum_sepolia = { key = "${ETHERSCAN_API_KEY}", chain = 421614 }

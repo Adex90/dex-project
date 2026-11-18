@@ -32,7 +32,7 @@ const enc = (n) => "0x" + n.toString(16).padStart(4, "0");
 // ---- verifier fixture for the batch circuit
 {
   let src = readFileSync("build/batch_swap_n4/batch_swap_n4.Verifier.sol", "utf8").replace(/contract Groth16Verifier/, "contract BatchSwapGroth16Verifier");
-  writeFileSync(`${OUT}/BatchSwapGroth16Verifier.dev.sol`, `// ⚠ DEV-ONLY VERIFICATION KEY (single-party local setup). TEST FIXTURE: NEVER DEPLOY.\n` + src);
+  writeFileSync(`${OUT}/BatchSwapGroth16Verifier.dev.sol`, `// ⚠ DEV-ONLY VERIFICATION KEY — generated from a single-party local setup (scripts/setup-dev.mjs).\n// Anyone holding that setup's toxic waste can forge proofs. TESTNET ONLY: deployed solely by\n// contracts/script/DeployTestnet.s.sol (Arbitrum Sepolia, chain 421614, or anvil), whose on-chain\n// TestnetDisclosure names it. NEVER deploy to mainnet or anywhere value is at stake.\n` + src);
 }
 
 // ---- actors. Each user has ONE key used for ownership, payout and refund.

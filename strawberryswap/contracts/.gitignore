@@ -2,3 +2,6 @@ out/
 cache/
 lib/
 broadcast/
+# Local and test deployment manifests (the testnet's, deployments/421614.json, is committed).
+deployments/31337.json
+deployments/test-*.json

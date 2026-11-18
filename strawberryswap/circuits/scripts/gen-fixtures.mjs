@@ -1,6 +1,6 @@
 // Generates the Foundry fixtures: REAL Groth16 proofs + verifiers (dev key) + the Poseidon contract bytecode.
 //   contracts/test/fixtures/PoseidonT3Code.sol        circomlibjs Poseidon(2) EVM bytecode
-//   contracts/test/fixtures/*Groth16Verifier.dev.sol  snarkjs verifiers for the DEV keys (never deploy!)
+//   contracts/test/fixtures/*Groth16Verifier.dev.sol  snarkjs verifiers for the DEV keys (testnet only, never mainnet)
 //   contracts/test/fixtures/Fixtures.sol              proofs for: shield -> transferZK -> unshield, oracle attestation
 // Everything is deterministic (fixed seeds) so regenerated fixtures diff cleanly.
 import * as snarkjs from "snarkjs";
@@ -30,9 +30,11 @@ library PoseidonT3Code {
 `);
 
 // ---------------------------------------------------------------- verifiers (rename, add DEV banner)
+// The banner also stands at the head of BatchSwapGroth16Verifier.dev.sol (gen-batch-fixtures.mjs): keep both in step.
+const DEV_BANNER = `// ⚠ DEV-ONLY VERIFICATION KEY — generated from a single-party local setup (scripts/setup-dev.mjs).\n// Anyone holding that setup's toxic waste can forge proofs. TESTNET ONLY: deployed solely by\n// contracts/script/DeployTestnet.s.sol (Arbitrum Sepolia, chain 421614, or anvil), whose on-chain\n// TestnetDisclosure names it. NEVER deploy to mainnet or anywhere value is at stake.\n`;
 for (const [name, cls] of [["joinsplit", "JoinSplitGroth16Verifier"], ["zkdeco_oracle", "OracleGroth16Verifier"]]) {
   let src = readFileSync(`build/${name}/${name}.Verifier.sol`, "utf8").replace(/contract Groth16Verifier/, `contract ${cls}`);
-  src = `// ⚠ DEV-ONLY VERIFICATION KEY — generated from a single-party local setup (scripts/setup-dev.mjs).\n// Anyone holding that setup's toxic waste can forge proofs. TEST FIXTURE: NEVER DEPLOY.\n` + src;
+  src = DEV_BANNER + src;
   writeFileSync(`${OUT}/${cls}.dev.sol`, src);
 }
 

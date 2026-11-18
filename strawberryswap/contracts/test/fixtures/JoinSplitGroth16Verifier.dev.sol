@@ -1,5 +1,7 @@
 // ⚠ DEV-ONLY VERIFICATION KEY — generated from a single-party local setup (scripts/setup-dev.mjs).
-// Anyone holding that setup's toxic waste can forge proofs. TEST FIXTURE: NEVER DEPLOY.
+// Anyone holding that setup's toxic waste can forge proofs. TESTNET ONLY: deployed solely by
+// contracts/script/DeployTestnet.s.sol (Arbitrum Sepolia, chain 421614, or anvil), whose on-chain
+// TestnetDisclosure names it. NEVER deploy to mainnet or anywhere value is at stake.
 // SPDX-License-Identifier: GPL-3.0
 /*
     Copyright 2021 0KIMS association.
