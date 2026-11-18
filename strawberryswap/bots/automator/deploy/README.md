@@ -22,8 +22,19 @@ cp deploy/tor/torrc /etc/tor/torrc && cp deploy/systemd/automator.service /etc/s
 systemctl restart tor && systemctl enable --now automator
 cat /var/lib/tor/automator/hostname                    # publish this .onion address to wallets
 ```
-The signing key is NOT on this host: `signerUrl` is an MPC/TSS gateway (ideally broadcasting through a private relay
-so batches do not appear in the public mempool before inclusion).
+The signing key is NOT on this host. Either of two signers holds it:
+
+* **The automator vault (the testnet's).** `vaultSocket` points at `vaults/threshold-signer --role automator`. It runs
+  as its own user next to the Automator and holds the automator's key in AWS KMS: the Automator holds neither the key
+  nor any KMS permission. It signs `DarkPool.settleBatch` only: 1 to `batchSize` notes, within its nonce rule and its
+  per-window caps (see its README).
+  * The Automator takes the pending nonce and capped fees (`maxFeeWei`, `maxPriorityFeeWei`) from the RPC, through
+    Tor as before. It has the vault sign over the vault's Unix socket, and broadcasts.
+  * At start it refuses a vault of another role, chain or pool, or one whose caps are below its own.
+  * The socket is AF_UNIX, so `IPAddressDeny` does not apply. Its directory must be shared with the `automator` group
+    (the vault's `RuntimeDirectoryMode=0750`, `--allow-uid` the automator's uid).
+* **`signerUrl`, an MPC/TSS gateway** (ideally broadcasting through a private relay, so batches do not appear in the
+  public mempool before inclusion). It is exclusive with `vaultSocket`.
 
 ## Verify it yourself
 ```bash

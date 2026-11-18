@@ -56,7 +56,7 @@ strawberryswap/
 │   ├── hft-engine-rust/            # A-S execution engine: 100 ms loop, curve planner, vault-signed txs, live chain (iteration 2)
 │   ├── searcher-rust/              # (reserved) production RPC / signer adapters
 │   └── inventory-cpp/              # Searcher core: LOB signals, Avellaneda–Stoikov, curve planner (C++20)
-├── vaults/threshold-signer/        # signer daemon for the HFT engine: Unix socket, strict policy (iteration 0: mock key)
+├── vaults/threshold-signer/        # the testnet vault: one role per process, its key in AWS KMS, chain-state rules (iteration 1)
 ├── oracle/                         # price-proof pipeline: ETHUSD endpoint, KMS notary, ~15 s relayer → ZkPriceFeed
 ├── mpc/tss-vault/                  # (Phase 4) threshold-ECDSA/EdDSA corporate vault coordinator
 ├── infra/
@@ -238,18 +238,19 @@ A mobile-first rebuild of the UI (presentation only: every hook, ABI, `lib/` and
    EIP-1559 `SearcherExecutor.rebalance` transaction.
 4. **Simulate** it as an `eth_call` from the vault's address. One a competing searcher already made unprofitable is
    dropped before any signature.
-5. **Sign** through the threshold signer's Unix socket, within a deadline. Then check the signed transaction and
+5. **Sign** through the operator vault's Unix socket, within a deadline. Then check the signed transaction and
    broadcast it, with one transaction in flight at a time.
 
 * **No key in the engine.** End-to-end tests recover every broadcast transaction to the vault's address. They scan
-  the engine's memory for the vault's test key, on the mock chain and live on anvil: it is never there, while the same
-  scan finds it in the vault.
-* **Checked at start.** The vault's address is the executor's operator, the engine's fees and gas are within the
-  vault's policy, and the chain and the pool's feed are the expected ones.
+  the engine's memory for the signing key, on the mock chain (the vault's test key) and live on anvil (the operator's
+  KMS key): it is never there.
+* **Checked at start.** The vault is an operator vault, its address is the executor's operator, the engine's fees and
+  gas are within its policy, and the chain and the pool's feed are the expected ones.
 * **Structured output.** Events, alerts (`rpc_down`, `oracle_stale`, `tx_stuck`, …) and a metrics snapshot with
   latency histograms, as text or JSON lines.
-* **The whole live path in CI.** On anvil, with the real contracts, the oracle pipeline pushing proven prices, the
-  vault and the engine: when the market moves, the engine rebalances the pool through the vault.
+* **The whole live path in CI.** On anvil, with the real contracts, the oracle pipeline pushing proven prices through
+  the relayer vault, and the engine: when the market moves, the engine rebalances the pool through the operator
+  vault.
 * **Matches the references.**
   * Planner: bit-identical to the C++ on 311 golden cases.
   * A-S: within 1 ulp of the lab.
@@ -259,21 +260,33 @@ A mobile-first rebuild of the UI (presentation only: every hook, ABI, `lib/` and
 cd bots/hft-engine-rust && cargo test     # unit tests, plus end to end with the vault binary
 ```
 
-## Threshold signer (Rust), iteration 0
+## The vault (Rust), iteration 1: testnet Phase 4
 
-`vaults/threshold-signer/` is the daemon that signs for the HFT engine, so that the engine never holds a key. The
-engine routes every rebalance through it.
+`vaults/threshold-signer/` signs for the bots, so that no bot holds a key. **One role per process,** each with its own
+key in **AWS KMS** (generated in its HSMs, never exported), its own socket and its own user. Each role signs **one
+function on one contract** and refuses the others' by name:
 
-* **The exchange.** The engine sends an unsigned EIP-1559 transaction over a local Unix socket. The vault decodes it,
-  checks it and returns the signature and the signed transaction.
-* **Access control.** The socket sits in a private directory, and the kernel checks the caller's uid (`SO_PEERCRED`).
-* **The policy.** Only `SearcherExecutor.rebalance`, on one chain, with bounded amounts, gas and fees, no ether, and
-  never `sweep`.
-* **What is mocked.** The key, held in memory behind `alloy_signer::Signer`, and the chain-aware rules. The crate's
-  README explains the separation, the threat model and the path to t-of-n threshold ECDSA.
+| role | client | signs only |
+|---|---|---|
+| operator | HFT engine | `SearcherExecutor.rebalance` (never `sweep`) |
+| relayer | oracle relayer | `ZkPriceFeed.submit`, for the feed's own provider and instrument |
+| automator | batch automator | `DarkPool.settleBatch` |
+
+* **The exchange.** A client sends an unsigned EIP-1559 transaction over a local Unix socket. The vault decodes it
+  strictly, checks it, has KMS sign it, and returns the signed transaction. The socket sits in a private directory,
+  and the kernel checks the caller's uid (`SO_PEERCRED`).
+* **Checked against the chain at start.** The operator's key must be the executor's `operator()`, and no other role's
+  key may be. The relayer reads its feed's configuration, and the automator its pool's batch size.
+* **Nonce sequencing.** Only the chain's next nonce (or up to `--max-pending` beyond it) is signed, so no signature can
+  be stockpiled. Every nonce the chain moves past must be the vault's own transaction (its receipt); anything else
+  means the key signs elsewhere, and the vault stops until restarted.
+* **Per-window caps** on signatures, fee budget, token volumes and notes.
+
+The crate's README has the rules, the protocol, the IAM policy per key, and the path to t-of-n threshold ECDSA before
+mainnet.
 
 ```bash
-cd vaults/threshold-signer && cargo test && cargo run --release -- --chain-id 31337 --executor 0x<SearcherExecutor>
+cd vaults/threshold-signer && cargo test     # 38 tests: policies, rules, KMS (local stand-in), socket
 ```
 
 ## Price-proof pipeline (Rust), testnet Phase 2
@@ -286,12 +299,13 @@ cd vaults/threshold-signer && cargo test && cargo run --release -- --chain-id 31
 * **`notary`** fetches that body itself over HTTPS and checks it byte for byte. It then has **AWS KMS** sign
   `ZkDecoOracle`'s digest of its commitment, and checks that the signature recovers to it before handing it out.
 * **`relayer`** runs every ~15 s. It checks the attestation as the contract will and proves it (Groth16, the committed
-  DEV keys in `oracle/zk/`). It preflights `submit`, then pushes an EIP-1559 transaction signed by its own KMS key,
-  with capped fees.
+  DEV keys in `oracle/zk/`). It preflights `submit`, then pushes an EIP-1559 transaction, with capped fees, signed by
+  the relayer vault (Phase 4): the relayer holds no key.
 
-No process holds key material: both keys are KMS keys (interim custody until the MPC vault). The tests run the
-production KMS signer against a stand-in that speaks KMS's protocol, and real proofs throughout. CI's end-to-end
-test runs the three binaries against `ZkPriceFeed` on anvil while the market moves.
+No process holds key material: the notary's key and the relayer's (behind its vault) are KMS keys, the interim custody
+until the MPC vault. The tests run the production KMS signer against a stand-in that speaks KMS's protocol, and real
+proofs throughout. CI's end-to-end test runs the three binaries and the relayer vault against `ZkPriceFeed` on anvil
+while the market moves.
 
 ```bash
 cd oracle && cargo test     # needs `npm ci` in circuits/ (snarkjs); the anvil end to end runs in CI (--ignored)

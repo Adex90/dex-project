@@ -14,7 +14,8 @@ and `x/crypto` for Keccak.
                                       sync note tree ◄──────────────── NoteInserted events
                                       batcher: choose feasible intents, uniform price, payouts, nets
                                       prover:  batch_swap Groth16 proof (private tmpfs, wiped)
-                                      chain:   settleBatch(calldata) ─(Tor)─► signer gateway ─► tx
+                                      chain:   settleBatch(calldata) ─► automator vault (local, KMS key) ─► tx
+                                                                      or ─(Tor)─► signer gateway ─► tx
  3. scan NoteInserted, open sealed output (AES-GCM under destBlinding) ─────────  payout note
  4. JoinSplit proof (own key): withdrawNote ───────────────────────────────────►  tokens
 ```
@@ -32,7 +33,7 @@ simply wait for the deadline and be refunded.
 | `intent` | intent terms, note commitment/nullifier, sealed outputs | unit tests + golden |
 | `batcher` | selection, closed-form clearing price, payouts, nets, witness | golden (entire witness), property test K'≥K, scenario tests |
 | `prover` | `snarkjs` wrapper (private tmpfs, process-group kill, public-signal check) | fake-prover tests + **real proof settled on-chain** |
-| `chain` | ABI encoder (== `cast`), JSON-RPC reader, remote-signer client | `cast calldata` golden |
+| `chain` | ABI encoder (== `cast`), JSON-RPC reader, the automator vault's client (EIP-1559 RLP, capped fees, broadcast) or the remote-signer client | `cast calldata` golden; the EIP-1559 payload == alloy's (`testdata/eip1559.vault.json`, also checked by the vault); stand-in vault and node |
 | `privacy` | listener/log/HTTP/egress guarantees G1–G5 | `privacy_test.go` |
 | `server`, `service` | HTTP intake, epoch loop | fake-chain end-to-end tests |
 
@@ -52,6 +53,7 @@ a global adversary; the intent *contents* from the Automator itself.
 ```bash
 go test ./... && go vet ./...
 go build -o automator ./cmd/automator
-./automator serve --config deploy/config.example.json      # needs Tor + signer gateway, see deploy/README.md
+./automator serve --config deploy/config.vault.example.json  # testnet: Tor + the automator vault, see deploy/README.md
+./automator serve --config deploy/config.example.json        # or Tor + a remote signer gateway
 ./automator batch-witness --state state.json --out witness.json && ./automator prove --witness witness.json --snarkjs … --wasm … --zkey … --out proof.json
 ```
