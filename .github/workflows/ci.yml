@@ -379,12 +379,13 @@ jobs:
 
   # ---------------------------------------------------------------------------
   # The price-proof pipeline (strawberryswap/oracle): the canonical body and
-  # the Poseidon commitments against the circuit's goldens, the notary and the
-  # relayer's key over a stand-in for AWS KMS that speaks its wire protocol (so
-  # alloy's AwsSigner runs as in production), the relayer with real Groth16
-  # proofs (snarkjs on the committed dev artifacts), and end to end: the three
-  # binaries as processes, pushing KMS-signed, proven prices to ZkPriceFeed on
-  # anvil while the market moves.
+  # the Poseidon commitments against the circuit's goldens, the notary's key
+  # over a stand-in for AWS KMS that speaks its wire protocol (so alloy's
+  # AwsSigner runs as in production), the relayer with real Groth16 proofs
+  # (snarkjs on the committed dev artifacts) and its vault signer, and end to
+  # end: the three binaries and the relayer vault (its key in the stand-in KMS)
+  # as processes, pushing proven prices to ZkPriceFeed on anvil while the
+  # market moves.
   oracle:
     name: Oracle pipeline (Rust; fmt, clippy, tests, end to end on anvil)
     runs-on: ubuntu-24.04
@@ -413,7 +414,9 @@ jobs:
       - name: Restore the Cargo cache
         uses: Swatinem/rust-cache@v2
         with:
-          workspaces: strawberryswap/oracle -> target
+          workspaces: |
+            strawberryswap/oracle -> target
+            strawberryswap/vaults/threshold-signer -> target
 
       # The prover runs circuits/scripts/prove-zkdeco.mjs, which imports snarkjs from circuits/node_modules.
       - uses: actions/setup-node@v7
@@ -446,23 +449,34 @@ jobs:
         if: ${{ !cancelled() && steps.rust.outcome == 'success' }}
         run: cargo clippy --all-targets --locked -- -D warnings
 
-      - name: cargo test (unit; endpoint, notary and relayer with KMS and the real prover)
+      - name: cargo test (unit; endpoint, notary with KMS, relayer with the real prover and its vault signer)
         if: ${{ !cancelled() && steps.rust.outcome == 'success' }}
         run: cargo test --locked --no-fail-fast
 
-      - name: End to end on anvil (endpoint, notary, relayer; ZkPriceFeed)
+      # The relayer signs only through the relayer vault (vaults/threshold-signer --role relayer).
+      - name: Build the relayer vault
+        id: vault
         if: ${{ !cancelled() && steps.rust.outcome == 'success' }}
+        working-directory: strawberryswap/vaults/threshold-signer
+        run: |
+          cargo build --locked
+          echo "THRESHOLD_SIGNER_BIN=$PWD/target/debug/threshold-signer" >> "$GITHUB_ENV"
+
+      - name: End to end on anvil (endpoint, notary, relayer and its vault; ZkPriceFeed)
+        if: ${{ !cancelled() && steps.vault.outcome == 'success' }}
         run: cargo test --locked --test e2e_anvil -- --ignored --nocapture
 
   # ---------------------------------------------------------------------------
-  # The whole live path on a local chain (Phase 3): the real contracts on anvil
-  # (DarkPool, SearcherExecutor, ZkPriceFeed, ZkDecoOracle and the dev
-  # verifier), the oracle pipeline pushing proven, KMS-signed prices every 2 s,
-  # the threshold vault (insecure test key) and the HFT engine in live mode.
-  # The market moves; the engine rebalances the pool through the vault, every
-  # rebalance simulated first, one in flight at a time; its memory is scanned
-  # for the vault's key while it trades. Also pins the engine's EngineLens
-  # creation code to this forge build.
+  # The whole live path on a local chain (Phases 3 and 4): the real contracts
+  # on anvil (DarkPool, SearcherExecutor, ZkPriceFeed, ZkDecoOracle and the dev
+  # verifier), the oracle pipeline pushing proven prices every 2 s through the
+  # relayer vault, and the HFT engine in live mode signing through the
+  # operator vault: each vault with its own key in the stand-in KMS, checked
+  # against the chain, refusing the other's function. The market moves; the
+  # engine rebalances the pool, every rebalance simulated first, one in flight
+  # at a time; memory is scanned for the operator key while it trades (in the
+  # KMS stand-in only: neither the vault nor the engine holds it). Also pins
+  # the engine's EngineLens creation code to this forge build.
   system-e2e:
     name: System end to end (anvil; contracts, oracle pipeline, vault, engine)
     runs-on: ubuntu-24.04
@@ -527,10 +541,10 @@ jobs:
             exit 1
           fi
 
-      - name: Build the vault (debug, insecure-test-key)
+      - name: Build the vault (debug; its keys in the stand-in KMS)
         working-directory: strawberryswap/vaults/threshold-signer
         run: |
-          cargo build --locked --features insecure-test-key
+          cargo build --locked
           echo "THRESHOLD_SIGNER_BIN=$PWD/target/debug/threshold-signer" >> "$GITHUB_ENV"
 
       - name: Build the oracle pipeline and its stand-ins
@@ -539,9 +553,49 @@ jobs:
           cargo build --locked --bins --example stand_ins
           echo "ORACLE_BIN_DIR=$PWD/target/debug" >> "$GITHUB_ENV"
 
-      - name: End to end on anvil (live engine, vault, oracle pipeline, contracts)
+      - name: End to end on anvil (live engine, operator and relayer vaults, oracle pipeline, contracts)
         working-directory: strawberryswap/bots/hft-engine-rust
         run: cargo test --locked --test live_e2e -- --ignored --nocapture
+
+  # ---------------------------------------------------------------------------
+  # The batch automator (strawberryswap/bots/automator, Go): its encoders
+  # against Foundry's and alloy's goldens (settleBatch calldata, the EIP-1559
+  # payload its vault signs), the batcher, the note tree, the privacy
+  # transport, and its vault signer against a stand-in vault and node.
+  automator:
+    name: Automator (Go; gofmt, vet, tests)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: strawberryswap/bots/automator
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: strawberryswap/bots/automator/go.mod
+          cache-dependency-path: strawberryswap/bots/automator/go.sum
+
+      # gofmt, vet and tests are independent: one failure does not hide the others.
+      - name: gofmt
+        id: gofmt
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "::error::not gofmt-formatted: $unformatted"
+            exit 1
+          fi
+
+      - name: go vet
+        if: ${{ !cancelled() }}
+        run: go vet ./...
+
+      - name: go test
+        if: ${{ !cancelled() }}
+        run: go test -count=1 ./...
 
   # ---------------------------------------------------------------------------
   sql-suites:
@@ -1043,7 +1097,7 @@ jobs:
   ci-ok:
     name: CI result
     if: ${{ always() }}
-    needs: [frontend, backend, contracts, hft-engine, threshold-signer, oracle, system-e2e, sql-suites, e2e, docker, iac-and-scripts]
+    needs: [frontend, backend, contracts, hft-engine, threshold-signer, oracle, system-e2e, automator, sql-suites, e2e, docker, iac-and-scripts]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
