@@ -247,6 +247,8 @@ The pipeline's suites (`oracle/`, CI job "Oracle pipeline"):
 
 * **The local stack.** The local deployment (`script/DeployLocal.s.sol`) keeps `DevLiveOracle`. The pipeline runs
   against `ZkPriceFeed` in the anvil end-to-end test, but no deploy script wires them together yet.
-* **The engine's live reads** come in Phase 3. It will read this feed through `DarkPool.oracle()`.
+* **The engine's live reads** are done (Phase 3): every tick it reads this feed through the pool, as DarkPool does,
+  in its one batched request. `bots/hft-engine-rust/tests/live_e2e.rs` runs the pipeline, the vault and the engine
+  together on anvil.
 * **The testnet deployment** comes in Phase 5: the KMS keys, the hosts, the 18-decimal test USD, and the app's testnet
   disclaimer.

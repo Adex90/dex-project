@@ -1,13 +1,19 @@
-//! The engine's view of the chain (reads and broadcast) and a deterministic mock of it.
+//! The engine's view of the chain (reads, simulation and broadcast) and a deterministic mock of it.
+//!
+//! Live, `live::LiveChain` implements it over JSON-RPC: one batched read per tick (the EngineLens snapshot, the
+//! operator's nonces and gas balance, and what the node knows of the transaction in flight), an `eth_call` simulation
+//! of each rebalance from the vault's address, and `eth_sendRawTransaction`.
 //!
 //! The mock is the C++ engine's `SimChain` (bots/inventory-cpp/include/strawberry/sim.hpp) behind a transaction
 //! boundary. It accepts only signed EIP-1559 transactions, recovers the sender from the signature, consumes the nonce,
 //! and executes `SearcherExecutor.rebalance` with the contract's checks: the sender must be the executor's operator,
-//! and the rebalance must pass DarkPool's acceptance rules (`planner::chain_rules`).
+//! and the rebalance must pass DarkPool's acceptance rules (`planner::chain_rules`). It mines a transaction as it is
+//! broadcast; the engine learns the outcome from its receipt on the next read, as it does live.
 
+use std::collections::HashMap;
 use std::time::Duration;
 
-use alloy::consensus::TxEnvelope;
+use alloy::consensus::{TxEip1559, TxEnvelope};
 use alloy::eips::eip2718::Decodable2718;
 use alloy::primitives::{Address, B256, TxKind, U256};
 use tokio::time;
@@ -36,17 +42,45 @@ impl PoolWei {
     }
 }
 
-/// One tick's reads, as the contracts return them.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// The block a tick's snapshot was read at.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct BlockInfo {
+    pub number: u64,
+    pub timestamp: u64,
+    /// EIP-1559 base fee, wei per gas.
+    pub base_fee: u128,
+}
+
+/// What the node knows of the transaction the engine asked about.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) enum Watched {
+    /// No transaction was asked about.
+    #[default]
+    Nothing,
+    /// The node does not know it: never received, or dropped.
+    Unknown,
+    /// Received, not mined yet.
+    Pending,
+    Mined(Receipt),
+}
+
+/// One tick's reads, as the contracts and the node return them.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ChainState {
-    /// IZKOracle.latestVerifiedPrice().
+    /// IZKOracle.latestVerifiedPrice(), read through the pool as DarkPool reads it.
     pub oracle: OracleReading,
     /// The SearcherExecutor's balances (IERC20.balanceOf), wei.
     pub token0: U256,
     pub token1: U256,
     pub pool: PoolWei,
-    /// The operator's next nonce (eth_getTransactionCount).
+    pub block: BlockInfo,
+    /// The operator's mined transactions (eth_getTransactionCount at `latest`): its next nonce when nothing is pending.
     pub nonce: u64,
+    /// Mined or pending (at `pending`). Above `nonce` while a transaction from the operator waits to be mined.
+    pub pending_nonce: u64,
+    /// The operator's ether, wei: what pays for the rebalances' gas.
+    pub gas_balance: U256,
+    pub watched: Watched,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -55,19 +89,26 @@ pub(crate) enum TxStatus {
     Reverted(String),
 }
 
+/// A mined transaction.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Receipt {
     pub tx_hash: B256,
-    /// The sender recovered from the signature.
-    pub signer: Address,
+    /// The sender (recovered from the signature).
+    pub from: Address,
     pub status: TxStatus,
+    pub block: u64,
+    pub gas_used: u64,
 }
 
-/// Reads and broadcast. Mocked in this iteration; live, `read` is a batch of eth_calls through an alloy provider and
-/// `send_raw_transaction` is eth_sendRawTransaction.
+/// Reads, simulation and broadcast: the live chain over JSON-RPC (`live::LiveChain`), or the mock below.
 pub(crate) trait Chain {
-    async fn read(&mut self) -> Result<ChainState, EngineError>;
-    async fn send_raw_transaction(&mut self, raw: &[u8]) -> Result<Receipt, EngineError>;
+    /// One tick's reads, in one round trip. `watch` asks what the node knows of that transaction as well.
+    async fn read(&mut self, watch: Option<B256>) -> Result<ChainState, EngineError>;
+    /// The transaction as an `eth_call` from `from` on the latest block: Ok if it would execute now, else why not
+    /// (`EngineError::Simulation`).
+    async fn simulate(&mut self, from: Address, tx: &TxEip1559) -> Result<(), EngineError>;
+    /// eth_sendRawTransaction: the hash, once the node has accepted the transaction.
+    async fn send_raw_transaction(&mut self, raw: &[u8]) -> Result<B256, EngineError>;
 }
 
 /// SplitMix64 (Steele, Lea and Flood, 2014): small, fast and well tested; deterministic for a given seed.
@@ -97,6 +138,10 @@ impl SplitMix64 {
 
 /// Simulated RPC round trip of each mock call.
 const MOCK_LATENCY: Duration = Duration::from_millis(2);
+/// The mock's base fee: 1 gwei.
+pub(crate) const MOCK_BASE_FEE: u128 = 1_000_000_000;
+/// The gas a mock rebalance uses.
+const MOCK_GAS_USED: u64 = 150_000;
 
 /// The mock world: a DarkPool, the zk oracle, the SearcherExecutor's inventory and the operator's nonce, in tokens.
 /// Each read advances it by one tick: the oracle follows dS = σ dW, and with some probability a batch of user trades
@@ -116,6 +161,12 @@ pub(crate) struct MockChain {
     /// Transactions included, and how many of those reverted.
     pub included: u64,
     pub reverted: u64,
+    /// The receipts of the transactions included, by hash.
+    pub receipts: HashMap<B256, Receipt>,
+    /// The base fee every block reports, wei per gas.
+    pub base_fee: u128,
+    /// Blocks so far: one per read.
+    pub block: u64,
     pub latency: Duration,
     step_sd: f64,
     flow_probability: f64,
@@ -157,6 +208,9 @@ impl MockChain {
             nonce: 0,
             included: 0,
             reverted: 0,
+            receipts: HashMap::new(),
+            base_fee: MOCK_BASE_FEE,
+            block: 0,
             latency: MOCK_LATENCY,
             step_sd: (sigma2_per_sec * crate::TICK.as_secs_f64()).sqrt(),
             flow_probability: 0.3,
@@ -188,47 +242,96 @@ impl MockChain {
 
     /// `SearcherExecutor.rebalance` then `DarkPool.flashRebalance`, as the C++ SimChain runs them: the executor must
     /// hold the repayment and the Treasury allowance, the pool's three acceptance rules must hold, and the pool pulls
-    /// exactly the cut (80 % of the harvest at the oracle price), never the whole allowance.
-    pub fn apply_rebalance(&mut self, r: &Rebalance) -> TxStatus {
+    /// exactly the cut (80 % of the harvest at the oracle price), never the whole allowance. Nothing changes; Ok holds
+    /// the state after it.
+    fn evaluate(&self, r: &Rebalance) -> Result<Applied, String> {
         let amounts =
             [r.amount0_out, r.amount1_out, r.pay0, r.pay1, r.treasury_pay].map(wad_to_f64);
         let [Ok(o0), Ok(o1), Ok(p0), Ok(p1), Ok(tr)] = amounts else {
-            return TxStatus::Reverted("amounts out of range".into());
+            return Err("amounts out of range".into());
         };
         if o0 == 0.0 && o1 == 0.0 {
-            return TxStatus::Reverted("InsufficientInput: nothing out".into());
+            return Err("InsufficientInput: nothing out".into());
         }
         if o0 >= self.pool.r0 || o1 >= self.pool.r1 {
-            return TxStatus::Reverted("InsufficientLiquidity".into());
+            return Err("InsufficientLiquidity".into());
         }
         if p0 > self.token0 + o0 || p1 + tr > self.token1 + o1 {
-            return TxStatus::Reverted(
-                "the executor cannot cover the repayment and the allowance".into(),
-            );
+            return Err("the executor cannot cover the repayment and the allowance".into());
         }
         let rules = chain_rules(&self.pool, self.oracle, o0, o1, p0, p1, tr);
         if !rules.k_ok {
-            return TxStatus::Reverted("I1: K would decrease".into());
+            return Err("I1: K would decrease".into());
         }
         if !rules.deviation_ok {
-            return TxStatus::Reverted("I3a: the pool does not move toward the oracle".into());
+            return Err("I3a: the pool does not move toward the oracle".into());
         }
         if !rules.treasury_ok {
-            return TxStatus::Reverted("I3b: the Treasury allowance is below the cut".into());
+            return Err("I3b: the Treasury allowance is below the cut".into());
         }
-        self.pool.r0 += p0 - o0;
-        self.pool.r1 += p1 - o1;
-        self.token0 += o0 - p0;
-        self.token1 += o1 - p1 - rules.cut;
-        self.treasury += rules.cut;
-        TxStatus::Success
+        let mut pool = self.pool;
+        pool.r0 += p0 - o0;
+        pool.r1 += p1 - o1;
+        Ok(Applied {
+            pool,
+            token0: self.token0 + o0 - p0,
+            token1: self.token1 + o1 - p1 - rules.cut,
+            cut: rules.cut,
+        })
+    }
+
+    /// Executes the rebalance (as `evaluate`, then commits it).
+    #[cfg(test)]
+    pub fn apply_rebalance(&mut self, r: &Rebalance) -> TxStatus {
+        match self.evaluate(r) {
+            Ok(applied) => {
+                self.pool = applied.pool;
+                self.token0 = applied.token0;
+                self.token1 = applied.token1;
+                self.treasury += applied.cut;
+                TxStatus::Success
+            }
+            Err(reason) => TxStatus::Reverted(reason),
+        }
+    }
+
+    /// What a call from `from` would do: the executor's checks, then the rebalance's.
+    fn check_call(&self, from: Address, tx: &TxEip1559) -> Result<Applied, String> {
+        if tx.to != TxKind::Call(self.executor) {
+            return Err("not a call to the SearcherExecutor".into());
+        }
+        if !tx.value.is_zero() {
+            return Err("rebalance is not payable".into());
+        }
+        if from != self.operator {
+            return Err("NotOperator".into());
+        }
+        let r = Rebalance::decode(&tx.input).ok_or("unknown function")?;
+        self.evaluate(&r)
     }
 }
 
+/// The state after a rebalance.
+struct Applied {
+    pool: PoolState,
+    token0: f64,
+    token1: f64,
+    cut: f64,
+}
+
 impl Chain for MockChain {
-    async fn read(&mut self) -> Result<ChainState, EngineError> {
+    async fn read(&mut self, watch: Option<B256>) -> Result<ChainState, EngineError> {
         time::sleep(self.latency).await;
         self.advance();
+        self.block += 1;
+        let watched = match watch {
+            None => Watched::Nothing,
+            // The mock mines as it accepts, so a transaction it knows is mined.
+            Some(hash) => self
+                .receipts
+                .get(&hash)
+                .map_or(Watched::Unknown, |receipt| Watched::Mined(receipt.clone())),
+        };
         Ok(ChainState {
             oracle: OracleReading {
                 price: Self::wei(self.oracle)?,
@@ -242,13 +345,28 @@ impl Chain for MockChain {
                 v0: Self::wei(self.pool.v0)?,
                 v1: Self::wei(self.pool.v1)?,
             },
+            block: BlockInfo {
+                number: self.block,
+                timestamp: unix_now(),
+                base_fee: self.base_fee,
+            },
             nonce: self.nonce,
+            pending_nonce: self.nonce,
+            gas_balance: U256::from(10u64).pow(U256::from(20u64)),
+            watched,
         })
+    }
+
+    async fn simulate(&mut self, from: Address, tx: &TxEip1559) -> Result<(), EngineError> {
+        time::sleep(self.latency).await;
+        self.check_call(from, tx)
+            .map(|_| ())
+            .map_err(EngineError::Simulation)
     }
 
     /// eth_sendRawTransaction on a chain that mines at once. A transaction that is not signed EIP-1559 on this chain at
     /// the account's nonce is rejected before inclusion; one that is included consumes the nonce, even if it reverts.
-    async fn send_raw_transaction(&mut self, raw: &[u8]) -> Result<Receipt, EngineError> {
+    async fn send_raw_transaction(&mut self, raw: &[u8]) -> Result<B256, EngineError> {
         time::sleep(self.latency).await;
         let envelope = TxEnvelope::decode_2718(&mut &raw[..])
             .map_err(|e| EngineError::Feed(format!("undecodable transaction: {e}")))?;
@@ -275,26 +393,31 @@ impl Chain for MockChain {
         }
         self.nonce += 1;
         self.included += 1;
-        let status = if tx.to != TxKind::Call(self.executor) {
-            TxStatus::Reverted("not a call to the SearcherExecutor".into())
-        } else if !tx.value.is_zero() {
-            TxStatus::Reverted("rebalance is not payable".into())
-        } else if signer != self.operator {
-            TxStatus::Reverted("NotOperator".into())
-        } else {
-            match Rebalance::decode(&tx.input) {
-                Some(r) => self.apply_rebalance(&r),
-                None => TxStatus::Reverted("unknown function".into()),
+        let status = match self.check_call(signer, tx) {
+            Ok(applied) => {
+                self.pool = applied.pool;
+                self.token0 = applied.token0;
+                self.token1 = applied.token1;
+                self.treasury += applied.cut;
+                TxStatus::Success
+            }
+            Err(reason) => {
+                self.reverted += 1;
+                TxStatus::Reverted(reason)
             }
         };
-        if status != TxStatus::Success {
-            self.reverted += 1;
-        }
-        Ok(Receipt {
-            tx_hash: *signed.hash(),
-            signer,
-            status,
-        })
+        let hash = *signed.hash();
+        self.receipts.insert(
+            hash,
+            Receipt {
+                tx_hash: hash,
+                from: signer,
+                status,
+                block: self.block,
+                gas_used: MOCK_GAS_USED,
+            },
+        );
+        Ok(hash)
     }
 }
 
@@ -396,12 +519,20 @@ mod tests {
     async fn a_vault_signed_rebalance_executes_only_from_the_operator() {
         let raw = hex::decode(fixtures::SIGNED_REBALANCE).unwrap();
         let mut c = fixtures::scenario_chain();
-        let receipt = c.send_raw_transaction(&raw).await.unwrap();
+        let hash = c.send_raw_transaction(&raw).await.unwrap();
+        assert_eq!(hash, alloy::primitives::keccak256(&raw));
+        let receipt = c.receipts[&hash].clone();
         assert_eq!(
-            (receipt.signer, receipt.status.clone()),
+            (receipt.from, receipt.status.clone()),
             (fixtures::VAULT_ADDRESS, TxStatus::Success)
         );
-        assert_eq!(receipt.tx_hash, alloy::primitives::keccak256(&raw));
+        // The next read reports it mined.
+        let reads = c.read(Some(hash)).await.unwrap();
+        assert_eq!(reads.watched, Watched::Mined(receipt));
+        assert_eq!(
+            c.read(Some(B256::repeat_byte(1))).await.unwrap().watched,
+            Watched::Unknown
+        );
         assert_eq!((c.nonce, c.included, c.reverted), (1, 1, 0));
         // Replaying it: the nonce is spent.
         assert!(
@@ -414,9 +545,42 @@ mod tests {
 
         let mut other = fixtures::scenario_chain();
         other.operator = Address::repeat_byte(0x11);
-        let receipt = other.send_raw_transaction(&raw).await.unwrap();
-        assert_eq!(receipt.status, TxStatus::Reverted("NotOperator".into()));
+        let hash = other.send_raw_transaction(&raw).await.unwrap();
+        assert_eq!(
+            other.receipts[&hash].status,
+            TxStatus::Reverted("NotOperator".into())
+        );
         assert_eq!((other.nonce, other.reverted), (1, 1));
+    }
+
+    /// The simulation runs the executor's and the pool's checks without changing anything.
+    #[tokio::test]
+    async fn the_simulation_reports_what_the_transaction_would_do_and_changes_nothing() {
+        let mut c = fixtures::scenario_chain();
+        let tx = fixtures::scenario_tx();
+        c.simulate(fixtures::VAULT_ADDRESS, &tx).await.unwrap();
+        assert_eq!(
+            (c.pool, c.treasury, c.nonce),
+            (fixtures::SCENARIO_POOL, 0.0, 0)
+        );
+        let refused = |e: EngineError| match e {
+            EngineError::Simulation(reason) => reason,
+            other => panic!("{other:?}"),
+        };
+        let not_operator = c
+            .simulate(Address::repeat_byte(0x11), &tx)
+            .await
+            .unwrap_err();
+        assert_eq!(refused(not_operator), "NotOperator");
+        // Beaten: someone else moved the pool to the oracle first, so the same rebalance no longer reduces the
+        // deviation.
+        c.pool = PoolState {
+            r1: fixtures::SCENARIO_POOL.r1 * fixtures::SCENARIO_ORACLE / 2000.0,
+            v1: fixtures::SCENARIO_POOL.v1 * fixtures::SCENARIO_ORACLE / 2000.0,
+            ..fixtures::SCENARIO_POOL
+        };
+        let beaten = refused(c.simulate(fixtures::VAULT_ADDRESS, &tx).await.unwrap_err());
+        assert!(beaten.starts_with("I"), "{beaten}");
     }
 
     #[tokio::test]
@@ -428,7 +592,7 @@ mod tests {
         let at = tampered.len() - 80;
         tampered[at] ^= 0x01;
         match c.send_raw_transaction(&tampered).await {
-            Ok(receipt) => assert_ne!(receipt.signer, fixtures::VAULT_ADDRESS),
+            Ok(hash) => assert_ne!(c.receipts[&hash].from, fixtures::VAULT_ADDRESS),
             Err(e) => assert!(
                 e.to_string().contains("invalid signature")
                     || e.to_string().contains("undecodable")

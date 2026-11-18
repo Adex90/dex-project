@@ -53,7 +53,7 @@ strawberryswap/
 │   └── src/{app/{,trade},components,hooks,lib,styles}
 ├── bots/
 │   ├── automator/                  # Go relayer: intents → batch → proof → settleBatch; Tor-only metadata layer
-│   ├── hft-engine-rust/            # A-S execution engine: 100 ms loop, curve planner, vault-signed txs (iteration 1: mock chain)
+│   ├── hft-engine-rust/            # A-S execution engine: 100 ms loop, curve planner, vault-signed txs, live chain (iteration 2)
 │   ├── searcher-rust/              # (reserved) production RPC / signer adapters
 │   └── inventory-cpp/              # Searcher core: LOB signals, Avellaneda–Stoikov, curve planner (C++20)
 ├── vaults/threshold-signer/        # signer daemon for the HFT engine: Unix socket, strict policy (iteration 0: mock key)
@@ -226,21 +226,30 @@ A mobile-first rebuild of the UI (presentation only: every hook, ABI, `lib/` and
   are native `<select>`s, tabs are ARIA tablists, and motion stops under `prefers-reduced-motion`. Skeletons are sized like
   the data they stand in for, so content fades in without layout shift.
 
-## HFT execution engine (Rust), iteration 1
+## HFT execution engine (Rust), iteration 2: the live chain
 
 `bots/hft-engine-rust/` runs the market-making loop end to end, every 100 ms:
 
-1. Quote with the Python lab's Avellaneda–Stoikov closed forms, using the `engine` block of `calibration.json`.
-2. Size a DarkPool rebalance with the C++ engine's curve planner, ported bit for bit.
-3. Build the unsigned EIP-1559 `SearcherExecutor.rebalance` transaction.
-4. Have it signed by the threshold signer over its Unix socket, within a deadline.
-5. Check the signed transaction and broadcast it.
+1. **Read** the chain in one batched RPC request: the zk oracle (through the pool), the reserves, the executor's
+   inventory, the block, the operator's nonces and gas balance. One `eth_call` of a never-deployed lens
+   (`EngineLens`) returns the contract reads from a single block.
+2. **Quote** with the Python lab's Avellaneda–Stoikov closed forms, using the `engine` block of `calibration.json`.
+3. **Size** a DarkPool rebalance with the C++ engine's curve planner, ported bit for bit, and build the unsigned
+   EIP-1559 `SearcherExecutor.rebalance` transaction.
+4. **Simulate** it as an `eth_call` from the vault's address. One a competing searcher already made unprofitable is
+   dropped before any signature.
+5. **Sign** through the threshold signer's Unix socket, within a deadline. Then check the signed transaction and
+   broadcast it, with one transaction in flight at a time.
 
-* **No key in the engine.** A late, refused or mismatched signature withdraws the rebalance. End-to-end tests run the
-  engine against the real vault. They recover every broadcast transaction to the vault's address and scan the
-  engine's memory for the vault's test key: it is not there, while the same scan finds it in the vault.
-* **The chain is a mock.** It is the C++ SimChain behind a real transaction boundary: signed EIP-1559 only, the sender
-  recovered, the nonce consumed and the operator enforced.
+* **No key in the engine.** End-to-end tests recover every broadcast transaction to the vault's address. They scan
+  the engine's memory for the vault's test key, on the mock chain and live on anvil: it is never there, while the same
+  scan finds it in the vault.
+* **Checked at start.** The vault's address is the executor's operator, the engine's fees and gas are within the
+  vault's policy, and the chain and the pool's feed are the expected ones.
+* **Structured output.** Events, alerts (`rpc_down`, `oracle_stale`, `tx_stuck`, …) and a metrics snapshot with
+  latency histograms, as text or JSON lines.
+* **The whole live path in CI.** On anvil, with the real contracts, the oracle pipeline pushing proven prices, the
+  vault and the engine: when the market moves, the engine rebalances the pool through the vault.
 * **Matches the references.**
   * Planner: bit-identical to the C++ on 311 golden cases.
   * A-S: within 1 ulp of the lab.

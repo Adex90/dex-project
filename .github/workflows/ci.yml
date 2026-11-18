@@ -455,6 +455,95 @@ jobs:
         run: cargo test --locked --test e2e_anvil -- --ignored --nocapture
 
   # ---------------------------------------------------------------------------
+  # The whole live path on a local chain (Phase 3): the real contracts on anvil
+  # (DarkPool, SearcherExecutor, ZkPriceFeed, ZkDecoOracle and the dev
+  # verifier), the oracle pipeline pushing proven, KMS-signed prices every 2 s,
+  # the threshold vault (insecure test key) and the HFT engine in live mode.
+  # The market moves; the engine rebalances the pool through the vault, every
+  # rebalance simulated first, one in flight at a time; its memory is scanned
+  # for the vault's key while it trades. Also pins the engine's EngineLens
+  # creation code to this forge build.
+  system-e2e:
+    name: System end to end (anvil; contracts, oracle pipeline, vault, engine)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install Rust ${{ env.RUST_TOOLCHAIN }}
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --no-self-update
+          rustup default "$RUST_TOOLCHAIN"
+          rustc --version
+          cargo --version
+
+      - name: Restore the Cargo cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            strawberryswap/bots/hft-engine-rust -> target
+            strawberryswap/oracle -> target
+            strawberryswap/vaults/threshold-signer -> target
+
+      # The relayer's prover runs circuits/scripts/prove-zkdeco.mjs with snarkjs from circuits/node_modules.
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: strawberryswap/circuits/package-lock.json
+
+      - name: npm ci (circuits; snarkjs for the relayer's prover)
+        working-directory: strawberryswap/circuits
+        run: npm ci --ignore-scripts --no-audit --no-fund
+
+      - name: Install Foundry ${{ env.FOUNDRY_VERSION }} (anvil; forge for the contracts)
+        uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: ${{ env.FOUNDRY_VERSION }}
+
+      - name: Fetch forge-std ${{ env.FORGE_STD_VERSION }} and check its source tree
+        working-directory: strawberryswap/contracts
+        run: |
+          git clone --quiet --depth 1 --branch "$FORGE_STD_VERSION" https://github.com/foundry-rs/forge-std.git lib/forge-std
+          got=$(cd lib/forge-std && find src -type f | LC_ALL=C sort | xargs sha256sum | sha256sum | cut -d' ' -f1)
+          if [ "$got" != "$FORGE_STD_SRC_SHA256" ]; then
+            echo "::error::forge-std $FORGE_STD_VERSION src/ tree is $got, expected $FORGE_STD_SRC_SHA256"
+            exit 1
+          fi
+
+      - name: forge build
+        working-directory: strawberryswap/contracts
+        run: forge build
+
+      - name: The engine's pinned EngineLens creation code is this build's
+        run: |
+          want=$(jq -r .bytecode.object strawberryswap/contracts/out/EngineLens.sol/EngineLens.json)
+          got="0x$(tr -d '[:space:]' < strawberryswap/bots/hft-engine-rust/src/lens.hex)"
+          if [ "$want" != "$got" ]; then
+            echo "::error::bots/hft-engine-rust/src/lens.hex is not contracts/src/periphery/EngineLens.sol's creation code"
+            echo "forge build: $want"
+            exit 1
+          fi
+
+      - name: Build the vault (debug, insecure-test-key)
+        working-directory: strawberryswap/vaults/threshold-signer
+        run: |
+          cargo build --locked --features insecure-test-key
+          echo "THRESHOLD_SIGNER_BIN=$PWD/target/debug/threshold-signer" >> "$GITHUB_ENV"
+
+      - name: Build the oracle pipeline and its stand-ins
+        working-directory: strawberryswap/oracle
+        run: |
+          cargo build --locked --bins --example stand_ins
+          echo "ORACLE_BIN_DIR=$PWD/target/debug" >> "$GITHUB_ENV"
+
+      - name: End to end on anvil (live engine, vault, oracle pipeline, contracts)
+        working-directory: strawberryswap/bots/hft-engine-rust
+        run: cargo test --locked --test live_e2e -- --ignored --nocapture
+
+  # ---------------------------------------------------------------------------
   sql-suites:
     name: SQL suite ${{ matrix.suite }}
     runs-on: ubuntu-24.04
@@ -954,7 +1043,7 @@ jobs:
   ci-ok:
     name: CI result
     if: ${{ always() }}
-    needs: [frontend, backend, contracts, hft-engine, threshold-signer, oracle, sql-suites, e2e, docker, iac-and-scripts]
+    needs: [frontend, backend, contracts, hft-engine, threshold-signer, oracle, system-e2e, sql-suites, e2e, docker, iac-and-scripts]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:

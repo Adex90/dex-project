@@ -11,7 +11,7 @@
 use alloy::consensus::TxEip1559;
 use alloy::primitives::{Address, B256, U256, address, keccak256};
 
-use crate::chain::{ChainState, MockChain, PoolWei};
+use crate::chain::{BlockInfo, ChainState, MockChain, PoolWei, Watched};
 use crate::model::{OracleReading, wad};
 use crate::planner::{PlannerParams, PoolState};
 use crate::tx::{Rebalance, TxConfig, unsigned_tx};
@@ -92,7 +92,15 @@ pub(crate) fn scenario_reads(updated_at: u64) -> ChainState {
             v0: wad("1000"),
             v1: wad("2000000"),
         },
+        block: BlockInfo {
+            number: 1,
+            timestamp: updated_at,
+            base_fee: 1_000_000_000,
+        },
         nonce: 0,
+        pending_nonce: 0,
+        gas_balance: wad("1"),
+        watched: Watched::Nothing,
     }
 }
 

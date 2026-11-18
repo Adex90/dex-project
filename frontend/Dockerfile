@@ -29,7 +29,11 @@
 #
 # Dependency audit: the `audit` stage runs `npm audit` against the registry's advisory
 # database and the build fails on a moderate or worse advisory in a runtime dependency,
-# or a high or worse one anywhere in the tree (build tools run code during the build).
+# with no exceptions, or a high or worse one anywhere in the tree (build tools run code
+# during the build). The whole-tree gate (scripts/audit.mjs) honours the dated exceptions
+# in audit-exceptions.json, for dev and build tooling only (it checks package-lock.json):
+# each lapses on its date, or as soon as the advisory's range changes or the package has
+# a newer release (a candidate fix), whichever comes first.
 # It runs alongside the build. CI passes --build-arg AUDIT_EPOCH=<run id> so a cached
 # layer never hides a new advisory.
 
@@ -60,13 +64,16 @@ FROM node AS audit
 WORKDIR /audit
 ENV npm_config_fund=false \
     npm_config_update_notifier=false
-COPY package.json package-lock.json ./
+COPY package.json package-lock.json audit-exceptions.json ./
+COPY scripts/audit.mjs scripts/
 ARG AUDIT_EPOCH=local
+# Runtime dependencies first, with no exceptions; then the whole tree, high or worse,
+# less the dev-tooling exceptions.
 RUN --mount=type=secret,id=extra_ca,required=false \
     if [ -s /run/secrets/extra_ca ]; then export NODE_EXTRA_CA_CERTS=/run/secrets/extra_ca; fi; \
     echo "npm audit (${AUDIT_EPOCH})" \
  && npm audit --omit=dev --audit-level=moderate \
- && npm audit --audit-level=high \
+ && node scripts/audit.mjs \
  && touch /audit.ok
 
 # ---------------------------------------------------------------------------------------
