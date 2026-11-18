@@ -1408,6 +1408,42 @@ available, so Session Manager itself was not exercised. Everything around it was
 - **Backend:** rustfmt and clippy `-D warnings` clean; 314 tests passed, 0 failed.
   hadolint, actionlint and ShellCheck (with the CI settings) are clean.
 
+**Cryptographic Solvency Explorer: asset positions in the reserve cut** (migration
+`0018`, `GET /api/v1/reserva/prueba` and the public cuts extended, the Reserve tab):
+
+- **Database:** every SQL suite passes on its own fresh database with all migrations
+  (13 suites), the new `tests/db/0018_reserva_posiciones.sql` (29 checks) included.
+  It covers:
+  - cuts that omit the gold tree, carry a quantity other than the live one, give one
+    client's position to another, put gold in the silver tree, add a tree nobody
+    holds, declare a wrong total, start indices at 1, or invent a leaf hash;
+  - the market anchor: not the head, missing, or behind a published one after the
+    market ledger is truncated;
+  - the cash breakdown: missing, not adding up, or not the account's;
+  - the honest cut, built from the reference vector, and its immutability.
+- **Backend:** rustfmt and clippy `-D warnings` clean. 393 tests passed, 0
+  failed (387 before):
+  - exact reference vectors for cash and position leaves, computed separately from
+    the spec;
+  - positions in the cut, their proofs and the public verifier;
+  - tampering after publication, and a cut that omits positions.
+- **Frontend:** typecheck, lint, 279 unit tests (the verifier's vectors, path shape
+  and malformed proofs; the verdict with positions; the explorer's helpers) and
+  `next build`.
+- **End to end** on a fresh stack: smoke 242 checks (223 before) and AML console
+  130 (125 before).
+  - The smoke run checks the explorer on fresh snapshots:
+    - the root, Copy root, the 100.00% ratio, equal custody and liabilities, and
+      both anchors;
+    - the leaf as published and its 15,000.00;
+    - Verify My Inclusion, the trace and the match seal;
+    - after trading, on a phone: every position listed and hashing up to its
+      asset's published root, with no horizontal scroll;
+    - a private root or another client's leaf refused.
+  - The AML run checks a frozen client's leaf: its funds on hold shown in the
+    neutral copy, the proof still verified, and no tipping-off words on the Reserve
+    tab.
+
 **Identity verification: declarations, agreements and the wizard** (migration `0017`, the
 extended `POST /api/v1/kyc/verificar`, `/dashboard/verify`), and third-party SPEI payments off
 by default:
