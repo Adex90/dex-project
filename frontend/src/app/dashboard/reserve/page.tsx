@@ -1,17 +1,17 @@
 "use client";
 
-import { ProofOfReservePanel } from "@/components/dashboard/proof-of-reserve";
 import { useDashboard } from "@/components/layout/dashboard-shell";
+import { SolvencyExplorer } from "@/components/reserve/solvency-explorer";
 import { useDashboardStore } from "@/store/dashboard";
 
-/** Reserve: verify, in the browser, that this account is inside the bank's published 100% reserve. */
+/**
+ * Reserve: the Solvency Explorer. The published snapshot (root, ratio,
+ * anchors, asset roots), the customer's own leaf, and the in-browser proof
+ * that the leaf hashes up to the published root.
+ */
 export default function ReservePage() {
   const { token } = useDashboard();
   const accountId = useDashboardStore((s) => s.summary?.boveda?.id ?? null);
 
-  return (
-    <div className="max-w-4xl">
-      <ProofOfReservePanel token={token} accountId={accountId} />
-    </div>
-  );
+  return <SolvencyExplorer token={token} accountId={accountId} />;
 }

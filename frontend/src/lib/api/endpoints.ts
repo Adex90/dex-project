@@ -174,10 +174,18 @@ export const api = {
   /** Public copy of a published cut, fetched without credentials. */
   publicCut: (id: string) => request<CorteReserva>(`/api/v1/reserva/cortes/${encodeURIComponent(id)}`),
 
+  /** The latest published cut (public): its roots, totals and anchors. */
+  latestCut: (signal?: AbortSignal) => request<CorteReserva>("/api/v1/reserva/cortes/ultimo", { signal }),
+
   verifyProof: (proof: PruebaReserva) =>
     request<ResultadoVerificacionPrueba>("/api/v1/reserva/verificar", {
       method: "POST",
-      body: { corte_id: proof.corte.id, hoja: proof.hoja, ruta: proof.ruta },
+      body: {
+        corte_id: proof.corte.id,
+        hoja: proof.hoja,
+        ruta: proof.ruta,
+        posiciones: (proof.posiciones ?? []).map((p) => ({ hoja: p.hoja, ruta: p.ruta })),
+      },
     }),
 
   /** The signed-in client (its `estatus_kyc` tells a SUSPENDIDO client from a rejected one). */

@@ -246,6 +246,15 @@ export interface ResultadoLiquidacion {
   idempotente: boolean;
 }
 
+/** Root of one asset's tree of positions in a cut (migration 0018). */
+export interface ActivoCorte {
+  ticker: string;
+  merkle_root: string;
+  num_hojas: number;
+  /** Units of the asset owed to all clients. */
+  total_cantidad: Decimal;
+}
+
 export interface CorteReserva {
   id: Uuid;
   merkle_root: string;
@@ -256,15 +265,46 @@ export interface CorteReserva {
   hash_ledger: string;
   algoritmo: string;
   creado_en: IsoDateTime;
+  /** Market ledger anchor (0018): null on older cuts, absent from a backend before 0018. */
+  secuencia_mercado?: number | null;
+  hash_mercado?: string | null;
+  /** One tree per asset with open positions (0018): empty on older cuts, absent before 0018. */
+  activos?: ActivoCorte[];
 }
 
 export type LadoMerkle = "IZQUIERDA" | "DERECHA";
+
+export interface PasoRuta {
+  lado: LadoMerkle;
+  hash: string;
+  suma: Decimal;
+}
+
+/** What the cash leaf's balance was made of at the cut (0018; outside the hash). */
+export interface DesgloseSaldo {
+  disponible: Decimal;
+  /** Funds on hold: shown to the client only with the neutral hold copy (lib/aml.ts). */
+  bloqueado: Decimal;
+  /** Held by open limit and stop orders. */
+  comprometido: Decimal;
+}
+
+export interface PruebaPosicion {
+  indice: number;
+  hoja: { ticker: string; cuenta_id: Uuid; cantidad: Decimal; sal: string; hash: string | null };
+  ruta: PasoRuta[];
+  valida: boolean;
+}
 
 export interface PruebaReserva {
   corte: CorteReserva;
   indice: number;
   hoja: { cuenta_id: Uuid; saldo: Decimal; sal: string; hash: string | null };
-  ruta: { lado: LadoMerkle; hash: string; suma: Decimal }[];
+  /** Null on cuts from before migration 0018 (absent from an older backend). */
+  desglose?: DesgloseSaldo | null;
+  ruta: PasoRuta[];
+  /** One per open position of the account in the cut, each in its asset's tree (absent before 0018). */
+  posiciones?: PruebaPosicion[];
   valida: boolean;
   saldo_actual: Decimal;
 }
@@ -276,6 +316,14 @@ export interface ResultadoVerificacionPrueba {
   raiz_publicada: string;
   total_pasivo_publicado: Decimal;
   total_reserva_publicado: Decimal;
+  posiciones: {
+    ticker: string;
+    valida: boolean;
+    raiz_calculada: string;
+    suma_calculada: Decimal;
+    raiz_publicada: string | null;
+    total_publicado: Decimal | null;
+  }[];
 }
 
 // -----------------------------------------------------------------------------

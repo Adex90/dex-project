@@ -524,6 +524,31 @@ try {
   const hits = [...vaultText.matchAll(TIP_OFF)].map((m) => m[0]);
   check(hits.length === 0, `dashboard text has no tipping-off words (${hits.join(", ") || "none"})`, hits);
   await shot(cp, "client-dashboard-frozen");
+  // The Reserve tab on a fresh snapshot (a new client's first proof cuts again,
+  // over every account): the held funds are in the leaf, with the neutral copy,
+  // and the proof still verifies.
+  const cutClient = { email: `e2e-cut-${runId}@example.mx`, password: client.password };
+  const cutReg = await apiCall("POST", "/api/v1/auth/registro", {
+    body: { tipo_persona: "FISICA", nombre: "Corte", apellido_paterno: "Nuevo", email: cutClient.email, password: cutClient.password },
+  });
+  const cutProof = await apiCall("GET", "/api/v1/reserva/prueba", { token: (await apiLogin(cutClient)).token });
+  check(cutReg.status === 201 && cutProof.status === 200, `a fresh reserve snapshot is cut (proof ${cutProof.status})`);
+  const ownProof = await pageFetch(cp, "GET", "/api/v1/reserva/prueba");
+  check(!/aml|pld|congel|alerta|cumplimiento|nivel_riesgo|es_pep|retenido/i.test(JSON.stringify(ownProof.body ?? {})), "the client's reserve proof carries no AML wording", ownProof.body);
+  await openTab(cp, "Reserve");
+  await cp.getByTestId("leaf-total").waitFor();
+  const holdRow = cp.getByTestId("balance-line").and(cp.locator("[data-key=hold]"));
+  const heldAtCut = Number(ownProof.body?.desglose?.bloqueado ?? 0);
+  check(
+    heldAtCut > 0 ? (await holdRow.innerText()).includes("Funds on hold (still fully backed)") : (await holdRow.count()) === 0,
+    `held funds in the leaf use the neutral hold copy (${ownProof.body?.desglose?.bloqueado ?? "no breakdown"} on hold)`,
+  );
+  await cp.getByTestId("verify-inclusion").click();
+  await cp.getByTestId("proof-verdict").and(cp.locator("[data-status=verified]")).waitFor({ timeout: 20_000 });
+  check(true, "a client with funds on hold still verifies their inclusion in the reserve");
+  const reserveHits = await tipOffWords(cp);
+  check(reserveHits.length === 0, `the Reserve tab has no tipping-off words (${reserveHits.join(", ") || "none"})`, reserveHits);
+  await shot(cp, "client-reserve-held");
   // The Vault home (balance, reserve seal, deposit card, chart) must not tip off either.
   await openTab(cp, "Vault");
   await cp.getByTestId("vault-total").waitFor();

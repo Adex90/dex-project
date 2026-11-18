@@ -85,6 +85,20 @@ async function apiLogin(emailAddress, secret) {
   return body.token;
 }
 
+/**
+ * A fresh Proof of Reserve cut over every account, as it stands now: the stack
+ * cuts on demand (CORTE_MIN_INTERVALO_SEG=0), and a new client's first proof
+ * is not in the latest cut, so the server cuts again. Returns the public copy.
+ */
+async function freshCut(emailAddress, secret) {
+  if ((await apiRegister(emailAddress, secret)) !== 201) throw new Error(`could not register ${emailAddress}`);
+  const proof = await fetch(`${API}/api/v1/reserva/prueba`, {
+    headers: { authorization: `Bearer ${await apiLogin(emailAddress, secret)}` },
+  });
+  if (proof.status !== 200) throw new Error(`the new client's proof answered ${proof.status}`);
+  return (await fetch(`${API}/api/v1/reserva/cortes/ultimo`)).json();
+}
+
 /** Registers a client through the API: a new account, still without KYC, holding nothing. */
 async function apiRegister(emailAddress, secret) {
   const response = await fetch(`${API}/api/v1/auth/registro`, {
@@ -512,10 +526,52 @@ try {
         "on a phone the Account tab fits the width: the yield, the card and the account stack",
       );
       await shot(page, "account-mobile");
+      // The Solvency Explorer on a fresh snapshot that holds this client's
+      // positions: each one is a leaf in its asset's tree.
+      const positionsCut = await freshCut(`e2e-${runId}-por2@example.mx`, password);
+      const ownProof = await (
+        await fetch(`${API}/api/v1/reserva/prueba`, {
+          headers: { authorization: `Bearer ${await apiLogin(email, password)}` },
+        })
+      ).json();
+      const held = ownProof.posiciones.map((x) => x.hoja.ticker);
+      check(
+        ownProof.corte.id === positionsCut.id && held.length > 0 && positionsCut.activos.length >= held.length,
+        `the fresh snapshot has a tree per asset and this client's positions (${held.join(", ")})`,
+      );
       await openTab(page, "Reserve");
-      await page.getByRole("button", { name: "Verify My Merkle Proof" }).click();
-      await page.getByTestId("proof-verdict").waitFor({ timeout: 15_000 });
-      await page.waitForTimeout(1500);
+      await page.getByTestId("position-row").first().waitFor();
+      const listed = await page
+        .getByTestId("position-row")
+        .evaluateAll((rows) => rows.filter((r) => r.dataset.status === "included").map((r) => r.dataset.ticker));
+      check(
+        held.every((t) => listed.includes(t)),
+        `the leaf auditor lists each position in the snapshot (${listed.join(", ")})`,
+      );
+      await page.getByTestId("verify-inclusion").click();
+      await page.getByTestId("proof-verdict").and(page.locator("[data-status=verified]")).waitFor({ timeout: 15_000 });
+      const tabs = page.getByTestId("trace-tab");
+      check((await tabs.count()) === held.length + 1, "one proof trace per tree: the cash and each asset");
+      for (const ticker of held) {
+        await tabs.and(page.locator(`[data-key="${ticker}"]`)).click();
+        await page.getByTestId("match-seal").and(page.locator("[data-status=match]")).waitFor();
+        check(
+          (await page.getByTestId("computed-root").innerText()).trim() ===
+            positionsCut.activos.find((a) => a.ticker === ticker)?.merkle_root,
+          `the ${ticker} position hashes up to the published ${ticker} root`,
+        );
+      }
+      check(
+        (await page.getByTestId("position-row").evaluateAll((rows) => rows.map((r) => r.innerText).join(" "))).includes(
+          "Verified",
+        ),
+        "the verified positions are marked in the leaf auditor",
+      );
+      check(
+        await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth),
+        "on a phone the Solvency Explorer fits the width",
+      );
+      await page.waitForTimeout(500);
       await shot(page, "reserve-mobile");
       check(true, "the dashboard works on a phone-sized screen");
 
@@ -1306,14 +1362,98 @@ try {
     await page.mouse.move(0, 0);
     await shot(page, "account-wealth-desktop");
 
-    // Proof of Reserve.
+    // Proof of Reserve: the Solvency Explorer, on a fresh snapshot that holds
+    // the deposit and the transfer to fixed term (15,000 cash, no positions).
+    const snapshot = await freshCut(`e2e-${runId}-por1@example.mx`, password);
     await openTab(page, "Reserve");
-    await page.getByRole("button", { name: "Verify My Merkle Proof" }).click();
+    await page.getByTestId("solvency-header").and(page.locator("[data-status=loaded]")).waitFor();
+    check(
+      (await page.getByTestId("reserve-root").innerText()).trim() === snapshot.merkle_root,
+      "the solvency header shows the latest published reserve root",
+    );
+    check(
+      (await page.getByTestId("reserve-ratio").innerText()).trim() === "100.00%",
+      "the reserve ratio reads 100.00%",
+    );
+    const custody = await page.getByTestId("custody-total").getAttribute("data-amount");
+    const owed = await page.getByTestId("liabilities-total").getAttribute("data-amount");
+    check(
+      custody === snapshot.total_reserva && owed === snapshot.total_pasivo && custody === owed,
+      `custody assets equal client liabilities (${owed})`,
+    );
+    const headerText = await page.getByTestId("solvency-header").innerText();
+    check(
+      snapshot.secuencia_mercado !== null &&
+        headerText.includes(`#${snapshot.secuencia_ledger}`) &&
+        headerText.includes(`#${snapshot.secuencia_mercado}`),
+      `the snapshot is anchored to the cash and market ledgers (#${snapshot.secuencia_ledger}, #${snapshot.secuencia_mercado})`,
+    );
+    // What Copy root puts on the clipboard is the root.
+    await page.evaluate(() => {
+      const write = navigator.clipboard.writeText.bind(navigator.clipboard);
+      navigator.clipboard.writeText = (text) => {
+        window.__copiedRoot = text;
+        return write(text);
+      };
+    });
+    await page.getByTestId("copy-root").click();
+    await page.getByTestId("copy-root").filter({ hasText: "Copied" }).waitFor();
+    check(
+      (await page.evaluate(() => window.__copiedRoot)) === snapshot.merkle_root,
+      "Copy root copies the published root",
+    );
+    // The leaf auditor: the leaf as published and what it commits to.
+    const leafAuditor = page.getByTestId("leaf-auditor");
+    await leafAuditor.getByTestId("leaf-hash").waitFor();
+    const publishedLeaf = (await leafAuditor.getByTestId("leaf-hash").innerText()).trim();
+    check(
+      /^[0-9a-f]{64}$/.test(publishedLeaf) && /as published/i.test(await leafAuditor.getByTestId("leaf-hash-source").innerText()),
+      "the leaf auditor shows the leaf hash as published",
+    );
+    check(
+      (await leafAuditor.getByTestId("leaf-total").innerText()).includes("15,000.00") &&
+        (await leafAuditor.getByTestId("balance-line").count()) === 1,
+      "the leaf commits to 15,000.00, all of it available cash",
+    );
+    check(
+      (await page.getByTestId("position-row").count()) === 0,
+      "no asset positions yet: nothing else in the snapshot is this client's",
+    );
+    await page.getByTestId("trace-idle").waitFor();
+    const verifyButton = page.getByTestId("verify-inclusion");
+    await page.mouse.move(0, 0);
+    const verifyStyle = await verifyButton.evaluate((el) => ({
+      color: getComputedStyle(el).backgroundColor,
+      radius: getComputedStyle(el).borderRadius,
+    }));
+    check(
+      verifyStyle.color === "rgb(234, 179, 8)" && verifyStyle.radius === "0px",
+      "Verify My Inclusion is a square, solid gold button",
+    );
+    await shot(page, "reserve-before");
+    await verifyButton.click();
     const proof = page.getByTestId("proof-verdict");
-    await proof.waitFor({ timeout: 15_000 });
+    await proof.and(page.locator("[data-status=verified]")).waitFor({ timeout: 15_000 });
     check((await proof.innerText()).includes("Verified"), "browser verifies the Merkle proof against the published root");
+    await page.getByTestId("match-seal").and(page.locator("[data-status=match]")).waitFor();
+    check(
+      (await page.getByTestId("computed-root").innerText()).trim() === snapshot.merkle_root &&
+        (await page.getByTestId("published-root").innerText()).trim() === snapshot.merkle_root,
+      "the trace ends on the published root, under the cryptographic match seal",
+    );
+    check(
+      (await leafAuditor.getByTestId("leaf-hash").innerText()).trim() === publishedLeaf &&
+        /recomputed in your browser/i.test(await leafAuditor.getByTestId("leaf-hash-source").innerText()),
+      "the browser recomputes the same leaf hash",
+    );
+    const levels = await page.getByTestId("trace-level").count();
+    check(
+      levels >= 1 && levels <= Math.ceil(Math.log2(snapshot.num_hojas)),
+      `the trace shows each level from the leaf to the root (${levels} for ${snapshot.num_hojas} leaves)`,
+    );
     await page.getByText("Server check: agrees").waitFor();
     check(true, "server-side verification agrees");
+    await shot(page, "reserve-verified");
 
     // Immutable ledger feed.
     await openTab(page, "Account");
@@ -1345,7 +1485,7 @@ try {
     // A dishonest server: a private root (differs from the public copy of the
     // cut) or a leaf for another account must both fail in the browser.
     await openTab(page, "Reserve");
-    await page.getByRole("button", { name: "Verify My Merkle Proof" }).click();
+    await page.getByTestId("verify-inclusion").click();
     await page.getByTestId("proof-verdict").waitFor({ timeout: 15_000 });
     const tamper = async (pattern, edit) => {
       await page.route(pattern, async (route) => {
@@ -1360,6 +1500,10 @@ try {
     };
     let issues = await tamper("**/api/v1/reserva/cortes/*", (cut) => ({ ...cut, merkle_root: "00".repeat(32) }));
     check(issues.includes("public copy"), "a root that differs from the public cut fails verification");
+    check(
+      (await page.getByTestId("match-seal").getAttribute("data-status")) === "mismatch",
+      "against a private root the trace ends without the match seal",
+    );
     issues = await tamper("**/api/v1/reserva/prueba", (pr) => ({
       ...pr,
       hoja: { ...pr.hoja, cuenta_id: "00000000-0000-4000-8000-000000000000" },
