@@ -257,6 +257,35 @@ jobs:
       - name: forge test
         run: forge test -vv
 
+      # The Arbitrum Sepolia deployment (script/DeployTestnet.s.sol), rehearsed on anvil end to end: broadcast, then
+      # CheckTestnet re-checks every wiring from the manifest it wrote. Public addresses only, no key anywhere:
+      # anvil's unlocked account 0 deploys (--unlocked), its accounts 1 to 4 stand in for the KMS keys' addresses,
+      # and the feed's provider and commitment are the fixtures' (circuits/scripts/gen-feed-fixtures.mjs).
+      - name: Testnet deployment, rehearsed on anvil (DeployTestnet, then CheckTestnet from its manifest)
+        env:
+          RPC: http://127.0.0.1:8545
+          DEPLOYER: "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"
+          OPERATOR_ADDRESS: "0x70997970C51812dc3A010C7d01b50e0d17dc79C8"
+          NOTARY_ADDRESS: "0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC"
+          RELAYER_ADDRESS: "0x90F79bf6EB2c4f870365E785982E1f101E93b906"
+          AUTOMATOR_ADDRESS: "0x15d34AAf54267DB7D7c367839AAf71A00a2C6A65"
+          PROVIDER_ID: "0x08abf07e8766aa49bf37ef22bd0341a2953a237b4933784bd9fee44bda8be771"
+          QUERY_COMMITMENT: "0x16deddae37e6a51b4a9b7e8ee87c29e94b8f38e75a2ad04d1d883956ffe5a162"
+          INITIAL_PRICE: "3456780000000000000000"
+          BOT_GAS_WEI: "100000000000000000"
+        run: |
+          anvil --silent --port 8545 &
+          for _ in $(seq 100); do cast chain-id --rpc-url "$RPC" >/dev/null 2>&1 && break; sleep 0.1; done
+          forge script script/DeployTestnet.s.sol:DeployTestnet --rpc-url "$RPC" --unlocked --sender "$DEPLOYER" --broadcast
+          forge script script/DeployTestnet.s.sol:CheckTestnet --rpc-url "$RPC"
+          jq -e '.chainId == 31337 and .devKeyVerifiers == true and .batchSize == 4 and .operator == env.OPERATOR_ADDRESS' deployments/31337.json
+          # The executor answers to the operator's key, and the bots got their gas.
+          executor=$(jq -r .contracts.executor deployments/31337.json)
+          test "$(cast call --rpc-url "$RPC" "$executor" 'operator()(address)')" = "$OPERATOR_ADDRESS"
+          test "$(cast balance --rpc-url "$RPC" "$RELAYER_ADDRESS")" = "$BOT_GAS_WEI"
+          # The frontend's configuration comes from this manifest (strawberryswap/frontend/scripts/env-from-manifest.mjs).
+          echo "TESTNET_MANIFEST=$PWD/deployments/31337.json" >> "$GITHUB_ENV"
+
   # ---------------------------------------------------------------------------
   # StrawberrySwap's market-making engine (strawberryswap/bots/hft-engine-rust):
   # the Avellaneda–Stoikov closed forms against the Python lab's golden vectors,
@@ -1050,6 +1079,31 @@ jobs:
           echo "Using ${config}"
           tflint --chdir=terraform --config="${config}" --init
           tflint --chdir=terraform --config="${config}" --format=compact
+
+      # StrawberrySwap's AWS environment (strawberryswap/infra/terraform): the bot host, its metadata bucket and the
+      # testnet's KMS signing keys. `terraform test` plans the signing-keys module offline (placeholder credentials)
+      # and checks the key policies it renders: only each signer's role signs, digests only, never the account root.
+      - name: StrawberrySwap Terraform - fmt, validate, signing-keys tests
+        id: strawberryswap-terraform
+        if: ${{ !cancelled() && steps.setup-terraform.outcome == 'success' }}
+        working-directory: strawberryswap/infra/terraform
+        run: |
+          terraform fmt -check -recursive -diff
+          terraform -chdir=envs/prod init -backend=false -input=false
+          terraform -chdir=envs/prod validate
+          terraform -chdir=modules/signing-keys init -backend=false -input=false
+          terraform -chdir=modules/signing-keys test
+
+      - name: StrawberrySwap Terraform - tflint
+        if: ${{ !cancelled() && steps.strawberryswap-terraform.outcome == 'success' && steps.setup-tflint.outcome == 'success' }}
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          config="${GITHUB_WORKSPACE}/.github/linters/.tflint.hcl"
+          for dir in envs/prod modules/signing-keys; do
+            tflint --chdir="strawberryswap/infra/terraform/${dir}" --config="${config}" --init
+            tflint --chdir="strawberryswap/infra/terraform/${dir}" --config="${config}" --format=compact
+          done
 
       - name: Install ShellCheck ${{ env.SHELLCHECK_VERSION }} and actionlint ${{ env.ACTIONLINT_VERSION }}
         id: linters

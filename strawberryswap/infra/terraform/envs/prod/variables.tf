@@ -14,8 +14,15 @@ variable "alert_email" {
 }
 
 variable "monthly_budget_usd" {
-  type    = number
-  default = 5
+  type        = number
+  default     = 20
+  description = "Alert threshold. The testnet's signing keys cost about $1 a month each (5 with a deployer key) plus ~$0.15 per 10,000 signatures: the relayer's and the notary's ~15 s cadence is about 173,000 each a month (~$2.60 each)."
+}
+
+variable "deployer_principal_arns" {
+  type        = list(string)
+  default     = []
+  description = "IAM roles or users that may sign with the deployer's KMS key (forge script --aws). Empty: no deployer key; deploy with a hardware wallet instead."
 }
 
 variable "instance_type" {

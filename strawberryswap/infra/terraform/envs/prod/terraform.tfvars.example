@@ -3,3 +3,5 @@ alert_email = "ops@example.org"
 # instance_type        = "t3.micro"
 # instance_count       = 1        # >1 leaves the 750 h/month Free Tier; also set allow_over_free_tier = true
 # db_deletion_protection = true
+# monthly_budget_usd   = 20       # alert threshold; the KMS signing keys are ~$1/month each plus signatures
+# deployer_principal_arns = ["arn:aws:iam::123456789012:role/strawberryswap-deployers"]  # adds a KMS deployer key
