@@ -1,13 +1,14 @@
-//! End to end, every piece real but the exchanges and KMS: the three binaries as separate processes, the dev Groth16
-//! verifier, ZkDecoOracle and ZkPriceFeed deployed on anvil, and the relayer's KMS-signed pushes landing on chain.
+//! End to end, every piece real but the exchanges and KMS: the three binaries and the relayer vault as separate
+//! processes, the dev Groth16 verifier, ZkDecoOracle and ZkPriceFeed deployed on anvil, and the relayer's pushes,
+//! signed by the relayer vault with the relayer's KMS key, landing on chain.
 //!
 //! ```text
-//! stand-in exchanges ─► price-endpoint ─► notary (KMS) ─► relayer (proof, KMS-signed push) ─► ZkPriceFeed on anvil
+//! stand-in exchanges ─► price-endpoint ─► notary (KMS) ─► relayer (proof) ─► relayer vault (KMS) ─► ZkPriceFeed
 //! ```
 //!
-//! It needs anvil and the contracts' forge build (contracts/out), so it is ignored by default; CI runs it:
-//! `forge build` in strawberryswap/contracts, then `cargo test --test e2e_anvil -- --ignored`. `ANVIL` overrides the
-//! anvil executable.
+//! It needs anvil, the contracts' forge build (contracts/out) and the vault's binary, so it is ignored by default; CI
+//! runs it: `forge build` in strawberryswap/contracts, the vault built, then `cargo test --test e2e_anvil -- --ignored`.
+//! `ANVIL` overrides the anvil executable, `THRESHOLD_SIGNER_BIN` the vault's.
 
 mod common;
 
@@ -143,7 +144,50 @@ fn salt_file(dir: &Path, name: &str, salt: U256) -> PathBuf {
     path
 }
 
-fn relayer(rpc: &str, feed: Address, notary: &str, salt_file: &Path, kms: &FakeKms, cycles: u64) -> Command {
+/// The relayer vault: the relayer's key in the stand-in KMS, `ZkPriceFeed.submit` only. Returns once it listens.
+async fn relayer_vault(rpc: &str, feed: Address, kms: &FakeKms, socket: &Path) -> Process {
+    let binary = std::env::var_os("THRESHOLD_SIGNER_BIN").map_or_else(
+        || common::crate_dir().join("../vaults/threshold-signer/target/debug/threshold-signer"),
+        PathBuf::from,
+    );
+    let mut command = service(binary.to_str().unwrap());
+    command.args([
+        "--role",
+        "relayer",
+        "--chain-id",
+        &CHAIN_ID.to_string(),
+        "--rpc-url",
+        rpc,
+        "--kms-key-id",
+        "relayer-key",
+        "--kms-endpoint",
+        &kms.url,
+        "--kms-region",
+        "us-east-1",
+        "--feed",
+        &feed.to_string(),
+        "--max-fee-eth-per-window",
+        "100",
+        "--socket",
+        socket.to_str().unwrap(),
+    ]);
+    let mut child = command.spawn().unwrap();
+    let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
+    loop {
+        let line = tokio::time::timeout(Duration::from_secs(30), lines.next_line())
+            .await
+            .expect("the vault did not start")
+            .unwrap()
+            .expect("the vault exited");
+        println!("vault: {line}");
+        if line.starts_with("listening on") {
+            break;
+        }
+    }
+    Process(child)
+}
+
+fn relayer(rpc: &str, feed: Address, notary: &str, salt_file: &Path, vault: &Path, cycles: u64) -> Command {
     let crate_dir = common::crate_dir();
     let mut command = service(env!("CARGO_BIN_EXE_relayer"));
     command.args([
@@ -157,12 +201,8 @@ fn relayer(rpc: &str, feed: Address, notary: &str, salt_file: &Path, kms: &FakeK
         notary,
         "--salt-file",
         salt_file.to_str().unwrap(),
-        "--kms-key-id",
-        "relayer-key",
-        "--kms-endpoint",
-        &kms.url,
-        "--kms-region",
-        "us-east-1",
+        "--vault-socket",
+        vault.to_str().unwrap(),
         "--zk-dir",
         crate_dir.join("zk").to_str().unwrap(),
         "--prover-script",
@@ -196,7 +236,7 @@ async fn the_pipeline_keeps_the_feed_fresh_on_chain() {
     let provider = ProviderBuilder::new().connect_http(rpc.parse().unwrap()).erased();
     let deployer = provider.get_accounts().await.unwrap()[0];
 
-    // KMS: the notary's key and the relayer's gas key. The relayer's address gets test ETH for gas.
+    // KMS: the notary's key and the relayer's gas key (the relayer vault's). Its address gets test ETH for gas.
     let notary_key = test_key("e2e: notary");
     let relayer_key = test_key("e2e: relayer");
     let kms = FakeKms::start(&[("notary-key", notary_key.clone()), ("relayer-key", relayer_key.clone())]).await;
@@ -261,17 +301,19 @@ async fn the_pipeline_keeps_the_feed_fresh_on_chain() {
 
     let dir = std::env::temp_dir().join(format!("zk-oracle-e2e-{}", std::process::id()));
     fs::create_dir_all(&dir).unwrap();
+    let socket = dir.join("vault").join("relayer.sock");
+    let _vault = relayer_vault(&rpc, feed, &kms, &socket).await;
 
     // A relayer with the wrong salt never starts: its instrument is not the feed's.
     let wrong = salt_file(&dir, "wrong-salt", salt() + U256::from(1));
-    let output = relayer(&rpc, feed, &notary_url, &wrong, &kms, 1).stderr(Stdio::piped()).output().await.unwrap();
+    let output = relayer(&rpc, feed, &notary_url, &wrong, &socket, 1).stderr(Stdio::piped()).output().await.unwrap();
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("wrong salt"), "{stderr}");
 
     // The relayer: four cycles, 3 s apart. After its first push the market moves to 3500, and the feed follows.
     let right = salt_file(&dir, "salt", salt());
-    let mut child = relayer(&rpc, feed, &notary_url, &right, &kms, 4).spawn().unwrap();
+    let mut child = relayer(&rpc, feed, &notary_url, &right, &socket, 4).spawn().unwrap();
     let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
     let mut relayer_process = Process(child);
     let mut pushes = Vec::new();
@@ -294,7 +336,8 @@ async fn the_pipeline_keeps_the_feed_fresh_on_chain() {
     let (last_at, last_price) = *pushes.last().unwrap();
     assert_eq!(last_price, wad("3500"), "the feed follows the market");
 
-    // On chain: the feed holds the last push, and every push is a PriceUpdated from the relayer's KMS address.
+    // On chain: the feed holds the last push, and every push is a PriceUpdated from the relayer's KMS address (the
+    // relayer vault's).
     let latest = feed_contract.latestVerifiedPrice().call().await.unwrap();
     assert_eq!((latest.price1e18, latest.updatedAt), (last_price, last_at));
     let block = provider.get_block_number().await.unwrap();
@@ -314,7 +357,7 @@ async fn the_pipeline_keeps_the_feed_fresh_on_chain() {
     println!("{} pushes on chain by {relayer_address}, up to block {block}", events.len());
 
     // The notary signed one digest per attestation, and KMS never saw the relayer's key sign anything else than
-    // the pushes (one signature per transaction, plus none for the refused relayer).
+    // the pushes: the vault signed once per transaction, and nothing for the refused relayer.
     let signed = kms.signed();
     let by_relayer = signed.iter().filter(|(key, _)| key == "relayer-key").count();
     assert_eq!(by_relayer, pushes.len());
