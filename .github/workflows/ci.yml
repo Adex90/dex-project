@@ -383,6 +383,37 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
   # ---------------------------------------------------------------------------
+  # The testnet soak's harness and the calibration lab (Python): the lab's tests, and ops/soak's: the telemetry export
+  # in the lab's formats, the comparison with the lab at γ = 0.0041 (it reruns the lab), the RPC failover proxy, the
+  # drill checker, the competing searcher's plan against DarkPool's rules, and the live drills' scripts run against a
+  # stand-in engine (systemctl stubbed; the RPC drill drives a real proxy).
+  soak-harness:
+    name: Soak harness and calibration lab (Python)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: strawberryswap/hft-engine/python-sim/requirements.txt
+
+      - name: The lab's requirements (pinned)
+        run: python -m pip install --disable-pip-version-check -r strawberryswap/hft-engine/python-sim/requirements.txt
+
+      - name: The calibration lab's tests
+        working-directory: strawberryswap/hft-engine/python-sim
+        run: python -m unittest discover -s tests -t .
+
+      - name: The soak harness's tests
+        working-directory: strawberryswap
+        run: python -m unittest discover -s ops/soak/tests -t ops/soak -v
+
+  # ---------------------------------------------------------------------------
   # StrawberrySwap's market-making engine (strawberryswap/bots/hft-engine-rust):
   # the Avellaneda–Stoikov closed forms against the Python lab's golden vectors,
   # the curve planner against the C++ engine's, the 100 ms loop on paused
@@ -1247,7 +1278,7 @@ jobs:
   ci-ok:
     name: CI result
     if: ${{ always() }}
-    needs: [frontend, backend, contracts, testnet-release, hft-engine, threshold-signer, oracle, system-e2e, automator, sql-suites, e2e, docker, iac-and-scripts]
+    needs: [frontend, backend, contracts, testnet-release, soak-harness, hft-engine, threshold-signer, oracle, system-e2e, automator, sql-suites, e2e, docker, iac-and-scripts]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
