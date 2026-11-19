@@ -265,9 +265,9 @@ jobs:
   # testnet deployment, CheckTestnet re-checks every wiring from the manifest it wrote, the frontend is configured
   # from that manifest (scripts/env-from-manifest.mjs) and built as a static export that must carry the
   # trusted-bootstrap banner, and ops/release/publish-ipfs.sh computes the release's IPFS CIDs (dry run: no node,
-  # no network). Public addresses only, no key anywhere: anvil's unlocked account 0 deploys (--unlocked), its
-  # accounts 1 to 4 stand in for the KMS keys' addresses, and the feed's provider and commitment are the fixtures'
-  # (circuits/scripts/gen-feed-fixtures.mjs).
+  # no network). Public addresses only, no key anywhere: anvil's unlocked account 0 deploys (--unlocked), unfunded
+  # placeholder addresses stand in for the KMS keys' (so the gas they receive is all they hold), and the feed's
+  # provider and commitment are the fixtures' (circuits/scripts/gen-feed-fixtures.mjs).
   testnet-release:
     name: Testnet release rehearsal (anvil deployment, frontend, IPFS CIDs)
     runs-on: ubuntu-24.04
@@ -275,10 +275,10 @@ jobs:
     env:
       RPC: http://127.0.0.1:8545
       DEPLOYER: "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"
-      OPERATOR_ADDRESS: "0x70997970C51812dc3A010C7d01b50e0d17dc79C8"
-      NOTARY_ADDRESS: "0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC"
-      RELAYER_ADDRESS: "0x90F79bf6EB2c4f870365E785982E1f101E93b906"
-      AUTOMATOR_ADDRESS: "0x15d34AAf54267DB7D7c367839AAf71A00a2C6A65"
+      OPERATOR_ADDRESS: "0x1000000000000000000000000000000000000001"
+      NOTARY_ADDRESS: "0x1000000000000000000000000000000000000002"
+      RELAYER_ADDRESS: "0x1000000000000000000000000000000000000003"
+      AUTOMATOR_ADDRESS: "0x1000000000000000000000000000000000000004"
       PROVIDER_ID: "0x08abf07e8766aa49bf37ef22bd0341a2953a237b4933784bd9fee44bda8be771"
       QUERY_COMMITMENT: "0x16deddae37e6a51b4a9b7e8ee87c29e94b8f38e75a2ad04d1d883956ffe5a162"
       INITIAL_PRICE: "3456780000000000000000"
@@ -312,15 +312,20 @@ jobs:
           forge script script/DeployTestnet.s.sol:DeployTestnet --rpc-url "$RPC" --unlocked --sender "$DEPLOYER" --broadcast
           forge script script/DeployTestnet.s.sol:CheckTestnet --rpc-url "$RPC"
           jq -e '.chainId == 31337 and .devKeyVerifiers == true and .batchSize == 4 and .operator == env.OPERATOR_ADDRESS' deployments/31337.json
-          # The executor answers to the operator's key, and the bots got their gas.
+          # The executor answers to the operator's key, and each bot got its gas.
           executor=$(jq -r .contracts.executor deployments/31337.json)
-          test "$(cast call --rpc-url "$RPC" "$executor" 'operator()(address)')" = "$OPERATOR_ADDRESS"
-          test "$(cast balance --rpc-url "$RPC" "$RELAYER_ADDRESS")" = "$BOT_GAS_WEI"
+          got=$(cast call --rpc-url "$RPC" "$executor" 'operator()(address)')
+          [ "$got" = "$OPERATOR_ADDRESS" ] || { echo "::error::the executor's operator is $got"; exit 1; }
+          for bot in "$OPERATOR_ADDRESS" "$RELAYER_ADDRESS" "$AUTOMATOR_ADDRESS"; do
+            got=$(cast balance --rpc-url "$RPC" "$bot")
+            [ "$got" = "$BOT_GAS_WEI" ] || { echo "::error::$bot holds $got wei, not $BOT_GAS_WEI"; exit 1; }
+          done
           # Every contract the release publishes (deployments/contracts.tsv) has its address and its artifact.
           while IFS=$'\t' read -r key source name; do
             case "$key" in '#'* | '') continue ;; esac
-            jq -e --arg k "$key" '.contracts[$k] | test("^0x[0-9a-fA-F]{40}$")' deployments/31337.json >/dev/null
-            test -f "out/$(basename "$source")/$name.json"
+            jq -e --arg k "$key" '.contracts[$k] | test("^0x[0-9a-fA-F]{40}$")' deployments/31337.json >/dev/null ||
+              { echo "::error::the manifest has no address for $key"; exit 1; }
+            [ -f "out/$(basename "$source")/$name.json" ] || { echo "::error::no artifact for $key ($source:$name)"; exit 1; }
           done < deployments/contracts.tsv
 
       - uses: actions/setup-node@v7
