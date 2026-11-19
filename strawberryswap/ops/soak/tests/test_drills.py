@@ -74,10 +74,10 @@ class DrillScriptsTest(unittest.TestCase):
             if 1.0 <= t < 1.2:
                 yield {"event": "skipped", "reason": "oracle reading stamped … outside [now − 45 s, now + 5 s]"}
                 yield {"event": "alert", "alert": "oracle_stale", "detail": "stale"}
-            if 4.5 <= t < 4.7:  # the relayer's first push after the restart (the drill ends at ~3.5 s)
+            if 5.5 <= t < 5.7:  # the relayer's first push after the restart (the drill ends at ~3.6 s)
                 yield {"event": "resolved", "alert": "oracle_stale"}
 
-        rc, out = self.run_drill("stale-feed", script, DOWN_S="3", RECOVER_S="4")
+        rc, out = self.run_drill("stale-feed", script, DOWN_S="3", RECOVER_S="6")
         self.assertEqual(rc, 0, out)
         self.assertIn("drill stale-feed: PASS", out)
 
@@ -92,15 +92,15 @@ class DrillScriptsTest(unittest.TestCase):
 
     def test_vault_down(self):
         def script(t):
-            if 1.0 <= t < 3.0:
+            if 1.0 <= t < 3.6:  # ~13 attempts, each withdrawn: nothing can sign them
                 yield {"event": "withdrawn", "nonce": 7, "reason": "vault unavailable: connect: no such file"}
-            if 2.8 <= t < 3.0:
+            if 3.4 <= t < 3.6:
                 yield {"event": "alert", "alert": "vault_down", "detail": "vault unavailable"}
-            if 5.0 <= t < 5.2:  # the vault is back (the drill ends at ~4.5 s): the next rebalance is sent
+            if 6.5 <= t < 6.7:  # the vault is back (the drill ends at ~4.6 s): the next rebalance is sent
                 yield {"event": "sent", "nonce": 7, "tx": "0x07"}
                 yield {"event": "resolved", "alert": "vault_down"}
 
-        rc, out = self.run_drill("vault-down", script, DOWN_S="4", RECOVER_S="5")
+        rc, out = self.run_drill("vault-down", script, DOWN_S="4", RECOVER_S="8")
         self.assertEqual(rc, 0, out)
         self.assertIn("drill vault-down: PASS", out)
 

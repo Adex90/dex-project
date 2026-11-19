@@ -6,6 +6,7 @@ import csv
 import importlib.util
 import json
 import math
+import os
 import random
 import sys
 import tempfile
@@ -169,7 +170,13 @@ class CompareTest(unittest.TestCase):
             (d / "calibration.json").write_text(json.dumps({"engine": PARAMS}))
             out = d / "export"
             self.assertEqual(export_lab.main(["--engine", str(d / "engine.jsonl"), "--calibration", str(d / "calibration.json"), "--out", str(out)]), 0)
-            self.assertEqual(compare.main(["--export", str(out), "--gamma", "0.0041", "--paths", "40"]), 0)
+            # A relative --export, as the runbook writes it: the lab runs from its own directory.
+            cwd = os.getcwd()
+            os.chdir(d)
+            try:
+                self.assertEqual(compare.main(["--export", "export", "--gamma", "0.0041", "--paths", "40"]), 0)
+            finally:
+                os.chdir(cwd)
             result = json.loads((out / "comparison.json").read_text())
             self.assertEqual(result["gamma"], 0.0041)
             names = [c["name"] for c in result["checks"]]

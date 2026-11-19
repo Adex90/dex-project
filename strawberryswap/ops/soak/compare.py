@@ -189,6 +189,9 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--paths", type=int, default=500, help="the lab's Monte Carlo fill paths per episode [500]")
     p.add_argument("--python", default=sys.executable, help="the Python with the lab's requirements")
     args = p.parse_args(argv)
+    args.export = args.export.resolve()  # the lab runs from its own directory
+    if args.lab_run:
+        args.lab_run = args.lab_run.resolve()
 
     summary = json.loads((args.export / "soak_summary.json").read_text())
     engine_gamma = summary["engine_params"]["gamma"]
