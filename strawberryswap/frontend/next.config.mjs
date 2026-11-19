@@ -29,6 +29,9 @@ const nextConfig = {
   reactStrictMode: true,
   poweredByHeader: false,
   productionBrowserSourceMaps: false,
+  // Reproducible releases: the same commit and configuration give the same files, so the same IPFS CID
+  // (ops/release/publish-ipfs.sh). Next's build id is otherwise random per build; NEXT_BUILD_ID pins it.
+  generateBuildId: async () => process.env.NEXT_BUILD_ID || null,
   webpack(config, { isServer }) {
     // `web-worker` (an ffjavascript dependency) has a Node variant with a dynamic require. Only the SERVER pass
     // (prerendering) resolves it; that code never runs there, and the client pass uses the browser variant

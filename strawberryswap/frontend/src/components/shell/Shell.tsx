@@ -8,6 +8,7 @@ import { useApp } from "@/components/AppState";
 import { SettingsMenu, useSettings } from "@/components/settings/Settings";
 import { IconEarn, IconPortfolio, IconStocks, IconTrade, IconWallet } from "@/components/ui/icons";
 import { Logo } from "@/components/ui/Mascot";
+import { TestnetBadge } from "@/components/shell/TestnetBanner";
 import { useWalletModal } from "@/components/wallet/WalletModal";
 
 const TABS = [
@@ -64,6 +65,7 @@ export function AppHeader() {
         <Link href="/" aria-label="StrawberrySwap home" className="rounded-2xl focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-fuchsia">
           <Logo compact />
         </Link>
+        <TestnetBadge />
 
         <nav aria-label="Main" className="ml-4 hidden items-center gap-1 rounded-full bg-plum-900/70 p-1 shadow-inset lg:flex">
           {TABS.map(({ href, label, short, Icon }) => {

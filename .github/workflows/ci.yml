@@ -69,6 +69,9 @@ env:
   # forge-std, which they import. lib/ is not committed, so CI clones the tag and
   # checks its src/ tree against this SHA-256 (the tree the suites were verified
   # with): `find src -type f | LC_ALL=C sort | xargs sha256sum | sha256sum`.
+  # kubo (the IPFS CLI) for the testnet release rehearsal's CIDs: GitHub release asset, SHA-256 of the tarball.
+  KUBO_VERSION: v0.38.1
+  KUBO_SHA256: 2588079855e6a4d218cf3c70b9945d5daa356fe852f67c4cfb62a4809b69c002
   FOUNDRY_VERSION: v1.7.1
   FORGE_STD_VERSION: v1.9.4
   FORGE_STD_SRC_SHA256: 6796bb6e13e5fe07ebc0f8f3e31f92c7d96cf226a428cd9e381cbf0ede15b14d
@@ -257,23 +260,53 @@ jobs:
       - name: forge test
         run: forge test -vv
 
-      # The Arbitrum Sepolia deployment (script/DeployTestnet.s.sol), rehearsed on anvil end to end: broadcast, then
-      # CheckTestnet re-checks every wiring from the manifest it wrote. Public addresses only, no key anywhere:
-      # anvil's unlocked account 0 deploys (--unlocked), its accounts 1 to 4 stand in for the KMS keys' addresses,
-      # and the feed's provider and commitment are the fixtures' (circuits/scripts/gen-feed-fixtures.mjs).
-      - name: Testnet deployment, rehearsed on anvil (DeployTestnet, then CheckTestnet from its manifest)
-        env:
-          RPC: http://127.0.0.1:8545
-          DEPLOYER: "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"
-          OPERATOR_ADDRESS: "0x70997970C51812dc3A010C7d01b50e0d17dc79C8"
-          NOTARY_ADDRESS: "0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC"
-          RELAYER_ADDRESS: "0x90F79bf6EB2c4f870365E785982E1f101E93b906"
-          AUTOMATOR_ADDRESS: "0x15d34AAf54267DB7D7c367839AAf71A00a2C6A65"
-          PROVIDER_ID: "0x08abf07e8766aa49bf37ef22bd0341a2953a237b4933784bd9fee44bda8be771"
-          QUERY_COMMITMENT: "0x16deddae37e6a51b4a9b7e8ee87c29e94b8f38e75a2ad04d1d883956ffe5a162"
-          INITIAL_PRICE: "3456780000000000000000"
-          BOT_GAS_WEI: "100000000000000000"
+  # ---------------------------------------------------------------------------
+  # The Arbitrum Sepolia release, rehearsed end to end on anvil: script/DeployTestnet.s.sol broadcasts the whole
+  # testnet deployment, CheckTestnet re-checks every wiring from the manifest it wrote, the frontend is configured
+  # from that manifest (scripts/env-from-manifest.mjs) and built as a static export that must carry the
+  # trusted-bootstrap banner, and ops/release/publish-ipfs.sh computes the release's IPFS CIDs (dry run: no node,
+  # no network). Public addresses only, no key anywhere: anvil's unlocked account 0 deploys (--unlocked), its
+  # accounts 1 to 4 stand in for the KMS keys' addresses, and the feed's provider and commitment are the fixtures'
+  # (circuits/scripts/gen-feed-fixtures.mjs).
+  testnet-release:
+    name: Testnet release rehearsal (anvil deployment, frontend, IPFS CIDs)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      RPC: http://127.0.0.1:8545
+      DEPLOYER: "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"
+      OPERATOR_ADDRESS: "0x70997970C51812dc3A010C7d01b50e0d17dc79C8"
+      NOTARY_ADDRESS: "0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC"
+      RELAYER_ADDRESS: "0x90F79bf6EB2c4f870365E785982E1f101E93b906"
+      AUTOMATOR_ADDRESS: "0x15d34AAf54267DB7D7c367839AAf71A00a2C6A65"
+      PROVIDER_ID: "0x08abf07e8766aa49bf37ef22bd0341a2953a237b4933784bd9fee44bda8be771"
+      QUERY_COMMITMENT: "0x16deddae37e6a51b4a9b7e8ee87c29e94b8f38e75a2ad04d1d883956ffe5a162"
+      INITIAL_PRICE: "3456780000000000000000"
+      BOT_GAS_WEI: "100000000000000000"
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install Foundry ${{ env.FOUNDRY_VERSION }}
+        uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: ${{ env.FOUNDRY_VERSION }}
+
+      - name: Fetch forge-std ${{ env.FORGE_STD_VERSION }} and check its source tree
+        working-directory: strawberryswap/contracts
         run: |
+          git clone --quiet --depth 1 --branch "$FORGE_STD_VERSION" https://github.com/foundry-rs/forge-std.git lib/forge-std
+          got=$(cd lib/forge-std && find src -type f | LC_ALL=C sort | xargs sha256sum | sha256sum | cut -d' ' -f1)
+          if [ "$got" != "$FORGE_STD_SRC_SHA256" ]; then
+            echo "::error::forge-std $FORGE_STD_VERSION src/ tree is $got, expected $FORGE_STD_SRC_SHA256"
+            exit 1
+          fi
+
+      - name: Deploy the testnet on anvil (DeployTestnet), then re-check it from its manifest (CheckTestnet)
+        working-directory: strawberryswap/contracts
+        run: |
+          forge build
           anvil --silent --port 8545 &
           for _ in $(seq 100); do cast chain-id --rpc-url "$RPC" >/dev/null 2>&1 && break; sleep 0.1; done
           forge script script/DeployTestnet.s.sol:DeployTestnet --rpc-url "$RPC" --unlocked --sender "$DEPLOYER" --broadcast
@@ -283,8 +316,58 @@ jobs:
           executor=$(jq -r .contracts.executor deployments/31337.json)
           test "$(cast call --rpc-url "$RPC" "$executor" 'operator()(address)')" = "$OPERATOR_ADDRESS"
           test "$(cast balance --rpc-url "$RPC" "$RELAYER_ADDRESS")" = "$BOT_GAS_WEI"
-          # The frontend's configuration comes from this manifest (strawberryswap/frontend/scripts/env-from-manifest.mjs).
-          echo "TESTNET_MANIFEST=$PWD/deployments/31337.json" >> "$GITHUB_ENV"
+          # Every contract the release publishes (deployments/contracts.tsv) has its address and its artifact.
+          while IFS=$'\t' read -r key source name; do
+            case "$key" in '#'* | '') continue ;; esac
+            jq -e --arg k "$key" '.contracts[$k] | test("^0x[0-9a-fA-F]{40}$")' deployments/31337.json >/dev/null
+            test -f "out/$(basename "$source")/$name.json"
+          done < deployments/contracts.tsv
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: strawberryswap/frontend/package-lock.json
+
+      - name: Frontend for this deployment (env-from-manifest), with the testnet banner on every page
+        working-directory: strawberryswap/frontend
+        env:
+          NEXT_TELEMETRY_DISABLED: "1"
+        run: |
+          npm ci --no-audit --no-fund
+          npm run typecheck
+          node --test scripts/env-from-manifest.test.mjs
+          node scripts/env-from-manifest.mjs ../contracts/deployments/31337.json --out .env.production.local
+          NEXT_BUILD_ID="${GITHUB_SHA::12}" npm run build
+          npm run verify:static
+          for page in out/index.html out/trade/index.html out/terms/index.html; do
+            grep -q 'data-testid="testnet-banner"' "$page" || { echo "::error::$page has no testnet banner"; exit 1; }
+            grep -q 'development keys from a single-party setup' "$page" || { echo "::error::$page does not disclose the dev keys"; exit 1; }
+          done
+
+      - name: Install kubo ${{ env.KUBO_VERSION }} (the IPFS CLI)
+        run: |
+          cd "${RUNNER_TEMP}"
+          tarball="kubo_${KUBO_VERSION}_linux-amd64.tar.gz"
+          curl -fsSL --retry 3 -O "https://github.com/ipfs/kubo/releases/download/${KUBO_VERSION}/${tarball}"
+          echo "${KUBO_SHA256}  ${tarball}" | sha256sum --check --strict -
+          tar -xzf "${tarball}" kubo/ipfs
+          echo "${RUNNER_TEMP}/kubo" >> "$GITHUB_PATH"
+
+      - name: The release's IPFS CIDs (publish-ipfs.sh --dry-run)
+        working-directory: strawberryswap
+        run: |
+          ipfs version
+          ops/release/publish-ipfs.sh --manifest contracts/deployments/31337.json --site frontend/out \
+            --version "ci-${GITHUB_SHA::12}" --dry-run --record "${RUNNER_TEMP}/release.json"
+          jq -e '.site.cid | startswith("bafy")' "${RUNNER_TEMP}/release.json"
+          {
+            echo "### Testnet release rehearsal (anvil)"
+            echo
+            echo '```json'
+            cat "${RUNNER_TEMP}/release.json"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
 
   # ---------------------------------------------------------------------------
   # StrawberrySwap's market-making engine (strawberryswap/bots/hft-engine-rust):
@@ -1127,11 +1210,11 @@ jobs:
           "${bin}/shellcheck" --version
           "${bin}/actionlint" -version
 
-      - name: ShellCheck (scripts/*.sh, frontend/e2e/*.sh)
+      - name: ShellCheck (scripts/*.sh, frontend/e2e/*.sh, StrawberrySwap's ops and deployment scripts)
         if: ${{ !cancelled() && steps.linters.outcome == 'success' }}
         run: |
           shopt -s nullglob
-          files=(scripts/*.sh frontend/e2e/*.sh)
+          files=(scripts/*.sh frontend/e2e/*.sh strawberryswap/ops/*/*.sh strawberryswap/contracts/script/*.sh)
           if [ "${#files[@]}" -eq 0 ]; then
             echo "::warning::no shell scripts found"
             exit 0
@@ -1151,7 +1234,7 @@ jobs:
   ci-ok:
     name: CI result
     if: ${{ always() }}
-    needs: [frontend, backend, contracts, hft-engine, threshold-signer, oracle, system-e2e, automator, sql-suites, e2e, docker, iac-and-scripts]
+    needs: [frontend, backend, contracts, testnet-release, hft-engine, threshold-signer, oracle, system-e2e, automator, sql-suites, e2e, docker, iac-and-scripts]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
