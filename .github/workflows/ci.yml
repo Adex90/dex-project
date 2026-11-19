@@ -307,10 +307,18 @@ jobs:
         working-directory: strawberryswap/contracts
         run: |
           forge build
-          anvil --silent --port 8545 &
+          anvil --port 8545 > "${RUNNER_TEMP}/anvil.log" 2>&1 &
           for _ in $(seq 100); do cast chain-id --rpc-url "$RPC" >/dev/null 2>&1 && break; sleep 0.1; done
-          forge script script/DeployTestnet.s.sol:DeployTestnet --rpc-url "$RPC" --unlocked --sender "$DEPLOYER" --broadcast
-          forge script script/DeployTestnet.s.sol:CheckTestnet --rpc-url "$RPC"
+          # Each transaction after its predecessor is mined (--slow), within 5 minutes; if not, show where it stopped.
+          if ! timeout 300 forge script script/DeployTestnet.s.sol:DeployTestnet --rpc-url "$RPC" --unlocked \
+            --sender "$DEPLOYER" --broadcast --slow; then
+            echo "::error::the deployment did not complete on anvil"
+            echo "block $(cast block-number --rpc-url "$RPC" 2>&1)"
+            cast rpc --rpc-url "$RPC" txpool_status 2>&1 || true
+            tail -n 80 "${RUNNER_TEMP}/anvil.log"
+            exit 1
+          fi
+          timeout 300 forge script script/DeployTestnet.s.sol:CheckTestnet --rpc-url "$RPC"
           jq -e '.chainId == 31337 and .devKeyVerifiers == true and .batchSize == 4 and .operator == env.OPERATOR_ADDRESS' deployments/31337.json
           # The executor answers to the operator's key, and each bot got its gas.
           executor=$(jq -r .contracts.executor deployments/31337.json)
