@@ -4,6 +4,7 @@ import "@fontsource-variable/outfit";
 import "@fontsource-variable/jetbrains-mono";
 import "@/styles/globals.css";
 import { SettingsProvider } from "@/components/settings/Settings";
+import { TestnetBanner } from "@/components/shell/TestnetBanner";
 
 export const metadata: Metadata = {
   title: "StrawberrySwap — zero-fee private dark pool",
@@ -35,7 +36,11 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
   return (
     <html lang="en" className="dark">
       <body>
-        <SettingsProvider>{children}</SettingsProvider>
+        <SettingsProvider>
+          {/* Every page of a testnet build opens with the trusted-bootstrap disclosure (not dismissible). */}
+          <TestnetBanner />
+          {children}
+        </SettingsProvider>
       </body>
     </html>
   );

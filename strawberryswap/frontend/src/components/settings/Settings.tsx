@@ -113,6 +113,14 @@ const EN = {
   "phase.syncing": "Syncing",
   "phase.ready": "Ready",
   "phase.error": "Error",
+  "testnet.badge": "Testnet",
+  "testnet.region": "Testnet disclosure",
+  "testnet.title": "{chain} testnet with a trusted bootstrap. Nothing here has value.",
+  "testnet.oracle": "Rothbard operates the ETHUSD price endpoint and the notary, so the on-chain price is only as honest as both.",
+  "testnet.keys": "The zero-knowledge verifiers use development keys from a single-party setup: whoever holds that setup's secret could forge proofs.",
+  "testnet.tokens": "tWETH and tUSD are faucet tokens with no value.",
+  "testnet.disclosure": "On-chain disclosure",
+  "testnet.faucet": "{token} faucet",
 } as const;
 
 type Key = keyof typeof EN;
@@ -213,6 +221,14 @@ const ES: Record<Key, string> = {
   "phase.syncing": "Sincronizando",
   "phase.ready": "Lista",
   "phase.error": "Error",
+  "testnet.badge": "Testnet",
+  "testnet.region": "Aviso de red de prueba",
+  "testnet.title": "Red de prueba {chain} con arranque de confianza. Nada aquí tiene valor.",
+  "testnet.oracle": "Rothbard opera el servicio de precios ETHUSD y el notario, así que el precio en la cadena es tan honesto como ambos.",
+  "testnet.keys": "Los verificadores de conocimiento cero usan claves de desarrollo de una configuración de una sola parte: quien tenga el secreto de esa configuración podría falsificar pruebas.",
+  "testnet.tokens": "tWETH y tUSD son tokens de grifo sin valor.",
+  "testnet.disclosure": "Aviso en la cadena",
+  "testnet.faucet": "Grifo de {token}",
 };
 
 const DICT: Record<Lang, Record<Key, string>> = { en: EN, es: ES };

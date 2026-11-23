@@ -260,6 +260,35 @@ A mobile-first rebuild of the UI (presentation only: every hook, ABI, `lib/` and
 cd bots/hft-engine-rust && cargo test     # unit tests, plus end to end with the vault binary
 ```
 
+## The Arbitrum Sepolia testnet: testnet Phase 5
+
+Deploying the whole stack on Arbitrum Sepolia, and soaking it. `docs/TESTNET.md` is the deployment, end to end;
+`ops/soak/RUNBOOK.md` is the 72-hour soak.
+
+* **Keys** (`infra/terraform/modules/signing-keys`). One secp256k1 key in KMS per role (operator, relayer,
+  automator, notary; optionally deployer), each signable by one IAM role only, digests only. Administrators cannot sign.
+  The bot host may assume exactly the signer roles; each signer runs as its own user, and only those users reach
+  instance metadata. `terraform test` checks the rendered policies offline.
+* **Deployment** (`contracts/script/DeployTestnet.s.sol`). Faucet-capped tWETH and tUSD, the clearly labelled dev-key
+  verifiers, Poseidon, the notary registry, ZkPriceFeed, a minimal Treasury, DarkPool, SearcherExecutor bound to the
+  operator's KMS address, and `TestnetDisclosure` on chain. It refuses any chain but 421614 and 31337, checks every
+  wiring and writes the manifest; `CheckTestnet` re-checks it at any time. `script/verify-testnet.sh` source-verifies
+  every contract.
+* **Frontend.** Built from the manifest (`scripts/env-from-manifest.mjs`), with a trusted-bootstrap banner on every
+  page that cannot be dismissed. Reproducible: the same commit gives the same IPFS CID. `ops/release/publish-ipfs.sh`
+  publishes the site and the build artifacts (contract artifacts, manifest, the three dev proving keys) to IPFS.
+* **Soak and drills** (`ops/`). Telemetry export in the calibration lab's formats and a comparison at γ = 0.0041; the
+  service levels; an RPC failover proxy; and five drills (vault down, stale feed, RPC failover, chain reorg, competing
+  searcher), each judged from the engine's own events.
+
+```bash
+python3 -m unittest discover -s ops/soak/tests -t ops/soak     # the soak harness, the proxy and the drills' scripts
+cd infra/terraform/modules/signing-keys && terraform init -backend=false && terraform test
+```
+
+CI rehearses the release on anvil on every change: the deployment and CheckTestnet, the frontend built from that
+manifest with its banner checked, and the IPFS CIDs.
+
 ## The vault (Rust), iteration 1: testnet Phase 4
 
 `vaults/threshold-signer/` signs for the bots, so that no bot holds a key. **One role per process,** each with its own

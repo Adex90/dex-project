@@ -29,3 +29,9 @@ variable "db_password_parameter_name" { type = string }
 variable "metadata_bucket_name" { type = string }
 variable "metadata_bucket_arn" { type = string }
 variable "metadata_kms_key_arn" { type = string }
+
+variable "signer_role_arns" {
+  type        = map(string)
+  default     = {}
+  description = "Signer name => the IAM role of its KMS key (modules/signing-keys). The host may assume exactly these; each signer runs as its own user, whose AWS profile assumes its role, and only those users (and root) reach instance metadata."
+}

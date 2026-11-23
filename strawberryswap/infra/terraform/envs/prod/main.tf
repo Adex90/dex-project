@@ -34,6 +34,19 @@ module "automators" {
   metadata_bucket_name       = module.metadata.bucket_name
   metadata_bucket_arn        = module.metadata.bucket_arn
   metadata_kms_key_arn       = module.metadata.kms_key_arn
+  # Every signer on this host except the deployer, whose key only its own principals may use.
+  signer_role_arns = { for signer, arn in module.signing_keys.role_arns : signer => arn if signer != "deployer" }
+}
+
+# The testnet's signing keys in KMS, one per role (modules/signing-keys). The host's instance role may assume the four
+# host signers' roles; the deployer's role only the principals in deployer_principal_arns (no deployer key without).
+module "signing_keys" {
+  source = "../../modules/signing-keys"
+  name   = var.name
+  signers = merge(
+    { for signer in ["operator", "relayer", "automator", "notary"] : signer => [module.automators.role_arn] },
+    length(var.deployer_principal_arns) > 0 ? { deployer = var.deployer_principal_arns } : {},
+  )
 }
 
 # Free Tier guard rail: email when actual spend passes 80 % or forecast passes 100 % of the budget.

@@ -1,0 +1,18 @@
+# The contracts of a testnet deployment (script/DeployTestnet.s.sol): manifest key, source file, contract name.
+# script/verify-testnet.sh source-verifies each on the explorer; ops/release/publish-ipfs.sh publishes each one's
+# compiler artifact. Poseidon is not listed: circomlibjs generates its bytecode (no Solidity source), and
+# CheckTestnet checks the deployed hasher against circomlib's Poseidon(1, 2).
+tWETH	src/testnet/TestToken.sol	TestToken
+tUSD	src/testnet/TestToken.sol	TestToken
+hasher	src/verifiers/Groth16Adapters.sol	PoseidonHasherAdapter
+joinSplitGroth16	test/fixtures/JoinSplitGroth16Verifier.dev.sol	JoinSplitGroth16Verifier
+joinSplitVerifier	src/verifiers/Groth16Adapters.sol	JoinSplitVerifierAdapter
+batchGroth16	test/fixtures/BatchSwapGroth16Verifier.dev.sol	BatchSwapGroth16Verifier
+batchVerifier	src/verifiers/GenericGroth16Adapter.sol	GenericGroth16Adapter
+oracleVerifier	test/fixtures/OracleGroth16Verifier.dev.sol	OracleGroth16Verifier
+notaryRegistry	src/oracle/ZkDecoOracle.sol	ZkDecoOracle
+feed	src/oracle/ZkPriceFeed.sol	ZkPriceFeed
+treasury	src/testnet/Treasury.sol	Treasury
+pool	src/dex/DarkPool.sol	DarkPool
+executor	src/periphery/SearcherExecutor.sol	SearcherExecutor
+disclosure	src/testnet/TestnetDisclosure.sol	TestnetDisclosure

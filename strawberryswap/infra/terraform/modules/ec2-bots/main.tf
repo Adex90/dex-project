@@ -28,9 +28,18 @@ resource "aws_iam_role_policy_attachment" "ssm_core" {
   policy_arn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
 }
 
-# Least privilege: read ONLY this project's parameters, read/write ONLY the metadata bucket.
-# Note: the bots hold NO signing key. Transactions are signed by a remote MPC/TSS signer.
+# Least privilege: read ONLY this project's parameters, read/write ONLY the metadata bucket, and assume ONLY the
+# signer roles (modules/signing-keys). The bots hold NO signing key and no KMS permission: each signer (a vault per
+# role, the notary) runs as its own user whose AWS profile assumes its own role, which alone may sign with its key.
 data "aws_iam_policy_document" "bot" {
+  dynamic "statement" {
+    for_each = length(var.signer_role_arns) > 0 ? [1] : []
+    content {
+      sid       = "AssumeTheSignerRolesOnly"
+      actions   = ["sts:AssumeRole"]
+      resources = sort(values(var.signer_role_arns))
+    }
+  }
   statement {
     sid       = "ReadOwnParameters"
     actions   = ["ssm:GetParameter", "ssm:GetParameters", "ssm:GetParametersByPath"]
@@ -90,6 +99,7 @@ resource "aws_instance" "bot" {
     db_user     = var.db_user
     db_password = var.db_password_parameter_name
     bucket      = var.metadata_bucket_name
+    signers     = var.signer_role_arns
   })
 
   metadata_options {

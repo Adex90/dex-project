@@ -19,6 +19,10 @@ path = "src/bin/notary.rs"
 name = "relayer"
 path = "src/bin/relayer.rs"
 
+[[bin]]
+name = "query-commitment"
+path = "src/bin/query_commitment.rs"
+
 [dependencies]
 # EIP-1559 transactions, contract bindings, the HTTP provider (rustls) and the AWS KMS signer: the notary's and the
 # relayer's keys never leave KMS (no local signer feature).

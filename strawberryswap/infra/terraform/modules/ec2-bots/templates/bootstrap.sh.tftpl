@@ -20,17 +20,76 @@ METADATA_BUCKET=${bucket}
 ENV
 chmod 0640 /etc/strawberry/automator.env
 
-# Wrapper: pull the secret into the process environment only.
+# Wrapper: pull the secret into the process environment only. It runs as root (systemd `ExecStart=+…`), since only
+# root and the signer users reach instance metadata (below), then runs the workload as its own user:
+#   with-automator-secrets <user> <command> [args…]
 cat >/usr/local/bin/with-automator-secrets <<'WRAP'
 #!/bin/bash
 set -euo pipefail
+user="$1"; shift
 set -a; . /etc/strawberry/automator.env; set +a
 PGPASSWORD="$(aws ssm get-parameter --with-decryption --name "$DB_PASSWORD_PARAM" \
   --region "$AWS_REGION" --query Parameter.Value --output text)"
 export PGPASSWORD
-exec "$@"
+exec setpriv --reuid="$user" --regid="$user" --init-groups --no-new-privs -- "$@"
 WRAP
 chmod 0750 /usr/local/bin/with-automator-secrets
+
+# Signers (modules/signing-keys): one system user per signer (the operator, relayer and automator vaults, the
+# notary), whose AWS profile assumes that signer's role, which alone may sign with its KMS key. No key is on this
+# host: KMS signs. The clients (engine, relayer, automator) run as other users and get no AWS credentials at all.
+%{ for signer, role_arn in signers ~}
+id -u signer-${signer} >/dev/null 2>&1 || useradd --system --home-dir /var/lib/signer-${signer} --create-home --shell /sbin/nologin signer-${signer}
+install -d -m 0700 -o signer-${signer} -g signer-${signer} /var/lib/signer-${signer}/.aws
+cat >/var/lib/signer-${signer}/.aws/config <<PROFILE
+[default]
+region = ${region}
+role_arn = ${role_arn}
+credential_source = Ec2InstanceMetadata
+role_session_name = signer-${signer}
+PROFILE
+chown signer-${signer}:signer-${signer} /var/lib/signer-${signer}/.aws/config
+chmod 0600 /var/lib/signer-${signer}/.aws/config
+%{ endfor ~}
+
+# Instance metadata serves the instance role's credentials: only root (the SSM agent, this bootstrap) and the signer
+# users may reach it. (Containers cannot either: IMDSv2 with a hop limit of 1.) Reloaded at every boot.
+dnf -y install nftables
+uids="0"
+%{ for signer, role_arn in signers ~}
+uids="$uids, $(id -u signer-${signer})"
+%{ endfor ~}
+cat >/etc/strawberry/imds-guard.nft <<NFT
+table inet strawberry_imds
+delete table inet strawberry_imds
+table inet strawberry_imds {
+  chain output {
+    type filter hook output priority filter; policy accept;
+    ip daddr 169.254.169.254 meta skuid { $uids } accept
+    ip6 daddr fd00:ec2::254 meta skuid { $uids } accept
+    ip daddr 169.254.169.254 counter reject
+    ip6 daddr fd00:ec2::254 counter reject
+  }
+}
+NFT
+cat >/etc/systemd/system/strawberry-imds-guard.service <<'UNIT'
+[Unit]
+Description=Instance metadata for root and the signer users only
+DefaultDependencies=no
+Before=network-pre.target
+Wants=network-pre.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/sbin/nft -f /etc/strawberry/imds-guard.nft
+ExecStop=/usr/sbin/nft delete table inet strawberry_imds
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+systemctl daemon-reload
+systemctl enable --now strawberry-imds-guard.service
 
 # The Automator workload itself (relayer, oracle watcher, limit-order matcher) is deployed by CI
 # as a container or binary and run under systemd via `with-automator-secrets`. Nothing starts here.

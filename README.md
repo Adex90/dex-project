@@ -682,11 +682,11 @@ cd frontend && npm audit --omit=dev --audit-level=moderate && node scripts/audit
   `scripts/audit.mjs` honours an exception only while npm reports the advisory
   with the approved range, the package has no release newer than the approved
   one (any may be the fix), the date has not passed, and every vulnerable copy
-  in `package-lock.json` is a dev dependency. Today there is one:
-  GHSA-fc5q-39xc-vjpf (`picomatch`, ReDoS, no fixed release), reached only by
-  the lint toolchain; it expires on 2026-12-31 or at an upstream release,
-  whichever comes first. Otherwise a finding with no fixed version is pinned
-  through `overrides` or removed.
+  in `package-lock.json` is a dev dependency. Today there are none: the last,
+  GHSA-fc5q-39xc-vjpf (`picomatch`, dev tooling only), was removed on
+  2026-11-23 once npm stopped reporting the advisory, as its approval provided.
+  Otherwise a finding with no fixed version is pinned through `overrides` or
+  removed.
 
 ### Production database users
 
