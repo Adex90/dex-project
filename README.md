@@ -1340,6 +1340,73 @@ words. Signing out ends the session on the server too, and an unattended
 tab signs itself out after the timeout, here and on the server, saying why
 on the sign-in page.
 
+## Legal beneficiaries and the Document Inbox (migration `0020`)
+
+**Legal beneficiaries.** A verified client names who receives the account
+should they die (as a bank deposit account does under art. 56 of the Ley de
+Instituciones de Crédito): up to five people, each with their full legal
+name, relationship, CURP or date of birth, and a share.
+
+- **Versions.** `kyc.designaciones_beneficiarios` keeps every save as a new,
+  immutable version with the session, IP and device that saved it;
+  `kyc.beneficiarios` holds its people. The database sets the version, the
+  time and the chain: each version's `hash` is the SHA-256 of the canonical
+  payload SC-BENEF-v1 over the version and its beneficiaries, linked to the
+  previous one. The backend recomputes the whole chain on every read
+  (`cadena_verificada`); an empty version withdraws the designation.
+- **At commit** the database checks every new version: as many
+  beneficiaries as it declares, in positions 1..n, shares that are positive,
+  in hundredths, and add up to **exactly 100%**; none the holder (their
+  CURP), none repeated; a CURP whose date matches the date of birth; and a
+  hash covering exactly what was stored. Only a `VERIFICADO` client
+  designates. Nothing is corrected or deleted, and altering a stored row
+  breaks the chain at that version.
+- **Audit trail.** The same transaction writes `BENEFICIARIOS_DESIGNADOS`
+  (with the version) to the client's append-only security log, so the
+  Security page shows "Beneficiaries updated". A trigger writes it, so no
+  path saves a version without it; `sc_kyc` may write that event and no
+  other, only for a version that exists, with its own session and device.
+- **The API.** `GET /api/v1/kyc/beneficiarios`: the version on record, its
+  history and whether the client may designate. `POST` takes the whole
+  designation and `version_base`, the version the client edited: if another
+  session saved since, 409 `DESIGNACION_DESACTUALIZADA` and nothing changes.
+  Refusals: `BENEFICIARIOS_PORCENTAJE`, `BENEFICIARIOS_MAXIMO`,
+  `BENEFICIARIO_TITULAR`, `BENEFICIARIO_DUPLICADO`, `KYC_NO_VERIFICADO`
+  (422) and `VALIDACION` (400).
+
+**The Document Inbox.** `GET /api/v1/wealth/documentos` lists a trade
+confirmation (Comprobante de Operación) for every executed order and an
+account statement (Estado de Cuenta) for every month with activity, newest
+first; `GET /api/v1/wealth/documentos/{id}` returns one. Both are derived on
+every read, in one snapshot, from the hash-chained ledgers
+(`mercado.ordenes` and `ifpe.transacciones`), so an issued document never
+changes.
+
+- **Trade confirmation** (`co_<order id>`, folio `CO-` and the market
+  ledger's sequence): side, order type and its limit or stop, amount
+  requested, quantity, price and its source, gross amount, commission
+  (zero), net, and for a sale the cost basis and realized gain or loss. Its
+  reference is the order's hash in the market ledger; it also carries the
+  cash ledger entry that settled it.
+- **Account statement** (`ec_<YYYY-MM>`, folio `EC-<period>-<last 4 of the
+  CLABE>`): Mexico City calendar months; the month in progress is
+  `provisional`. Opening and closing balance, credits, debits, the
+  balance-changing movements with their running balance (holds and order
+  commitments move cash inside the account: they appear only in the
+  closing breakdown, the hold with the neutral copy), trades, positions at
+  the end of the period, and a reference: the SHA-256 of the canonical
+  payload SC-EDC-v1 over all of it.
+- **Reserve seal.** The first published Proof of Reserve snapshot whose
+  ledger and market anchors reach the document's entries: its id, Merkle
+  root, time, anchors and reserve ratio; `pending` until one does.
+
+**The pages** (`/dashboard/beneficiaries` and `/dashboard/documents`, with
+Security in the sidebar's Account group; on phones a strip of links on the
+Account tab and on each account page): the beneficiaries editor with its
+live gold allocation bar and the record; the inbox, filtered by kind, and a
+viewer that prints a paper copy (Print / Save as PDF) and downloads the
+document as served (JSON).
+
 ## Layout
 
 ```
@@ -1575,6 +1642,7 @@ the password is hashed, so a parallel burst cannot test more than 5 passwords.
 | GET | `/api/v1/kyc/expediente` | client: onboarding state, attempts, last biometric result, own declarations and the agreements' version in force |
 | POST | `/api/v1/kyc/perfil` | client: step 1, personal data, CURP, RFC and address |
 | POST | `/api/v1/kyc/verificar` | client: the wizard's submission, INE images and data + liveness frames + consent + declarations + accepted agreements (up to 12 MB) |
+| GET, POST | `/api/v1/kyc/beneficiarios` | client: the legal beneficiaries on record, their versions and the chain check; POST saves the whole designation on top of `version_base` (201; 409 if another session saved first) |
 | POST | `/api/v1/kyc/webhook` | biometric provider (HMAC signature `X-Kyc-Firma`) |
 | GET | `/api/v1/operaciones/kyc/pendientes` | operator: files awaiting human review |
 | POST | `/api/v1/operaciones/kyc/{cliente_id}` | operator: verify / reject (with reason) / reopen, risk level (not lowered while the client is under AML review); answers the client projection, without risk fields; an empty dictamen is 400 |
@@ -1588,6 +1656,7 @@ the password is hashed, so a parallel burst cannot test more than 5 passwords.
 | POST | `/api/v1/market/orders/{id}/cancel` | client: cancels a pending order and releases what it held |
 | GET | `/api/v1/wealth/linked-accounts` | client: its linked bank accounts, all in its own name (`MODO_DEMO` links a demo one) |
 | POST | `/api/v1/wealth/withdraw` | client: withdraws available cash to a linked account by SPEI (`WithdrawalReceipt`, processing until settled) |
+| GET | `/api/v1/wealth/documentos`, `/api/v1/wealth/documentos/{id}` | client: its statements and trade confirmations, derived from the ledgers, each with its reserve seal |
 | GET | `/api/v1/ifpe/cuenta`, `/api/v1/ifpe/movimientos` | client |
 | POST | `/api/v1/ifpe/transferencias` | client: internal transfer |
 | POST | `/api/v1/ifpe/retiros` | client: withdrawal to own external CLABE (an outgoing SPEI), which must be a linked account |

@@ -10,7 +10,9 @@
 --  coherentes, ninguno el titular ni repetido; la versión, la fecha y la
 --  cadena de hashes las pone la base de datos, que al COMMIT comprueba que el
 --  hash cubre exactamente lo guardado; nada se corrige ni se borra; solo un
---  cliente verificado designa; escribe sc_kyc y el cliente lee lo suyo.
+--  cliente verificado designa; escribe sc_kyc y el cliente lee lo suyo; cada
+--  versión deja su evento en la bitácora de seguridad del cliente, el único
+--  que sc_kyc puede escribir allí.
 --  backend/tests/beneficiarios.rs cubre la API y la cadena recalculada en Rust.
 -- =============================================================================
 \set ON_ERROR_STOP on
@@ -314,7 +316,48 @@ SELECT pg_temp.exigir('ningún otro rol de la aplicación toca la designación',
          unnest(ARRAY['kyc.designaciones_beneficiarios', 'kyc.beneficiarios']) AS t));
 
 -- -----------------------------------------------------------------------------
--- 7. La cadena delata una alteración por fuera de la aplicación
+-- 7. Cada versión queda también en la bitácora de seguridad del cliente
+-- -----------------------------------------------------------------------------
+SELECT pg_temp.exigir('un evento BENEFICIARIOS_DESIGNADOS por versión guardada, con su IP, dispositivo y versión, escrito por sc_kyc', (
+  SELECT array_agg(detalle ORDER BY id) = ARRAY['1', '2', '3']
+     AND bool_and(ip = '203.0.113.7' AND dispositivo = 'Chrome on macOS' AND registrado_por = 'sc_kyc')
+    FROM kyc.eventos_autenticacion
+   WHERE cliente_id = 'a0000000-0000-0000-0000-00000000000a' AND evento = 'BENEFICIARIOS_DESIGNADOS')
+  AND (SELECT count(*) = 1 FROM kyc.eventos_autenticacion
+        WHERE cliente_id = 'b0000000-0000-0000-0000-00000000000b' AND evento = 'BENEFICIARIOS_DESIGNADOS'));
+SELECT pg_temp.exigir('las versiones rechazadas no dejaron evento (ni la de Carla)', (
+  SELECT count(*) = 4 FROM kyc.eventos_autenticacion WHERE evento = 'BENEFICIARIOS_DESIGNADOS'));
+SELECT pg_temp.exigir('Ana lee sus tres eventos y Beto el suyo', (
+  pg_temp.visibles('a0000000-0000-0000-0000-00000000000a',
+    $q$SELECT count(*) FROM kyc.eventos_autenticacion WHERE evento = 'BENEFICIARIOS_DESIGNADOS'$q$) = 3
+  AND pg_temp.visibles('b0000000-0000-0000-0000-00000000000b',
+    $q$SELECT count(*) FROM kyc.eventos_autenticacion WHERE evento = 'BENEFICIARIOS_DESIGNADOS'$q$) = 1));
+SELECT pg_temp.debe_fallar('sc_kyc no escribe otro evento en la bitácora',
+  ARRAY['SET LOCAL ROLE sc_kyc',
+        $q$INSERT INTO kyc.eventos_autenticacion (cliente_id, evento)
+           VALUES ('a0000000-0000-0000-0000-00000000000a', 'INICIO_SESION')$q$],
+  'row-level security');
+SELECT pg_temp.debe_fallar('ni el de una versión que no existe',
+  ARRAY['SET LOCAL ROLE sc_kyc',
+        $q$INSERT INTO kyc.eventos_autenticacion (cliente_id, evento, ip, dispositivo, detalle)
+           VALUES ('a0000000-0000-0000-0000-00000000000a', 'BENEFICIARIOS_DESIGNADOS', '203.0.113.7', 'Chrome on macOS', '9')$q$],
+  'row-level security');
+SELECT pg_temp.debe_fallar('ni el de una versión con otro dispositivo',
+  ARRAY['SET LOCAL ROLE sc_kyc',
+        $q$INSERT INTO kyc.eventos_autenticacion (cliente_id, evento, ip, dispositivo, detalle)
+           VALUES ('a0000000-0000-0000-0000-00000000000a', 'BENEFICIARIOS_DESIGNADOS', '203.0.113.7', 'Edge on Windows', '2')$q$],
+  'row-level security');
+SELECT pg_temp.debe_fallar('ni un segundo evento de la misma versión',
+  ARRAY['SET LOCAL ROLE sc_kyc',
+        $q$INSERT INTO kyc.eventos_autenticacion (cliente_id, evento, ip, dispositivo, detalle)
+           VALUES ('a0000000-0000-0000-0000-00000000000a', 'BENEFICIARIOS_DESIGNADOS', '203.0.113.7', 'Chrome on macOS', '2')$q$],
+  'ux_eventos_autenticacion_designacion');
+SELECT pg_temp.debe_fallar('y el evento, como toda la bitácora, no se borra',
+  ARRAY[$q$DELETE FROM kyc.eventos_autenticacion WHERE evento = 'BENEFICIARIOS_DESIGNADOS'$q$],
+  'SC_LEDGER_INMUTABLE');
+
+-- -----------------------------------------------------------------------------
+-- 8. La cadena delata una alteración por fuera de la aplicación
 -- -----------------------------------------------------------------------------
 -- El dueño del esquema desactiva el trigger y cambia un nombre de la versión 1:
 -- la versión 1 ya no cuadra con su hash.

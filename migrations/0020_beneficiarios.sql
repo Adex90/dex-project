@@ -29,6 +29,12 @@
 --     versión anterior, no pasa).
 --  4. Solo un cliente con KYC VERIFICADO designa. Escribe sc_kyc; el cliente
 --     lee lo suyo (sc_cliente, RLS como en 0011) y no escribe nada.
+--  5. Cambiar a quién hereda la cuenta es además un evento de seguridad: la
+--     base de datos escribe BENEFICIARIOS_DESIGNADOS en la bitácora inmutable
+--     del cliente (`kyc.eventos_autenticacion`, 0010/0019) en la misma
+--     transacción que cada versión, con su sesión, IP, dispositivo y la
+--     versión. El cliente lo ve en su Centro de Seguridad; ninguna versión se
+--     guarda sin su evento, y sc_kyc no puede escribir ningún otro.
 -- =============================================================================
 
 -- -----------------------------------------------------------------------------
@@ -287,3 +293,60 @@ CREATE POLICY solo_del_cliente ON kyc.designaciones_beneficiarios AS RESTRICTIVE
 CREATE POLICY solo_del_cliente ON kyc.beneficiarios AS RESTRICTIVE FOR ALL TO sc_cliente
     USING (designacion_id IN (SELECT id FROM kyc.designaciones_beneficiarios WHERE cliente_id = nucleo.cliente_actual()))
     WITH CHECK (false);
+
+-- -----------------------------------------------------------------------------
+-- 5. Bitácora de seguridad: cada versión, también en la del cliente
+-- -----------------------------------------------------------------------------
+-- La bitácora es inmutable (filas); cambiar su catálogo es DDL y no la toca.
+ALTER TABLE kyc.eventos_autenticacion DROP CONSTRAINT ck_eventos_autenticacion_evento;
+ALTER TABLE kyc.eventos_autenticacion ADD CONSTRAINT ck_eventos_autenticacion_evento CHECK (evento IN (
+    -- 0010
+    'MFA_SECRETO_GENERADO',
+    'MFA_ACTIVADO',
+    'MFA_VERIFICADO',
+    'MFA_CODIGO_RECHAZADO',
+    'MFA_DESACTIVADO',
+    'RESTABLECIMIENTO_SOLICITADO',
+    'CONTRASENA_RESTABLECIDA',
+    -- 0019
+    'INICIO_SESION',
+    'INICIO_FALLIDO',
+    'CUENTA_BLOQUEADA',
+    'SESION_CERRADA',
+    'SESION_REVOCADA',
+    'SESIONES_REVOCADAS',
+    'CONTRASENA_CAMBIADA',
+    'CAMBIO_CONTRASENA_RECHAZADO',
+    'PREFERENCIAS_ACTUALIZADAS',
+    -- 0020: `detalle` es la versión guardada
+    'BENEFICIARIOS_DESIGNADOS'));
+
+-- Uno por versión.
+CREATE UNIQUE INDEX ux_eventos_autenticacion_designacion ON kyc.eventos_autenticacion (cliente_id, detalle)
+    WHERE evento = 'BENEFICIARIOS_DESIGNADOS';
+
+-- Corre con el rol de quien guarda la versión (sc_kyc, o el DBA), que queda en
+-- `registrado_por`; si la versión no llega al COMMIT, su evento tampoco.
+CREATE FUNCTION kyc.fn_auditar_designacion() RETURNS trigger
+LANGUAGE plpgsql SET search_path = pg_catalog, pg_temp
+AS $$
+BEGIN
+    INSERT INTO kyc.eventos_autenticacion (cliente_id, evento, ip, sesion_id, dispositivo, detalle)
+    VALUES (NEW.cliente_id, 'BENEFICIARIOS_DESIGNADOS', NEW.ip, NEW.sesion_id, NEW.dispositivo, NEW.version::text);
+    RETURN NULL;
+END
+$$;
+CREATE TRIGGER trg_designaciones_auditar AFTER INSERT ON kyc.designaciones_beneficiarios
+    FOR EACH ROW EXECUTE FUNCTION kyc.fn_auditar_designacion();
+
+-- sc_kyc escribe en la bitácora este evento y ningún otro: el de una versión
+-- que existe, con su misma sesión, IP y dispositivo.
+GRANT INSERT (cliente_id, evento, ip, sesion_id, dispositivo, detalle) ON kyc.eventos_autenticacion TO sc_kyc;
+CREATE POLICY solo_designaciones ON kyc.eventos_autenticacion AS RESTRICTIVE FOR INSERT TO sc_kyc
+    WITH CHECK (evento = 'BENEFICIARIOS_DESIGNADOS' AND EXISTS (
+        SELECT 1 FROM kyc.designaciones_beneficiarios d
+         WHERE d.cliente_id = eventos_autenticacion.cliente_id
+           AND d.version::text = eventos_autenticacion.detalle
+           AND d.sesion_id IS NOT DISTINCT FROM eventos_autenticacion.sesion_id
+           AND d.ip IS NOT DISTINCT FROM eventos_autenticacion.ip
+           AND d.dispositivo IS NOT DISTINCT FROM eventos_autenticacion.dispositivo));

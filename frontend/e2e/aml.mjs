@@ -575,6 +575,46 @@ try {
   const securityHits = await tipOffWords(cp);
   check(securityHits.length === 0, `the Security tab has no tipping-off words (${securityHits.join(", ") || "none"})`, securityHits);
   await shot(cp, "client-security-frozen");
+  // The Document Inbox and Legal Beneficiaries (migration 0020): the month's
+  // statement shows held funds with the neutral copy only, and neither page,
+  // nor what the API answers, tells a client under review anything.
+  await openTab(cp, "Documents");
+  const statementRow = cp.getByTestId("document-row").and(cp.locator("[data-kind=account_statement]")).first();
+  await statementRow.waitFor();
+  const statementId = await statementRow.getAttribute("data-id");
+  await statementRow.click();
+  const documentViewer = cp.getByTestId("document-viewer");
+  await documentViewer.getByTestId("statement-closing").waitFor();
+  const documentReads = await Promise.all(
+    ["/api/v1/wealth/documentos", `/api/v1/wealth/documentos/${statementId}`, "/api/v1/kyc/beneficiarios"].map((path) =>
+      pageFetch(cp, "GET", path),
+    ),
+  );
+  check(
+    documentReads.every((r) => r.status === 200) &&
+      !/aml|pld|congel|alerta|cumplimiento|nivel_riesgo|es_pep|retenido|sospech|uif|preventiv/i.test(
+        // The holder's own name is not the bank's wording.
+        JSON.stringify(documentReads.map((r) => r.body), (key, value) => (key === "holder" ? undefined : value)),
+      ),
+    "the client's documents, statement and beneficiaries carry no AML wording",
+    documentReads.map((r) => r.body),
+  );
+  const onHold = documentReads[1].body?.closing_breakdown?.on_hold ?? "0";
+  const statementText = await documentViewer.getByTestId("document-screen").innerText();
+  check(
+    Number(onHold) > 0 ? statementText.includes("Funds on hold (still fully backed)") : !statementText.includes("on hold"),
+    `the statement shows held funds only as "Funds on hold (still fully backed)" (${onHold} on hold)`,
+  );
+  const documentHits = await tipOffWords(cp);
+  check(documentHits.length === 0, `the Documents page and its statement have no tipping-off words (${documentHits.join(", ") || "none"})`, documentHits);
+  await shot(cp, "client-statement-frozen");
+  await cp.keyboard.press("Escape");
+  await documentViewer.waitFor({ state: "detached" });
+  await openTab(cp, "Beneficiaries");
+  await cp.getByTestId("designation-history").waitFor();
+  const beneficiaryHits = await tipOffWords(cp);
+  check(beneficiaryHits.length === 0, `the Beneficiaries page has no tipping-off words (${beneficiaryHits.join(", ") || "none"})`, beneficiaryHits);
+  await shot(cp, "client-beneficiaries-frozen");
   // The Vault home (balance, reserve seal, deposit card, chart) must not tip off either.
   await openTab(cp, "Vault");
   await cp.getByTestId("vault-total").waitFor();

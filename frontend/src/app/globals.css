@@ -194,6 +194,8 @@ body {
     --color-synthetic-yellow: #a16207;
     background: #ffffff;
     color: #000000;
+    /* Paper is denser than a screen: a confirmation fits on one A4 or Letter page. */
+    zoom: 0.8;
   }
 
   .document-print-copy .print-seal {

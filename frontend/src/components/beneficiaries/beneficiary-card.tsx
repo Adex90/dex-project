@@ -161,7 +161,7 @@ export function BeneficiaryCard({
               spellCheck={false}
               maxLength={18}
               placeholder="18 characters"
-              className="h-11 font-mono uppercase"
+              className="h-11 font-mono uppercase placeholder:font-sans placeholder:normal-case"
             />
           </Field>
         </div>

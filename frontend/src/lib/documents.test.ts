@@ -168,7 +168,7 @@ const STATEMENT = {
       date: "2026-11-23T11:00:00Z",
       kind: "deposit",
       ticker: null,
-      tracking_key: "DEMO123",
+      tracking_key: "99999:20000101:DEMO09CBB1AF9EA6E44B7B6471313B",
       sequence: 7,
       hash: H("1"),
       amount: "25000.00000000",

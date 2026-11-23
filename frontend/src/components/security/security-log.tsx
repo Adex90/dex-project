@@ -1,6 +1,16 @@
 "use client";
 
-import { History, KeyRound, LogIn, LogOut, ShieldAlert, ShieldCheck, Timer, type LucideIcon } from "lucide-react";
+import {
+  History,
+  KeyRound,
+  LogIn,
+  LogOut,
+  ShieldAlert,
+  ShieldCheck,
+  Timer,
+  Users,
+  type LucideIcon,
+} from "lucide-react";
 
 import { Card, CardHeader, Skeleton, cx } from "@/components/ui/primitives";
 import { describeEvent, formatWhen, timeAgo, type EventTone } from "@/lib/security";
@@ -9,7 +19,7 @@ import type { SecurityEvent } from "@/types/security";
 /*
  * Recent security activity (roadmap item 20): sign-ins and failed attempts,
  * sign-outs and revoked devices, password and two-step changes, the
- * inactivity timeout. The server keeps it in an append-only log: the
+ * inactivity timeout, and every new version of the legal beneficiaries. The server keeps it in an append-only log: the
  * database refuses to edit or delete an entry. This shows the latest 50.
  */
 
@@ -25,6 +35,7 @@ const ICONS: Record<string, LucideIcon> = {
   RESTABLECIMIENTO_SOLICITADO: KeyRound,
   CONTRASENA_RESTABLECIDA: KeyRound,
   PREFERENCIAS_ACTUALIZADAS: Timer,
+  BENEFICIARIOS_DESIGNADOS: Users,
   MFA_CODIGO_RECHAZADO: ShieldAlert,
 };
 

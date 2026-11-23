@@ -101,8 +101,8 @@ function ConfirmationBody({ doc, variant }: { doc: TradeConfirmation; variant: V
         <p className="text-[11px] font-semibold tracking-[0.18em] text-muted uppercase">Executed</p>
         <p className="text-lg font-semibold text-ink" data-testid="confirmation-headline">
           {sell ? "Sold" : "Bought"} {formatUnits(doc.quantity)} {doc.ticker}{" "}
-          <span className="font-normal text-muted">at</span> {formatPrice(doc.price)}
-          <span className="ml-1 text-xs font-medium text-muted">MXN</span>
+          <span className="font-normal text-muted">at</span> {formatPrice(doc.price)}{" "}
+          <span className="text-xs font-medium text-muted">MXN</span>
         </p>
         <p className="text-sm text-ink-2">
           {doc.asset_name} · {documentTime(doc.executed_at)}
@@ -126,8 +126,8 @@ function ConfirmationBody({ doc, variant }: { doc: TradeConfirmation; variant: V
             </span>
           </Row>
           <Row label="Execution price">
-            <span className="tabular-nums">{formatPrice(doc.price)}</span>
-            <span className="ml-1 text-[0.7em] font-medium text-muted">MXN</span>
+            <span className="tabular-nums">{formatPrice(doc.price)}</span>{" "}
+            <span className="text-[0.7em] font-medium text-muted">MXN</span>
           </Row>
           <Row label="Price source">{PRICE_SOURCE_LABELS[doc.price_source]}</Row>
         </Rows>
@@ -164,12 +164,7 @@ function ConfirmationBody({ doc, variant }: { doc: TradeConfirmation; variant: V
           ) : null}
           {doc.realized_pnl ? (
             <Row label="Realized gain or loss">
-              <span className={compareAmounts(doc.realized_pnl, "0") < 0 ? "text-loss" : "text-gain"}>
-                <Money
-                  value={doc.realized_pnl.replace(/^-/, "")}
-                  sign={compareAmounts(doc.realized_pnl, "0") < 0 ? "-" : "+"}
-                />
-              </span>
+              <PnL value={doc.realized_pnl} />
             </Row>
           ) : null}
         </Rows>
@@ -433,6 +428,16 @@ function SealPanel({ seal, variant }: { seal: ReserveSeal; variant: Variant }) {
 }
 
 /* ------------------------------------------------------------------------ */
+
+/** A gain in green with "+", a loss in red with "−", nothing in plain ink. */
+function PnL({ value }: { value: string }) {
+  const sign = compareAmounts(value, "0");
+  return (
+    <span className={sign < 0 ? "text-loss" : sign > 0 ? "text-gain" : "text-ink"}>
+      <Money value={value.replace(/^-/, "")} sign={sign < 0 ? "-" : sign > 0 ? "+" : undefined} />
+    </span>
+  );
+}
 
 function Section({ title, children, testId }: { title: string; children: ReactNode; testId?: string }) {
   return (

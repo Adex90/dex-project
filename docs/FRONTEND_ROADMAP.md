@@ -404,8 +404,61 @@ what the module waits on. They do not change its scope.
 - [ ] **23. Activity Feed** (Immutable ledger of deposits, trades, and dividends)
   - Foundation: the Account tab's SHA-256-chained ledger feed. Trades and
     dividends arrive with Phase 1.
-- [ ] **24. Document Inbox** (PDF statements, trade confirmations)
-- [ ] **25. Legal Beneficiaries** (Assigning heirs and succession percentages)
+- [x] **24. Document Inbox** (PDF statements, trade confirmations)
+  - The Documents page, `/dashboard/documents` (`components/documents/`),
+    in the sidebar's Account group and, on phones, in the strip of account
+    pages on the Account tab and on each account page. An inbox of every
+    trade confirmation (Comprobante de Operación) and monthly account
+    statement (Estado de Cuenta), newest first, filtered by kind, with date,
+    folio, reference hash and amount; the month in progress says so.
+  - The viewer: a confirmation's execution figures (side, order type and
+    its limit or stop, amount requested, quantity, price and its source),
+    the settlement (gross, a $0.00 commission marked Zero commission, net,
+    and for a sale its cost basis and realized gain or loss) and both
+    ledgers' entries and hashes; a statement's opening and closing balances,
+    credits, debits, the closing breakdown (available, funds on hold with
+    the neutral copy, held for open orders), its movements, trades,
+    positions and content hash. Both carry the reserve seal: the first
+    Proof of Reserve snapshot that covers them (100.00% backed, Merkle root,
+    anchors), or pending until one does. Print / Save as PDF prints a paper
+    copy in normal flow (every hash in full); Download (.json) saves the
+    document as served. `?id=` opens one directly.
+  - The contract (README "Document Inbox"): `GET /api/v1/wealth/documentos`
+    and `GET /api/v1/wealth/documentos/{id}`, derived on every read from
+    `mercado.ordenes` and the IFPE ledger, so an issued document never
+    changes; months follow Mexico City.
+  - Tests: `backend/tests/documentos.rs`, `lib/documents.test.ts`, smoke e2e
+    (one confirmation per settlement in the cash ledger, the sale's figures,
+    the seal before and after a snapshot, the statement against the
+    account's balance, the download compared with the API, the printed page
+    and both PDFs) and the AML e2e (a frozen client's statement and pages
+    carry no tipping-off words).
+  - Left: server-side PDF generation with a digital signature (today the
+    browser prints), closed months materialized once instead of derived on
+    every read, and the SAT's CFDI for interest (module 26).
+- [x] **25. Legal Beneficiaries** (Assigning heirs and succession percentages)
+  - The Beneficiaries page, `/dashboard/beneficiaries`
+    (`components/beneficiaries/`): up to five people with their full legal
+    name, relationship, CURP or date of birth (a valid CURP fills in the
+    date) and share. A gold allocation bar counts the shares in cents of a
+    percent and reads "100% allocated" or what is left or over; Save stays
+    off until the sum is exactly 100%. Split evenly gives 33.34, 33.33 and
+    33.33. The record shows the version on record, its history and the
+    server's chain verification.
+  - The contract (migration 0020, README "Legal beneficiaries"):
+    `GET`/`POST /api/v1/kyc/beneficiarios`. Each save is a new immutable,
+    hash-chained version on top of the one the page loaded (409 if another
+    session saved first: the newer one shows and the edits stay). The
+    database refuses any sum but exactly 100% at commit, the holder or a
+    repeated CURP, and an unverified client; and writes every version to
+    the client's security log, where the Security page shows "Beneficiaries
+    updated".
+  - Tests: `tests/db/0020_beneficiarios.sql`, `backend/tests/beneficiarios.rs`,
+    `lib/beneficiaries.test.ts`, smoke e2e (60 + 30 refused, 60 + 40 saved,
+    reloaded, split evenly, a save refused after another device saved, the
+    API refusing 99%, every version in the security log) and the AML e2e.
+  - Left: step-up authentication before saving (module 22), notifying the
+    client by email of a change, and designations for business accounts.
 - [ ] **26. Tax Center** (W-8BEN, SAT tax withholding certificates, CSV export)
   - W-8BEN applies only to US securities held through a US broker or
     custodian.

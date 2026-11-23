@@ -16,7 +16,13 @@
  * (the Sovereign Yield counter, the debit card), a withdrawal to the linked
  * bank account, Proof of Reserve, ledger,
  * moving between the dashboard's tabs (Vault, Discover, Account, Invest,
- * Reserve) and the Security page (devices signed in, Revoke and "Sign out all
+ * Reserve), the Document Inbox (a trade confirmation per executed order and
+ * the month's statement, reconciled with the ledgers; the zero-commission
+ * breakdown, the reserve seal before and after a snapshot, the JSON download,
+ * printing and Save as PDF), Legal Beneficiaries (the live allocation bar,
+ * Save only at exactly 100%, Split evenly, versions, a save refused because
+ * another device saved first, every version in the security log)
+ * and the Security page (devices signed in, Revoke and "Sign out all
  * other devices", the inactivity timeout, a password change, the security
  * log; then, for a client of its own on a phone, two-step verification turned
  * on from there and the inactivity sign-out on a fake clock). It ends on asset pages opened by their address (AUG1, an unknown
@@ -42,11 +48,14 @@
  */
 import { createRequire } from "node:module";
 import { createHmac } from "node:crypto";
-import { mkdirSync } from "node:fs";
+import { mkdirSync, readFileSync } from "node:fs";
+import { isDeepStrictEqual } from "node:util";
 
 // Node >= 22.18 strips TypeScript types, so the app's own (framework-free)
 // KYC library builds an identity that passes every frontend and backend check.
-import { sampleIdentity, SAMPLE_IDENTITY_SPACE, todayInMexicoCity } from "../src/lib/kyc.ts";
+import { curpCheckDigit, sampleIdentity, SAMPLE_IDENTITY_SPACE, todayInMexicoCity } from "../src/lib/kyc.ts";
+// And exact decimals, to read the documents' figures as the screens do.
+import { formatMoney, isZero, toUnits } from "../src/lib/decimal.ts";
 // And the allocation's exact math, to know what the Vault must show for the figures the API gives.
 import { allocation, formatShare } from "../src/lib/allocation.ts";
 // And the Sovereign Yield preview's, to check the Account tab's live counter against it.
@@ -2079,6 +2088,475 @@ try {
     check(true, "buying and selling all of it at the same price returns exactly the cash paid (15,000.00)");
 
     // ---------------------------------------------------------------------
+    // Documents (roadmap item 24): a trade confirmation for every executed
+    // order and the month's statement, derived from the ledgers
+    // ---------------------------------------------------------------------
+    const accountToken = await pageToken(page);
+    /** An API call with this browser's session, from outside the page. */
+    const asClient = async (path, init = {}) => {
+      const response = await fetch(`${API}${path}`, {
+        ...init,
+        headers: {
+          authorization: `Bearer ${accountToken}`,
+          ...(init.body ? { "content-type": "application/json" } : {}),
+        },
+      });
+      return { status: response.status, body: await response.json().catch(() => null) };
+    };
+    const inbox = (await asClient("/api/v1/wealth/documentos")).body;
+    const cashLedger = (await asClient("/api/v1/ifpe/movimientos?limite=200")).body;
+    const settlements = cashLedger.filter((m) => m.tipo === "COMPRA_MERCADO" || m.tipo === "VENTA_MERCADO");
+    const confirmations = inbox.documents.filter((d) => d.kind === "trade_confirmation");
+    const statements = inbox.documents.filter((d) => d.kind === "account_statement");
+    const mexicoMonth = (iso) => new Date(Date.parse(iso) - 6 * 3_600_000).toISOString().slice(0, 7);
+    const activeMonths = new Set(cashLedger.map((m) => mexicoMonth(m.creado_en)));
+    check(
+      settlements.length >= 2 &&
+        confirmations.length === settlements.length &&
+        statements.length === activeMonths.size &&
+        statements[0].provisional &&
+        !inbox.truncated,
+      `the inbox holds a trade confirmation for each of the ${settlements.length} executed orders (one per settlement in the cash ledger) and a statement per active month, this one in progress`,
+    );
+
+    await openTab(page, "Documents");
+    check(
+      JSON.stringify(await mainNav(page).locator("ul").nth(1).getByRole("link").allInnerTexts()) ===
+        JSON.stringify(["Documents", "Beneficiaries", "Security"]),
+      "the sidebar's Account group lists Documents, Beneficiaries and Security",
+    );
+    const docRows = page.getByTestId("document-row");
+    await docRows.nth(inbox.documents.length - 1).waitFor();
+    const newestRow = flat(await docRows.first().innerText());
+    check(
+      (await docRows.count()) === inbox.documents.length &&
+        JSON.stringify(await docRows.evaluateAll((rows) => rows.map((r) => r.getAttribute("data-id")))) ===
+          JSON.stringify(inbox.documents.map((d) => d.id)) &&
+        newestRow.includes(inbox.documents[0].folio) &&
+        newestRow.includes(inbox.documents[0].reference.slice(0, 8)),
+      "the inbox lists every document the API serves, newest first, each with its folio and reference hash",
+    );
+    const inboxFilter = page.getByTestId("documents-filter");
+    await inboxFilter.getByText(`Confirmations · ${confirmations.length}`).click();
+    await page.waitForFunction(
+      (n) => document.querySelectorAll("[data-testid=document-row]").length === n,
+      confirmations.length,
+    );
+    check(
+      await docRows.evaluateAll((rows) => rows.every((r) => r.getAttribute("data-kind") === "trade_confirmation")),
+      "the Confirmations filter keeps only the trade confirmations",
+    );
+    await shot(page, "documents-inbox");
+
+    // The newest confirmation: the sale of the whole STSLA position.
+    const latest = confirmations[0];
+    const sale = (await asClient(`/api/v1/wealth/documentos/${latest.id}`)).body;
+    check(
+      sale.side === "sell" &&
+        sale.ticker === "STSLA" &&
+        toUnits(sale.quantity) === toUnits("0.2264") &&
+        isZero(sale.commission) &&
+        sale.net_amount === sale.gross_amount &&
+        sale.reference === latest.reference &&
+        sale.settlement_sequence === settlements.find((m) => m.tipo === "VENTA_MERCADO")?.secuencia,
+      "the newest confirmation is the sale of all 0.2264 STSLA, settled by the latest sale in the cash ledger, with zero commission: net equals gross",
+    );
+    const viewer = page.getByTestId("document-viewer");
+    await docRows.first().click();
+    await viewer.getByTestId("document-screen").waitFor();
+    await page.waitForURL(`**/dashboard/documents?id=${latest.id}`);
+    const headline = flat(await viewer.getByTestId("confirmation-headline").innerText());
+    check(headline === "Sold 0.2264 STSLA at $4,415.30 MXN", `the confirmation reads "${headline}"`);
+    check(
+      (await viewer.getByTestId("document-folio").innerText()) === sale.folio &&
+        (await viewer.getByTestId("document-reference").getAttribute("data-value")) === sale.reference &&
+        (await viewer.getByTestId("confirmation-commission").innerText()).includes("$0.00") &&
+        (await viewer.getByTestId("commission-breakdown").getByText("Zero commission").isVisible()) &&
+        (await viewer.getByTestId("confirmation-net").innerText()).includes(formatMoney(sale.net_amount)),
+      "the viewer shows the folio, the reference hash, a $0.00 commission marked Zero commission and the net credited",
+    );
+    check(
+      (await viewer.getByTestId("reserve-seal").getAttribute("data-status")) === sale.reserve_seal.status,
+      `before a new Proof of Reserve snapshot covers it, the seal reads ${sale.reserve_seal.status}`,
+    );
+    await viewer.getByRole("button", { name: "Close" }).click();
+    await viewer.waitFor({ state: "detached" });
+    await page.waitForURL((url) => url.pathname === "/dashboard/documents" && url.search === "");
+
+    // A new snapshot seals it: the first one whose anchors reach its entries.
+    await freshCut(`e2e-${runId}-docs@example.mx`, password);
+    const seal = (await asClient(`/api/v1/wealth/documentos/${latest.id}`)).body.reserve_seal;
+    const sealingCut = await (await fetch(`${API}/api/v1/reserva/cortes/${seal.snapshot_id}`)).json();
+    check(
+      seal.status === "sealed" &&
+        seal.reserve_ratio === "100.00" &&
+        seal.root === sealingCut.merkle_root &&
+        seal.ledger_anchor === sealingCut.secuencia_ledger &&
+        sealingCut.secuencia_ledger >= sale.settlement_sequence &&
+        (sealingCut.secuencia_mercado ?? 0) >= sale.market_sequence,
+      "after a new Proof of Reserve snapshot the confirmation is sealed by it: its Merkle root, its anchors past the trade, 100.00% backed",
+    );
+    await docRows.first().click();
+    await viewer.getByTestId("reserve-seal").and(page.locator("[data-status=sealed]")).waitFor();
+    check(
+      (await viewer.getByTestId("seal-root").getAttribute("data-value")) === seal.root &&
+        flat(await viewer.getByTestId("reserve-seal").textContent()).includes("Reserve verified · 100.00% backed"),
+      "the viewer shows the seal: Reserve verified · 100.00% backed, with the snapshot's Merkle root",
+    );
+    await shot(page, "document-confirmation", { fullPage: false });
+
+    // Download (.json): the document exactly as the API serves it.
+    const [download] = await Promise.all([
+      page.waitForEvent("download"),
+      viewer.getByTestId("document-download").click(),
+    ]);
+    const downloadPath = `${OUT}/${download.suggestedFilename()}`;
+    await download.saveAs(downloadPath);
+    const served = (await asClient(`/api/v1/wealth/documentos/${latest.id}`)).body;
+    check(
+      download.suggestedFilename() === `synthetic-capital-${served.folio}.json` &&
+        isDeepStrictEqual(JSON.parse(readFileSync(downloadPath, "utf8")), served),
+      `Download (.json) saves ${download.suggestedFilename()}: the confirmation exactly as the API serves it`,
+    );
+
+    // Printed: the document alone, black on white, every hash in full.
+    await page.emulateMedia({ media: "print" });
+    const paper = await page.evaluate(() => {
+      const copy = document.querySelector("body > .document-print-copy");
+      return {
+        copy: copy ? getComputedStyle(copy).display : null,
+        rest: [...document.body.children]
+          .filter((el) => el !== copy)
+          .every((el) => getComputedStyle(el).display === "none"),
+        dialog: getComputedStyle(document.querySelector("dialog")).display,
+        paper: copy ? getComputedStyle(copy.querySelector(".print-document")).backgroundColor : null,
+        ink: copy ? getComputedStyle(copy.querySelector("[data-testid=confirmation-headline]")).color : null,
+        hash: copy?.querySelector("[data-testid=document-reference]")?.textContent ?? null,
+      };
+    });
+    check(
+      paper.copy === "block" &&
+        paper.rest &&
+        paper.dialog === "none" &&
+        paper.paper === "rgb(255, 255, 255)" &&
+        paper.ink === "rgb(0, 0, 0)" &&
+        paper.hash === served.reference,
+      "printed, the page is the document alone, black on white, with the reference hash in full",
+    );
+    const confirmationPdf = await page.pdf({ path: `${OUT}/trade-confirmation.pdf`, format: "A4" });
+    await page.emulateMedia({ media: null });
+    check(
+      confirmationPdf.subarray(0, 5).toString() === "%PDF-" && confirmationPdf.length > 10_000,
+      `Print / Save as PDF renders the confirmation (${Math.round(confirmationPdf.length / 1024)} KB)`,
+    );
+    await viewer.getByRole("button", { name: "Close" }).click();
+    await viewer.waitFor({ state: "detached" });
+
+    // The month's statement: the account's balance, every movement, zero commissions.
+    await inboxFilter.getByText(`Statements · ${statements.length}`).click();
+    await page.waitForFunction(
+      (n) => document.querySelectorAll("[data-testid=document-row]").length === n,
+      statements.length,
+    );
+    const statement = (await asClient(`/api/v1/wealth/documentos/${statements[0].id}`)).body;
+    const account = (await asClient("/api/v1/tablero")).body.boveda;
+    // Holds and order commitments move cash inside the account: the statement lists what changes its balance.
+    const BALANCE_MOVEMENTS = [
+      "DEPOSITO",
+      "RETIRO",
+      "TRANSFERENCIA",
+      "TRASPASO_A_SOFOM",
+      "RETORNO_DE_SOFOM",
+      "COMPRA_MERCADO",
+      "VENTA_MERCADO",
+    ];
+    const monthLedger = cashLedger.filter(
+      (m) => mexicoMonth(m.creado_en) === statement.period && BALANCE_MOVEMENTS.includes(m.tipo),
+    );
+    const tradesThisMonth = settlements.filter((m) => mexicoMonth(m.creado_en) === statement.period).length;
+    check(
+      toUnits(statement.closing_balance) ===
+        toUnits(account.saldo_disponible) +
+          toUnits(account.saldo_bloqueado) +
+          toUnits(account.saldo_comprometido ?? "0") &&
+        toUnits(statement.closing_breakdown.available) === toUnits(account.saldo_disponible) &&
+        toUnits(statement.opening_balance) + toUnits(statement.credits) - toUnits(statement.debits) ===
+          toUnits(statement.closing_balance) &&
+        statement.entries.length === monthLedger.length &&
+        statement.trades.buys + statement.trades.sells === tradesThisMonth &&
+        isZero(statement.trades.commission),
+      `the statement closes at the account's balance (opening + credits − debits), lists all ${monthLedger.length} movements of the month and its ${tradesThisMonth} trades, with zero commissions`,
+    );
+    await docRows.first().click();
+    await viewer.getByTestId("statement-closing").waitFor();
+    check(
+      (await viewer.getByTestId("document-folio").innerText()) === statement.folio &&
+        (await viewer.getByTestId("statement-closing").innerText()).includes(formatMoney(statement.closing_balance)) &&
+        (await viewer.getByTestId("statement-commission").innerText()).includes("$0.00") &&
+        (await viewer.getByTestId("statement-entries").locator("tbody tr").count()) === statement.entries.length,
+      "the viewer shows the statement's folio, closing balance, every movement and $0.00 in commissions",
+    );
+    await page.emulateMedia({ media: "print" });
+    const statementPdf = await page.pdf({ path: `${OUT}/account-statement.pdf`, format: "A4" });
+    await page.emulateMedia({ media: null });
+    check(
+      statementPdf.subarray(0, 5).toString() === "%PDF-" && statementPdf.length > 10_000,
+      `Print / Save as PDF renders the statement (${Math.round(statementPdf.length / 1024)} KB)`,
+    );
+    await viewer.getByRole("button", { name: "Close" }).click();
+    await viewer.waitFor({ state: "detached" });
+
+    // A document's address opens it; Escape closes it and the address returns to the inbox.
+    await page.goto(`${BASE}/dashboard/documents?id=${statement.id}`);
+    await viewer.getByTestId("statement-closing").waitFor();
+    check(true, "a document's address (?id=) opens it in the viewer");
+    await page.keyboard.press("Escape");
+    await viewer.waitFor({ state: "detached" });
+    await page.waitForURL((url) => url.pathname === "/dashboard/documents" && url.search === "");
+    check(true, "Escape closes the viewer, and the address returns to the inbox");
+
+    // On a phone: the account pages as a strip of links, the viewer full screen.
+    await page.setViewportSize({ width: 390, height: 844 });
+    const accountPages = page.getByRole("navigation", { name: "Account pages" });
+    const documentsLink = accountPages.getByRole("link", { name: "Documents" });
+    await documentsLink.waitFor();
+    check(
+      JSON.stringify(await accountPages.getByRole("link").allInnerTexts()) ===
+        JSON.stringify(["Documents", "Beneficiaries", "Security"]) &&
+        (await documentsLink.getAttribute("aria-current")) === "page" &&
+        (await settledStyle(documentsLink, "backgroundColor")) === "rgb(234, 179, 8)" &&
+        (await mainNav(page).getByRole("link").count()) === 5,
+      "on a phone the account pages are a strip of links, Documents gold while current; the tab bar keeps its five tabs",
+    );
+    check(
+      await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth),
+      "the inbox fits a phone's width",
+    );
+    await shot(page, "documents-phone");
+    await docRows.and(page.locator("[data-kind=trade_confirmation]")).first().click();
+    await viewer.getByTestId("document-screen").waitFor();
+    // Measured once the sheet has slid into place.
+    await viewer.evaluate((d) => Promise.all(d.getAnimations().map((a) => a.finished.catch(() => undefined))));
+    const sheet = await viewer.boundingBox();
+    check(
+      sheet.x === 0 &&
+        sheet.y === 0 &&
+        sheet.width === 390 &&
+        sheet.height === 844 &&
+        (await viewer.evaluate((d) => d.scrollWidth <= d.clientWidth)),
+      "on a phone the viewer takes the whole screen, without sideways scrolling",
+    );
+    await shot(page, "document-confirmation-phone", { fullPage: false });
+    await page.keyboard.press("Escape");
+    await viewer.waitFor({ state: "detached" });
+    await page.setViewportSize({ width: 1440, height: 1000 });
+
+    // ---------------------------------------------------------------------
+    // Legal beneficiaries (roadmap item 25): shares that add up to exactly
+    // 100%, saved as immutable, hash-chained versions
+    // ---------------------------------------------------------------------
+    const spouseCurp = `LORJ900101HDFPJS0${curpCheckDigit("LORJ900101HDFPJS0")}`;
+    await openTab(page, "Beneficiaries");
+    const allocationText = page.getByTestId("allocation-label");
+    const allocationMeter = page.getByTestId("allocation-bar");
+    const saveDesignation = page.getByTestId("save-beneficiaries");
+    const designationStatus = page.getByTestId("designation-status");
+    const beneficiaryCards = page.getByTestId("beneficiary-card");
+    const addBeneficiary = page.getByRole("button", { name: "Add beneficiary" });
+    const shares = () =>
+      beneficiaryCards.getByTestId("beneficiary-percent").evaluateAll((inputs) => inputs.map((i) => i.value));
+    await page.getByText("No beneficiaries yet.", { exact: false }).waitFor();
+    check(
+      (await allocationText.innerText()) === "No beneficiaries" && !(await saveDesignation.isEnabled()),
+      "with no beneficiaries yet the allocation is empty and there is nothing to save",
+    );
+    await addBeneficiary.click();
+    const firstHeir = beneficiaryCards.nth(0);
+    check(
+      (await firstHeir.getByTestId("beneficiary-percent").inputValue()) === "100" &&
+        (await firstHeir.getByLabel("Full legal name").evaluate((el) => el === document.activeElement)) &&
+        (await allocationText.innerText()) === "100% allocated",
+      "the first beneficiary takes 100%, and the cursor waits in their name",
+    );
+    await firstHeir.getByLabel("Full legal name").fill("María López Rojas");
+    await firstHeir.getByLabel("Relationship").selectOption("HIJO");
+    await firstHeir.getByLabel("Date of birth").fill("2005-06-07");
+    await firstHeir.getByTestId("beneficiary-percent").fill("60");
+    await addBeneficiary.click();
+    const secondHeir = beneficiaryCards.nth(1);
+    check(
+      (await secondHeir.getByTestId("beneficiary-percent").inputValue()) === "40",
+      "a second beneficiary takes what is left: 40%",
+    );
+    await secondHeir.getByLabel("Full legal name").fill("José López Rojas");
+    await secondHeir.getByLabel("Relationship").selectOption("CONYUGE");
+    await secondHeir.getByLabel("CURP").fill(spouseCurp);
+    check(
+      (await secondHeir.getByLabel("Date of birth").inputValue()) === "1990-01-01",
+      "a valid CURP fills in the date of birth it carries",
+    );
+    await secondHeir.getByTestId("beneficiary-percent").fill("30");
+    check(
+      (await allocationText.innerText()) === "90% allocated · 10% left" &&
+        (await allocationMeter.getAttribute("aria-valuetext")) === "90% allocated · 10% left" &&
+        (await allocationMeter.getAttribute("data-status")) === "under" &&
+        !(await saveDesignation.isEnabled()) &&
+        (await designationStatus.innerText()) === "The percentages must add up to exactly 100%.",
+      "60% + 30% reads 90% allocated · 10% left, and Save stays off until the shares add up to exactly 100%",
+    );
+    await secondHeir.getByTestId("beneficiary-percent").fill("40");
+    check(
+      (await allocationText.innerText()) === "100% allocated" &&
+        (await settledStyle(allocationMeter, "borderTopColor")) === "rgb(234, 179, 8)" &&
+        (await saveDesignation.isEnabled()) &&
+        (await designationStatus.innerText()) === "Ready to save.",
+      "60% + 40%: 100% allocated, the bar outlined in gold, and Save turns on",
+    );
+    await shot(page, "beneficiaries-draft");
+    await saveDesignation.click();
+    await page.getByText("Saved as version 1").waitFor();
+    const firstVersion = (await asClient("/api/v1/kyc/beneficiarios")).body;
+    check(
+      firstVersion.version === 1 &&
+        JSON.stringify(
+          firstVersion.vigente.beneficiarios.map((b) => [
+            b.nombre_completo,
+            b.parentesco,
+            b.curp,
+            b.fecha_nacimiento,
+            b.porcentaje,
+          ]),
+        ) ===
+          JSON.stringify([
+            ["MARÍA LÓPEZ ROJAS", "HIJO", null, "2005-06-07", "60.00"],
+            ["JOSÉ LÓPEZ ROJAS", "CONYUGE", spouseCurp, "1990-01-01", "40.00"],
+          ]) &&
+        firstVersion.cadena_verificada,
+      "saved as version 1: legal names in capitals, 60.00% and 40.00%, the chain verified by the server",
+    );
+    check(
+      (await page.getByTestId("designation-version").innerText()) === "Version 1" &&
+        (await page.getByTestId("chain-seal").getAttribute("data-verified")) === "true" &&
+        (await page.getByTestId("history-row").count()) === 1 &&
+        (await designationStatus.innerText()) === "No unsaved changes.",
+      "the record shows version 1 with its chain verified, and its history",
+    );
+    await page.reload();
+    await beneficiaryCards.nth(1).waitFor();
+    check(
+      JSON.stringify(await shares()) === JSON.stringify(["60", "40"]) &&
+        (await allocationText.innerText()) === "100% allocated",
+      "after a reload the editor holds what is on record: 60% and 40%",
+    );
+
+    // A third beneficiary, and the shares split evenly to the cent.
+    await addBeneficiary.click();
+    const thirdHeir = beneficiaryCards.nth(2);
+    check(
+      (await thirdHeir.getByTestId("beneficiary-percent").inputValue()) === "",
+      "with nothing left, a third beneficiary starts without a share",
+    );
+    await thirdHeir.getByLabel("Full legal name").fill("Ana López Rojas");
+    await thirdHeir.getByLabel("Relationship").selectOption("NIETO");
+    await thirdHeir.getByLabel("Date of birth").fill("2015-03-04");
+    await page.getByRole("button", { name: "Split evenly" }).click();
+    check(
+      JSON.stringify(await shares()) === JSON.stringify(["33.34", "33.33", "33.33"]) &&
+        (await allocationText.innerText()) === "100% allocated",
+      "Split evenly gives 33.34%, 33.33% and 33.33%: exactly 100%",
+    );
+    await saveDesignation.click();
+    await page.getByText("Saved as version 2").waitFor();
+
+    // Another device saves first: this page's save is refused (409); the newer
+    // version shows and the edits stay, to be saved again on top of it.
+    await thirdHeir.getByRole("button", { name: "Remove beneficiary 3" }).click();
+    await page.getByRole("button", { name: "Split evenly" }).click();
+    const otherDevice = await apiLogin(email, password, WINDOWS_UA);
+    const savedElsewhere = await fetch(`${API}/api/v1/kyc/beneficiarios`, {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${otherDevice}`, "user-agent": WINDOWS_UA },
+      body: JSON.stringify({
+        beneficiarios: [
+          {
+            nombre_completo: "María López Rojas",
+            parentesco: "HIJO",
+            fecha_nacimiento: "2005-06-07",
+            porcentaje: "100",
+          },
+        ],
+        version_base: 2,
+      }),
+    });
+    check(savedElsewhere.status === 201, "meanwhile another device saves version 3");
+    expectFailure("/api/v1/kyc/beneficiarios");
+    await saveDesignation.click();
+    await page.getByText("Your beneficiaries were changed from another session.", { exact: false }).waitFor();
+    check(
+      (await page.getByTestId("designation-version").innerText()) === "Version 3" &&
+        JSON.stringify(await shares()) === JSON.stringify(["50", "50"]) &&
+        (await saveDesignation.isEnabled()),
+      "this page's save on top of version 2 is refused (409): version 3 shows on record, the 50/50 edits stay",
+    );
+    await saveDesignation.click();
+    await page.getByText("Saved as version 4").waitFor();
+    check(
+      (await page.getByTestId("history-row").count()) === 4,
+      "saved again, as version 4: four versions in the history",
+    );
+    const refusedSum = await asClient("/api/v1/kyc/beneficiarios", {
+      method: "POST",
+      body: JSON.stringify({
+        beneficiarios: [
+          {
+            nombre_completo: "María López Rojas",
+            parentesco: "HIJO",
+            fecha_nacimiento: "2005-06-07",
+            porcentaje: "60",
+          },
+          { nombre_completo: "José López Rojas", parentesco: "CONYUGE", curp: spouseCurp, porcentaje: "39" },
+        ],
+        version_base: 4,
+      }),
+    });
+    const afterRefusal = (await asClient("/api/v1/kyc/beneficiarios")).body;
+    check(
+      refusedSum.status === 422 &&
+        refusedSum.body.error.codigo === "BENEFICIARIOS_PORCENTAJE" &&
+        afterRefusal.version === 4 &&
+        afterRefusal.cadena_verificada,
+      "the API refuses shares that add up to 99% (422 BENEFICIARIOS_PORCENTAJE): still version 4, the chain intact",
+    );
+    const designationEvents = (await asClient("/api/v1/auth/security/events")).body.eventos.filter(
+      (e) => e.evento === "BENEFICIARIOS_DESIGNADOS",
+    );
+    check(
+      JSON.stringify(designationEvents.map((e) => [e.detalle, e.dispositivo])) ===
+        JSON.stringify([
+          ["4", designationEvents[0]?.dispositivo ?? null],
+          ["3", "Edge on Windows"],
+          ["2", designationEvents[0]?.dispositivo ?? null],
+          ["1", designationEvents[0]?.dispositivo ?? null],
+        ]) && designationEvents[0].sesion_actual,
+      "every version is in the security log, with the device that saved it (version 3 from the other device)",
+    );
+    await fetch(`${API}/api/v1/auth/logout`, { method: "POST", headers: { authorization: `Bearer ${otherDevice}` } });
+
+    await page.setViewportSize({ width: 390, height: 844 });
+    const beneficiariesLink = page
+      .getByRole("navigation", { name: "Account pages" })
+      .getByRole("link", { name: "Beneficiaries" });
+    await beneficiariesLink.waitFor();
+    check(
+      (await beneficiariesLink.getAttribute("aria-current")) === "page" &&
+        (await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)),
+      "on a phone the Beneficiaries page fits the width, gold in the account pages' strip",
+    );
+    await shot(page, "beneficiaries-phone");
+    await page.setViewportSize({ width: 1440, height: 1000 });
+    await shot(page, "beneficiaries-saved");
+
+    // ---------------------------------------------------------------------
     // Security (roadmap items 20 and 21): devices, the password, the log
     // ---------------------------------------------------------------------
     // A phone and a work laptop sign in through the API: sessions of their own.
@@ -2209,8 +2687,9 @@ try {
         "Signed out all other devices",
         "Device signed out",
         "Signed in",
+        "Beneficiaries updated",
       ].every((title) => logTitles.includes(title)) && logTitles[0] === "Password changed",
-      "the security log shows the change, the refused try, the timeout, both sign-outs and the sign-ins, newest first",
+      "the security log shows the change, the refused try, the timeout, both sign-outs, the sign-ins and the new beneficiaries, newest first",
     );
     await page.mouse.move(0, 0);
     await shot(page, "security-after-changes");

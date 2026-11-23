@@ -247,6 +247,9 @@ export function describeEvent(event: SecurityEvent): EventDescription {
         detail: isInactivityMinutes(n) ? `Now ${inactivityLabel(n)}` : null,
         tone: "neutral",
       };
+    case "BENEFICIARIOS_DESIGNADOS":
+      // Who inherits the account changed: worth noticing if it was not the client.
+      return { title: "Beneficiaries updated", detail: n > 0 ? `Version ${n} on record` : null, tone: "accent" };
     case "MFA_SECRETO_GENERADO":
       return { title: "Two-step verification setup started", detail: null, tone: "neutral" };
     case "MFA_ACTIVADO":

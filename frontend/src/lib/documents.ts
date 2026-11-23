@@ -213,7 +213,8 @@ function parseConfirmation(v: Record<string, unknown>): TradeConfirmation | null
 function parseEntry(value: unknown): StatementEntry | null {
   if (!isRecord(value)) return null;
   const ticker = orNull(value.ticker, isTicker);
-  const tracking = orNull(value.tracking_key, (x): x is string => isText(x, 40));
+  // A deposit's SPEI identity ("90646:20261123:<clave de rastreo>"), or a withdrawal's destination CLABE.
+  const tracking = orNull(value.tracking_key, (x): x is string => isText(x, 120));
   if (
     ticker === undefined ||
     tracking === undefined ||

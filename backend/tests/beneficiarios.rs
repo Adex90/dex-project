@@ -41,9 +41,13 @@ async fn banco(pool: &PgPool) -> Banco {
 
 impl Banco {
     async fn llamar(&self, metodo: &str, token: &str, cuerpo: Option<Value>) -> (StatusCode, Value) {
+        self.pedir(metodo, "/api/v1/kyc/beneficiarios", token, cuerpo).await
+    }
+
+    async fn pedir(&self, metodo: &str, uri: &str, token: &str, cuerpo: Option<Value>) -> (StatusCode, Value) {
         let mut req = Request::builder()
             .method(metodo)
-            .uri("/api/v1/kyc/beneficiarios")
+            .uri(uri)
             .header("authorization", format!("Bearer {token}"))
             .header("user-agent", MAC)
             .header("x-forwarded-for", "203.0.113.7");
@@ -149,6 +153,34 @@ async fn designar_por_versiones_con_su_cadena(pool: PgPool) {
         .await
         .unwrap();
     assert_eq!(primera_mala, None, "la cadena de la base de datos cuadra también");
+
+    // Cada versión guardada está en la bitácora de seguridad del cliente, con
+    // la sesión que la guardó; el intento rechazado (409) no dejó evento.
+    let (s, v) = b.pedir("GET", "/api/v1/auth/security/events", &token, None).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let designaciones: Vec<(&str, bool, &str, &str)> = v["eventos"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["evento"] == "BENEFICIARIOS_DESIGNADOS")
+        .map(|e| {
+            (
+                e["detalle"].as_str().unwrap(),
+                e["sesion_actual"].as_bool().unwrap(),
+                e["dispositivo"].as_str().unwrap(),
+                e["ip"].as_str().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        designaciones,
+        [
+            ("3", true, "Chrome on macOS", "203.0.113.7"),
+            ("2", true, "Chrome on macOS", "203.0.113.7"),
+            ("1", true, "Chrome on macOS", "203.0.113.7")
+        ],
+        "{v}"
+    );
 }
 
 #[sqlx::test(migrations = "../migrations")]

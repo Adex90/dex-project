@@ -172,6 +172,11 @@ test("log entries in words", () => {
   assert.equal(describeEvent(event("PREFERENCIAS_ACTUALIZADAS", { detail: 60 })).detail, "Now 1 hour");
   assert.equal(describeEvent(event("CUENTA_BLOQUEADA")).tone, "danger");
   assert.equal(describeEvent(event("INICIO_FALLIDO")).tone, "warning");
+  assert.deepEqual(describeEvent(event("BENEFICIARIOS_DESIGNADOS", { detail: 3 })), {
+    title: "Beneficiaries updated",
+    detail: "Version 3 on record",
+    tone: "accent",
+  });
   assert.equal(describeEvent(event("ALGO_NUEVO")).title, "Security event");
 });
 
@@ -190,6 +195,7 @@ test("no log entry uses words that would tip off a client under review", () => {
     "RESTABLECIMIENTO_SOLICITADO",
     "CONTRASENA_RESTABLECIDA",
     "PREFERENCIAS_ACTUALIZADAS",
+    "BENEFICIARIOS_DESIGNADOS",
     "MFA_SECRETO_GENERADO",
     "MFA_ACTIVADO",
     "MFA_VERIFICADO",
