@@ -70,11 +70,18 @@ export OPERATOR_ADDRESS=0x… NOTARY_ADDRESS=0x… RELAYER_ADDRESS=0x… AUTOMAT
 export PROVIDER_ID=0x… QUERY_COMMITMENT=0x…                                                  # step 2
 export INITIAL_PRICE=$(cast to-wei 3456.78)        # tUSD per tWETH now: the price endpoint's median
 export BOT_GAS_WEI=$(cast to-wei 0.05)             # testnet gas for each bot, from the deployer
-export ARBITRUM_SEPOLIA_RPC_URL=… ETHERSCAN_API_KEY=…   # read from the environment, never printed
-AWS_KMS_KEY_ID=alias/strawberryswap/deployer \
-  forge script script/DeployTestnet.s.sol --rpc-url arbitrum_sepolia --aws --sender <deployer address> \
+read -rs ARBITRUM_SEPOLIA_RPC_URL && read -rs ETHERSCAN_API_KEY   # typed without echo: never in shell history
+export ARBITRUM_SEPOLIA_RPC_URL ETHERSCAN_API_KEY                 # read from the environment, never printed
+AWS_PROFILE=strawberryswap-deployer AWS_KMS_KEY_ID=alias/strawberryswap/deployer \
+  forge script script/DeployTestnet.s.sol:DeployTestnet --rpc-url arbitrum_sepolia --aws --sender <deployer address> \
   --broadcast --verify --slow
 ```
+
+* The script file also holds `CheckTestnet`, so name the contract: `script/DeployTestnet.s.sol:DeployTestnet`.
+* Only the deployer's role may sign with its key. `AWS_PROFILE` names a profile in `~/.aws/config` that assumes it:
+  `role_arn` is `terraform output -json signer_role_arns | jq -r .deployer`, `source_profile` is an identity in
+  `deployer_principal_arns`, and `region` is the keys' region.
+* Leave out `--broadcast --verify --slow` for a dry run: simulated against the live chain, nothing sent.
 
 The script deploys, in one broadcast:
 
