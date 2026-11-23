@@ -1,0 +1,33 @@
+# cargo audit: Cargo.lock against the RustSec advisory database. CI runs it on every change
+# (ops/ci/cargo-audit.sh, in this crate's job), and fails on any known vulnerability, unsound crate
+# or yanked version. Unmaintained crates are reported but do not fail. Locally, from this
+# directory: cargo audit
+#
+# An exception goes in `ignore` only with its ticket in a comment: the advisory, why it does not
+# apply here or why there is no fix yet, who approved it and when it expires. Prefer updating the
+# dependency (cargo update -p <crate>) to ignoring the advisory.
+
+[advisories]
+ignore = [
+    # RUSTSEC-2026-0387, crypto-bigint 0.5.5: operations meant to be constant-time can leak
+    # timing (fixed in 0.7.6).
+    # * No fix yet. It comes in through alloy's signer stack (k256 0.13, ecdsa 0.16,
+    #   elliptic-curve 0.13). alloy 2.6.1, the newest release, still requires k256 ^0.13, which
+    #   pins crypto-bigint 0.5.
+    # * It does not apply here. It leaks only secret integers, and the vault holds no private
+    #   key: it signs with its KMS key (alloy-signer-aws). crypto-bigint only processes the KMS
+    #   public key, signatures and digests.
+    # * Where a local key exists:
+    #   * alloy-signer-local is a dev-dependency, for the tests' known keys.
+    #   * It is also an optional dependency of the insecure-test-key feature, which is
+    #     debug-only: src/main.rs refuses it in optimized builds.
+    # * The guard: ops/ci/cargo-audit.sh fails if alloy-signer-local ever enters this crate's
+    #   production build graph (default features).
+    # * Approved by the repository owner (Adex90) on 2026-11-23. Expires on 2027-02-23 or when
+    #   alloy moves to k256 0.14, whichever comes first.
+    "RUSTSEC-2026-0387",
+]
+
+[output]
+deny = ["unsound", "yanked"]
+quiet = false

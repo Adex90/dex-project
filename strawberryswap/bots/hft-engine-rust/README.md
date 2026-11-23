@@ -236,6 +236,7 @@ vault once and passes it in `THRESHOLD_SIGNER_BIN`; without it, the test builds 
 | Loop, on a misbehaving node | A rebalance that would revert is never signed (no vault call, no transaction). One transaction in flight: consecutive nonces, each sent once, nothing new while one waits. A dropped transaction is forgotten after 3 s and its nonce reused. A foreign pending transaction holds the engine and raises `foreign_transaction`. A node a block behind on the nonce does not make the engine reuse one. Fees above the cap hold it and raise `fees_above_cap`, resolved when they fall. Late reads raise `rpc_down`. Events and metrics are structured. |
 | Memory | `#![forbid(unsafe_code)]`. valgrind memcheck shows 0 errors on the release binary trading against the vault (150 ticks) and on the unit tests. Nothing is definitely or indirectly lost. The only block reported is 48 bytes "possibly lost": std's handle for the main thread, allocated once for the life of the process. |
 | Lint | `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings` |
+| Dependencies | CI runs `cargo audit` (`ops/ci/cargo-audit.sh`). Cargo.lock has no known vulnerability, unsound crate or yanked version beyond the documented exception in `.cargo/audit.toml`, and the production build has no local private-key signer. |
 
 To regenerate:
 

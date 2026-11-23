@@ -259,6 +259,9 @@ Credentials and region come from the standard AWS chain: on EC2, the instance ro
 * **Code checks:**
   * `#![forbid(unsafe_code)]`, and clippy with `-D warnings`, with and without the test-key feature.
   * CI checks that an optimized build with `insecure-test-key` fails to compile.
+  * CI runs `cargo audit` (`ops/ci/cargo-audit.sh`). Cargo.lock has no known vulnerability, unsound crate or yanked
+    version beyond the documented exception in `.cargo/audit.toml`. The default build has no local private-key
+    signer.
 
 ## The `insecure-test-key` feature (the engine's end-to-end tests only)
 
