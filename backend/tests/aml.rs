@@ -2007,6 +2007,9 @@ async fn sin_aviso_al_cliente(pool: PgPool) {
         // Beneficiarios (0020) y el buzón de documentos.
         "/api/v1/kyc/beneficiarios",
         "/api/v1/wealth/documentos",
+        // Centro fiscal (0021): el resumen, el W-8BEN y la exportación contable.
+        "/api/v1/wealth/impuestos",
+        "/api/v1/wealth/impuestos/export.csv",
     ] {
         let (s, cuerpo) = api.llamar_crudo("GET", ruta, Some(&tok_ana), None).await;
         assert_eq!(s, StatusCode::OK, "{ruta}");

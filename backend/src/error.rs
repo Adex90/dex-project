@@ -268,6 +268,12 @@ fn traducir_error_bd(codigo_sql: &str, mensaje: &str, restriccion: &str) -> Opti
                 "DESIGNACION_DESACTUALIZADA",
                 "tus beneficiarios cambiaron en otra sesión; vuelve a cargarlos antes de guardar",
             )
+        } else if restriccion.starts_with("ux_w8ben") {
+            // Dos certificaciones del W-8BEN a la vez: gana una.
+            AppError::conflicto(
+                "W8BEN_CONCURRENTE",
+                "otra sesión certificó tu W-8BEN al mismo tiempo; vuelve a cargarlo",
+            )
         } else if restriccion.starts_with("ux_beneficiarios") {
             AppError::negocio("BENEFICIARIO_DUPLICADO", "un beneficiario aparece dos veces")
         } else if restriccion.starts_with("ux_perfiles") {

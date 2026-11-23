@@ -53,17 +53,22 @@ const VERSION_ESTADO: &str = "SC-EDC-v1";
 // Lo que se lee de los ledgers
 // -----------------------------------------------------------------------------
 
+/// Un movimiento del ledger IFPE de la cuenta (también lo lee `impuestos.rs`).
 #[derive(Debug, Clone, sqlx::FromRow)]
-struct Movimiento {
-    secuencia: i64,
-    tipo: String,
-    monto: Decimal,
-    cuenta_destino_id: Option<Uuid>,
-    referencia_externa: Option<String>,
-    ref_movimiento_espejo: Option<Uuid>,
-    tx_hash: String,
-    creado_en: DateTime<Utc>,
+pub(crate) struct Movimiento {
+    pub(crate) secuencia: i64,
+    pub(crate) tipo: String,
+    pub(crate) monto: Decimal,
+    pub(crate) cuenta_destino_id: Option<Uuid>,
+    pub(crate) referencia_externa: Option<String>,
+    pub(crate) ref_movimiento_espejo: Option<Uuid>,
+    pub(crate) tx_hash: String,
+    pub(crate) creado_en: DateTime<Utc>,
 }
+
+/// Las columnas de [`Movimiento`], para leerlo con `query_as`.
+pub(crate) const COLUMNAS_MOVIMIENTO: &str =
+    "secuencia, tipo, monto, cuenta_destino_id, referencia_externa, ref_movimiento_espejo, tx_hash, creado_en";
 
 #[derive(Debug, Clone, sqlx::FromRow)]
 struct Orden {
@@ -220,10 +225,26 @@ pub enum TipoAsiento {
     MarketSell,
 }
 
+impl TipoAsiento {
+    /// Su nombre en la API y en la exportación contable ("market_sell").
+    pub fn como_texto(self) -> &'static str {
+        match self {
+            TipoAsiento::Deposit => "deposit",
+            TipoAsiento::Withdrawal => "withdrawal",
+            TipoAsiento::TransferIn => "transfer_in",
+            TipoAsiento::TransferOut => "transfer_out",
+            TipoAsiento::ToFixedTerm => "to_fixed_term",
+            TipoAsiento::FromFixedTerm => "from_fixed_term",
+            TipoAsiento::MarketBuy => "market_buy",
+            TipoAsiento::MarketSell => "market_sell",
+        }
+    }
+}
+
 /// Efecto de un movimiento en el saldo total de la cuenta (disponible +
 /// retenido + comprometido), y qué fue. Las reclasificaciones internas
 /// (retenciones y compromisos de órdenes) no cambian el total: `None`.
-fn asiento(m: &Movimiento, cuenta: Uuid) -> Option<(TipoAsiento, Decimal)> {
+pub(crate) fn asiento(m: &Movimiento, cuenta: Uuid) -> Option<(TipoAsiento, Decimal)> {
     match m.tipo.as_str() {
         "DEPOSITO" => Some((TipoAsiento::Deposit, m.monto)),
         "RETIRO" => Some((TipoAsiento::Withdrawal, -m.monto)),
