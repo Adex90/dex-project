@@ -37,7 +37,7 @@
 # It runs alongside the build. CI passes --build-arg AUDIT_EPOCH=<run id> so a cached
 # layer never hides a new advisory.
 
-FROM docker.io/library/node:22.23.4-trixie-slim@sha256:2117f713a417f3aff682ac8f5bc2ebbdf1beed51f36e67ab1e0fd3866b6d2d8f AS node
+FROM docker.io/library/node:26.13.1-trixie-slim@sha256:e6bedef217677b276c591795e169840edd9096dbf13f29df8ef8d1856b8820bc AS node
 
 # ---------------------------------------------------------------------------------------
 # deps: exact dependency tree from package-lock.json (dev dependencies included: the
@@ -115,7 +115,7 @@ COPY --from=audit /audit.ok /tmp/audit.ok
 # ---------------------------------------------------------------------------------------
 # runtime: distroless Node.js 22 (no shell, no package manager), uid/gid 65532.
 # ---------------------------------------------------------------------------------------
-FROM gcr.io/distroless/nodejs22-debian13:nonroot@sha256:10747a1323be68f206aed893599d43e6697ad67257e7c42703553f99fbce3d33 AS runtime
+FROM gcr.io/distroless/nodejs22-debian13:nonroot@sha256:f991e86a080567b6ab7c3392e36f7a0a4f9300639e526b48ee81b92d523af62e AS runtime
 # The base image's default user is 65532: create /app and its files as root, so the
 # service user can neither modify nor replace application code even on a writable rootfs.
 USER 0:0
