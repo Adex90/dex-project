@@ -152,3 +152,62 @@ body {
     animation: none;
   }
 }
+
+/*
+ * Printing a document from the Document Inbox. While the viewer is open, a
+ * copy of the document sits at the end of <body> (.document-print-copy):
+ * hidden on screen, and on paper the only thing printed, in paper colors and
+ * in normal flow, so a long statement breaks across pages instead of being
+ * clipped to the dialog's scroll box.
+ */
+.document-print-copy {
+  display: none;
+}
+
+@media print {
+  body:has(> .document-print-copy) > :not(.document-print-copy),
+  body:has(> .document-print-copy) dialog {
+    display: none !important;
+  }
+
+  html:has(.document-print-copy),
+  body:has(> .document-print-copy) {
+    height: auto !important;
+    overflow: visible !important;
+    background: #ffffff !important;
+    color-scheme: light;
+  }
+
+  .document-print-copy {
+    display: block;
+    /* Paper colors for the semantic tokens the document uses. */
+    --bg: #ffffff;
+    --surface: #ffffff;
+    --surface-2: #f4f4f5;
+    --border: #d4d4d8;
+    --border-strong: #52525b;
+    --ink: #000000;
+    --ink-2: #27272a;
+    --muted: #52525b;
+    --gain: #15803d;
+    --loss: #b91c1c;
+    --color-synthetic-yellow: #a16207;
+    background: #ffffff;
+    color: #000000;
+  }
+
+  .document-print-copy .print-seal {
+    break-inside: avoid;
+    -webkit-print-color-adjust: exact;
+    print-color-adjust: exact;
+  }
+
+  .document-print-copy tr,
+  .document-print-copy h4 {
+    break-inside: avoid;
+  }
+
+  @page {
+    margin: 16mm 14mm;
+  }
+}

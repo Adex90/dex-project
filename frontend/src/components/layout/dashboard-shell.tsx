@@ -5,7 +5,7 @@ import { usePathname, useRouter } from "next/navigation";
 
 import { DashboardHeader } from "@/components/dashboard/dashboard-header";
 import { KycBanner, isKycLocked } from "@/components/dashboard/kyc-status";
-import { Navigation, activeItem, resetNavOrigin, useNavOrigin } from "@/components/layout/navigation";
+import { AccountLinks, Navigation, activeItem, resetNavOrigin, useNavOrigin } from "@/components/layout/navigation";
 import { Alert, Button } from "@/components/ui/primitives";
 import { ONBOARDING_PATH } from "@/hooks/use-client-home";
 import { useDashboardData } from "@/hooks/use-dashboard-data";
@@ -43,6 +43,8 @@ import { displayedRealtime, useVaultStore } from "@/store/vault";
  * page: after that long without a click, key or touch in this tab, the
  * session ends here and on the server (see `useIdleSignOut`).
  */
+
+const ACCOUNT_TAB_PATH = "/dashboard/account";
 
 export interface DashboardContextValue {
   /** The session's access token. */
@@ -136,6 +138,8 @@ export function DashboardShell({ children }: { children: ReactNode }) {
   const section = activeItem(pathname, origin);
   // The verification wizard is the banner's destination: it does not repeat it.
   const verifying = pathname === ONBOARDING_PATH;
+  // Phones reach the account pages from the Account tab and from one another.
+  const accountLinks = section?.settings === true || pathname === ACCOUNT_TAB_PATH;
 
   return (
     <DashboardContext value={context}>
@@ -165,6 +169,7 @@ export function DashboardShell({ children }: { children: ReactNode }) {
             <Alert tone="warning">Showing the last data received. {describeError(error)}</Alert>
           ) : null}
           {client && kycLocked && !verifying ? <KycBanner client={client} token={context.token} /> : null}
+          {accountLinks ? <AccountLinks /> : null}
           {children}
         </main>
       </div>

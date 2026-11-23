@@ -117,7 +117,8 @@ const MESSAGES: Record<string, string> = {
   SALDO_INSUFICIENTE: "Insufficient available balance in your vault.",
   KYC_NO_VERIFICADO: "Your identity (KYC) has not been verified yet, so money movements are disabled.",
   DESTINO_NO_ACREDITABLE: "The destination account cannot receive this transfer.",
-  KYC_PROVEEDOR_NO_DISPONIBLE: "Identity verification is not available right now. Your file was not changed; please try again later.",
+  KYC_PROVEEDOR_NO_DISPONIBLE:
+    "Identity verification is not available right now. Your file was not changed; please try again later.",
   CLIENTE_EN_LISTA_BLOQUEADAS: "Operations are blocked on this account for compliance reasons.",
   CUENTA_CONGELADA: "Your vault account is frozen.",
   CUENTA_CERRADA: "Your vault account is closed.",
@@ -142,7 +143,8 @@ const MESSAGES: Record<string, string> = {
   MERCADO_NO_DISPONIBLE: "The market opens once live prices are connected. No order was placed.",
   MERCADO_CERRADO: "This asset is not trading right now. No order was placed.",
   MONTO_INSUFICIENTE: "That amount is too small to buy the smallest unit of this asset.",
-  POSICION_INSUFICIENTE: "That is more than the units you can sell are worth. Units held by open orders cannot be sold.",
+  POSICION_INSUFICIENTE:
+    "That is more than the units you can sell are worth. Units held by open orders cannot be sold.",
   // Limit and stop orders (migration 0015).
   PRECIO_STOP_INVALIDO:
     "The price has already reached that stop. A buy stop goes above the current price, a sell stop below it.",
@@ -153,6 +155,14 @@ const MESSAGES: Record<string, string> = {
   CUENTA_NO_VINCULADA: "Withdrawals go only to a bank account linked in your name. Nothing was sent.",
   TRANSFERENCIAS_TERCEROS_NO_DISPONIBLES:
     "Payments to other people's accounts are not available. Withdrawals go to a bank account in your name.",
+  // Legal beneficiaries (migration 0020): a save is all or nothing.
+  BENEFICIARIOS_PORCENTAJE: "The percentages must add up to exactly 100%. Nothing was saved.",
+  BENEFICIARIOS_MAXIMO: "Name at most 5 beneficiaries. Nothing was saved.",
+  BENEFICIARIO_TITULAR: "You cannot name yourself as a beneficiary. Nothing was saved.",
+  BENEFICIARIO_DUPLICADO: "The same person appears twice. Nothing was saved.",
+  BENEFICIARIO_INVALIDO: "Check each beneficiary's details. Nothing was saved.",
+  DESIGNACION_DESACTUALIZADA:
+    "Your beneficiaries were changed from another session. The latest version is shown; review it and save again.",
   // A client whose account is restricted gets this one neutral message whatever
   // the cause (no tipping off): it must not mention compliance, alerts or freezes.
   OPERACION_NO_DISPONIBLE: GENERIC_UNAVAILABLE_MESSAGE,

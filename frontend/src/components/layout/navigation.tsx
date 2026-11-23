@@ -3,11 +3,23 @@
 import { useEffect } from "react";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { Landmark, LockKeyhole, Search, ShieldCheck, TrendingUp, Vault, type LucideIcon } from "lucide-react";
+import {
+  FileText,
+  Landmark,
+  LockKeyhole,
+  Search,
+  ShieldCheck,
+  TrendingUp,
+  Users,
+  Vault,
+  type LucideIcon,
+} from "lucide-react";
 import { create } from "zustand";
 
 import { Brand } from "@/components/brand";
 import { cx } from "@/components/ui/primitives";
+import { BENEFICIARIES_PATH } from "@/lib/beneficiaries";
+import { DOCUMENTS_PATH } from "@/lib/documents";
 import { SECURITY_PATH } from "@/lib/security";
 
 /*
@@ -26,8 +38,10 @@ import { SECURITY_PATH } from "@/lib/security";
  * and from Discover, and the tab that opened it stays current there (its
  * Back link returns to that tab). Opened by its address, it is the Vault's.
  *
- * Settings pages (Security) sit in the sidebar's own "Account" group and, on
- * phones, behind the header's shield button: the tab bar keeps five tabs.
+ * Account pages (Documents, Beneficiaries, Security) sit in the sidebar's own
+ * "Account" group. On phones the tab bar keeps its five tabs: the Account tab
+ * and each account page carry a strip of links to them (`AccountLinks`), and
+ * the header's lock opens Security.
  */
 
 export interface NavItem {
@@ -49,8 +63,13 @@ export const DASHBOARD_NAV: readonly NavItem[] = [
   { href: "/dashboard/account", label: "Account", icon: Landmark },
   { href: "/dashboard/invest", label: "Invest", icon: TrendingUp },
   { href: "/dashboard/reserve", label: "Reserve", icon: ShieldCheck },
+  { href: DOCUMENTS_PATH, label: "Documents", icon: FileText, settings: true },
+  { href: BENEFICIARIES_PATH, label: "Beneficiaries", icon: Users, settings: true },
   { href: SECURITY_PATH, label: "Security", icon: LockKeyhole, settings: true },
 ];
+
+/** The account pages, in the sidebar's "Account" group and in `AccountLinks`. */
+export const ACCOUNT_PAGES: readonly NavItem[] = DASHBOARD_NAV.filter((item) => item.settings);
 
 /** Pages that open from more than one tab: they belong to the tab that opened them. */
 const DETAIL_PATHS: readonly string[] = ["/dashboard/asset"];
@@ -141,9 +160,7 @@ export function Navigation({ items = DASHBOARD_NAV }: { items?: readonly NavItem
           </ul>
           {settings.length > 0 ? (
             <>
-              <p className="px-3 pt-6 pb-3 text-[10px] font-semibold tracking-[0.24em] text-muted uppercase">
-                Account
-              </p>
+              <p className="px-3 pt-6 pb-3 text-[10px] font-semibold tracking-[0.24em] text-muted uppercase">Account</p>
               <ul className="space-y-1">
                 {settings.map((item) => (
                   <li key={item.href}>
@@ -164,10 +181,7 @@ export function Navigation({ items = DASHBOARD_NAV }: { items?: readonly NavItem
         aria-label="Main"
         className="fixed inset-x-0 bottom-0 z-30 border-t border-border bg-bg/95 pb-[env(safe-area-inset-bottom)] backdrop-blur-md lg:hidden"
       >
-        <ul
-          className="mx-auto grid max-w-lg"
-          style={{ gridTemplateColumns: `repeat(${tabs.length}, minmax(0, 1fr))` }}
-        >
+        <ul className="mx-auto grid max-w-lg" style={{ gridTemplateColumns: `repeat(${tabs.length}, minmax(0, 1fr))` }}>
           {tabs.map((item) => (
             <li key={item.href}>
               <TabLink item={item} active={item === current} />
@@ -196,9 +210,7 @@ function SidebarLink({ item, active }: { item: NavItem; active: boolean }) {
       )}
     >
       {/* The active bar sits on the sidebar's inner edge. */}
-      {active ? (
-        <span aria-hidden className="absolute inset-y-2 -left-3 w-[3px] bg-synthetic-yellow" />
-      ) : null}
+      {active ? <span aria-hidden className="absolute inset-y-2 -left-3 w-[3px] bg-synthetic-yellow" /> : null}
       <Icon className="size-[18px] shrink-0" strokeWidth={active ? 2.25 : 1.75} aria-hidden />
       {item.label}
     </Link>
@@ -231,5 +243,40 @@ function TabLink({ item, active }: { item: NavItem; active: boolean }) {
         {item.label}
       </span>
     </Link>
+  );
+}
+
+/**
+ * Phones only (the sidebar lists them from `lg` up): the account pages as a
+ * strip of links, on the Account tab and on each account page. The current
+ * one is solid gold.
+ */
+export function AccountLinks({ className }: { className?: string }) {
+  const pathname = usePathname();
+  return (
+    <nav aria-label="Account pages" className={cx("lg:hidden", className)}>
+      <ul className="grid grid-cols-3 border border-border bg-surface">
+        {ACCOUNT_PAGES.map((item) => {
+          const active = isActive(item, pathname);
+          const Icon = item.icon;
+          return (
+            <li key={item.href} className="min-w-0 border-r border-border last:border-r-0">
+              <Link
+                href={item.href}
+                aria-current={active ? "page" : undefined}
+                className={cx(
+                  "flex min-h-11 items-center justify-center gap-1.5 px-2 text-xs font-semibold transition-colors",
+                  "focus-visible:ring-2 focus-visible:ring-synthetic-yellow focus-visible:outline-none focus-visible:ring-inset",
+                  active ? "bg-synthetic-yellow text-black" : "text-muted hover:bg-surface-2 hover:text-ink",
+                )}
+              >
+                <Icon className="size-4 shrink-0" strokeWidth={active ? 2.25 : 1.75} aria-hidden />
+                <span className="truncate">{item.label}</span>
+              </Link>
+            </li>
+          );
+        })}
+      </ul>
+    </nav>
   );
 }

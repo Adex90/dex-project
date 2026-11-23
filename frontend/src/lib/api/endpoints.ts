@@ -1,5 +1,6 @@
 import { passwordChangeBody } from "@/lib/security";
 import type { LimitOrderRequest, MarketOrderRequest, StopOrderRequest } from "@/types/market";
+import type { DesignationRequest } from "@/types/beneficiaries";
 import type { InactivityMinutes, PasswordChange } from "@/types/security";
 import type { WithdrawalRequest } from "@/types/wealth";
 
@@ -58,7 +59,8 @@ const AML = "/api/v1/aml";
 
 /** One function per backend route used by the client app (see backend/src/routes). */
 export const api = {
-  register: (input: RegistroInput) => request<RegistroRespuesta>("/api/v1/auth/registro", { method: "POST", body: input }),
+  register: (input: RegistroInput) =>
+    request<RegistroRespuesta>("/api/v1/auth/registro", { method: "POST", body: input }),
 
   login: (email: string, password: string) =>
     request<ResultadoLogin>("/api/v1/auth/login", { method: "POST", body: { email, password } }),
@@ -126,8 +128,7 @@ export const api = {
    * The market catalog: every asset that can be quoted and traded now.
    * Untyped on purpose: `parseMarketCatalog` validates it before it is stored.
    */
-  marketAssets: (token: string, signal?: AbortSignal) =>
-    request<unknown>("/api/v1/market/assets", { token, signal }),
+  marketAssets: (token: string, signal?: AbortSignal) => request<unknown>("/api/v1/market/assets", { token, signal }),
 
   /**
    * A market quote: the asset and its price history (src/types/market.ts).
@@ -182,6 +183,17 @@ export const api = {
   withdraw: (token: string, body: WithdrawalRequest) =>
     request<unknown>("/api/v1/wealth/withdraw", { method: "POST", token, body }),
 
+  /**
+   * The Document Inbox: monthly account statements and a trade confirmation
+   * for every executed order, derived from the hash-chained ledgers, newest
+   * first. Untyped on purpose: `parseDocumentList` validates the answer.
+   */
+  documents: (token: string, signal?: AbortSignal) => request<unknown>("/api/v1/wealth/documentos", { token, signal }),
+
+  /** One document ("co_<order id>" or "ec_<YYYY-MM>"); 404 when it is not the client's. Validate with `parseDocument`. */
+  document: (token: string, id: string, signal?: AbortSignal) =>
+    request<unknown>(`/api/v1/wealth/documentos/${encodeURIComponent(id)}`, { token, signal }),
+
   movements: (token: string, params: { limit?: number; before?: number } = {}, signal?: AbortSignal) =>
     request<TransaccionIfpe[]>("/api/v1/ifpe/movimientos", {
       token,
@@ -190,7 +202,11 @@ export const api = {
     }),
 
   simulatedDeposit: (token: string, monto: string, clave_idempotencia: string) =>
-    request<Movimiento>("/api/v1/ifpe/depositos/simulados", { method: "POST", token, body: { monto, clave_idempotencia } }),
+    request<Movimiento>("/api/v1/ifpe/depositos/simulados", {
+      method: "POST",
+      token,
+      body: { monto, clave_idempotencia },
+    }),
 
   rates: () => request<PlazoTasa[]>("/api/v1/sofom/tasas"),
 
@@ -232,7 +248,8 @@ export const api = {
   me: (token: string, signal?: AbortSignal) => request<Cliente>("/api/v1/yo", { token, signal }),
 
   /** The customer's KYC file: state, attempts left and the last biometric result. */
-  kycFile: (token: string, signal?: AbortSignal) => request<VistaExpediente>("/api/v1/kyc/expediente", { token, signal }),
+  kycFile: (token: string, signal?: AbortSignal) =>
+    request<VistaExpediente>("/api/v1/kyc/expediente", { token, signal }),
 
   /** Step 1: personal data and address (only while the file is PENDIENTE). */
   kycSaveProfile: (token: string, body: DatosPersonalesInput) =>
@@ -244,6 +261,18 @@ export const api = {
    */
   kycVerify: (token: string, body: SolicitudVerificacion, signal?: AbortSignal) =>
     request<EnvioVerificacion>("/api/v1/kyc/verificar", { method: "POST", token, body, signal }),
+
+  /** Legal beneficiaries: the current designation and its history. Validate with `parseBeneficiaries`. */
+  beneficiaries: (token: string, signal?: AbortSignal) =>
+    request<unknown>("/api/v1/kyc/beneficiarios", { token, signal }),
+
+  /**
+   * Saves the whole designation as a new version on top of `version_base`
+   * (201); an empty list withdraws it. 409 DESIGNACION_DESACTUALIZADA when
+   * another session saved first. Validate the answer with `parseBeneficiaries`.
+   */
+  saveBeneficiaries: (token: string, body: DesignationRequest) =>
+    request<unknown>("/api/v1/kyc/beneficiarios", { method: "POST", token, body }),
 
   // ---------------------------------------------------------------------------
   // Compliance console (/admin/aml): CUMPLIMIENTO and AUDITOR only; every POST
@@ -316,7 +345,11 @@ export const api = {
 
   /** Four-eyes queue, PENDIENTE by default. */
   amlRequests: (token: string, q: { estado?: string; limite?: number }, signal?: AbortSignal) =>
-    request<ListaSolicitudesAml>(`${AML}/solicitudes`, { token, signal, query: { estado: q.estado, limite: q.limite } }),
+    request<ListaSolicitudesAml>(`${AML}/solicitudes`, {
+      token,
+      signal,
+      query: { estado: q.estado, limite: q.limite },
+    }),
 
   /** Second officer's decision on an unfreeze or release request. */
   amlDecideRequest: (token: string, requestId: Uuid, body: DecisionInput) =>
@@ -350,10 +383,18 @@ export const api = {
     request<PropuestaCreadaAml>(`${AML}/propuestas`, { method: "POST", token, body }),
 
   amlDecideProposal: (token: string, id: Uuid, body: DecisionInput) =>
-    request<DecisionPropuestaAml>(`${AML}/propuestas/${encodeURIComponent(id)}/decision`, { method: "POST", token, body }),
+    request<DecisionPropuestaAml>(`${AML}/propuestas/${encodeURIComponent(id)}/decision`, {
+      method: "POST",
+      token,
+      body,
+    }),
 
   /** Quarterly register of relevant operations. */
-  amlRelevant: (token: string, q: { trimestre?: string; antes_de?: IsoDateTime; limite?: number }, signal?: AbortSignal) =>
+  amlRelevant: (
+    token: string,
+    q: { trimestre?: string; antes_de?: IsoDateTime; limite?: number },
+    signal?: AbortSignal,
+  ) =>
     request<ListaRelevantesAml>(`${AML}/relevantes`, {
       token,
       signal,
