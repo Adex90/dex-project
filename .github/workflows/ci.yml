@@ -1208,9 +1208,11 @@ jobs:
           tflint --chdir=terraform --config="${config}" --format=compact
 
       # StrawberrySwap's AWS environment (strawberryswap/infra/terraform): the bot host, its metadata bucket and the
-      # testnet's KMS signing keys. `terraform test` plans the signing-keys module offline (placeholder credentials)
-      # and checks the key policies it renders: only each signer's role signs, digests only, never the account root.
-      - name: StrawberrySwap Terraform - fmt, validate, signing-keys tests
+      # testnet's KMS signing keys. `terraform test` plans two modules offline (placeholder credentials):
+      # * signing-keys, checking the key policies it renders: only each signer's role signs, digests only, never the
+      #   account root;
+      # * ec2-bots, checking that the host runs the pinned image (ami_id), never the floating "latest" parameter.
+      - name: StrawberrySwap Terraform - fmt, validate, module tests
         id: strawberryswap-terraform
         if: ${{ !cancelled() && steps.setup-terraform.outcome == 'success' }}
         working-directory: strawberryswap/infra/terraform
@@ -1218,8 +1220,10 @@ jobs:
           terraform fmt -check -recursive -diff
           terraform -chdir=envs/prod init -backend=false -input=false
           terraform -chdir=envs/prod validate
-          terraform -chdir=modules/signing-keys init -backend=false -input=false
-          terraform -chdir=modules/signing-keys test
+          for module in signing-keys ec2-bots; do
+            terraform -chdir="modules/${module}" init -backend=false -input=false
+            terraform -chdir="modules/${module}" test
+          done
 
       - name: StrawberrySwap Terraform - tflint
         if: ${{ !cancelled() && steps.strawberryswap-terraform.outcome == 'success' && steps.setup-tflint.outcome == 'success' }}
@@ -1227,7 +1231,7 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
         run: |
           config="${GITHUB_WORKSPACE}/.github/linters/.tflint.hcl"
-          for dir in envs/prod modules/signing-keys; do
+          for dir in envs/prod modules/signing-keys modules/ec2-bots; do
             tflint --chdir="strawberryswap/infra/terraform/${dir}" --config="${config}" --init
             tflint --chdir="strawberryswap/infra/terraform/${dir}" --config="${config}" --format=compact
           done

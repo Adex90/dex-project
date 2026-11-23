@@ -23,6 +23,7 @@ module "automators" {
   name                       = var.name
   public_subnet_ids          = module.network.public_subnet_ids
   security_group_id          = module.network.bots_security_group_id
+  ami_id                     = var.bot_ami_id
   instance_type              = var.instance_type
   instance_count             = var.instance_count
   allow_over_free_tier       = var.allow_over_free_tier

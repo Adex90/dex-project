@@ -22,10 +22,18 @@ anvil, on every change: the `testnet-release` job.
 
 ```bash
 cd infra/terraform/envs/prod
-cp terraform.tfvars.example terraform.tfvars    # alert_email; deployer_principal_arns for a KMS deployer key
+cp terraform.tfvars.example terraform.tfvars    # alert_email, bot_ami_id; deployer_principal_arns for a deployer key
+aws ssm get-parameter --region us-east-1 --query Parameter.Value --output text \
+  --name /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64    # the image to pin: bot_ami_id
 terraform init && terraform apply
 terraform output signing_key_arns               # operator, relayer, automator, notary (and deployer)
 ```
+
+`bot_ami_id` pins the bot host's Amazon Linux 2023 image by id. A routine apply never moves it to a newer image.
+
+* A new image replaces the host and deletes its disk. Change the pin deliberately: never during a soak, and only with
+  the relayer's salt backed up (§ 2). The plan then shows `aws_instance.bot` "must be replaced".
+* Changing the bootstrap, or a value it renders, also replaces the host.
 
 `modules/signing-keys` creates one secp256k1 key (`ECC_SECG_P256K1`, `SIGN_VERIFY`) per signer, plus one IAM role per
 key.
@@ -66,8 +74,9 @@ cargo run --release --bin query-commitment -- --salt-file ~/strawberryswap-relay
 * `PROVIDER_ID` is the notary's key in `ZkDecoOracle`, a field element derived from the label.
 * **Keep an encrypted backup of the salt**, for example in a password manager.
   * The feed's `queryCommitment` is immutable, so a lost salt means a new feed.
-  * The bot host is disposable. Terraform replaces it, and deletes its disk, whenever its bootstrap or the latest
-    Amazon Linux image changes. Read every plan for `aws_instance.bot` "must be replaced"; never apply during a soak.
+  * The bot host is disposable. Terraform replaces it, and deletes its disk, whenever its bootstrap or its pinned
+    image (`bot_ami_id`, § 1) changes. Read every plan for `aws_instance.bot` "must be replaced"; never apply during a
+    soak.
 * With the relayer (§ 4), install the salt on the bot host as `/etc/strawberryswap/relayer.salt`: mode 0600, owned
   by the relayer's user, typed without echo (`read -rs`). Then delete the working copy.
 * A leaked salt reveals only the instrument behind `queryCommitment`: ETHUSD, which the testnet discloses anyway.

@@ -25,6 +25,11 @@ variable "deployer_principal_arns" {
   description = "IAM roles or users that may sign with the deployer's KMS key (forge script --aws). Empty: no deployer key; deploy with a hardware wallet instead."
 }
 
+variable "bot_ami_id" {
+  type        = string
+  description = "The bot host's Amazon Linux 2023 x86_64 image, pinned by id (modules/ec2-bots). A new id replaces the host and deletes its disk: change it deliberately, never during a soak, and only with the relayer's salt backed up. The current image: aws ssm get-parameter --region us-east-1 --name /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64 --query Parameter.Value --output text"
+}
+
 variable "instance_type" {
   type    = string
   default = "t3.micro"

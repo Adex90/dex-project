@@ -3,11 +3,6 @@
 data "aws_region" "current" {}
 data "aws_caller_identity" "current" {}
 
-# Latest Amazon Linux 2023 x86_64 (resolved through the public SSM parameter, not a hard-coded AMI id)
-data "aws_ssm_parameter" "al2023" {
-  name = "/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64"
-}
-
 data "aws_iam_policy_document" "assume" {
   statement {
     actions = ["sts:AssumeRole"]
@@ -82,7 +77,9 @@ resource "aws_iam_instance_profile" "bot" {
 resource "aws_instance" "bot" {
   count = var.instance_count
 
-  ami                         = data.aws_ssm_parameter.al2023.value
+  # A pinned image (var.ami_id), never the floating "latest" parameter. A new image replaces the instance and
+  # deletes its disk, so it happens only when the operator changes the pin, never on a routine apply.
+  ami                         = var.ami_id
   instance_type               = var.instance_type
   subnet_id                   = var.public_subnet_ids[count.index % length(var.public_subnet_ids)]
   vpc_security_group_ids      = [var.security_group_id]
