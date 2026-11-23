@@ -1456,6 +1456,75 @@ available, so Session Manager itself was not exercised. Everything around it was
 - **Backend:** rustfmt and clippy `-D warnings` clean; 314 tests passed, 0 failed.
   hadolint, actionlint and ShellCheck (with the CI settings) are clean.
 
+**Legal beneficiaries and the Document Inbox** (migration `0020`, the routes
+`/api/v1/kyc/beneficiarios` and `/api/v1/wealth/documentos`, the Beneficiaries and
+Documents pages):
+
+- **Database:** every SQL suite passes on its own fresh database with all migrations
+  (15 suites), the new `tests/db/0020_beneficiarios.sql` (53 checks) included.
+  It covers:
+  - a valid designation: the version, time and chain set by the database, and the
+    hash recomputable from the canonical payload;
+  - shares that do not add up to exactly 100 % (60 + 30, 60 + 50), a declared total
+    that does not match, a sixth beneficiary, a gap in the positions, a share of 0
+    or with three decimals (never rounded in silence): all refused at commit;
+  - who each beneficiary is: CURP or date of birth, a CURP whose date and century
+    match, no future date or one before 1900, no repeated CURP, never the holder,
+    only relationships from the catalog;
+  - versions chained 1, 2, 3 (the last one empty, withdrawing the designation), the
+    version and hash not chosen by `sc_kyc`, no beneficiary added to a saved
+    version, and no designation for an unverified client;
+  - immutability for the schema owner too, and row-level security: each client
+    reads only their own versions and writes none;
+  - the security log: one `BENEFICIARIOS_DESIGNADOS` event per saved version with
+    its IP, device and version, written by `sc_kyc`; none for a refused version;
+    `sc_kyc` cannot write another event, one for a version that does not exist or
+    with another device, or a second one for the same version;
+  - tampering outside the application (triggers disabled) breaking the chain at
+    that version.
+- **Backend:** rustfmt and clippy `-D warnings` clean. 427 tests passed, 0 failed
+  (412 before):
+  - `tests/beneficiarios.rs`: versions and their chain through the API, a save on
+    top of an old version (409), withdrawing, every rule (count, sum, holder,
+    duplicates, identity, names), only a verified client and only their own
+    designation, the database refusing a sum the backend let through, a tampered
+    row detected on read, and every version in the security log with its session;
+  - `tests/documentos.rs`: a market buy, a limit buy filled at once and a sale,
+    each confirmation's figures against the orders and the ledgers, the statement's
+    balances, entries and trades, the seal pending and then sealed by a new cut,
+    404 for another client's or a malformed id, 401 without a session and 403 for
+    staff;
+  - the tipping-off guard also reading the beneficiaries, the inbox and every
+    document; unit tests for the months, the entries and the name and share rules.
+- **Frontend:** typecheck, lint, 304 unit tests (292 before: every answer
+  validated whole, the allocation in cents, the rules as the server applies them,
+  the request, times in Mexico City, the log entry in words, and no tipping-off
+  word) and `next build`.
+- **End to end** on a fresh stack: smoke 301 checks (261 before) and AML
+  console 137 (133 before).
+  - The smoke run, after the trades:
+    - one trade confirmation per settlement in the cash ledger and a statement for
+      the month, in progress, as the API serves them, newest first;
+    - the STSLA sale: "Sold 0.2264 STSLA at $4,415.30 MXN", a $0.00 commission
+      marked Zero commission, net equal to gross, its folio and reference hash;
+    - the reserve seal pending, then, after a new snapshot, sealed with that cut's
+      Merkle root and anchors past the trade;
+    - Download (.json) equal to the API's document; printing shows the document
+      alone, black on white, the hashes in full; both documents printed to PDF;
+    - the statement closing at the account's balance, with every balance-changing
+      movement of the month and its trades;
+    - `?id=` opening a document and Escape closing it; on a phone, the strip of
+      account pages and the viewer full screen;
+    - beneficiaries: 60 % + 30 % reading "90% allocated · 10% left" with Save off,
+      60 % + 40 % saved as version 1, a valid CURP filling in the date of birth,
+      the editor after a reload, Split evenly into 33.34, 33.33 and 33.33, a save
+      refused (409) after another device saved, saved again on top, the API
+      refusing 99 %, and every version in the security log with its device.
+  - The AML run checks a frozen client's statement (425,000.00 on hold, shown only
+    as "Funds on hold (still fully backed)"), the Documents and Beneficiaries pages
+    and their API reads: no tipping-off words; the same 11 deliberate console
+    errors as before, 0 failed requests.
+
 **Security Center and per-device sessions** (migration `0019`, the routes
 `/api/v1/auth/sessions`, `/auth/logout`, `/auth/password/change` and
 `/auth/security/*`, the Security page):
