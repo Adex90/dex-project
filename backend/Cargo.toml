@@ -43,7 +43,7 @@ rust_decimal = { version = "1", features = ["serde-with-str"] }
 # Criptografía
 sha2 = "0.10"
 # Firma de webhooks SPEI (HMAC-SHA256, comparación en tiempo constante).
-hmac = "0.12"
+hmac = "0.13"
 hex = "0.4"
 # Imágenes del onboarding KYC (base64 en JSON).
 base64 = "0.22"
