@@ -250,6 +250,8 @@ jobs:
             expect: "tests/db/0018_reserva_posiciones.sql: todas las pruebas pasaron (ROLLBACK)"
           - suite: 0019_sesiones_seguridad
             expect: "tests/db/0019_sesiones_seguridad.sql: todas las pruebas pasaron (ROLLBACK)"
+          - suite: 0020_beneficiarios
+            expect: "tests/db/0020_beneficiarios.sql: todas las pruebas pasaron (ROLLBACK)"
     services:
       postgres:
         image: postgres:16
