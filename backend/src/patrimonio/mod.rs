@@ -18,6 +18,7 @@
 //!   vincula ninguna: falta el flujo que verifica con el banco que la cuenta
 //!   es del cliente (docs/FRONTEND_ROADMAP.md, módulo 16).
 
+pub mod documentos;
 pub mod modelos;
 pub mod vinculadas;
 

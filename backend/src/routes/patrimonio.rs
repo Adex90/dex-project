@@ -19,15 +19,34 @@ use crate::{
     error::AppResult,
     patrimonio::{
         self,
+        documentos::{self, Documento, Documentos},
         modelos::{CuentasVinculadas, ReciboRetiro},
         SolicitudRetiro,
     },
-    routes::extraccion::Json,
+    routes::extraccion::{Json, Path},
     state::AppState,
 };
 
 pub fn rutas() -> Router<AppState> {
-    Router::new().route("/wealth/linked-accounts", get(cuentas_vinculadas)).route("/wealth/withdraw", post(retirar))
+    Router::new()
+        .route("/wealth/linked-accounts", get(cuentas_vinculadas))
+        .route("/wealth/withdraw", post(retirar))
+        .route("/wealth/documentos", get(listar_documentos))
+        .route("/wealth/documentos/{id}", get(ver_documento))
+}
+
+/// El buzón (`Documents`): estados de cuenta de cada mes con actividad y
+/// comprobantes de operación, el más reciente primero.
+async fn listar_documentos(State(e): State<AppState>, u: Usuario) -> AppResult<Json<Documentos>> {
+    u.exigir_cliente()?;
+    Ok(Json(documentos::listar(&e.pool, u.cliente_id).await?))
+}
+
+/// Un documento completo (`Document`): `co_<orden>` o `ec_<AAAA-MM>`. 404 si
+/// no existe o no es del cliente.
+async fn ver_documento(State(e): State<AppState>, u: Usuario, Path(id): Path<String>) -> AppResult<Json<Documento>> {
+    u.exigir_cliente()?;
+    Ok(Json(documentos::obtener(&e.pool, u.cliente_id, &id).await?))
 }
 
 /// Las cuentas vinculadas activas del cliente (`LinkedAccounts`): a dónde

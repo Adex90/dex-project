@@ -16,6 +16,7 @@
 //!    firmado) -> VERIFICADO, revisión humana, reintento o RECHAZADO.
 //! 3. [`dictamen::dictaminar`]: decisión del oficial de cumplimiento.
 
+pub mod beneficiarios;
 pub mod biometria;
 pub mod curp;
 pub mod dictamen;

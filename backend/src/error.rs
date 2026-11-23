@@ -194,6 +194,7 @@ fn es_invariante(codigo: &str) -> bool {
             | "AML_LIBERACION_SIN_APROBACION"
             | "MFA_SIN_SECRETO"
             | "MFA_SOLO_DUENO"
+            | "DESIGNACION_INVALIDA"
     ) || codigo.ends_with("_INMUTABLE")
 }
 
@@ -261,7 +262,15 @@ fn traducir_error_bd(codigo_sql: &str, mensaje: &str, restriccion: &str) -> Opti
             AppError::negocio("RESTRICCION_VIOLADA", format!("la operación viola la restricción {restriccion}"))
         }),
         // unique_violation
-        "23505" => Some(if restriccion.starts_with("ux_perfiles") {
+        "23505" => Some(if restriccion.starts_with("ux_designaciones") {
+            // Dos guardados de beneficiarios sobre la misma versión: gana uno.
+            AppError::conflicto(
+                "DESIGNACION_DESACTUALIZADA",
+                "tus beneficiarios cambiaron en otra sesión; vuelve a cargarlos antes de guardar",
+            )
+        } else if restriccion.starts_with("ux_beneficiarios") {
+            AppError::negocio("BENEFICIARIO_DUPLICADO", "un beneficiario aparece dos veces")
+        } else if restriccion.starts_with("ux_perfiles") {
             AppError::conflicto(
                 "IDENTIDAD_EN_USO",
                 "esa CURP, RFC o clave de elector ya está en un expediente verificado o en revisión",

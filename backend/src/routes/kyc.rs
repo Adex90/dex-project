@@ -6,6 +6,8 @@
 //! | POST | `/kyc/perfil` | cliente: datos personales y domicilio (paso 1) |
 //! | POST | `/kyc/verificar` | cliente: INE + selfie (pasos 2 y 3) |
 //! | POST | `/kyc/webhook` | proveedor biométrico (firma HMAC `X-Kyc-Firma`) |
+//! | GET  | `/kyc/beneficiarios` | cliente: designación vigente, historial y cadena comprobada |
+//! | POST | `/kyc/beneficiarios` | cliente verificado: guarda una versión nueva, completa (0020) |
 
 use axum::{
     extract::{DefaultBodyLimit, State},
@@ -18,10 +20,12 @@ use std::convert::Infallible;
 use tower::limit::ConcurrencyLimitLayer;
 
 use crate::{
-    auth::Usuario,
+    auth::{sesiones::Origen, Usuario},
     error::AppResult,
     kyc::{
-        self, biometria,
+        self,
+        beneficiarios::{self, Autor, SolicitudDesignacion, VistaBeneficiarios},
+        biometria,
         expediente::{self, DatosGuardados, DatosPersonales, OrigenEnvio, SolicitudVerificacion, VistaExpediente},
         verificacion::{self, ResultadoVerificacion},
         EnvioVerificacion,
@@ -52,6 +56,7 @@ pub fn rutas(limites: &Limitadores) -> Router<AppState> {
     Router::new()
         .route("/kyc/expediente", get(ver_expediente))
         .route("/kyc/perfil", post(guardar_perfil))
+        .route("/kyc/beneficiarios", get(ver_beneficiarios).post(designar_beneficiarios))
         .merge(limites::aplicar(verificar, &limites.kyc))
 }
 
@@ -64,6 +69,26 @@ pub fn webhooks() -> Router<AppState> {
 async fn ver_expediente(State(e): State<AppState>, u: Usuario) -> AppResult<Json<VistaExpediente>> {
     u.exigir_cliente()?;
     Ok(Json(expediente::vista(&e.pool, u.cliente_id).await?.para_cliente()))
+}
+
+/// La designación vigente, su historial y si la cadena cuadra.
+async fn ver_beneficiarios(State(e): State<AppState>, u: Usuario) -> AppResult<Json<VistaBeneficiarios>> {
+    u.exigir_cliente()?;
+    Ok(Json(beneficiarios::consultar(&e.pool, u.cliente_id).await?))
+}
+
+/// Guarda la designación completa como una versión nueva (201). La suma de
+/// 100% y lo demás también lo comprueba la base de datos al COMMIT.
+async fn designar_beneficiarios(
+    State(e): State<AppState>,
+    u: Usuario,
+    origen: Origen,
+    Json(s): Json<SolicitudDesignacion>,
+) -> AppResult<(StatusCode, Json<VistaBeneficiarios>)> {
+    u.exigir_cliente()?;
+    let autor = Autor { sesion_id: Some(u.sesion_id), ip: origen.ip, dispositivo: Some(&origen.dispositivo) };
+    let vista = beneficiarios::designar(&e.pool, u.cliente_id, &s, &autor, spei::hoy_cdmx()).await?;
+    Ok((StatusCode::CREATED, Json(vista)))
 }
 
 async fn guardar_perfil(

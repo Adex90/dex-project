@@ -2004,8 +2004,25 @@ async fn sin_aviso_al_cliente(pool: PgPool) {
         "/api/v1/auth/sessions",
         "/api/v1/auth/security/events",
         "/api/v1/auth/security/preferences",
+        // Beneficiarios (0020) y el buzón de documentos.
+        "/api/v1/kyc/beneficiarios",
+        "/api/v1/wealth/documentos",
     ] {
         let (s, cuerpo) = api.llamar_crudo("GET", ruta, Some(&tok_ana), None).await;
+        assert_eq!(s, StatusCode::OK, "{ruta}");
+        let texto = String::from_utf8(cuerpo).unwrap().to_lowercase();
+        for palabra in prohibidas {
+            assert!(!texto.contains(palabra), "{ruta} contiene «{palabra}»: {texto}");
+        }
+    }
+    // Cada documento, completo: su estado de cuenta muestra lo retenido sin delatarlo.
+    let (_, docs) = api.get("/api/v1/wealth/documentos", &tok_ana).await;
+    let ids: Vec<String> =
+        docs["documents"].as_array().unwrap().iter().map(|x| x["id"].as_str().unwrap().to_owned()).collect();
+    assert!(ids.iter().any(|id| id.starts_with("ec_")), "Ana tiene su estado de cuenta: {docs}");
+    for id in ids {
+        let ruta = format!("/api/v1/wealth/documentos/{id}");
+        let (s, cuerpo) = api.llamar_crudo("GET", &ruta, Some(&tok_ana), None).await;
         assert_eq!(s, StatusCode::OK, "{ruta}");
         let texto = String::from_utf8(cuerpo).unwrap().to_lowercase();
         for palabra in prohibidas {
