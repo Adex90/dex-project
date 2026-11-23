@@ -51,17 +51,26 @@ instead (`--ledger`).
 
 ## 2. The feed's constants (`oracle/`)
 
-On the relayer's host, as the relayer's user, create its secret query salt and derive the feed's constants:
+Create the relayer's secret query salt and derive the feed's constants. Run it on a machine with Rust 1.97 or later
+(macOS or Linux); the bot host has no Rust toolchain:
 
 ```bash
-cargo run --release --bin query-commitment -- --salt-file /etc/strawberryswap/relayer.salt --new-salt \
+cd oracle
+cargo run --release --bin query-commitment -- --salt-file ~/strawberryswap-relayer.salt --new-salt \
     --provider-label rothbard/ethusd-endpoint/testnet
 # QUERY_COMMITMENT=0x…   PROVIDER_ID=0x…
 ```
 
-* The salt file is created mode 0600 and never overwritten: a new salt would orphan the deployed feed.
-* The salt is never printed. Only its commitment, `Poseidon(pack("ETHUSD"), salt)`, goes on chain.
+* The salt file is created mode 0600 and never overwritten. The salt is never printed. Only its commitment,
+  `Poseidon(pack("ETHUSD"), salt)`, goes on chain.
 * `PROVIDER_ID` is the notary's key in `ZkDecoOracle`, a field element derived from the label.
+* **Keep an encrypted backup of the salt**, for example in a password manager.
+  * The feed's `queryCommitment` is immutable, so a lost salt means a new feed.
+  * The bot host is disposable. Terraform replaces it, and deletes its disk, whenever its bootstrap or the latest
+    Amazon Linux image changes. Read every plan for `aws_instance.bot` "must be replaced"; never apply during a soak.
+* With the relayer (§ 4), install the salt on the bot host as `/etc/strawberryswap/relayer.salt`: mode 0600, owned
+  by the relayer's user, typed without echo (`read -rs`). Then delete the working copy.
+* A leaked salt reveals only the instrument behind `queryCommitment`: ETHUSD, which the testnet discloses anyway.
 
 ## 3. Deploy (`contracts/`)
 
