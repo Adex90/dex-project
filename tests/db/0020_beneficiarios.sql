@@ -71,7 +71,9 @@ END
 $$;
 
 -- Una versión como la guarda el backend (sc_kyc): primero sus beneficiarios
--- (posicion, nombre, parentesco, curp, fecha, porcentaje), después la versión.
+-- (posicion, nombre, parentesco, curp, fecha, porcentaje), después la versión,
+-- desde la sesión del cliente con su verificación reforzada vigente (0022;
+-- tests/db/0022_verificacion_reforzada.sql prueba esa regla).
 CREATE FUNCTION pg_temp.designacion(id TEXT, cliente TEXT, beneficiarios TEXT[], num INTEGER, total TEXT)
 RETURNS TEXT[]
 LANGUAGE plpgsql AS $$
@@ -85,10 +87,14 @@ BEGIN
             id, b);
     END LOOP;
     RETURN sentencias || format(
-        'INSERT INTO kyc.designaciones_beneficiarios (id, cliente_id, num_beneficiarios, total_porcentaje, ip, dispositivo) VALUES (%L, %L, %s, %s, %L, %L)',
-        id, cliente, num, total, '203.0.113.7', 'Chrome on macOS') || 'RESET ROLE'::text;
+        'INSERT INTO kyc.designaciones_beneficiarios (id, cliente_id, num_beneficiarios, total_porcentaje, sesion_id, ip, dispositivo) VALUES (%L, %L, %s, %s, %L, %L, %L)',
+        id, cliente, num, total, pg_temp.sesion_de(cliente), '203.0.113.7', 'Chrome on macOS') || 'RESET ROLE'::text;
 END
 $$;
+
+-- La sesión de cada cliente: 5e…0a para Ana, 5e…0b para Beto, 5e…0c para Carla.
+CREATE FUNCTION pg_temp.sesion_de(cliente TEXT) RETURNS TEXT
+LANGUAGE sql IMMUTABLE AS $$ SELECT '5e000000-0000-0000-0000-0000000000' || right(cliente, 2) $$;
 
 -- Filas visibles para sc_cliente a nombre de `cliente`.
 CREATE FUNCTION pg_temp.visibles(cliente TEXT, consulta TEXT) RETURNS BIGINT
@@ -112,6 +118,14 @@ INSERT INTO kyc.clientes (id, tipo_persona, nombre, apellido_paterno, email, cur
   ('a0000000-0000-0000-0000-00000000000a', 'FISICA', 'Ana', 'Rojas', 'ana@example.mx', 'ROJA850315MDFDRN03', 'VERIFICADO', now(), 'BAJO'),
   ('b0000000-0000-0000-0000-00000000000b', 'FISICA', 'Beto', 'Ibarra', 'beto@example.mx', NULL, 'VERIFICADO', now(), 'BAJO'),
   ('c0000000-0000-0000-0000-00000000000c', 'FISICA', 'Carla', 'Mena', 'carla@example.mx', NULL, 'PENDIENTE', NULL, 'BAJO');
+
+-- Una sesión por cliente, verificada de nuevo (0022): la ventana dura 5
+-- minutos, y en esta transacción `now()` no avanza.
+INSERT INTO kyc.sesiones (id, cliente_id, expira_en, mfa, dispositivo, ip)
+SELECT pg_temp.sesion_de(c)::uuid, c::uuid, now() + interval '60 minutes', FALSE, 'Chrome on macOS', '203.0.113.7'
+  FROM unnest(ARRAY['a0000000-0000-0000-0000-00000000000a', 'b0000000-0000-0000-0000-00000000000b',
+                    'c0000000-0000-0000-0000-00000000000c']) AS c;
+UPDATE kyc.sesiones SET step_up_valido_hasta = now();
 
 \set maria '''1, ''''MARÍA LÓPEZ GARCÍA'''', ''''HIJO'''', ''''LOGM900101MDFPRR05'''', NULL, 60'''
 \set jose '''2, ''''JOSÉ LÓPEZ GARCÍA'''', ''''HIJO'''', NULL, ''''2005-06-07'''', 40'''
@@ -349,8 +363,9 @@ SELECT pg_temp.debe_fallar('ni el de una versión con otro dispositivo',
   'row-level security');
 SELECT pg_temp.debe_fallar('ni un segundo evento de la misma versión',
   ARRAY['SET LOCAL ROLE sc_kyc',
-        $q$INSERT INTO kyc.eventos_autenticacion (cliente_id, evento, ip, dispositivo, detalle)
-           VALUES ('a0000000-0000-0000-0000-00000000000a', 'BENEFICIARIOS_DESIGNADOS', '203.0.113.7', 'Chrome on macOS', '2')$q$],
+        $q$INSERT INTO kyc.eventos_autenticacion (cliente_id, evento, ip, sesion_id, dispositivo, detalle)
+           VALUES ('a0000000-0000-0000-0000-00000000000a', 'BENEFICIARIOS_DESIGNADOS', '203.0.113.7',
+                   '5e000000-0000-0000-0000-00000000000a', 'Chrome on macOS', '2')$q$],
   'ux_eventos_autenticacion_designacion');
 SELECT pg_temp.debe_fallar('y el evento, como toda la bitácora, no se borra',
   ARRAY[$q$DELETE FROM kyc.eventos_autenticacion WHERE evento = 'BENEFICIARIOS_DESIGNADOS'$q$],
