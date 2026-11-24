@@ -195,8 +195,29 @@ function clabeWithCheck(d17) {
 // ---------------------------------------------------------------------------
 const browser = await chromium.launch({ args: ["--use-fake-ui-for-media-stream", "--use-fake-device-for-media-stream"] });
 
+/** API requests each context has in flight: a reload in the middle would abort them (net::ERR_ABORTED). */
+const inFlight = new Map();
+
+/** Waits until `label`'s context has had no API request in flight for 300 ms (at most `timeout` ms). */
+async function apiQuiet(page, label, timeout = 5000) {
+  const deadline = Date.now() + timeout;
+  let quietSince = Date.now();
+  while (Date.now() < deadline) {
+    if ((inFlight.get(label) ?? 0) > 0) quietSince = Date.now();
+    else if (Date.now() - quietSince >= 300) return;
+    await page.waitForTimeout(50);
+  }
+}
+
 async function newContext(label, options = {}) {
   const ctx = await browser.newContext({ viewport: { width: 1440, height: 1000 }, permissions: ["camera"], ...options });
+  const settled = (req) => {
+    if (req.url().startsWith(API)) inFlight.set(label, Math.max(0, (inFlight.get(label) ?? 0) - 1));
+  };
+  ctx.on("request", (req) => {
+    if (req.url().startsWith(API)) inFlight.set(label, (inFlight.get(label) ?? 0) + 1);
+  });
+  ctx.on("requestfinished", settled);
   ctx.on("response", async (res) => {
     const req = res.request();
     const url = req.url();
@@ -219,6 +240,7 @@ async function newContext(label, options = {}) {
     }
   });
   ctx.on("requestfailed", (req) => {
+    settled(req);
     if (!req.url().startsWith(API)) return;
     failedRequests.push({ label, step, method: req.method(), url: req.url(), error: req.failure()?.errorText });
   });
@@ -502,6 +524,8 @@ try {
   // =========================================================================
   phase("3-client-sees-nothing");
   // =========================================================================
+  // The last deposit's live refresh may still be loading: let it finish, or the reload aborts it.
+  await apiQuiet(cp, "client");
   await cp.reload();
   await cp.getByTestId("vault-available").waitFor();
   await cp.waitForTimeout(1500);
@@ -920,6 +944,7 @@ try {
   // =========================================================================
   phase("9-client-operates-again");
   // =========================================================================
+  await apiQuiet(cp, "client");
   await cp.reload();
   await cp.getByTestId("vault-available").waitFor();
   await cp.waitForTimeout(1500);

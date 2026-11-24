@@ -1506,6 +1506,82 @@ available, so Session Manager itself was not exercised. Everything around it was
 - **Backend:** rustfmt and clippy `-D warnings` clean; 314 tests passed, 0 failed.
   hadolint, actionlint and ShellCheck (with the CI settings) are clean.
 
+**Step-up authentication** (migration `0022`, `/api/v1/auth/step-up`, the check
+before withdrawals, transfers and saving the beneficiaries):
+
+- **Database:** every SQL suite passes on its own fresh database with all migrations
+  (17 suites), the new `tests/db/0022_verificacion_reforzada.sql` (51 checks)
+  included; the 0020 suite now saves from sessions with an open window. It covers:
+  - a session born without a window: `sc_auth` cannot set one, and the schema owner
+    is refused too;
+  - opening: whatever is written, the database stamps now + 5 minutes, never past
+    the session's expiry (120 seconds for one ending in 2 minutes), on every write
+    of the column (writing the same value again counts); a revoked session, an
+    expired one or one revoked in the same statement opens none, for the owner
+    either; with the trigger off, the CHECK still refuses a window past the
+    expiry; NULL closes it without an event;
+  - the log: one `STEP_UP_VERIFICADO` per window, with the session, the request's
+    IP and device (the session's without them), the seconds and `sc_auth` as the
+    author; `sc_auth` cannot log one without its window, with another client's or
+    without a session; the detail stays numeric and the log immutable;
+  - beneficiaries: a designation without a session, from one without a window,
+    with another client's window, an expired window or a revoked session (even
+    with its window), or from the owner without one, is refused
+    (`SC_STEP_UP_REQUERIDO`) before the KYC rule; with its window it is saved, its
+    session in the version and in the event, and nothing is left of the refused;
+  - privileges: `sc_auth` updates only the window, last use and the revocation;
+    `sc_kyc` reads the window and cannot write it; the client cannot read it; no
+    other application role touches it.
+- **Backend:** rustfmt and clippy `-D warnings` clean. 446 tests passed, 0 failed
+  (438 before):
+  - `tests/step_up.rs`: without a window, `/wealth/withdraw`, `/ifpe/retiros`,
+    `/ifpe/transferencias`, `/spei/transfer` and `/kyc/beneficiarios` answer 403
+    with the constant message and nothing moves or is saved, while reads stay
+    open; with the password the same requests and keys pass (600 of 1,000 left);
+    the window is 300 seconds, on that session only, and `GET` reports it; the
+    failed and successful checks are in the security log with the session, the IP
+    and the device, which the client reads; a success resets the counter; four
+    refusals say 4, 3, 2 and 1 tries left, the fifth answers 423
+    `SESION_BLOQUEADA` and closes the session (`BLOQUEO`), and the account then
+    refuses the right password from another session and at sign-in (423
+    `BLOQUEADO`, uncounted); with two-step on, the password, an empty body, a
+    malformed code and both fields are refused without counting, a wrong code
+    counts, a code with spaces passes and the same code fails on another session;
+    an expired window is refused until the next check;
+  - `tests/beneficiarios.rs`: the database refuses a designation from a session
+    without a window or with another client's (403), and takes it with its own;
+  - `tests/aml.rs`: without a window a frozen and an unfrozen client get the same
+    bytes, the frozen one confirms like anyone, and `GET /auth/step-up` passes the
+    tipping-off guard; the other suites confirm before moving money;
+  - unit tests for the error mapping and the tries left in the error body.
+- **Frontend:** typecheck, lint, 323 unit tests (311 before: the status and window
+  parsers rejecting malformed answers whole, the request body, the feedback after
+  a refusal, the descriptions of what waits, the two new log entries and the
+  sign-in path after a lockout) and `next build`.
+- **End to end** on a fresh stack: smoke 326 checks (316 before), AML 142 (139
+  before).
+  - The smoke run: the first save of the beneficiaries asks, naming both and
+    their shares, and the next save in the window does not; another device
+    cannot save without its own check (403), then confirms and saves; before the
+    withdrawal the check opens above the drawer, focused, square under a gold
+    rule; Cancel leaves it unsent and says so; a wrong password shows 4 tries
+    left; the right one resumes the same withdrawal; with two-step on, the code is
+    required and works once; the Security page lists "Identity confirmed". 13
+    deliberate API failures, each announced; no other console error.
+  - The AML run: without a check the frozen client's transfer answers 403
+    `STEP_UP_REQUERIDO` with nothing to tip it off, the client confirms, and each
+    operation is then refused with the identical constant answer; client B
+    confirms before its refused SPEI; after the release the client confirms
+    again and transfers. 12 console errors, all deliberate 4xx calls; 0 failed
+    requests. One run recorded two requests aborted by the script's own reload
+    in phase 3 (the dashboard refresh after the last deposit was still loading);
+    the script now waits for in-flight requests before reloading, and the rerun
+    had none.
+  - On a phone (390 px): the check is a bottom sheet across the width, focused,
+    without horizontal scroll; Cancel leaves the withdrawal unsent; with two-step
+    on it takes the code; a wrong code shows 4 tries left; the fifth ends the
+    session and the sign-in page says why.
+
 **Tax Center: fiscal year, W-8BEN and accounting export** (migration `0021`, the
 routes `/api/v1/wealth/impuestos`, `/impuestos/w8ben` and `/impuestos/export.csv`,
 the Taxes page):
