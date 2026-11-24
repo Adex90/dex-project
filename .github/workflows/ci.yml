@@ -256,6 +256,8 @@ jobs:
             expect: "tests/db/0021_centro_fiscal.sql: todas las pruebas pasaron (ROLLBACK)"
           - suite: 0022_verificacion_reforzada
             expect: "tests/db/0022_verificacion_reforzada.sql: todas las pruebas pasaron (ROLLBACK)"
+          - suite: 0023_planes_ahorro
+            expect: "tests/db/0023_planes_ahorro.sql: todas las pruebas pasaron (ROLLBACK)"
     services:
       postgres:
         image: postgres:16
