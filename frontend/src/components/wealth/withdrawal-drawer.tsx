@@ -39,6 +39,9 @@ import type { LinkedAccount, Withdrawal, WithdrawalRequest } from "@/types/wealt
  * - One idempotency key per withdrawal: a retry of the same account and
  *   amount reuses it, so a lost answer can never send the money twice;
  *   changing either draws a new one.
+ * - Confirm may first ask "Confirm it's you" (step-up, roadmap item 22): a
+ *   dialog above this one; once confirmed, the same withdrawal goes on with
+ *   the same key. Closing it leaves the withdrawal unsent, here, to retry.
  * - A native <dialog> opened as a modal: focus stays inside, the page behind
  *   is inert, Escape closes (not while sending), and closing returns focus to
  *   the button that opened it. Each step moves the focus to its title (the
@@ -58,8 +61,11 @@ export interface WithdrawalDrawerProps {
   held: DecimalString;
   /** Loads the linked accounts; rejects with the error to show. */
   loadAccounts: (signal: AbortSignal) => Promise<LinkedAccount[]>;
-  /** Sends the withdrawal: resolves with it, or rejects with the error to show. */
-  onConfirm: (request: WithdrawalRequest) => Promise<Withdrawal>;
+  /**
+   * Sends the withdrawal to `account`: resolves with it, or rejects with the
+   * error to show. It may first ask the person to confirm it's them (step-up).
+   */
+  onConfirm: (request: WithdrawalRequest, account: LinkedAccount) => Promise<Withdrawal>;
 }
 
 export function WithdrawalDrawer(props: WithdrawalDrawerProps) {
@@ -201,7 +207,7 @@ function WithdrawalDialog({ onClose, cash, held, loadAccounts, onConfirm }: Omit
     setBusy(true);
     setError(null);
     try {
-      setReceipt(await onConfirm(withdrawalRequest(selected.id, amount, attempt.current.key)));
+      setReceipt(await onConfirm(withdrawalRequest(selected.id, amount, attempt.current.key), selected));
       setStep("done");
     } catch (cause) {
       setError(cause);

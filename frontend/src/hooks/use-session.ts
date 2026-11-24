@@ -33,6 +33,7 @@ export function useSession({ redirect = false }: { redirect?: boolean } = {}) {
   const expiresAt = useAuthStore((s) => s.expiresAt);
   const expired = useAuthStore((s) => s.expired);
   const idle = useAuthStore((s) => s.idle);
+  const locked = useAuthStore((s) => s.locked);
   const role = useAuthStore((s) => s.role);
   const email = useAuthStore((s) => s.email);
   const logout = useAuthStore((s) => s.logout);
@@ -49,7 +50,7 @@ export function useSession({ redirect = false }: { redirect?: boolean } = {}) {
       return;
     }
     if (!token) {
-      const target = guardRedirect({ token, expiresAt, expired, idle });
+      const target = guardRedirect({ token, expiresAt, expired, idle, locked });
       if (redirect && target) router.replace(target);
       return;
     }
@@ -59,7 +60,7 @@ export function useSession({ redirect = false }: { redirect?: boolean } = {}) {
       router.replace(EXPIRED_LOGIN_PATH);
     }, Math.max(0, Math.min(remaining, 2 ** 31 - 1)));
     return () => clearTimeout(timer);
-  }, [hydrated, token, expiresAt, expired, idle, redirect, expire, router]);
+  }, [hydrated, token, expiresAt, expired, idle, locked, redirect, expire, router]);
 
   return { hydrated, valid, token: valid ? token : null, role, email, logout, expire };
 }

@@ -149,7 +149,12 @@ function LoginForm() {
         <p className="text-sm text-muted">Access your vault and fixed-term contracts.</p>
       </div>
 
-      {params.get("expired") === "idle" ? (
+      {params.get("expired") === "locked" ? (
+        <Alert tone="warning" title="Signed out after too many failed attempts">
+          For your security, your account is locked for 15 minutes after too many wrong codes or passwords. Sign in
+          again once it ends.
+        </Alert>
+      ) : params.get("expired") === "idle" ? (
         <Alert tone="info" title="Signed out after inactivity">
           For your security, you were signed out after the inactivity time set in Security. Please sign in again.
         </Alert>

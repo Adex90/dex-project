@@ -7,12 +7,15 @@ import type { ApiErrorBody } from "./types";
 export class ApiError extends Error {
   readonly status: number;
   readonly code: string;
+  /** A refused credential (step-up): the tries left before the account locks. Null otherwise. */
+  readonly remainingAttempts: number | null;
 
-  constructor(status: number, code: string, message: string) {
+  constructor(status: number, code: string, message: string, remainingAttempts: number | null = null) {
     super(message);
     this.name = "ApiError";
     this.status = status;
     this.code = code;
+    this.remainingAttempts = remainingAttempts;
   }
 
   /**
@@ -46,6 +49,12 @@ function isErrorBody(value: unknown): value is ApiErrorBody {
     "error" in value &&
     typeof (value as ApiErrorBody).error?.codigo === "string"
   );
+}
+
+function apiError(status: number, body: ApiErrorBody): ApiError {
+  const left = body.error.intentos_restantes;
+  const remaining = typeof left === "number" && Number.isSafeInteger(left) && left >= 0 ? left : null;
+  return new ApiError(status, body.error.codigo, body.error.mensaje, remaining);
 }
 
 /** Typed fetch wrapper for the Rust API. Never caches: balances must be live. */
@@ -83,7 +92,7 @@ export async function request<T>(path: string, options: RequestOptions = {}): Pr
     }
   }
   if (!response.ok) {
-    if (isErrorBody(data)) throw new ApiError(response.status, data.error.codigo, data.error.mensaje);
+    if (isErrorBody(data)) throw apiError(response.status, data);
     throw new ApiError(response.status, `HTTP_${response.status}`, response.statusText || "Unexpected error");
   }
   return data as T;
@@ -119,7 +128,7 @@ export async function requestText(
     } catch {
       data = null;
     }
-    if (isErrorBody(data)) throw new ApiError(response.status, data.error.codigo, data.error.mensaje);
+    if (isErrorBody(data)) throw apiError(response.status, data);
     throw new ApiError(response.status, `HTTP_${response.status}`, response.statusText || "Unexpected error");
   }
   return { text, contentType: response.headers.get("content-type") ?? "" };
@@ -147,6 +156,12 @@ const MESSAGES: Record<string, string> = {
   CONTRASENA_REPETIDA: "Choose a new password that is different from your current one.",
   CODIGO_MFA_REQUERIDO: "Enter the 6-digit code from your authenticator app.",
   CONTRASENA_CAMBIADA_EN_PARALELO: "Your password or code was used somewhere else at the same time. Please try again.",
+  // Step-up (migration 0022): withdrawals, transfers and beneficiaries ask to confirm it's you.
+  STEP_UP_REQUERIDO: "For your security, confirm it's you before this action. Nothing was done.",
+  CONTRASENA_REQUERIDA: "Enter your account password.",
+  CODIGO_MFA_USADO: "That code was already used. Wait for the next one in your authenticator app.",
+  SESION_BLOQUEADA:
+    "Too many failed attempts. For your security, your account is locked for 15 minutes and this session has ended.",
   PROHIBIDO: "You are not allowed to perform this operation.",
   EMAIL_REGISTRADO: "That email is already registered.",
   IDENTIDAD_REGISTRADA: "That CURP/RFC is already registered.",

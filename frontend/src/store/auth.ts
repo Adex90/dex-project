@@ -33,6 +33,8 @@ interface AuthState {
   expired: boolean;
   /** ...by the inactivity timeout in particular. Not persisted. */
   idle: boolean;
+  /** ...by a lockout after too many failed security checks (the server closed it). Not persisted. */
+  locked: boolean;
   /** Not persisted. */
   pending: PendingSignIn | null;
   /** First step: a session, or the second step still to complete (see `pending`). */
@@ -51,6 +53,8 @@ interface AuthState {
   expire: () => void;
   /** No activity for the client's inactivity timeout: ends the session on the server too, with the notice. */
   expireIdle: () => void;
+  /** A security check locked the account and the server already closed this session: the notice says so. */
+  expireLocked: () => void;
 }
 
 /** Ends a session on the server; best effort: a session the server already ended needs nothing more. */
@@ -78,6 +82,7 @@ export const useAuthStore = create<AuthState>()(
           email,
           expired: false,
           idle: false,
+          locked: false,
           pending: null,
         });
       /** Token for the enrollment endpoints: the pending enrollment, or the current session. */
@@ -92,6 +97,7 @@ export const useAuthStore = create<AuthState>()(
         ...EMPTY,
         expired: false,
         idle: false,
+        locked: false,
         pending: null,
 
         login: async (email, password) => {
@@ -106,7 +112,7 @@ export const useAuthStore = create<AuthState>()(
             result.estado === "2FA_REQUIRED"
               ? { kind: "verify", token: result.token_mfa, expiresAt: result.expira_en, email: normalized }
               : { kind: "enroll", token: result.token_inscripcion, expiresAt: result.expira_en, email: normalized };
-          set({ ...EMPTY, expired: false, idle: false, pending });
+          set({ ...EMPTY, expired: false, idle: false, locked: false, pending });
           return pending;
         },
 
@@ -139,6 +145,7 @@ export const useAuthStore = create<AuthState>()(
             email: result.cliente.email,
             expired: false,
             idle: false,
+            locked: false,
             pending: null,
           });
           return result;
@@ -146,15 +153,16 @@ export const useAuthStore = create<AuthState>()(
 
         logout: () => {
           const token = get().token;
-          set({ ...EMPTY, expired: false, idle: false, pending: null });
+          set({ ...EMPTY, expired: false, idle: false, locked: false, pending: null });
           endOnServer(token);
         },
-        expire: () => set({ ...EMPTY, expired: true, idle: false, pending: null }),
+        expire: () => set({ ...EMPTY, expired: true, idle: false, locked: false, pending: null }),
         expireIdle: () => {
           const token = get().token;
-          set({ ...EMPTY, expired: true, idle: true, pending: null });
+          set({ ...EMPTY, expired: true, idle: true, locked: false, pending: null });
           endOnServer(token);
         },
+        expireLocked: () => set({ ...EMPTY, expired: true, idle: false, locked: true, pending: null }),
       };
     },
     {

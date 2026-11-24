@@ -17,7 +17,8 @@ export type NivelRiesgo = "BAJO" | "MEDIO" | "ALTO";
 export type EstadoCuenta = "ACTIVA" | "CONGELADA" | "CERRADA";
 
 export interface ApiErrorBody {
-  error: { codigo: string; mensaje: string };
+  /** `intentos_restantes`: a refused credential, the tries left before the lockout (step-up, 0022). */
+  error: { codigo: string; mensaje: string; intentos_restantes?: number };
 }
 
 export interface Sesion {

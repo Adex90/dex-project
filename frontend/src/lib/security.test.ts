@@ -189,6 +189,17 @@ test("log entries in words", () => {
     detail: "Version 2 on record",
     tone: "accent",
   });
+  assert.deepEqual(describeEvent(event("STEP_UP_VERIFICADO", { detail: 300 })), {
+    title: "Identity confirmed",
+    detail: "Withdrawals and beneficiary changes unlocked for 5 minutes",
+    tone: "accent",
+  });
+  assert.equal(describeEvent(event("STEP_UP_VERIFICADO", { detail: 120 })).detail?.endsWith("2 minutes"), true);
+  assert.deepEqual(describeEvent(event("STEP_UP_FALLIDO")), {
+    title: "Identity check failed",
+    detail: "Wrong code or password",
+    tone: "warning",
+  });
   assert.equal(describeEvent(event("ALGO_NUEVO")).title, "Security event");
 });
 
@@ -209,6 +220,8 @@ test("no log entry uses words that would tip off a client under review", () => {
     "PREFERENCIAS_ACTUALIZADAS",
     "BENEFICIARIOS_DESIGNADOS",
     "W8BEN_CERTIFICADO",
+    "STEP_UP_VERIFICADO",
+    "STEP_UP_FALLIDO",
     "MFA_SECRETO_GENERADO",
     "MFA_ACTIVADO",
     "MFA_VERIFICADO",

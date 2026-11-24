@@ -9,6 +9,7 @@ import { AllocationBar } from "@/components/beneficiaries/allocation-bar";
 import { BeneficiaryCard, type DraftField } from "@/components/beneficiaries/beneficiary-card";
 import { DesignationRecord } from "@/components/beneficiaries/designation-record";
 import { useDashboard } from "@/components/layout/dashboard-shell";
+import { useStepUp } from "@/components/security/step-up-provider";
 import { Alert, Button, Skeleton } from "@/components/ui/primitives";
 import { ONBOARDING_PATH } from "@/hooks/use-client-home";
 import { ApiError, describeError } from "@/lib/api/client";
@@ -30,6 +31,7 @@ import {
 } from "@/lib/beneficiaries";
 import { todayInMexicoCity } from "@/lib/kyc";
 import { EXPIRED_LOGIN_PATH } from "@/lib/session";
+import { designationCheck } from "@/lib/step-up";
 import { useAuthStore } from "@/store/auth";
 import type { BeneficiariesView, BeneficiaryDraft } from "@/types/beneficiaries";
 
@@ -50,6 +52,9 @@ const SAVED_UNREADABLE = "Your beneficiaries were saved, but the answer could no
  *   the server answers 409: the newer version shows on the right and the
  *   edits stay, to review and save again.
  * - Only verified clients can designate; the page says how to get verified.
+ * - Saving asks "Confirm it's you" first unless this session confirmed in
+ *   the last 5 minutes (step-up, roadmap item 22): the server, and its
+ *   database, refuse a designation without that check.
  *
  * Layout: one column on phones (editor, record, history); from xl, the
  * editor in two thirds and the record beside it.
@@ -57,6 +62,7 @@ const SAVED_UNREADABLE = "Your beneficiaries were saved, but the answer could no
 export default function BeneficiariesPage() {
   const router = useRouter();
   const { token, client } = useDashboard();
+  const guard = useStepUp();
   const [view, setView] = useState<BeneficiariesView | null>(null);
   const [drafts, setDrafts] = useState<BeneficiaryDraft[]>([]);
   const [touched, setTouched] = useState<Record<string, ReadonlySet<DraftField>>>({});
@@ -174,7 +180,8 @@ export default function BeneficiariesPage() {
     setSavedVersion(null);
     let body: unknown;
     try {
-      body = await api.saveBeneficiaries(token, designationRequest(drafts, view.version));
+      const request = designationRequest(drafts, view.version);
+      body = await guard(() => api.saveBeneficiaries(token, request), designationCheck(drafts));
     } catch (error) {
       setSaving(false);
       if (error instanceof ApiError && error.isUnauthorized) {

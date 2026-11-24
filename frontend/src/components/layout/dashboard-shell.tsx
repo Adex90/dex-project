@@ -6,6 +6,7 @@ import { usePathname, useRouter } from "next/navigation";
 import { DashboardHeader } from "@/components/dashboard/dashboard-header";
 import { KycBanner, isKycLocked } from "@/components/dashboard/kyc-status";
 import { AccountLinks, Navigation, activeItem, resetNavOrigin, useNavOrigin } from "@/components/layout/navigation";
+import { StepUpProvider } from "@/components/security/step-up-provider";
 import { Alert, Button } from "@/components/ui/primitives";
 import { ONBOARDING_PATH } from "@/hooks/use-client-home";
 import { useDashboardData } from "@/hooks/use-dashboard-data";
@@ -17,7 +18,7 @@ import { describeError } from "@/lib/api/client";
 import { api } from "@/lib/api/endpoints";
 import type { Cliente } from "@/lib/api/types";
 import { SECURITY_PATH, parseSecurityPreferences } from "@/lib/security";
-import { EXPIRED_LOGIN_PATH, IDLE_LOGIN_PATH } from "@/lib/session";
+import { EXPIRED_LOGIN_PATH, IDLE_LOGIN_PATH, LOCKED_LOGIN_PATH } from "@/lib/session";
 import { useAuthStore } from "@/store/auth";
 import { useCardStore } from "@/store/card";
 import { useDashboardStore } from "@/store/dashboard";
@@ -42,6 +43,11 @@ import { displayedRealtime, useVaultStore } from "@/store/vault";
  * It also enforces the inactivity timeout the client chose on the Security
  * page: after that long without a click, key or touch in this tab, the
  * session ends here and on the server (see `useIdleSignOut`).
+ *
+ * And it holds the step-up gate (components/security/step-up-provider.tsx):
+ * a withdrawal or a change of beneficiaries that the server refuses without a
+ * fresh check opens "Confirm it's you" and goes on once confirmed. A lockout
+ * there ends the session, and the sign-in page says why.
  */
 
 const ACCOUNT_TAB_PATH = "/dashboard/account";
@@ -75,7 +81,22 @@ export function DashboardShell({ children }: { children: ReactNode }) {
     useAuthStore.getState().expire();
     router.replace(EXPIRED_LOGIN_PATH);
   }, [router]);
-  useVaultSocket(token, { onAdvance: () => void refreshDashboard(), onSessionEnded: endSession });
+  useVaultSocket(token, {
+    onAdvance: () => void refreshDashboard(),
+    onSessionEnded: endSession,
+  });
+  const endStepUpSession = useCallback(
+    (reason: "locked" | "expired") => {
+      if (reason === "expired") {
+        endSession();
+        return;
+      }
+      // The server already closed the session: nothing to end there.
+      useAuthStore.getState().expireLocked();
+      router.replace(LOCKED_LOGIN_PATH);
+    },
+    [endSession, router],
+  );
   const signOutIdle = useCallback(() => {
     useAuthStore.getState().expireIdle();
     router.replace(IDLE_LOGIN_PATH);
@@ -143,36 +164,38 @@ export function DashboardShell({ children }: { children: ReactNode }) {
 
   return (
     <DashboardContext value={context}>
-      <Navigation />
-      <div className="lg:pl-60">
-        <DashboardHeader
-          title={verifying ? "Verify identity" : (section?.label ?? "Dashboard")}
-          client={client}
-          realtime={realtime}
-          lastUpdated={lastUpdated}
-          refreshing={loading}
-          onRefresh={() => void refresh()}
-          onLogout={signOut}
-          securityActive={pathname === SECURITY_PATH}
-        />
-        {/* Bottom padding below lg: the tab bar (and the phone's home indicator) never covers content. */}
-        <main className="mx-auto max-w-7xl space-y-6 px-4 pt-6 pb-[calc(6rem+env(safe-area-inset-bottom))] sm:px-6 lg:pb-10">
-          {error && !summary ? (
-            <Alert tone="error" title="Could not load your accounts">
-              {describeError(error)}{" "}
-              <Button variant="ghost" size="sm" onClick={() => void refresh()}>
-                Retry
-              </Button>
-            </Alert>
-          ) : null}
-          {error && summary ? (
-            <Alert tone="warning">Showing the last data received. {describeError(error)}</Alert>
-          ) : null}
-          {client && kycLocked && !verifying ? <KycBanner client={client} token={context.token} /> : null}
-          {accountLinks ? <AccountLinks /> : null}
-          {children}
-        </main>
-      </div>
+      <StepUpProvider token={context.token} onSessionEnded={endStepUpSession}>
+        <Navigation />
+        <div className="lg:pl-60">
+          <DashboardHeader
+            title={verifying ? "Verify identity" : (section?.label ?? "Dashboard")}
+            client={client}
+            realtime={realtime}
+            lastUpdated={lastUpdated}
+            refreshing={loading}
+            onRefresh={() => void refresh()}
+            onLogout={signOut}
+            securityActive={pathname === SECURITY_PATH}
+          />
+          {/* Bottom padding below lg: the tab bar (and the phone's home indicator) never covers content. */}
+          <main className="mx-auto max-w-7xl space-y-6 px-4 pt-6 pb-[calc(6rem+env(safe-area-inset-bottom))] sm:px-6 lg:pb-10">
+            {error && !summary ? (
+              <Alert tone="error" title="Could not load your accounts">
+                {describeError(error)}{" "}
+                <Button variant="ghost" size="sm" onClick={() => void refresh()}>
+                  Retry
+                </Button>
+              </Alert>
+            ) : null}
+            {error && summary ? (
+              <Alert tone="warning">Showing the last data received. {describeError(error)}</Alert>
+            ) : null}
+            {client && kycLocked && !verifying ? <KycBanner client={client} token={context.token} /> : null}
+            {accountLinks ? <AccountLinks /> : null}
+            {children}
+          </main>
+        </div>
+      </StepUpProvider>
     </DashboardContext>
   );
 }

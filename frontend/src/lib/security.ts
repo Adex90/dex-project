@@ -16,6 +16,7 @@
  */
 
 import { PASSWORD_MAX_LENGTH, PASSWORD_MIN_LENGTH } from "./mfa.ts";
+import { windowLabel } from "./step-up.ts";
 import { isRecord, isText } from "./vault.ts";
 import type {
   DeviceSession,
@@ -253,6 +254,15 @@ export function describeEvent(event: SecurityEvent): EventDescription {
       return { title: "Beneficiaries updated", detail: n > 0 ? `Version ${n} on record` : null, tone: "accent" };
     case "W8BEN_CERTIFICADO":
       return { title: "W-8BEN certified", detail: n > 0 ? `Version ${n} on record` : null, tone: "accent" };
+    // Step-up (migration 0022): `detail` is the window's length in seconds.
+    case "STEP_UP_VERIFICADO":
+      return {
+        title: "Identity confirmed",
+        detail: n > 0 ? `Withdrawals and beneficiary changes unlocked for ${windowLabel(n)}` : null,
+        tone: "accent",
+      };
+    case "STEP_UP_FALLIDO":
+      return { title: "Identity check failed", detail: "Wrong code or password", tone: "warning" };
     case "MFA_SECRETO_GENERADO":
       return { title: "Two-step verification setup started", detail: null, tone: "neutral" };
     case "MFA_ACTIVADO":

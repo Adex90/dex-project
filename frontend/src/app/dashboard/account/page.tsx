@@ -6,13 +6,15 @@ import { useRouter } from "next/navigation";
 import { LedgerFeed } from "@/components/dashboard/ledger-feed";
 import { VaultCard } from "@/components/dashboard/vault-card";
 import { useDashboard } from "@/components/layout/dashboard-shell";
+import { useStepUp } from "@/components/security/step-up-provider";
 import { CardManagement } from "@/components/wealth/card-management";
 import { CashYieldSection } from "@/components/wealth/cash-yield-section";
 import { WithdrawalDrawer } from "@/components/wealth/withdrawal-drawer";
 import { ApiError } from "@/lib/api/client";
 import { api } from "@/lib/api/endpoints";
 import { EXPIRED_LOGIN_PATH } from "@/lib/session";
-import { parseLinkedAccounts, parseWithdrawalReceipt } from "@/lib/withdrawal";
+import { withdrawalCheck } from "@/lib/step-up";
+import { accountLabel, parseLinkedAccounts, parseWithdrawalReceipt } from "@/lib/withdrawal";
 import { useAuthStore } from "@/store/auth";
 import { useDashboardStore } from "@/store/dashboard";
 import { useVaultStore } from "@/store/vault";
@@ -30,7 +32,8 @@ const INVALID_AMOUNT = "Enter an amount in pesos, with at most two decimals.";
  *   cash and the Sovereign Yield counter, live. A preview: nothing is paid.
  * - Withdraw, in the Cash & Yield section: the fiat off-ramp
  *   (components/wealth/withdrawal-drawer.tsx), by SPEI to a linked bank
- *   account in the client's own name, from the available cash only.
+ *   account in the client's own name, from the available cash only. Money
+ *   leaving needs a fresh "Confirm it's you" (step-up, roadmap item 22).
  * - The debit card (components/wealth/card-management.tsx): lock, PIN,
  *   settings and saveback. A preview: no card is issued yet.
  * - The account itself (balance, CLABE, deposits) and its ledger, as before.
@@ -42,6 +45,7 @@ const INVALID_AMOUNT = "Enter an amount in pesos, with at most two decimals.";
 export default function AccountPage() {
   const router = useRouter();
   const { token, kycLocked, refresh } = useDashboard();
+  const guard = useStepUp();
   const [withdrawing, setWithdrawing] = useState(false);
   const cash = useVaultStore((s) => s.balance?.available_cash ?? null);
   const held = useVaultStore((s) => s.balance?.held_cash ?? "0");
@@ -72,10 +76,11 @@ export default function AccountPage() {
   );
 
   const withdraw = useCallback(
-    async (request: WithdrawalRequest): Promise<Withdrawal> => {
+    async (request: WithdrawalRequest, account: LinkedAccount): Promise<Withdrawal> => {
       let body: unknown;
       try {
-        body = await api.withdraw(token, request);
+        // Without a fresh check the server sends nothing (403): confirm, then the same request again.
+        body = await guard(() => api.withdraw(token, request), withdrawalCheck(request.amount, accountLabel(account)));
       } catch (error) {
         if (error instanceof ApiError && error.isUnauthorized) endSession();
         // The drawer validates the amount before sending: a 400 means it did not travel in the API's format.
@@ -91,7 +96,7 @@ export default function AccountPage() {
       void refresh();
       return parsed.withdrawal;
     },
-    [token, endSession, refresh],
+    [token, endSession, refresh, guard],
   );
 
   return (

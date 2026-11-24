@@ -1,7 +1,9 @@
 import { passwordChangeBody } from "@/lib/security";
+import { stepUpBody } from "@/lib/step-up";
 import type { LimitOrderRequest, MarketOrderRequest, StopOrderRequest } from "@/types/market";
 import type { DesignationRequest } from "@/types/beneficiaries";
 import type { InactivityMinutes, PasswordChange } from "@/types/security";
+import type { StepUpCredential } from "@/types/step-up";
 import type { W8benCertification } from "@/types/taxes";
 import type { WithdrawalRequest } from "@/types/wealth";
 
@@ -101,6 +103,17 @@ export const api = {
   /** Current password (and authenticator code, with two-step verification on); signs other devices out. */
   changePassword: (token: string, change: PasswordChange) =>
     request<unknown>("/api/v1/auth/password/change", { method: "POST", token, body: passwordChangeBody(change) }),
+
+  /** How this session confirms a sensitive action, and its open window; validate with `parseStepUpStatus`. */
+  stepUpStatus: (token: string, signal?: AbortSignal) => request<unknown>("/api/v1/auth/step-up", { token, signal }),
+
+  /**
+   * Confirms the authenticator code (or the password, without two-step
+   * verification) and opens a 5-minute window on this session; validate with
+   * `parseStepUpWindow`. Counts toward the sign-in lockout.
+   */
+  stepUp: (token: string, credential: StepUpCredential) =>
+    request<unknown>("/api/v1/auth/step-up", { method: "POST", token, body: stepUpBody(credential) }),
 
   /** The security log, newest first; validate with `parseSecurityEvents`. */
   securityEvents: (token: string, signal?: AbortSignal) =>
