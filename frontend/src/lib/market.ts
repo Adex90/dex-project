@@ -195,12 +195,13 @@ export function orderTypesFor(side: OrderSide): readonly OrderType[] {
 }
 
 /**
- * What the backend executes: market orders, and limit and stop orders, which
- * wait for their price with their cash or units held (migration 0015). The
- * checkout lets a client set up a savings plan and see what it would do, but
- * schedules none until the backend does (roadmap module 4).
+ * What the backend executes: market orders; limit and stop orders, which
+ * wait for their price with their cash or units held (migration 0015); and
+ * savings plans, which buy the same amount every week, two weeks or month
+ * from the vault's cash (migration 0023). The checkout still takes a narrower
+ * list (`liveTypes`), previewing the types left out without sending them.
  */
-export const LIVE_ORDER_TYPES: readonly OrderType[] = ["market", "limit", "stop"];
+export const LIVE_ORDER_TYPES: readonly OrderType[] = ["market", "limit", "stop", "savings_plan"];
 
 export const PLAN_FREQUENCIES: readonly PlanFrequency[] = ["weekly", "biweekly", "monthly"];
 

@@ -24,6 +24,7 @@ import { useCardStore } from "@/store/card";
 import { useDashboardStore } from "@/store/dashboard";
 import { useMarketStore } from "@/store/market";
 import { useOrdersStore } from "@/store/orders";
+import { useSavingsPlansStore } from "@/store/savings-plans";
 import { useSecurityStore } from "@/store/security";
 import { displayedRealtime, useVaultStore } from "@/store/vault";
 
@@ -130,6 +131,7 @@ export function DashboardShell({ children }: { children: ReactNode }) {
     () => () => {
       useMarketStore.getState().reset();
       useOrdersStore.getState().reset();
+      useSavingsPlansStore.getState().reset();
       useCardStore.getState().reset();
       useSecurityStore.getState().reset();
       resetNavOrigin();

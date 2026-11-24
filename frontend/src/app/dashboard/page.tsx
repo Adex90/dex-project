@@ -6,6 +6,7 @@ import { Lock } from "lucide-react";
 
 import { useDashboard } from "@/components/layout/dashboard-shell";
 import { OpenOrdersList } from "@/components/markets/open-orders-list";
+import { SavingsPlansList } from "@/components/markets/savings-plans-list";
 import { Alert, Button } from "@/components/ui/primitives";
 import { ONBOARDING_PATH } from "@/hooks/use-client-home";
 import { AssetList, AssetListSkeleton } from "@/components/vault/asset-list";
@@ -27,13 +28,15 @@ import { useVaultStore } from "@/store/vault";
  * (components/vault/portfolio-analytics.tsx) splits the total between cash,
  * each holding and fixed term, live from the same store. Open limit and stop
  * orders sit at the top of the holdings, with what they hold
- * (components/markets/open-orders-list.tsx); the section is absent when there
- * are none.
+ * (components/markets/open-orders-list.tsx), and the savings plans after
+ * them, with their next purchases and Pause, Resume and Cancel
+ * (components/markets/savings-plans-list.tsx); each section is absent when
+ * there is nothing in it.
  *
  * Layout: one column on phones (balance, allocation, trend, deposit, open
- * orders, assets); from xl, the balance (two thirds) beside the deposit card,
- * both the same height, then the allocation, the trend, the open orders and
- * the assets across the full width.
+ * orders, savings plans, assets); from xl, the balance (two thirds) beside
+ * the deposit card, both the same height, then the allocation, the trend, the
+ * open orders, the savings plans and the assets across the full width.
  */
 export default function VaultPage() {
   const { token, client, kycLocked, refresh } = useDashboard();
@@ -109,8 +112,9 @@ export default function VaultPage() {
           )}
         </div>
 
-        {/* Its own grid item, or nothing: no empty row (and no extra gap) without open orders. */}
+        {/* Each its own grid item, or nothing: no empty row (and no extra gap) without orders or plans. */}
         <OpenOrdersList token={token} className="min-w-0 xl:col-span-3" />
+        <SavingsPlansList token={token} className="min-w-0 xl:col-span-3" />
 
         <div className="min-w-0 xl:col-span-3">
           {loaded ? <AssetList holdings={holdings} /> : <AssetListSkeleton />}

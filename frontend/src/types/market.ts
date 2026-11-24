@@ -1,24 +1,25 @@
 /**
  * Markets: the contract between the trading screens and the backend's market
- * engine (backend/src/mercado, migrations 0013 to 0015). English field names,
- * amounts as exact decimal strings, never floats, the way the vault's is
- * (`types/vault.ts`).
+ * engine (backend/src/mercado, migrations 0013, 0015 and 0023). English field
+ * names, amounts as exact decimal strings, never floats, the way the vault's
+ * is (`types/vault.ts`).
  *
  * - `GET /api/v1/market/assets` → `MarketCatalog` (any signed-in session): the
  *   Discover tab.
  * - `GET /api/v1/market/quote/{ticker}` → `MarketQuote` (any signed-in session).
  * - `POST /api/v1/market/order` (clients only): a market `OrderRequest` →
  *   `OrderReceipt`; a limit or stop one → `PendingOrder` (its cash or units
- *   held; filled at once when a limit is already reachable). 201 for a new
- *   order, 200 when the idempotency key repeats the same order (as it stands
- *   now), 409 when it was used for something else.
+ *   held; filled at once when a limit is already reachable); a savings plan
+ *   → `SavingsPlan`, with its first purchase already made (or skipped). 201
+ *   for a new order, 200 when the idempotency key repeats the same order (as
+ *   it stands now), 409 when it was used for something else.
  * - `GET /api/v1/market/orders/pending` → `PendingOrders`; `POST
  *   /api/v1/market/orders/{id}/cancel` → the cancelled `PendingOrder`, its
  *   cash or units released.
- * - The backend executes limit and stop orders; the checkout sends them once
- *   `LIVE_ORDER_TYPES` (lib/market.ts) lists them. Savings plans (roadmap
- *   module 4) are contract only: the backend answers 422
- *   `TIPO_ORDEN_NO_DISPONIBLE` until their scheduler exists.
+ * - `GET /api/v1/market/savings-plans` → `SavingsPlans` (active and paused);
+ *   `POST /api/v1/market/savings-plans/{id}/pause`, `/resume` and `/cancel`
+ *   → the `SavingsPlan` as it stands (repeating one answers the same plan; a
+ *   cancelled plan is 409 `PLAN_CANCELADO` to anything but cancel).
  *
  * Until the price oracle is connected, prices are simulated (`price_source`)
  * and the backend only quotes and fills them in demo mode (otherwise 503
@@ -136,7 +137,11 @@ export interface StopOrderRequest extends OrderFields {
   stop_price: DecimalString;
 }
 
-/** Buys `amount` of the asset every period from the vault's cash (dollar-cost averaging). */
+/**
+ * Buys `amount` of the asset every period from the vault's cash
+ * (dollar-cost averaging): the first purchase at once, then at 9:00 a.m.
+ * Mexico City time every 7 or 14 days, or on the same day of each month.
+ */
 export interface SavingsPlanRequest extends OrderFields {
   order_type: "savings_plan";
   /** Plans only buy. */
@@ -233,5 +238,60 @@ export interface PendingOrders {
   orders: PendingOrder[];
 }
 
+/** Where a savings plan stands: a paused one buys nothing until resumed; cancelled is final. */
+export type SavingsPlanStatus = "active" | "paused" | "cancelled";
+
+/** What happened to a plan's last due purchase: bought, or skipped by a rule (not enough cash...). */
+export type PlanPurchaseResult = "executed" | "skipped";
+
+/**
+ * A savings plan: what creating, pausing, resuming or cancelling one answers,
+ * and each row of the plans list. Every purchase is a market order like any
+ * other, charged to the vault's cash at the price of the day; a purchase the
+ * cash cannot cover is skipped and the plan carries on at its next date.
+ */
+export interface SavingsPlan {
+  plan_id: string;
+  /** Tells it apart from a market receipt or a limit or stop order. */
+  order_type: "savings_plan";
+  status: SavingsPlanStatus;
+  ticker: string;
+  /** Plans only buy. */
+  side: "buy";
+  /** MXN per purchase. */
+  amount: DecimalString;
+  frequency: PlanFrequency;
+  /** The day it was created in Mexico City (YYYY-MM-DD): its dates count from it. */
+  anchor_date: string;
+  /** The next purchase, ISO 8601; null unless active. */
+  next_execution_at: string | null;
+  /** The next purchase and the two after it, ISO 8601; empty unless active. */
+  upcoming: string[];
+  /** When the last due purchase was processed (bought or skipped); null before the first. */
+  last_execution_at: string | null;
+  last_result: PlanPurchaseResult | null;
+  /** The rule that stopped the last purchase ("SALDO_INSUFICIENTE"); null unless it was skipped. */
+  failure_reason: string | null;
+  /** The most recent purchase made, even when a later one was skipped; null before the first. */
+  last_purchase: OrderExecution | null;
+  /** Purchases made and skipped since it was created. */
+  purchases: number;
+  skipped: number;
+  /** MXN charged by all its purchases. */
+  invested: DecimalString;
+  /** Units bought by all its purchases. */
+  quantity: DecimalString;
+  created_at: string;
+  cancelled_at: string | null;
+}
+
+/** `GET /api/v1/market/savings-plans`: the active and paused plans, newest first. */
+export interface SavingsPlans {
+  plans: SavingsPlan[];
+}
+
+/** The plan actions, as `POST /api/v1/market/savings-plans/{id}/{action}` names them. */
+export type PlanAction = "pause" | "resume" | "cancel";
+
 /** What `POST /api/v1/market/order` answers, by the order's type. */
-export type PlacedOrder = OrderReceipt | PendingOrder;
+export type PlacedOrder = OrderReceipt | PendingOrder | SavingsPlan;

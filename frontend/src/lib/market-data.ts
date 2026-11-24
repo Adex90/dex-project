@@ -1,7 +1,8 @@
 /**
  * Market data from the API (`types/market.ts`): runtime validation of the
  * catalog, a quote, an order receipt and limit and stop orders, and the small
- * vault-side helpers the asset page needs.
+ * vault-side helpers the asset page needs. Savings plans have their own
+ * (lib/savings-plans.ts).
  *
  * Network data is validated before anything renders it (definition of done,
  * docs/FRONTEND_ROADMAP.md): a malformed payload is rejected whole, never
@@ -161,6 +162,11 @@ export function parseOrderReceipt(value: unknown): OrderReceipt | null {
   }
   const { quantity, price, amount, commission, executed_at } = execution;
   return { order_id: execution.order_id, order_type, status, ticker, side, quantity, price, amount, commission, executed_at };
+}
+
+/** A fill on its own (`OrderExecution`): a limit or stop order's, or a savings plan's last purchase. */
+export function parseOrderExecution(value: unknown): OrderExecution | null {
+  return isRecord(value) ? parseExecution(value) : null;
 }
 
 /** The fill fields a receipt and an execution share. */

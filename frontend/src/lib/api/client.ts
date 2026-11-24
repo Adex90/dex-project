@@ -201,7 +201,10 @@ const MESSAGES: Record<string, string> = {
     "The price has already reached that stop. A buy stop goes above the current price, a sell stop below it.",
   LIMITE_ORDENES_PENDIENTES: "You have the maximum of 50 open orders. Cancel one to place another.",
   ORDEN_NO_PENDIENTE: "This order is no longer open: it has already filled or was rejected.",
-  TIPO_ORDEN_NO_DISPONIBLE: "Savings plans are not available yet. Nothing was scheduled.",
+  TIPO_ORDEN_NO_DISPONIBLE: "This order type is not available yet. Nothing was placed.",
+  // Savings plans (migration 0023).
+  LIMITE_PLANES: "You have the maximum of 20 savings plans. Cancel one to create another.",
+  PLAN_CANCELADO: "This savings plan was already cancelled: it cannot be paused or resumed.",
   // Withdrawals (migration 0016): only to a bank account linked in the client's own name.
   CUENTA_NO_VINCULADA: "Withdrawals go only to a bank account linked in your name. Nothing was sent.",
   TRANSFERENCIAS_TERCEROS_NO_DISPONIBLES:

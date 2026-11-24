@@ -173,10 +173,10 @@ test("prices: four decimals on the numpad and the keyboard; two to four for the 
   assert.equal(formatPrice("1580.50000000"), "$1,580.50");
 });
 
-test("order types: a savings plan only buys, and every type but the plan is live", () => {
+test("order types: a savings plan only buys, and every type is live", () => {
   assert.deepEqual(orderTypesFor("buy"), ["market", "limit", "stop", "savings_plan"]);
   assert.deepEqual(orderTypesFor("sell"), ["market", "limit", "stop"]);
-  assert.deepEqual(LIVE_ORDER_TYPES, ["market", "limit", "stop"]);
+  assert.deepEqual(LIVE_ORDER_TYPES, ["market", "limit", "stop", "savings_plan"]);
   assert.equal(smallestUnit(4), "0.0001");
   assert.equal(smallestUnit(0), "1");
 });

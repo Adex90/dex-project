@@ -12,6 +12,7 @@ import { MarketNotice, NoticeLink } from "@/components/markets/market-notice";
 import { Alert, Button } from "@/components/ui/primitives";
 import { ApiError, describeError } from "@/lib/api/client";
 import { api } from "@/lib/api/endpoints";
+import { toUnits } from "@/lib/decimal";
 import {
   isTicker,
   parseMarketQuote,
@@ -20,9 +21,11 @@ import {
   positionFor,
   sellableFor,
 } from "@/lib/market-data";
+import { parseSavingsPlan } from "@/lib/savings-plans";
 import { EXPIRED_LOGIN_PATH } from "@/lib/session";
 import { useAuthStore } from "@/store/auth";
 import { useOrdersStore } from "@/store/orders";
+import { useSavingsPlansStore } from "@/store/savings-plans";
 import { useVaultStore } from "@/store/vault";
 import type { MarketQuote, OrderRequest, PlacedOrder } from "@/types/market";
 
@@ -43,11 +46,12 @@ import type { MarketQuote, OrderRequest, PlacedOrder } from "@/types/market";
  *   idempotency key, which the drawer reuses on a retry, so a retry never
  *   places an order twice. A market order answers its fill; a limit or stop
  *   order answers the order as it stands (waiting with its cash or units
- *   held, or filled at once when a limit is already reachable). Savings
- *   plans are not live: the drawer previews them but never sends them, and
- *   this page refuses them too.
- * - A limit or stop order refreshes the open orders the Vault lists, so the
- *   new order is there when the client goes back.
+ *   held, or filled at once when a limit is already reachable); a savings
+ *   plan answers the plan, its first purchase made (or skipped) and its next
+ *   dates.
+ * - A limit or stop order refreshes the open orders the Vault lists, and a
+ *   savings plan its savings plans, so the new one is there when the client
+ *   goes back.
  */
 
 type QuoteResult =
@@ -63,7 +67,8 @@ const UNREADABLE_RECEIPT =
   "The order was sent, but its receipt could not be read. Check your vault before trying again: retrying this same order cannot fill it twice.";
 const INVALID_AMOUNT = "Enter an amount in pesos, with at most two decimals.";
 const INVALID_ORDER = "Check the amount (pesos, at most two decimals) and the price (at most four decimals).";
-const NOT_LIVE = "Savings plans are not live yet. Nothing was scheduled.";
+const UNREADABLE_PLAN =
+  "The savings plan was created, but its confirmation could not be read. Check Savings plans on your Vault before trying again: retrying this same plan cannot create it twice.";
 
 export default function AssetPage() {
   const params = useParams<{ ticker: string }>();
@@ -121,7 +126,6 @@ export default function AssetPage() {
 
   const placeOrder = useCallback(
     async (order: OrderRequest): Promise<PlacedOrder> => {
-      if (order.order_type === "savings_plan") throw new Error(NOT_LIVE);
       let body: unknown;
       try {
         body = await api.placeOrder(token, order);
@@ -130,11 +134,25 @@ export default function AssetPage() {
         // The drawer validates the amount (and the price) before sending: a 400
         // means they did not travel in the API's format. Say so in English.
         if (error instanceof ApiError && error.code === "VALIDACION") {
-          throw new Error(order.order_type === "market" ? INVALID_AMOUNT : INVALID_ORDER);
+          const limitOrStop = order.order_type === "limit" || order.order_type === "stop";
+          throw new Error(limitOrStop ? INVALID_ORDER : INVALID_AMOUNT);
         }
         throw error;
       }
       // A 2xx means the order went through: never claim a failure that may be false.
+      if (order.order_type === "savings_plan") {
+        const plan = parseSavingsPlan(body);
+        void useSavingsPlansStore.getState().load((signal) => api.savingsPlans(token, signal));
+        if (
+          !plan ||
+          plan.ticker !== order.ticker ||
+          toUnits(plan.amount) !== toUnits(order.amount) ||
+          plan.frequency !== order.frequency
+        ) {
+          throw new Error(UNREADABLE_PLAN);
+        }
+        return plan;
+      }
       const placed: PlacedOrder | null = order.order_type === "market" ? parseOrderReceipt(body) : parsePendingOrder(body);
       if (
         !placed ||

@@ -1,19 +1,20 @@
 "use client";
 
 import { useEffect, useId, useRef, useState, type ChangeEvent, type FormEvent, type RefObject } from "react";
-import { Check, CircleSlash, Clock, Delete, Loader2, X } from "lucide-react";
+import { Check, CircleSlash, Clock, Delete, Loader2, Repeat, X } from "lucide-react";
 
 import { SegmentedControl } from "@/components/ui/segmented-control";
 import { cx } from "@/components/ui/primitives";
 import { describeError, messageForCode } from "@/lib/api/client";
 import { newIdempotencyKey } from "@/lib/api/endpoints";
-import { formatMoney } from "@/lib/decimal";
+import { formatMoney, toUnits } from "@/lib/decimal";
 import {
   LIVE_ORDER_TYPES,
   NUMPAD_KEYS,
   PLAN_FREQUENCIES,
   PRICE_DECIMALS,
   amountForApi,
+  amountUnits,
   assessOrder,
   buildOrder,
   draftSignature,
@@ -30,8 +31,25 @@ import {
   type OrderDraft,
 } from "@/lib/market";
 import { heldLabel, orderKind, triggerPhrase } from "@/lib/orders";
+import {
+  FREQUENCY_LABELS,
+  FREQUENCY_PHRASES,
+  formatPlanDate,
+  formatPlanDay,
+  skipReason,
+} from "@/lib/savings-plans";
 import { formatShares } from "@/lib/vault";
-import type { MarketAsset, OrderRequest, OrderSide, OrderType, PlacedOrder, PlanFrequency } from "@/types/market";
+import type {
+  MarketAsset,
+  OrderReceipt,
+  OrderRequest,
+  OrderSide,
+  OrderType,
+  PendingOrder,
+  PlacedOrder,
+  PlanFrequency,
+  SavingsPlan,
+} from "@/types/market";
 import type { DecimalString } from "@/types/vault";
 
 /*
@@ -43,17 +61,20 @@ import type { DecimalString } from "@/types/vault";
  *   limit or stop adds its price, typed on the same numpad as the amount
  *   (the field it types into is underlined in gold). A savings plan asks how
  *   often instead, and shows what it adds up to in a month.
- * - `liveTypes` can be placed: market, limit and stop orders
- *   (lib/market.ts). A limit or stop order holds what it would use (a buy,
- *   its amount from the cash; a sell, its units) until it fills or is
- *   cancelled, and the summary says so before it is placed. A savings plan
- *   can be set up and previewed, estimates included, but its button stays
- *   disabled and a note says why: nothing is sent for a type the backend
- *   does not execute.
+ * - `liveTypes` can be placed: every type by default (lib/market.ts). A
+ *   limit or stop order holds what it would use (a buy, its amount from the
+ *   cash; a sell, its units) until it fills or is cancelled, and the summary
+ *   says so before it is placed. A savings plan holds nothing: each purchase
+ *   is charged at its date, the first one right away, so the amount hint
+ *   warns when today's cash would not cover it (it would be skipped, and the
+ *   plan would carry on). A type left out of `liveTypes` can be set up and
+ *   previewed, but its button stays disabled and a note says why.
  * - The receipt follows the answer: a fill (a market order, or a limit
  *   already reachable, which fills at once), an order waiting for its price
  *   (what it waits for and what it holds; it is listed in the Vault's Open
- *   orders), or an order the bank could not fill.
+ *   orders), an order the bank could not fill, or a savings plan created
+ *   (its first purchase, made or skipped, and its next dates; it is listed
+ *   in the Vault's Savings plans).
  * - A native <dialog> opened as a modal: focus stays inside, the page behind
  *   is inert, Escape closes, and closing returns focus to the button that
  *   opened it.
@@ -112,16 +133,11 @@ const TYPE_PLURALS: Record<OrderType, string> = {
   savings_plan: "Savings plans",
 };
 
-const FREQUENCY_LABELS: Record<PlanFrequency, string> = {
-  weekly: "Weekly",
-  biweekly: "Every 2 weeks",
-  monthly: "Monthly",
-};
-
-const FREQUENCY_PHRASES: Record<PlanFrequency, string> = {
-  weekly: "every week",
-  biweekly: "every two weeks",
-  monthly: "every month",
+/** When a plan's purchases after the first one run (9:00 a.m. in Mexico City). */
+const THEN_LABELS: Record<PlanFrequency, string> = {
+  weekly: "Every week · 9:00 AM",
+  biweekly: "Every 2 weeks · 9:00 AM",
+  monthly: "Every month · 9:00 AM",
 };
 
 const QUIET_ACTION =
@@ -360,6 +376,10 @@ function CheckoutDialog({
             <p id={amountHintId} className="mt-3 flex flex-wrap items-center justify-center gap-x-2 text-xs">
               {amountProblem !== null ? (
                 <span className="font-medium text-danger">{amountProblem}</span>
+              ) : plan && amountUnits(amount) > toUnits(cash) ? (
+                <span className="text-ink-2" data-testid="order-plan-cash">
+                  The first purchase is due now: with {formatMoney(cash)} available, it would be skipped.
+                </span>
               ) : plan ? (
                 <span className="text-muted">Taken from your vault&apos;s cash at each purchase.</span>
               ) : (
@@ -493,6 +513,8 @@ function CheckoutDialog({
               <>
                 <SummaryRow label="Each purchase" value={formatMoney(amountForApi(amount))} />
                 <SummaryRow label="Frequency" value={FREQUENCY_LABELS[frequency]} />
+                <SummaryRow label="First purchase" value="Now" />
+                <SummaryRow label="Then" value={THEN_LABELS[frequency]} />
                 <SummaryRow label="Quantity (today's price)" value={quantity} />
                 <SummaryRow label="Commission" value="$0.00" strong />
                 <div className="border-t border-border pt-2.5">
@@ -561,7 +583,7 @@ function CheckoutDialog({
               data-testid="order-confirm"
             >
               {busy ? <Loader2 className="size-5 animate-spin" aria-hidden /> : null}
-              {busy ? "Placing order…" : confirmLabel(type, buying)}
+              {busy ? (plan ? "Creating plan…" : "Placing order…") : confirmLabel(type, buying)}
             </button>
           </div>
         </form>
@@ -638,7 +660,7 @@ function footnote(
         : `Stop-loss: when the price falls to ${at ?? "your stop"}, it becomes a market order and fills at the next available price, which may be lower. ${holdSentence(buying)}`;
     case "savings_plan": {
       const each = order.amountProblem === "empty" ? "your amount" : formatMoney(amountForApi(draft.amount));
-      return `Savings plan: buys ${each} of ${asset.ticker} ${FREQUENCY_PHRASES[draft.frequency]} at the price of the day, from your vault's cash, with no commission.`;
+      return `Savings plan: buys ${each} of ${asset.ticker} now, then ${FREQUENCY_PHRASES[draft.frequency]} at 9:00 a.m. Mexico City time, at the price of the day, from your vault's cash, with no commission. A purchase your cash cannot cover is skipped; pause or cancel the plan anytime from your Vault.`;
     }
   }
 }
@@ -662,7 +684,23 @@ function SummaryRow({
   );
 }
 
-function Receipt({
+function Receipt(props: {
+  placed: PlacedOrder;
+  ticker: string;
+  buying: boolean;
+  decimals: number;
+  doneRef: RefObject<HTMLButtonElement | null>;
+  onDone: () => void;
+}) {
+  const { placed } = props;
+  return placed.order_type === "savings_plan" ? (
+    <PlanReceipt {...props} plan={placed} />
+  ) : (
+    <OrderReceiptView {...props} placed={placed} />
+  );
+}
+
+function OrderReceiptView({
   placed,
   ticker,
   buying,
@@ -670,7 +708,7 @@ function Receipt({
   doneRef,
   onDone,
 }: {
-  placed: PlacedOrder;
+  placed: OrderReceipt | PendingOrder;
   ticker: string;
   buying: boolean;
   decimals: number;
@@ -746,14 +784,86 @@ function Receipt({
           <p className="mt-4 text-xs leading-relaxed text-muted">Nothing was charged, and nothing stays held.</p>
         </>
       ) : null}
-      <button
-        ref={doneRef}
-        type="button"
-        onClick={onDone}
-        className="mt-6 h-14 w-full bg-synthetic-yellow text-base font-bold tracking-[0.18em] text-black uppercase transition-colors hover:bg-synthetic-yellow-hover focus-visible:ring-2 focus-visible:ring-synthetic-yellow focus-visible:ring-offset-2 focus-visible:ring-offset-surface focus-visible:outline-none"
-      >
-        Done
-      </button>
+      <DoneButton doneRef={doneRef} onDone={onDone} />
     </div>
+  );
+}
+
+/**
+ * A savings plan created: what it buys and how often, its first purchase
+ * (made, skipped and why, or about to run) and its next dates, in Mexico City
+ * time like the plan's calendar.
+ */
+function PlanReceipt({
+  plan,
+  decimals,
+  doneRef,
+  onDone,
+}: {
+  plan: SavingsPlan;
+  decimals: number;
+  doneRef: RefObject<HTMLButtonElement | null>;
+  onDone: () => void;
+}) {
+  const [now] = useState(() => Date.now());
+  const fill = plan.last_purchase;
+  // A repeated request answers the plan as it stands, maybe after more purchases.
+  const label = plan.purchases + plan.skipped > 1 ? "Last purchase" : "First purchase";
+  const first =
+    plan.last_result === "skipped"
+      ? `Skipped: ${skipReason(plan.failure_reason)}`
+      : plan.last_result === "executed" && fill !== null
+        ? `${formatShares(fill.quantity, decimals)} ${plan.ticker} at ${formatMoney(fill.price)}`
+        : "In a moment";
+  const next = plan.next_execution_at;
+  const then = plan.upcoming.slice(1).map(formatPlanDay);
+  return (
+    <div
+      className="px-5 pt-8 pb-[calc(1.25rem+env(safe-area-inset-bottom))] text-center"
+      data-testid="order-receipt"
+      data-outcome="plan"
+    >
+      <span aria-hidden className="mx-auto grid size-12 place-items-center bg-synthetic-yellow text-black">
+        <Repeat className="size-6" strokeWidth={2.5} />
+      </span>
+      <p role="status" className="mt-4 text-lg font-semibold tracking-tight">
+        Savings plan created
+      </p>
+      <p className="mt-1 text-sm text-muted">{`Buys ${formatMoney(plan.amount)} of ${plan.ticker} ${FREQUENCY_PHRASES[plan.frequency]}.`}</p>
+      <dl className="mt-6 space-y-2.5 border-y border-border py-4 text-left text-sm">
+        <SummaryRow label="Each purchase" value={formatMoney(plan.amount)} />
+        <SummaryRow label="Frequency" value={FREQUENCY_LABELS[plan.frequency]} />
+        <SummaryRow label={label} value={first} testId="receipt-first-purchase" />
+        {fill !== null && plan.last_result === "executed" ? (
+          <SummaryRow label="Charged" value={formatMoney(fill.amount)} />
+        ) : null}
+        <SummaryRow
+          label="Next purchase"
+          value={next === null ? "—" : formatPlanDate(next, now)}
+          strong
+          testId="receipt-next-purchase"
+        />
+        {then.length > 0 ? <SummaryRow label="Then" value={then.join(" · ")} /> : null}
+        <SummaryRow label="Plan" value={plan.plan_id} />
+      </dl>
+      <p className="mt-4 text-xs leading-relaxed text-muted">
+        Purchases run at 9:00 a.m. Mexico City time, from your vault&apos;s cash at the price of the day. Pause or
+        cancel the plan anytime in Savings plans on your Vault.
+      </p>
+      <DoneButton doneRef={doneRef} onDone={onDone} />
+    </div>
+  );
+}
+
+function DoneButton({ doneRef, onDone }: { doneRef: RefObject<HTMLButtonElement | null>; onDone: () => void }) {
+  return (
+    <button
+      ref={doneRef}
+      type="button"
+      onClick={onDone}
+      className="mt-6 h-14 w-full bg-synthetic-yellow text-base font-bold tracking-[0.18em] text-black uppercase transition-colors hover:bg-synthetic-yellow-hover focus-visible:ring-2 focus-visible:ring-synthetic-yellow focus-visible:ring-offset-2 focus-visible:ring-offset-surface focus-visible:outline-none"
+    >
+      Done
+    </button>
   );
 }

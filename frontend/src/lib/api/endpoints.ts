@@ -1,6 +1,6 @@
 import { passwordChangeBody } from "@/lib/security";
 import { stepUpBody } from "@/lib/step-up";
-import type { LimitOrderRequest, MarketOrderRequest, StopOrderRequest } from "@/types/market";
+import type { OrderRequest, PlanAction } from "@/types/market";
 import type { DesignationRequest } from "@/types/beneficiaries";
 import type { InactivityMinutes, PasswordChange } from "@/types/security";
 import type { StepUpCredential } from "@/types/step-up";
@@ -156,11 +156,13 @@ export const api = {
    * endpoint reads as market) and answers an `OrderReceipt`, filled at the
    * current price; a limit or stop order carries its type and price and
    * answers a `PendingOrder`, waiting with its cash or units held (or filled
-   * at once, when a limit is already reachable). 201 for a new order, 200 when
-   * the idempotency key repeats the same one. Untyped on purpose:
-   * `parseOrderReceipt` and `parsePendingOrder` validate the answer.
+   * at once, when a limit is already reachable); a savings plan carries its
+   * frequency and answers the `SavingsPlan`, its first purchase made (or
+   * skipped). 201 for a new order, 200 when the idempotency key repeats the
+   * same one. Untyped on purpose: `parseOrderReceipt`, `parsePendingOrder`
+   * and `parseSavingsPlan` validate the answer.
    */
-  placeOrder: (token: string, order: MarketOrderRequest | LimitOrderRequest | StopOrderRequest) =>
+  placeOrder: (token: string, order: OrderRequest) =>
     request<unknown>("/api/v1/market/order", { method: "POST", token, body: orderBody(order) }),
 
   /**
@@ -178,6 +180,26 @@ export const api = {
    */
   cancelOrder: (token: string, orderId: string) =>
     request<unknown>(`/api/v1/market/orders/${encodeURIComponent(orderId)}/cancel`, { method: "POST", token }),
+
+  /**
+   * The client's active and paused savings plans, newest first, with their
+   * next dates and what they bought. Untyped on purpose: `parseSavingsPlans`
+   * validates the list.
+   */
+  savingsPlans: (token: string, signal?: AbortSignal) =>
+    request<unknown>("/api/v1/market/savings-plans", { token, signal }),
+
+  /**
+   * Pauses, resumes or cancels a savings plan and answers it as it stands.
+   * Repeating an action answers the same plan; a cancelled plan is 409
+   * `PLAN_CANCELADO` to pause or resume. Untyped on purpose:
+   * `parseSavingsPlan` validates the answer.
+   */
+  changeSavingsPlan: (token: string, planId: string, action: PlanAction) =>
+    request<unknown>(`/api/v1/market/savings-plans/${encodeURIComponent(planId)}/${action}`, {
+      method: "POST",
+      token,
+    }),
 
   /**
    * The client's bank accounts linked for withdrawals, all in their own name.
@@ -447,7 +469,7 @@ export function newIdempotencyKey(): string {
 }
 
 /** The body of `POST /api/v1/market/order`: exactly the fields the backend reads for each type. */
-export function orderBody(order: MarketOrderRequest | LimitOrderRequest | StopOrderRequest): Record<string, string> {
+export function orderBody(order: OrderRequest): Record<string, string> {
   const base = { ticker: order.ticker, side: order.side, amount: order.amount, idempotency_key: order.idempotency_key };
   switch (order.order_type) {
     case "market":
@@ -456,5 +478,7 @@ export function orderBody(order: MarketOrderRequest | LimitOrderRequest | StopOr
       return { ...base, order_type: "limit", limit_price: order.limit_price };
     case "stop":
       return { ...base, order_type: "stop", stop_price: order.stop_price };
+    case "savings_plan":
+      return { ...base, order_type: "savings_plan", frequency: order.frequency };
   }
 }
