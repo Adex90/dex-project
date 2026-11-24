@@ -21,6 +21,7 @@ use synthetic_capital::{
     error::AppResult,
     kyc::Registro,
     ledger::{self, hash, Movimiento},
+    mercado::planes,
     models::kyc::RolUsuario,
     routes,
     sofom::{credito, puente},
@@ -1926,12 +1927,25 @@ async fn sin_aviso_al_cliente(pool: PgPool) {
     let beto = cliente(&pool, &cfg, "Beto").await;
     let tok_ana = token_cliente(&api, "Ana").await;
     let tok_beto = token_cliente(&api, "Beto").await;
+    // Un plan de ahorro de Ana (0023), antes de tener efectivo: su primera compra se omite.
+    let (s, plan) = api
+        .post(
+            "/api/v1/market/order",
+            &tok_ana,
+            json!({ "ticker": "AUG1", "side": "buy", "amount": "500.00", "idempotency_key": clave_api(),
+                    "order_type": "savings_plan", "frequency": "weekly" }),
+        )
+        .await;
+    assert_eq!((s, &plan["failure_reason"]), (StatusCode::CREATED, &json!("SALDO_INSUFICIENTE")), "{plan}");
     // Ana: 10,000 libres y luego la estructuración, todo por el webhook del proveedor.
     for monto in ["10000", "145000", "145000", "145000"] {
         let (s, r) = api.webhook(&cfg, cuerpo_abono(&ana.cuenta_ifpe.clabe, monto)).await;
         assert_eq!((s, &r["mensaje"], &r["estado"]), (StatusCode::OK, &json!("confirmar"), &json!("ABONADO")), "{r}");
     }
     assert!(congelamiento_activo(&pool, ana.cliente.id).await.is_some());
+    // En su fecha, la compra del plan se omite con el error constante; el plan sigue.
+    vencer_plan(&pool, plan["plan_id"].as_str().unwrap().parse().unwrap()).await;
+    assert_eq!(planes::ejecutar_vencidos(&pool, &cfg).await.unwrap().omitidos, 1);
 
     // Quien envía a un cliente congelado ve un éxito normal.
     let (s, r) = api.webhook(&cfg, cuerpo_abono(&beto.cuenta_ifpe.clabe, "450000")).await;
@@ -2045,6 +2059,8 @@ async fn sin_aviso_al_cliente(pool: PgPool) {
         "/api/v1/wealth/impuestos/export.csv",
         // Verificación reforzada (0022).
         "/api/v1/auth/step-up",
+        // Planes de ahorro (0023), con la compra omitida bajo el congelamiento.
+        "/api/v1/market/savings-plans",
     ] {
         let (s, cuerpo) = api.llamar_crudo("GET", ruta, Some(&tok_ana), None).await;
         assert_eq!(s, StatusCode::OK, "{ruta}");
@@ -3725,6 +3741,9 @@ fn fuente_intercepta_toda_salida() {
         // La compra que ejecuta una orden límite o stop (0015), al dispararse;
         // comprometer su efectivo no es una salida.
         ("mercado/pendiente.rs", 1),
+        // Cada compra de un plan de ahorro (0023), en su fecha; crear el plan
+        // no mueve dinero.
+        ("mercado/planes.rs", 1),
         ("sofom/credito.rs", 2),
         ("sofom/puente.rs", 1),
         ("spei/inbound.rs", 1),

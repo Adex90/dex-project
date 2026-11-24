@@ -6,7 +6,8 @@
 //! 1. La cuenta IFPE del cliente `FOR NO KEY UPDATE`, el primer candado de
 //!    toda orden ([`crate::ledger`]); la idempotencia después, con el
 //!    candado: la repetición devuelve la orden en su estado actual y una clave
-//!    usada para otra cosa (otra orden, de mercado o pendiente) es 409.
+//!    usada para otra cosa (otra orden, de mercado o pendiente, o un plan de
+//!    ahorro) es 409.
 //! 2. Reglas: KYC operable, cuenta activa, activo abierto con precio real (o
 //!    MODO_DEMO), un stop que el precio aún no alcanza y a lo más
 //!    [`MAXIMO_PENDIENTES`] órdenes abiertas por cliente.
@@ -50,7 +51,7 @@ use super::{
     calculo, exigir_precio_real_o_demo, leer_activo,
     modelos::{EstadoPendiente, Lado, Orden, OrdenPendiente, TipoPendiente, VistaPendiente},
     orden::{self, NuevaOrden},
-    se_ofrece, ticker_valido,
+    planes, se_ofrece, ticker_valido,
 };
 use crate::{
     aml::{self, Canal, Contraparte, Decision, Operacion},
@@ -157,6 +158,7 @@ async fn colocar_tx(
         return Ok((previa, true, Decimal::ZERO));
     }
     if orden::orden_por_clave(&mut tx, &s.clave_idempotencia).await?.is_some()
+        || planes::por_clave(&mut tx, &s.clave_idempotencia).await?.is_some()
         || ledger::buscar_por_clave(&mut tx, &s.clave_idempotencia).await?.is_some()
     {
         return Err(orden::clave_reutilizada());
@@ -323,8 +325,9 @@ fn rechaza(e: &AppError) -> bool {
     }
 }
 
-/// El código del error, como lo acepta `mercado.ordenes_pendientes.motivo`.
-fn motivo_de(e: &AppError) -> String {
+/// El código del error, como lo aceptan `mercado.ordenes_pendientes.motivo`
+/// y `mercado.planes_ahorro.motivo`.
+pub(super) fn motivo_de(e: &AppError) -> String {
     let codigo = e.codigo();
     let valido = codigo.len() <= 64
         && codigo.starts_with(|c: char| c.is_ascii_uppercase())

@@ -38,9 +38,13 @@
 //! | GET  | `/api/v1/auditoria/ledger/{ifpe,sofom,mercado}` | operador / auditor |
 //! | GET  | `/api/v1/market/assets` | cualquier sesión: el catálogo que hoy se cotiza y se opera |
 //! | GET  | `/api/v1/market/quote/{ticker}` | cualquier sesión: el activo y su historial de precios |
-//! | POST | `/api/v1/market/order` | cliente: orden de mercado (ejecutada al precio vigente), límite o stop (pendiente, con su efectivo o sus títulos comprometidos) |
+//! | POST | `/api/v1/market/order` | cliente: orden de mercado (ejecutada al precio vigente), límite o stop (pendiente, con su efectivo o sus títulos comprometidos), o plan de ahorro (`savings_plan`: la misma compra cada semana, quincena o mes; la primera en seguida) |
 //! | GET  | `/api/v1/market/orders/pending` | cliente: sus órdenes límite y stop que esperan |
 //! | POST | `/api/v1/market/orders/{id}/cancel` | cliente: cancela una orden pendiente y devuelve lo comprometido |
+//! | GET  | `/api/v1/market/savings-plans` | cliente: sus planes de ahorro activos y pausados, con sus próximas compras |
+//! | POST | `/api/v1/market/savings-plans/{id}/pause` | cliente: pausa un plan de ahorro |
+//! | POST | `/api/v1/market/savings-plans/{id}/resume` | cliente: reanuda un plan pausado en su siguiente fecha |
+//! | POST | `/api/v1/market/savings-plans/{id}/cancel` | cliente: cancela un plan de ahorro (definitivo) |
 //! | GET  | `/api/v1/wealth/linked-accounts` | cliente: sus cuentas vinculadas, a dónde puede retirar (con `MODO_DEMO`, vincula la de demostración) |
 //! | POST | `/api/v1/wealth/withdraw` | cliente con verificación reforzada: retira efectivo disponible a una cuenta vinculada (SPEI a cuenta propia, en proceso hasta liquidarse) |
 //! | GET  | `/api/v1/kyc/expediente` | cliente: estado, intentos, bloqueo y último resultado |

@@ -47,7 +47,8 @@ pub struct Config {
     pub corte_min_intervalo_seg: u64,
     /// Periodicidad de liquidación automática de mutuos vencidos (0 = desactivado).
     pub liquidacion_intervalo_seg: u64,
-    /// Periodicidad del motor de disparo de órdenes límite y stop (0 = desactivado).
+    /// Periodicidad del motor de disparo de órdenes límite y stop y del
+    /// programador de planes de ahorro (0 = desactivado).
     pub mercado_disparo_intervalo_seg: u64,
     pub reserva_institucion: String,
     pub reserva_cuenta: String,

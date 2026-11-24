@@ -215,6 +215,12 @@ fn es_invariante(codigo: &str) -> bool {
             | "DESIGNACION_INVALIDA"
             | "STEP_UP_INVALIDO"
             | "STEP_UP_SESION_NO_VIGENTE"
+            | "PLAN_INCOHERENTE"
+            | "PLAN_NO_ACTIVO"
+            | "PLAN_NO_VENCIDO"
+            | "PLAN_SIN_EJECUCION"
+            | "PLAN_CALENDARIO"
+            | "PLAN_TRANSICION"
     ) || codigo.ends_with("_INMUTABLE")
 }
 
@@ -261,6 +267,8 @@ fn traducir_error_bd(codigo_sql: &str, mensaje: &str, restriccion: &str) -> Opti
             "AML_NO_ENCONTRADO" => return Some(AppError::no_encontrado(detalle)),
             // Otra petición (o el motor de disparo) cerró la orden primero.
             "ORDEN_NO_PENDIENTE" => return Some(AppError::conflicto("ORDEN_NO_PENDIENTE", detalle)),
+            // Otra sesión canceló el plan de ahorro primero (0023).
+            "PLAN_CANCELADO" => return Some(AppError::conflicto("PLAN_CANCELADO", detalle)),
             c if es_conflicto_aml(c) => return Some(AppError::conflicto(c, detalle)),
             _ => {}
         }
@@ -460,6 +468,34 @@ mod pruebas {
         ] {
             let e = traducir_error_bd("23514", mensaje, "").unwrap();
             assert_eq!((e.status(), e.codigo()), (StatusCode::UNPROCESSABLE_ENTITY, codigo), "{mensaje}");
+        }
+    }
+
+    #[test]
+    fn planes_de_ahorro_conflictos_e_invariantes() {
+        // Otra sesión lo canceló primero: 409.
+        let e = traducir_error_bd("23514", "SC_PLAN_CANCELADO: el plan x ya está cancelado", "").unwrap();
+        assert_eq!((e.status(), e.codigo()), (StatusCode::CONFLICT, "PLAN_CANCELADO"));
+        // Reglas que el backend comprueba antes: 422 con su código.
+        for (mensaje, codigo) in [
+            ("SC_LIMITE_PLANES: el cliente ya tiene 20 planes", "LIMITE_PLANES"),
+            ("SC_MONTO_INSUFICIENTE: 0.10 MXN no compran el incremento mínimo de AUG1", "MONTO_INSUFICIENTE"),
+        ] {
+            let e = traducir_error_bd("23514", mensaje, "").unwrap();
+            assert_eq!((e.status(), e.codigo()), (StatusCode::UNPROCESSABLE_ENTITY, codigo), "{mensaje}");
+        }
+        // Lo que solo un error del backend (o una base alterada) provoca: 500.
+        for mensaje in [
+            "SC_PLAN_INCOHERENTE: la orden x no es la compra 3 del plan y",
+            "SC_PLAN_NO_ACTIVO: el plan x no está activo",
+            "SC_PLAN_NO_VENCIDO: la compra del plan x es hasta mañana",
+            "SC_PLAN_SIN_EJECUCION: la orden x no es una compra registrada de su plan",
+            "SC_PLAN_CALENDARIO: sin fecha siguiente",
+            "SC_PLAN_TRANSICION: el plan x no pasa de CANCELADO a ACTIVO",
+            "SC_PLAN_INMUTABLE: los términos del plan x no cambian",
+        ] {
+            let e = traducir_error_bd("P0001", mensaje, "").unwrap();
+            assert_eq!(e.codigo(), "INTEGRIDAD", "{mensaje}");
         }
     }
 

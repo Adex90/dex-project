@@ -2,7 +2,8 @@
 //!
 //! Las rutas están en el grupo `api` del límite por IP (limites.rs) y exigen
 //! sesión (el extractor [`Usuario`] valida el JWT y la sesión en la base de
-//! datos). Colocar, listar y cancelar órdenes es solo del cliente.
+//! datos). Colocar, listar y cancelar órdenes, y crear y cambiar planes de
+//! ahorro, es solo del cliente.
 
 use axum::{
     extract::State,
@@ -21,6 +22,7 @@ use crate::{
     mercado::{
         self,
         pendiente::{self, SolicitudPendiente},
+        planes::{self, Cambio, Frecuencia, PlanesAhorro, SolicitudPlan, VistaPlan},
         Catalogo, Cotizacion, Lado, OrdenesPendientes, Recibo, SolicitudOrden, TipoPendiente, VistaPendiente,
     },
     routes::extraccion::{Json, Path},
@@ -34,6 +36,10 @@ pub fn rutas() -> Router<AppState> {
         .route("/market/order", post(orden))
         .route("/market/orders/pending", get(pendientes))
         .route("/market/orders/{id}/cancel", post(cancelar))
+        .route("/market/savings-plans", get(planes_de_ahorro))
+        .route("/market/savings-plans/{id}/pause", post(pausar_plan))
+        .route("/market/savings-plans/{id}/resume", post(reanudar_plan))
+        .route("/market/savings-plans/{id}/cancel", post(cancelar_plan))
 }
 
 /// El catálogo (`MarketCatalog`): lo que hoy se cotiza y se opera. Cualquier sesión válida.
@@ -57,7 +63,7 @@ enum TipoOrdenHttp {
     Limite,
     #[serde(rename = "stop")]
     Stop,
-    /// Plan de ahorro (compras periódicas): llegará con su programador.
+    /// Plan de ahorro: la misma compra cada semana, cada dos semanas o cada mes.
     #[serde(rename = "savings_plan")]
     PlanDeAhorro,
 }
@@ -80,23 +86,24 @@ struct SolicitudOrdenHttp {
     /// Solo de una orden stop, como texto.
     #[serde(default, with = "rust_decimal::serde::str_option")]
     stop_price: Option<Decimal>,
-    /// Solo de un plan de ahorro.
+    /// Solo de un plan de ahorro: `weekly`, `biweekly` o `monthly`.
     #[serde(default)]
-    frequency: Option<String>,
+    frequency: Option<Frecuencia>,
 }
 
-/// La respuesta de una orden: el recibo de una de mercado (`OrderReceipt`) o
-/// la orden límite o stop en su estado (`PendingOrder`). Ambas llevan
-/// `order_type`.
+/// La respuesta de una orden: el recibo de una de mercado (`OrderReceipt`),
+/// la orden límite o stop en su estado (`PendingOrder`) o el plan de ahorro
+/// con su primera compra (`SavingsPlan`). Las tres llevan `order_type`.
 #[derive(Serialize)]
 #[serde(untagged)]
 enum RespuestaOrden {
     Mercado(Recibo),
     Pendiente(VistaPendiente),
+    Plan(VistaPlan),
 }
 
-/// Orden de mercado, límite o stop: 201 con el recibo o la orden; 200 si
-/// repite una clave ya usada para la misma orden.
+/// Orden de mercado, límite o stop, o plan de ahorro: 201 con el recibo, la
+/// orden o el plan; 200 si repite una clave ya usada para lo mismo.
 async fn orden(
     State(e): State<AppState>,
     u: Usuario,
@@ -105,10 +112,24 @@ async fn orden(
     u.exigir_cliente()?;
     let clave_idempotencia = u.clave(&s.idempotency_key)?;
     if s.order_type == TipoOrdenHttp::PlanDeAhorro {
-        return Err(AppError::negocio(
-            "TIPO_ORDEN_NO_DISPONIBLE",
-            "los planes de ahorro aún no están disponibles; usa una orden de mercado, límite o stop",
-        ));
+        if s.limit_price.is_some() || s.stop_price.is_some() {
+            return Err(AppError::validacion("un plan de ahorro no lleva limit_price ni stop_price"));
+        }
+        let Some(frecuencia) = s.frequency else {
+            return Err(AppError::validacion("un plan de ahorro requiere frequency (weekly, biweekly o monthly)"));
+        };
+        if s.side != Lado::Compra {
+            return Err(AppError::validacion("un plan de ahorro solo compra (side buy)"));
+        }
+        let solicitud = SolicitudPlan {
+            cliente_id: u.cliente_id,
+            ticker: s.ticker,
+            monto: s.amount,
+            frecuencia,
+            clave_idempotencia,
+        };
+        let r = planes::crear(&e.pool, &e.config, &solicitud).await?;
+        return Ok((status_de(r.idempotente), Json(RespuestaOrden::Plan(r.plan))));
     }
     if s.frequency.is_some() {
         return Err(AppError::validacion("frequency solo aplica a un plan de ahorro (savings_plan)"));
@@ -161,4 +182,30 @@ async fn pendientes(State(e): State<AppState>, u: Usuario) -> AppResult<Json<Ord
 async fn cancelar(State(e): State<AppState>, u: Usuario, Path(id): Path<Uuid>) -> AppResult<Json<VistaPendiente>> {
     u.exigir_cliente()?;
     Ok(Json(pendiente::cancelar(&e.pool, u.cliente_id, id).await?))
+}
+
+/// Los planes de ahorro activos y pausados del cliente (`SavingsPlans`).
+async fn planes_de_ahorro(State(e): State<AppState>, u: Usuario) -> AppResult<Json<PlanesAhorro>> {
+    u.exigir_cliente()?;
+    Ok(Json(PlanesAhorro { planes: planes::listar(&e.pool, u.cliente_id).await? }))
+}
+
+/// Pausa un plan de ahorro del cliente: no compra hasta reanudarlo.
+async fn pausar_plan(State(e): State<AppState>, u: Usuario, Path(id): Path<Uuid>) -> AppResult<Json<VistaPlan>> {
+    cambiar_plan(&e, &u, id, Cambio::Pausar).await
+}
+
+/// Reanuda un plan de ahorro pausado: compra en la siguiente fecha de su calendario.
+async fn reanudar_plan(State(e): State<AppState>, u: Usuario, Path(id): Path<Uuid>) -> AppResult<Json<VistaPlan>> {
+    cambiar_plan(&e, &u, id, Cambio::Reanudar).await
+}
+
+/// Cancela un plan de ahorro del cliente, para siempre (sus compras se quedan).
+async fn cancelar_plan(State(e): State<AppState>, u: Usuario, Path(id): Path<Uuid>) -> AppResult<Json<VistaPlan>> {
+    cambiar_plan(&e, &u, id, Cambio::Cancelar).await
+}
+
+async fn cambiar_plan(e: &AppState, u: &Usuario, id: Uuid, cambio: Cambio) -> AppResult<Json<VistaPlan>> {
+    u.exigir_cliente()?;
+    Ok(Json(planes::cambiar(&e.pool, u.cliente_id, id, cambio).await?))
 }

@@ -446,8 +446,9 @@ async fn reglas_de_las_ordenes_limite_y_stop(pool: PgPool) {
         (base(json!({ "order_type": "limit", "limit_price": "1600.123456789" })), q, "VALIDACION"),
         (base(json!({ "order_type": "limit", "limit_price": 1600 })), q, ""),
         (base(json!({ "order_type": "twap" })), q, ""),
-        // Los planes de ahorro llegan después.
-        (base(json!({ "order_type": "savings_plan", "frequency": "weekly" })), u, "TIPO_ORDEN_NO_DISPONIBLE"),
+        // Un plan de ahorro lleva su frecuencia y ningún precio (tests/planes.rs).
+        (base(json!({ "order_type": "savings_plan" })), q, "VALIDACION"),
+        (base(json!({ "order_type": "savings_plan", "frequency": "weekly", "limit_price": "1600" })), q, "VALIDACION"),
         // Un stop que el precio (1 612.40) ya alcanzó.
         (stop("AUG1", "buy", "100.00", "1612.40", "stop-igual"), u, "PRECIO_STOP_INVALIDO"),
         (stop("AUG1", "buy", "100.00", "1600", "stop-abajo"), u, "PRECIO_STOP_INVALIDO"),

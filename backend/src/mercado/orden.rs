@@ -6,7 +6,7 @@
 //!    lo toma, así que su posición no cambia hasta el COMMIT.
 //! 2. Idempotencia, ya con el candado: la repetición de una orden espera a la
 //!    primera y devuelve su recibo; una clave usada para otra cosa (también
-//!    una orden límite o stop) es 409.
+//!    una orden límite o stop, o un plan de ahorro) es 409.
 //! 3. Reglas: KYC operable, el activo abierto y con precio real (o MODO_DEMO);
 //!    compra: saldo disponible para el monto; venta: los títulos libres (los
 //!    comprometidos en ventas límite o stop pendientes no se venden a mercado).
@@ -18,7 +18,8 @@
 //!    (COMPRA_MERCADO o VENTA_MERCADO); luego la orden, que la base de datos
 //!    revisa contra el catálogo y la posición, encadena y aplica a la
 //!    posición. Ambos hashes se recalculan aquí. La ejecución de una orden
-//!    límite o stop ([`super::pendiente`]) escribe con la misma función.
+//!    límite o stop ([`super::pendiente`]) y cada compra de un plan de ahorro
+//!    ([`super::planes`]) escriben con la misma función.
 //!
 //! El cambio de saldo sube la versión de la cuenta en esta transacción: al
 //! confirmar, `sc_boveda` avisa y el WebSocket envía la bóveda nueva.
@@ -29,7 +30,7 @@ use uuid::Uuid;
 
 use super::{
     calculo::{self, Ejecucion, Rechazo},
-    exigir_precio_real_o_demo, leer_activo, pendiente, ticker_valido, Activo, Lado, Orden, Recibo,
+    exigir_precio_real_o_demo, leer_activo, pendiente, planes, ticker_valido, Activo, Lado, Orden, Recibo,
 };
 use crate::{
     aml::{self, Canal, Contraparte, Decision, Operacion},
@@ -111,6 +112,7 @@ async fn colocar_tx(pool: &PgPool, config: &Config, s: &SolicitudOrden, monto: D
     }
     if ledger::buscar_por_clave(&mut tx, &s.clave_idempotencia).await?.is_some()
         || pendiente::por_clave(&mut tx, &s.clave_idempotencia).await?.is_some()
+        || planes::por_clave(&mut tx, &s.clave_idempotencia).await?.is_some()
     {
         return Err(clave_reutilizada());
     }
@@ -189,11 +191,12 @@ pub(super) struct NuevaOrden<'a> {
     pub cuenta_id: Uuid,
     pub activo: &'a Activo,
     pub lado: Lado,
-    /// El monto que pidió el cliente (el de la orden pendiente, si ejecuta una).
+    /// El monto que pidió el cliente (el de la orden pendiente o el del plan,
+    /// si ejecuta una u otro).
     pub monto_solicitado: Decimal,
     pub ejecucion: Ejecucion,
-    /// La clave de la orden y de su movimiento IFPE (la del cliente, o
-    /// `ord:<pendiente>:ejecucion`).
+    /// La clave de la orden y de su movimiento IFPE (la del cliente,
+    /// `ord:<pendiente>:ejecucion` o `plan:<plan>:<periodo>`).
     pub clave: &'a str,
 }
 

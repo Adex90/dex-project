@@ -8,7 +8,10 @@
 //!   redes entre clientes, reevaluación de marcas diferidas, plazos de
 //!   cumplimiento, sellado de la bitácora y entrega de notificaciones.
 //! - Motor de disparo del mercado ([`mercado::pendiente::disparar`]): ejecuta
-//!   las órdenes límite y stop que el precio vigente alcanzó.
+//!   las órdenes límite y stop que el precio vigente alcanzó; en la misma
+//!   pasada, el programador de planes de ahorro
+//!   ([`mercado::planes::ejecutar_vencidos`]) hace (u omite) cada compra
+//!   vencida.
 
 use std::time::Duration;
 
@@ -94,6 +97,21 @@ pub fn lanzar(estado: AppState) {
                     Ok(_) => {}
                     Err(err) => {
                         tracing::error!(codigo = err.codigo(), error = %err.detalle(), "falló el motor de disparo del mercado")
+                    }
+                }
+                match mercado::planes::ejecutar_vencidos(&e.pool, &e.config).await {
+                    Ok(r) if r.ejecutados + r.omitidos + r.errores > 0 => {
+                        tracing::info!(
+                            revisados = r.revisados,
+                            ejecutados = r.ejecutados,
+                            omitidos = r.omitidos,
+                            errores = r.errores,
+                            "programador de planes de ahorro"
+                        )
+                    }
+                    Ok(_) => {}
+                    Err(err) => {
+                        tracing::error!(codigo = err.codigo(), error = %err.detalle(), "falló el programador de planes de ahorro")
                     }
                 }
             }

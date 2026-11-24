@@ -718,6 +718,21 @@ pub async fn cabeza_ifpe(pool: &PgPool) -> (i64, String) {
     sqlx::query_as("SELECT ultima_secuencia, ultimo_hash::text FROM ifpe.ledger_cabeza").fetch_one(pool).await.unwrap()
 }
 
+/// Como si ya hubiera llegado la compra siguiente de un plan de ahorro
+/// (`now()` no avanza en una prueba): el dueño del esquema adelanta su fecha
+/// sin el trigger que la protege (0023).
+pub async fn vencer_plan(pool: &PgPool, plan: Uuid) {
+    let mut tx = pool.begin().await.unwrap();
+    for sql in [
+        "ALTER TABLE mercado.planes_ahorro DISABLE TRIGGER trg_planes_b_transicion",
+        "UPDATE mercado.planes_ahorro SET proxima_ejecucion_en = now() - interval '1 second' WHERE id = $1",
+        "ALTER TABLE mercado.planes_ahorro ENABLE TRIGGER trg_planes_b_transicion",
+    ] {
+        sqlx::query(sql).bind(plan).execute(&mut *tx).await.unwrap();
+    }
+    tx.commit().await.unwrap();
+}
+
 /// Ejecuta `sql` (una o varias sentencias) con el rol indicado y confirma;
 /// devuelve el texto del error si algo falla (también los triggers diferidos
 /// que disparan al confirmar).
