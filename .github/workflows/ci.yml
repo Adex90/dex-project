@@ -65,13 +65,17 @@ env:
   SHELLCHECK_SHA256: 8c3be12b05d5c177a04c29e3c78ce89ac86f1595681cab149b65b97c4e227198
   ACTIONLINT_VERSION: "1.7.12"
   ACTIONLINT_SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
+  # cargo-audit for the StrawberrySwap crates' RustSec gate (strawberryswap/ops/ci/cargo-audit.sh): the version
+  # backend/Dockerfile builds for the backend's gate, here its GitHub release asset; SHA-256 of the tarball.
+  CARGO_AUDIT_VERSION: "0.22.2"
+  CARGO_AUDIT_SHA256: 7fb9497f8594b389e5fce5ef9b92db08432996895b2e0c5a0167a69ed445c428
+  # kubo (the IPFS CLI) for the testnet release rehearsal's CIDs: GitHub release asset, SHA-256 of the tarball.
+  KUBO_VERSION: v0.38.1
+  KUBO_SHA256: 2588079855e6a4d218cf3c70b9945d5daa356fe852f67c4cfb62a4809b69c002
   # The contract suites: Foundry (installed by foundry-rs/foundry-toolchain) and
   # forge-std, which they import. lib/ is not committed, so CI clones the tag and
   # checks its src/ tree against this SHA-256 (the tree the suites were verified
   # with): `find src -type f | LC_ALL=C sort | xargs sha256sum | sha256sum`.
-  # kubo (the IPFS CLI) for the testnet release rehearsal's CIDs: GitHub release asset, SHA-256 of the tarball.
-  KUBO_VERSION: v0.38.1
-  KUBO_SHA256: 2588079855e6a4d218cf3c70b9945d5daa356fe852f67c4cfb62a4809b69c002
   FOUNDRY_VERSION: v1.7.1
   FORGE_STD_VERSION: v1.9.4
   FORGE_STD_SRC_SHA256: 6796bb6e13e5fe07ebc0f8f3e31f92c7d96cf226a428cd9e381cbf0ede15b14d
@@ -448,7 +452,7 @@ jobs:
             strawberryswap/bots/hft-engine-rust -> target
             strawberryswap/vaults/threshold-signer -> target
 
-      # fmt, clippy, tests and the run are independent: one failure does not hide the others.
+      # fmt, clippy, the audit, tests and the run are independent: one failure does not hide the others.
       - name: cargo fmt --check
         if: ${{ !cancelled() && steps.rust.outcome == 'success' }}
         run: cargo fmt --check
@@ -456,6 +460,13 @@ jobs:
       - name: cargo clippy
         if: ${{ !cancelled() && steps.rust.outcome == 'success' }}
         run: cargo clippy --all-targets --locked -- -D warnings
+
+      # RustSec: Cargo.lock against the advisory database, under .cargo/audit.toml. It also fails if a local
+      # private-key signer enters the production build graph, which that file's exceptions rule out.
+      - name: cargo audit (RustSec advisories)
+        if: ${{ !cancelled() && steps.rust.outcome == 'success' }}
+        run: |
+          "$GITHUB_WORKSPACE/strawberryswap/ops/ci/cargo-audit.sh"
 
       # The end-to-end tests run this binary (tests/vault_e2e.rs; without the variable they build it themselves).
       # The feature gives the vault a key the tests know, so that they can look for it in memory; it is debug-only.
@@ -506,7 +517,7 @@ jobs:
         with:
           workspaces: strawberryswap/vaults/threshold-signer -> target
 
-      # fmt, clippy and tests are independent: one failure does not hide the others.
+      # fmt, clippy, the audit and tests are independent: one failure does not hide the others.
       - name: cargo fmt --check
         if: ${{ !cancelled() && steps.rust.outcome == 'success' }}
         run: cargo fmt --check
@@ -516,6 +527,13 @@ jobs:
         run: |
           cargo clippy --all-targets --locked -- -D warnings
           cargo clippy --all-targets --locked --features insecure-test-key -- -D warnings
+
+      # RustSec: Cargo.lock against the advisory database, under .cargo/audit.toml. It also fails if a local
+      # private-key signer enters the production build graph (default features: insecure-test-key is debug-only).
+      - name: cargo audit (RustSec advisories)
+        if: ${{ !cancelled() && steps.rust.outcome == 'success' }}
+        run: |
+          "$GITHUB_WORKSPACE/strawberryswap/ops/ci/cargo-audit.sh"
 
       - name: cargo test
         if: ${{ !cancelled() && steps.rust.outcome == 'success' }}
@@ -596,7 +614,7 @@ jobs:
           forge build src/oracle/ZkDecoOracle.sol src/oracle/ZkPriceFeed.sol test/fixtures/OracleGroth16Verifier.dev.sol
           ls out/ZkDecoOracle.sol out/ZkPriceFeed.sol out/OracleGroth16Verifier.dev.sol
 
-      # fmt, clippy, tests and the end to end are independent: one failure does not hide the others.
+      # fmt, clippy, the audit, tests and the end to end are independent: one failure does not hide the others.
       - name: cargo fmt --check
         if: ${{ !cancelled() && steps.rust.outcome == 'success' }}
         run: cargo fmt --check
@@ -604,6 +622,13 @@ jobs:
       - name: cargo clippy
         if: ${{ !cancelled() && steps.rust.outcome == 'success' }}
         run: cargo clippy --all-targets --locked -- -D warnings
+
+      # RustSec: Cargo.lock against the advisory database, under .cargo/audit.toml. It also fails if a local
+      # private-key signer enters the production build graph, which that file's exceptions rule out.
+      - name: cargo audit (RustSec advisories)
+        if: ${{ !cancelled() && steps.rust.outcome == 'success' }}
+        run: |
+          "$GITHUB_WORKSPACE/strawberryswap/ops/ci/cargo-audit.sh"
 
       - name: cargo test (unit; endpoint, notary with KMS, relayer with the real prover and its vault signer)
         if: ${{ !cancelled() && steps.rust.outcome == 'success' }}
@@ -1208,9 +1233,11 @@ jobs:
           tflint --chdir=terraform --config="${config}" --format=compact
 
       # StrawberrySwap's AWS environment (strawberryswap/infra/terraform): the bot host, its metadata bucket and the
-      # testnet's KMS signing keys. `terraform test` plans the signing-keys module offline (placeholder credentials)
-      # and checks the key policies it renders: only each signer's role signs, digests only, never the account root.
-      - name: StrawberrySwap Terraform - fmt, validate, signing-keys tests
+      # testnet's KMS signing keys. `terraform test` plans two modules offline (placeholder credentials):
+      # * signing-keys, checking the key policies it renders: only each signer's role signs, digests only, never the
+      #   account root;
+      # * ec2-bots, checking that the host runs the pinned image (ami_id), never the floating "latest" parameter.
+      - name: StrawberrySwap Terraform - fmt, validate, module tests
         id: strawberryswap-terraform
         if: ${{ !cancelled() && steps.setup-terraform.outcome == 'success' }}
         working-directory: strawberryswap/infra/terraform
@@ -1218,8 +1245,10 @@ jobs:
           terraform fmt -check -recursive -diff
           terraform -chdir=envs/prod init -backend=false -input=false
           terraform -chdir=envs/prod validate
-          terraform -chdir=modules/signing-keys init -backend=false -input=false
-          terraform -chdir=modules/signing-keys test
+          for module in signing-keys ec2-bots; do
+            terraform -chdir="modules/${module}" init -backend=false -input=false
+            terraform -chdir="modules/${module}" test
+          done
 
       - name: StrawberrySwap Terraform - tflint
         if: ${{ !cancelled() && steps.strawberryswap-terraform.outcome == 'success' && steps.setup-tflint.outcome == 'success' }}
@@ -1227,7 +1256,7 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
         run: |
           config="${GITHUB_WORKSPACE}/.github/linters/.tflint.hcl"
-          for dir in envs/prod modules/signing-keys; do
+          for dir in envs/prod modules/signing-keys modules/ec2-bots; do
             tflint --chdir="strawberryswap/infra/terraform/${dir}" --config="${config}" --init
             tflint --chdir="strawberryswap/infra/terraform/${dir}" --config="${config}" --format=compact
           done

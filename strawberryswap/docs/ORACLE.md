@@ -248,6 +248,7 @@ The pipeline's suites (`oracle/`, CI job "Oracle pipeline"):
 | `tests/relayer.rs` | **The relayer with the real notary and the real prover.** The pushed attestation and 353-byte proof are exactly what the feed checks. It refuses an unregistered notary, a wrong salt, and a feed preflight refusal, all without a transaction. It waits for a lagging chain clock. It runs on its heartbeat and stops on shutdown. Its errors never show the RPC URL's key. The prover rejects other public signals, a bad witness and a missed deadline. |
 | `tests/zk_artifacts.rs` | **The committed verification key is the deployed verifier's.** All 26 constants. |
 | `tests/e2e_anvil.rs` | **End to end, in CI.** The three binaries and the relayer vault run as processes against stand-in exchanges and KMS. The dev verifier, `ZkDecoOracle` and `ZkPriceFeed` are deployed on anvil. Four cycles push proven prices, signed by the relayer vault, and when the market moves to 3,500 the feed follows. Every `PriceUpdated` comes from the relayer's KMS address, and KMS signs exactly one digest per push. A relayer with the wrong salt refuses to start. |
+| `cargo audit`, in CI (`ops/ci/cargo-audit.sh`) | **The dependencies.** Cargo.lock has no known vulnerability, unsound crate or yanked version beyond the documented exception in `oracle/.cargo/audit.toml`. The production build has no local private-key signer. |
 
 ## Not done yet
 

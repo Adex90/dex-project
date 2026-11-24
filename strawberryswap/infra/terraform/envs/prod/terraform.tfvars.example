@@ -1,4 +1,8 @@
 alert_email = "ops@example.org"
+# The bot host's image, pinned (required). The current Amazon Linux 2023 x86_64 image:
+#   aws ssm get-parameter --region us-east-1 --name /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64 --query Parameter.Value --output text
+# A new id replaces the host and deletes its disk: change it deliberately, never during a soak.
+bot_ami_id = "ami-REPLACE-WITH-THE-CURRENT-IMAGE"
 # region               = "us-east-1"
 # instance_type        = "t3.micro"
 # instance_count       = 1        # >1 leaves the 750 h/month Free Tier; also set allow_over_free_tier = true

@@ -2,6 +2,15 @@ variable "name" { type = string }
 variable "public_subnet_ids" { type = list(string) }
 variable "security_group_id" { type = string }
 
+variable "ami_id" {
+  type        = string
+  description = "The host's Amazon Linux 2023 x86_64 image, pinned by id. A new id replaces the instance and deletes its disk: change it deliberately, never during a soak. The current image: aws ssm get-parameter --name /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64 --query Parameter.Value --output text"
+  validation {
+    condition     = can(regex("^ami-([0-9a-f]{8}|[0-9a-f]{17})$", var.ami_id))
+    error_message = "ami_id must be a pinned AMI id (ami- and 8 or 17 hex digits), not an SSM parameter or an image name."
+  }
+}
+
 variable "instance_type" {
   type    = string
   default = "t3.micro"
