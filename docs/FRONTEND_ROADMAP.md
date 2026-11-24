@@ -459,9 +459,46 @@ what the module waits on. They do not change its scope.
     API refusing 99%, every version in the security log) and the AML e2e.
   - Left: step-up authentication before saving (module 22), notifying the
     client by email of a change, and designations for business accounts.
-- [ ] **26. Tax Center** (W-8BEN, SAT tax withholding certificates, CSV export)
-  - W-8BEN applies only to US securities held through a US broker or
-    custodian.
+- [x] **26. Tax Center** (W-8BEN, SAT tax withholding certificates, CSV export)
+  - The Taxes page, `/dashboard/taxes` (`components/taxes/`), in the
+    sidebar's Account group and the phones' strip of account pages. Three
+    panels:
+    - Fiscal status: the RFC, CURP, tax residence and citizenship on file,
+      and the W-8BEN: its status (not certified, active, expired, or needs
+      renewal when the file no longer matches what was signed), validity
+      window, chained history, and what it changes: US-source dividends and
+      dividend equivalents on US-linked synthetic equities (STSLA) withheld
+      at the US–Mexico treaty's 10% instead of 30%. The gold Certify /
+      Renew flow shows Part I from the verified file, asks for the three
+      Part III statements one by one, and takes the legal name as the
+      signature, matched live as the server compares it.
+    - Realized gains and withholding for the selected fiscal year (the
+      Mexico City calendar year; the current one to date): gross sales, the
+      average cost they released, the net result, fixed-term interest in
+      the year it was paid, ISR withheld, and an ISR preview from the year's
+      published rates (0.90% a year on fixed-term capital by days held in
+      2026, 0.50% in 2025; 10% of the year's net gain on equities and
+      funds; commodities and fixed income go to the annual return), with
+      each asset's treatment.
+    - Certificates and export: the accounting CSV (RFC 4180), parsed and
+      reconciled to the unit with a fresh summary before it is saved, and a
+      printable Constancia de Retenciones preview, in the Document Inbox's
+      frame and paper style.
+  - The contract (migration 0021, README "Tax Center"):
+    `GET /api/v1/wealth/impuestos?year=`,
+    `POST /api/v1/wealth/impuestos/w8ben` and
+    `GET /api/v1/wealth/impuestos/export.csv?year=`. The W-8BEN versions
+    are immutable and hash-chained, written with their security-log event
+    by the database; each year's rates are an immutable row.
+  - Tests: `tests/db/0021_centro_fiscal.sql`, `backend/tests/impuestos.rs`,
+    `lib/taxes.test.ts`, smoke e2e (the summary against the cash ledger,
+    the W-8BEN certified in the UI and renewed, both in the security log,
+    the CSV reconciled and identical to the API's, the Constancia printed
+    to PDF) and the AML e2e (a frozen client's Tax Center and its reads).
+  - Left: the CFDI de Retenciones itself (a PAC, the fiscal stamp, real
+    interest with the INPC), withholding ISR on fixed-term interest at
+    payment, the W-8BEN-E for business accounts, and dividend equivalents
+    once corporate actions exist (module 27).
 - [ ] **27. Corporate Actions UI** (Proxy voting, DRIP elections)
 - [x] **28. Cryptographic Solvency Explorer** (Merkle tree leaf node auditor)
   - The Reserve tab (`components/reserve/`), in three parts. The published

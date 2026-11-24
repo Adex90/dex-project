@@ -5,7 +5,14 @@ import { truncateHash } from "@/components/ui/data";
 import { Button, cx } from "@/components/ui/primitives";
 import { ONBOARDING_PATH } from "@/hooks/use-client-home";
 import { documentTime } from "@/lib/documents";
-import { W8BEN_BLOCK_MESSAGES, W8BEN_STATUS_LABELS, countryName, formatRate, validThrough } from "@/lib/taxes";
+import {
+  W8BEN_BLOCK_MESSAGES,
+  W8BEN_STATUS_LABELS,
+  countryName,
+  formatRate,
+  formatTaxDate,
+  validThrough,
+} from "@/lib/taxes";
 import type { TaxProfile, W8benState } from "@/types/taxes";
 
 /*
@@ -175,7 +182,7 @@ export function FiscalStatusCard({
                   <span className="text-xs text-ink-2">{documentTime(h.signed_at)}</span>
                   <span className="w-full truncate font-mono text-[11px] text-muted" title={h.hash}>
                     {truncateHash(h.hash, 10, 6)}
-                    {h.device ? ` · ${h.device}` : ""} · {validThrough(h.valid_until).toLowerCase()}
+                    {h.device ? ` · ${h.device}` : ""} · valid through {formatTaxDate(h.valid_until)}
                   </span>
                 </li>
               ))}

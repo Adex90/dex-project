@@ -21,7 +21,10 @@
  * breakdown, the reserve seal before and after a snapshot, the JSON download,
  * printing and Save as PDF), Legal Beneficiaries (the live allocation bar,
  * Save only at exactly 100%, Split evenly, versions, a save refused because
- * another device saved first, every version in the security log)
+ * another device saved first, every version in the security log), the
+ * Tax Center (the year's summary against the cash ledger, the W-8BEN
+ * certified and renewed, the accounting CSV reconciled before it is saved,
+ * the Constancia de Retenciones printed)
  * and the Security page (devices signed in, Revoke and "Sign out all
  * other devices", the inactivity timeout, a password change, the security
  * log; then, for a client of its own on a phone, two-step verification turned
@@ -56,6 +59,8 @@ import { isDeepStrictEqual } from "node:util";
 import { curpCheckDigit, sampleIdentity, SAMPLE_IDENTITY_SPACE, todayInMexicoCity } from "../src/lib/kyc.ts";
 // And exact decimals, to read the documents' figures as the screens do.
 import { formatMoney, isZero, toUnits } from "../src/lib/decimal.ts";
+// And the Tax Center's RFC 4180 parser, to read the accounting export it saves.
+import { CSV_HEADER, parseCsv } from "../src/lib/taxes.ts";
 // And the allocation's exact math, to know what the Vault must show for the figures the API gives.
 import { allocation, formatShare } from "../src/lib/allocation.ts";
 // And the Sovereign Yield preview's, to check the Account tab's live counter against it.
@@ -2122,8 +2127,8 @@ try {
     await openTab(page, "Documents");
     check(
       JSON.stringify(await mainNav(page).locator("ul").nth(1).getByRole("link").allInnerTexts()) ===
-        JSON.stringify(["Documents", "Beneficiaries", "Security"]),
-      "the sidebar's Account group lists Documents, Beneficiaries and Security",
+        JSON.stringify(["Documents", "Taxes", "Beneficiaries", "Security"]),
+      "the sidebar's Account group lists Documents, Taxes, Beneficiaries and Security",
     );
     const docRows = page.getByTestId("document-row");
     await docRows.nth(inbox.documents.length - 1).waitFor();
@@ -2322,7 +2327,7 @@ try {
     await documentsLink.waitFor();
     check(
       JSON.stringify(await accountPages.getByRole("link").allInnerTexts()) ===
-        JSON.stringify(["Documents", "Beneficiaries", "Security"]) &&
+        JSON.stringify(["Documents", "Taxes", "Beneficiaries", "Security"]) &&
         (await documentsLink.getAttribute("aria-current")) === "page" &&
         (await settledStyle(documentsLink, "backgroundColor")) === "rgb(234, 179, 8)" &&
         (await mainNav(page).getByRole("link").count()) === 5,
@@ -2557,6 +2562,184 @@ try {
     await shot(page, "beneficiaries-saved");
 
     // ---------------------------------------------------------------------
+    // Tax Center (roadmap item 26): the fiscal year from the ledgers, the
+    // W-8BEN, the reconciled accounting CSV and the Constancia preview
+    // ---------------------------------------------------------------------
+    const fiscalYear = Number(mexicoMonth(new Date().toISOString()).slice(0, 4));
+    const taxes = (await asClient("/api/v1/wealth/impuestos")).body;
+    const sales = cashLedger.filter((m) => m.tipo === "VENTA_MERCADO" && mexicoMonth(m.creado_en).startsWith(`${fiscalYear}-`));
+    const purchases = cashLedger.filter((m) => m.tipo === "COMPRA_MERCADO" && mexicoMonth(m.creado_en).startsWith(`${fiscalYear}-`));
+    const units = (rows) => rows.reduce((sum, m) => sum + toUnits(m.monto), 0n);
+    check(
+      taxes.summary.year === fiscalYear &&
+        taxes.summary.in_progress &&
+        taxes.summary.market.sells === sales.length &&
+        taxes.summary.market.buys === purchases.length &&
+        toUnits(taxes.summary.market.proceeds) === units(sales) &&
+        toUnits(taxes.summary.market.bought) === units(purchases) &&
+        isZero(taxes.summary.market.commissions) &&
+        taxes.summary.fixed_term.contracts_open === 1 &&
+        isZero(taxes.summary.isr.withheld),
+      `the ${fiscalYear} summary matches the cash ledger: ${sales.length} sale(s), ${purchases.length} purchase(s), zero commissions, the fixed-term contract still open, nothing withheld`,
+    );
+    await openTab(page, "Taxes");
+    const taxSummary = page.getByTestId("tax-summary");
+    await taxSummary.waitFor();
+    check(
+      (await page.getByTestId("tax-proceeds").innerText()).includes(formatMoney(taxes.summary.market.proceeds)) &&
+        (await page.getByTestId("tax-cost-basis").innerText()).includes(formatMoney(taxes.summary.market.cost_basis)) &&
+        (await page.getByTestId("tax-withheld").innerText()).includes("$0.00") &&
+        (await page.getByTestId("tax-estimated").innerText()).includes(formatMoney(taxes.summary.isr.estimated.total)) &&
+        (await page.getByTestId("tax-year").inputValue()) === String(fiscalYear) &&
+        (await page.getByTestId("tax-asset-row").count()) === taxes.summary.market.by_asset.length,
+      "the summary shows the year's gross sales, cost basis, ISR withheld ($0.00), the estimate and each asset",
+    );
+    check(
+      (await page.getByTestId("fiscal-rfc").innerText()) === taxes.profile.rfc &&
+        (await page.getByTestId("fiscal-residence").innerText()) === "México" &&
+        (await page.getByTestId("w8ben-panel").getAttribute("data-status")) === "pending" &&
+        (await page.getByTestId("w8ben-status").textContent()) === "Not certified" &&
+        (await page.getByTestId("w8ben-us-rate").innerText()) === "30%",
+      "fiscal status: the RFC on file, residence in México, no W-8BEN yet (US dividends at 30%)",
+    );
+    await shot(page, "taxes");
+
+    // Certify the W-8BEN: Part I from the file, the three statements, the signature.
+    await page.getByTestId("w8ben-certify").click();
+    const w8Dialog = page.getByTestId("w8ben-dialog");
+    const details = w8Dialog.getByTestId("w8ben-step-details");
+    await details.waitFor();
+    const detailsText = await details.innerText();
+    check(
+      detailsText.includes(taxes.profile.name) && detailsText.includes(taxes.profile.rfc) && detailsText.includes(taxes.profile.address),
+      "the W-8BEN's Part I is the verified file: legal name, RFC as the foreign tax number, permanent address",
+    );
+    const continueButton = w8Dialog.getByTestId("w8ben-continue");
+    await continueButton.click();
+    await w8Dialog.getByTestId("w8ben-step-statements").waitFor();
+    check(!(await continueButton.isEnabled()), "the statements must all be confirmed to continue");
+    for (const box of ["w8ben-check-beneficial-owner", "w8ben-check-not-us-person", "w8ben-check-treaty-resident"]) {
+      await w8Dialog.getByTestId(box).check();
+    }
+    await continueButton.click();
+    const signatureInput = w8Dialog.getByTestId("w8ben-signature");
+    const signButton = w8Dialog.getByTestId("w8ben-sign");
+    await signatureInput.fill("Somebody Else");
+    check(
+      (await w8Dialog.getByTestId("w8ben-signature-match").getAttribute("data-matches")) === "false" &&
+        !(await signButton.isEnabled()),
+      "a signature that is not the legal name cannot sign",
+    );
+    await signatureInput.fill(`  ${taxes.profile.name.toLowerCase()} `);
+    check(
+      (await w8Dialog.getByTestId("w8ben-signature-match").getAttribute("data-matches")) === "true" &&
+        (await signButton.isEnabled()),
+      "the legal name, typed in lower case with spaces, matches as the server compares it",
+    );
+    await shot(page, "w8ben-sign", { fullPage: false });
+    await signButton.click();
+    const done = w8Dialog.getByTestId("w8ben-step-done");
+    await done.waitFor();
+    const validUntil = `Dec 31, ${fiscalYear + 3}`;
+    check(
+      (await done.innerText()).includes("Version 1") && (await done.innerText()).includes(`valid through ${validUntil}`),
+      `certified: version 1, valid through ${validUntil} (the end of the third year after signing)`,
+    );
+    await w8Dialog.getByTestId("w8ben-done").click();
+    await w8Dialog.waitFor({ state: "detached" });
+    check(
+      (await page.getByTestId("w8ben-panel").getAttribute("data-status")) === "active" &&
+        (await page.getByTestId("w8ben-us-rate").innerText()) === "10%" &&
+        (await page.getByTestId("w8ben-validity").innerText()).includes(`Valid through ${validUntil}`) &&
+        (await page.getByTestId("w8ben-chain").getAttribute("data-verified")) === "true",
+      "the W-8BEN is active: US dividends at the treaty's 10%, valid through the date, its chain verified",
+    );
+    const renewal = await asClient("/api/v1/wealth/impuestos/w8ben", {
+      method: "POST",
+      body: JSON.stringify({ beneficial_owner: true, not_us_person: true, treaty_resident: true, signature: taxes.profile.name }),
+    });
+    const w8Events = (await asClient("/api/v1/auth/security/events")).body.eventos.filter((e) => e.evento === "W8BEN_CERTIFICADO");
+    check(
+      renewal.status === 201 &&
+        renewal.body.current.version === 2 &&
+        renewal.body.chain_verified &&
+        JSON.stringify(w8Events.map((e) => e.detalle)) === JSON.stringify(["2", "1"]),
+      "a renewal is version 2, chained; both certifications are in the security log",
+    );
+
+    // The accounting CSV: reconciled with the summary, then saved.
+    const [csvFile] = await Promise.all([page.waitForEvent("download"), page.getByTestId("tax-csv").click()]);
+    await page.getByTestId("tax-csv-verified").waitFor();
+    const csvPath = `${OUT}/${csvFile.suggestedFilename()}`;
+    await csvFile.saveAs(csvPath);
+    const csvText = readFileSync(csvPath, "utf8");
+    const csvRows = parseCsv(csvText);
+    const servedCsv = await (
+      await fetch(`${API}/api/v1/wealth/impuestos/export.csv?year=${fiscalYear}`, {
+        headers: { authorization: `Bearer ${accountToken}` },
+      })
+    ).text();
+    const yearMovements = cashLedger.filter(
+      (m) => mexicoMonth(m.creado_en).startsWith(`${fiscalYear}-`) && BALANCE_MOVEMENTS.includes(m.tipo),
+    );
+    check(
+      csvFile.suggestedFilename() === `synthetic-capital-taxes-${fiscalYear}.csv` &&
+        csvText === servedCsv &&
+        JSON.stringify(csvRows[0]) === JSON.stringify(CSV_HEADER) &&
+        csvRows.length - 1 === yearMovements.length &&
+        (await page.getByTestId("tax-csv-verified").innerText()).includes(`${yearMovements.length} movement`),
+      `the accounting CSV is saved only after it reconciles: ${yearMovements.length} movements, RFC 4180, exactly what the API serves`,
+    );
+
+    // The Constancia de Retenciones preview, printed like the Document Inbox.
+    await page.getByTestId("tax-constancia").click();
+    const constancia = page.getByTestId("constancia-viewer");
+    await constancia.getByTestId("constancia-screen").waitFor();
+    check(
+      (await constancia.getByTestId("constancia-year").innerText()) === String(fiscalYear) &&
+        (await constancia.getByTestId("constancia-withheld").innerText()).includes("$0.00") &&
+        /^[0-9a-f]{64}$/.test((await constancia.getByTestId("constancia-reference").getAttribute("data-value")) ?? "") &&
+        (await constancia.innerText()).includes("It is not a CFDI"),
+      "the Constancia preview shows the fiscal year, the ISR withheld, the summary's hash, and says it is not a CFDI",
+    );
+    await shot(page, "constancia", { fullPage: false });
+    await page.emulateMedia({ media: "print" });
+    const taxPaper = await page.evaluate(() => {
+      const copy = document.querySelector("body > .document-print-copy");
+      return {
+        copy: copy ? getComputedStyle(copy).display : null,
+        dialog: getComputedStyle(document.querySelector("dialog")).display,
+        paper: copy ? getComputedStyle(copy.querySelector(".print-document")).backgroundColor : null,
+        hash: copy?.querySelector("[data-testid=constancia-reference]")?.textContent ?? "",
+      };
+    });
+    const constanciaPdf = await page.pdf({ path: `${OUT}/constancia-de-retenciones.pdf`, format: "A4" });
+    await page.emulateMedia({ media: null });
+    check(
+      taxPaper.copy === "block" &&
+        taxPaper.dialog === "none" &&
+        taxPaper.paper === "rgb(255, 255, 255)" &&
+        /^[0-9a-f]{64}$/.test(taxPaper.hash) &&
+        constanciaPdf.subarray(0, 5).toString() === "%PDF-",
+      "printed, the Constancia is the paper copy alone, its hash in full, and saves as PDF",
+    );
+    await page.keyboard.press("Escape");
+    await constancia.waitFor({ state: "detached" });
+
+    // On a phone: the account pages as a 2×2 strip, Taxes gold; the page fits.
+    await page.setViewportSize({ width: 390, height: 844 });
+    const taxesLink = page.getByRole("navigation", { name: "Account pages" }).getByRole("link", { name: "Taxes" });
+    await taxesLink.waitFor();
+    check(
+      (await taxesLink.getAttribute("aria-current")) === "page" &&
+        (await settledStyle(taxesLink, "backgroundColor")) === "rgb(234, 179, 8)" &&
+        (await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)),
+      "on a phone the Tax Center fits the width, Taxes gold in the account pages' strip",
+    );
+    await shot(page, "taxes-phone");
+    await page.setViewportSize({ width: 1440, height: 1000 });
+
+    // ---------------------------------------------------------------------
     // Security (roadmap items 20 and 21): devices, the password, the log
     // ---------------------------------------------------------------------
     // A phone and a work laptop sign in through the API: sessions of their own.
@@ -2688,8 +2871,9 @@ try {
         "Device signed out",
         "Signed in",
         "Beneficiaries updated",
+        "W-8BEN certified",
       ].every((title) => logTitles.includes(title)) && logTitles[0] === "Password changed",
-      "the security log shows the change, the refused try, the timeout, both sign-outs, the sign-ins and the new beneficiaries, newest first",
+      "the security log shows the change, the refused try, the timeout, both sign-outs, the sign-ins, the new beneficiaries and the W-8BEN, newest first",
     );
     await page.mouse.move(0, 0);
     await shot(page, "security-after-changes");

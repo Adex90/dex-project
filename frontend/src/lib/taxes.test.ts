@@ -12,6 +12,7 @@ import {
   countryName,
   exportFileName,
   formatRate,
+  formatTaxDate,
   normalizeSignature,
   parseCsv,
   parseTaxCenter,
@@ -213,6 +214,7 @@ test("rates, countries and treatments in words", () => {
   );
   assert.equal(treatmentLabel("annual_return", null), "Added to your annual return");
   assert.equal(validThrough("2029-12-31"), "Valid through Dec 31, 2029");
+  assert.equal(formatTaxDate("2029-12-31"), "Dec 31, 2029");
   assert.equal(exportFileName(2026), "synthetic-capital-taxes-2026.csv");
 });
 

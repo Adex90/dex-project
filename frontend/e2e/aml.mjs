@@ -615,6 +615,29 @@ try {
   const beneficiaryHits = await tipOffWords(cp);
   check(beneficiaryHits.length === 0, `the Beneficiaries page has no tipping-off words (${beneficiaryHits.join(", ") || "none"})`, beneficiaryHits);
   await shot(cp, "client-beneficiaries-frozen");
+  // The Tax Center (migration 0021): the summary, the W-8BEN and the
+  // accounting CSV tell a client under review nothing either.
+  await openTab(cp, "Taxes");
+  await cp.getByTestId("tax-summary").waitFor();
+  await cp.getByTestId("w8ben-panel").waitFor();
+  const taxRead = await pageFetch(cp, "GET", "/api/v1/wealth/impuestos");
+  const taxCsv = await cp.evaluate(async (api) => {
+    const token = JSON.parse(sessionStorage.getItem("synthetic-capital-session") ?? "{}")?.state?.token;
+    const r = await fetch(`${api}/api/v1/wealth/impuestos/export.csv`, { headers: { authorization: `Bearer ${token}` } });
+    return { status: r.status, text: await r.text() };
+  }, API);
+  check(
+    taxRead.status === 200 &&
+      taxCsv.status === 200 &&
+      !/aml|pld|congel|alerta|cumplimiento|nivel_riesgo|es_pep|retenido|sospech|uif|preventiv/i.test(
+        JSON.stringify(taxRead.body, (key, value) => (key === "profile" ? undefined : value)) + taxCsv.text,
+      ),
+    "the client's tax summary, W-8BEN and accounting CSV carry no AML wording",
+    { body: taxRead.body, csv: taxCsv.text.slice(0, 400) },
+  );
+  const taxHits = await tipOffWords(cp);
+  check(taxHits.length === 0, `the Tax Center has no tipping-off words (${taxHits.join(", ") || "none"})`, taxHits);
+  await shot(cp, "client-taxes-frozen");
   // The Vault home (balance, reserve seal, deposit card, chart) must not tip off either.
   await openTab(cp, "Vault");
   await cp.getByTestId("vault-total").waitFor();

@@ -1407,6 +1407,62 @@ live gold allocation bar and the record; the inbox, filtered by kind, and a
 viewer that prints a paper copy (Print / Save as PDF) and downloads the
 document as served (JSON).
 
+## Tax Center: fiscal year, W-8BEN and accounting export (migration `0021`)
+
+`GET /api/v1/wealth/impuestos?year=` gives a client their fiscal profile,
+their W-8BEN and a summary of a fiscal year: the Mexico City calendar year,
+the current one to date. Like the Document Inbox, the summary is derived on
+every read, in one snapshot, from the hash-chained ledgers:
+
+- **Market** (`mercado.ordenes`): purchases by amount; each sale's amount,
+  the average cost it released (exact to 10⁻⁸, the figure the database
+  checks) and its result, per asset with its tax treatment. Commissions:
+  zero.
+- **Fixed term** (`sofom.contratos_mutuo`): interest in the year it was paid
+  (its `RETORNO_DE_SOFOM` in the cash ledger), and contracts still open.
+- **ISR.** *Withheld* is what the ledgers record: nothing yet, because the
+  SOFOM pays mutuum interest gross (DEPLOYMENT.md §12). *Estimated* uses the
+  year's rates in `kyc.parametros_fiscales` (one immutable row per year;
+  none, no estimate): withholding on fixed-term capital at the LIF's annual
+  rate (0.50% in 2025, 0.90% in 2026), divided by 365 and multiplied by the
+  days of the term in each year (LISR art. 54); 10% of the year's net gain
+  on equities and funds (LISR art. 129); commodities and fixed income are
+  reported, not estimated, because they are added to the annual return. It
+  is a preview, not a tax determination.
+- **Reference**: the SHA-256 of the summary (`SC-FISCAL-v1`).
+
+**W-8BEN.** `POST /api/v1/wealth/impuestos/w8ben` takes the three Part III
+statements (beneficial owner, not a US person, resident of Mexico for the
+US–Mexico treaty) and the signature. Each certification is a new
+immutable version in `kyc.formularios_w8ben`, chained by hash
+(`SC-W8BEN-v1`). The database copies Part I from the verified KYC file
+(legal name, citizenship, residence, permanent address, the RFC as the
+foreign TIN, date of birth), requires the signature to be the legal name
+(normalized with ICU, whatever the database's locale), stamps the signing
+time and sets the validity to December 31 of the third year after signing.
+Only a verified individual resident in Mexico who is not a US person
+certifies (`W8BEN_PERSONA_EUA`, `W8BEN_PERSONA_MORAL`, `W8BEN_RESIDENCIA`,
+`W8BEN_DATOS_INCOMPLETOS`, `KYC_NO_VERIFICADO`); `W8BEN_FIRMA` and
+`W8BEN_CERTIFICACIONES` refuse a wrong signature or an unconfirmed
+statement. The same transaction writes `W8BEN_CERTIFICADO` to the client's
+security log. The state is `pending`, `active`, `expired` or `outdated`
+(the file no longer matches the signed Part I: a change in circumstances),
+with the chain recomputed on read and the US withholding on US-source
+dividends that applies (the treaty's 10% with an active form, 30% without).
+
+**Accounting export.** `GET /api/v1/wealth/impuestos/export.csv?year=` is
+RFC 4180 CSV (CRLF, quoted fields, `text/csv; header=present`): each
+balance-changing movement of the year with its date (Mexico City), kind,
+reference, asset, quantity, price, amount, commission, cost basis,
+realized result, interest, running balance and its sequence and hash in the
+cash ledger. Holds and order commitments are internal and not listed.
+
+**The Taxes page** (`/dashboard/taxes`, `frontend/src/components/taxes/`):
+fiscal status with the W-8BEN and its gold Certify / Renew flow; realized
+gains and withholding for the selected year; and the export, which the page
+reconciles with a fresh summary before saving it, plus a printable
+Constancia de Retenciones preview (not a CFDI).
+
 ## Layout
 
 ```
@@ -1657,6 +1713,9 @@ the password is hashed, so a parallel burst cannot test more than 5 passwords.
 | GET | `/api/v1/wealth/linked-accounts` | client: its linked bank accounts, all in its own name (`MODO_DEMO` links a demo one) |
 | POST | `/api/v1/wealth/withdraw` | client: withdraws available cash to a linked account by SPEI (`WithdrawalReceipt`, processing until settled) |
 | GET | `/api/v1/wealth/documentos`, `/api/v1/wealth/documentos/{id}` | client: its statements and trade confirmations, derived from the ledgers, each with its reserve seal |
+| GET | `/api/v1/wealth/impuestos?year=` | client: fiscal profile, W-8BEN state and the fiscal year's summary (realized results, fixed-term interest, ISR withheld and estimated) |
+| POST | `/api/v1/wealth/impuestos/w8ben` | client: certifies or renews the W-8BEN (201); the database copies Part I from the KYC file and logs it |
+| GET | `/api/v1/wealth/impuestos/export.csv?year=` | client: the year's accounting export, RFC 4180 CSV |
 | GET | `/api/v1/ifpe/cuenta`, `/api/v1/ifpe/movimientos` | client |
 | POST | `/api/v1/ifpe/transferencias` | client: internal transfer |
 | POST | `/api/v1/ifpe/retiros` | client: withdrawal to own external CLABE (an outgoing SPEI), which must be a linked account |

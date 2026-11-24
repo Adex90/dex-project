@@ -81,7 +81,12 @@ const EVENT = {
 
 test("security log: validated, with the numeric detail as a number", () => {
   const parsed = parseSecurityEvents({
-    eventos: [EVENT, { ...EVENT, id: 6, evento: "SESIONES_REVOCADAS", detalle: "3" }],
+    eventos: [
+      EVENT,
+      { ...EVENT, id: 6, evento: "SESIONES_REVOCADAS", detalle: "3" },
+      // Codes may carry digits: one unreadable code would reject the whole log.
+      { ...EVENT, id: 7, evento: "W8BEN_CERTIFICADO", detalle: "2" },
+    ],
   });
   assert.ok(parsed);
   assert.deepEqual(
@@ -89,11 +94,13 @@ test("security log: validated, with the numeric detail as a number", () => {
     [
       ["SESION_REVOCADA", null, true],
       ["SESIONES_REVOCADAS", 3, true],
+      ["W8BEN_CERTIFICADO", 2, true],
     ],
   );
   for (const bad of [
     { eventos: [{ ...EVENT, detalle: "tres" }] },
     { eventos: [{ ...EVENT, evento: "<script>" }] },
+    { eventos: [{ ...EVENT, evento: "8BEN" }] },
     { eventos: [{ ...EVENT, id: "7" }] },
     { eventos: [{ ...EVENT, sesion_actual: null }] },
     { eventos: Array.from({ length: 101 }, () => EVENT) },

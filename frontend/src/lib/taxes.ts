@@ -464,14 +464,16 @@ export function treatmentLabel(treatment: TaxTreatment, rates: TaxRates | null):
   return rates ? `Listed shares · ${formatRate(rates.listed_shares)} (LISR art. 129)` : "Listed shares (LISR art. 129)";
 }
 
+/** A calendar date ("YYYY-MM-DD") as the Tax Center writes it: "Dec 31, 2029". */
+export function formatTaxDate(date: string): string {
+  return new Intl.DateTimeFormat("en-US", { month: "short", day: "numeric", year: "numeric", timeZone: "UTC" }).format(
+    new Date(`${date}T00:00:00Z`),
+  );
+}
+
 /** "Valid through Dec 31, 2029". */
 export function validThrough(date: string): string {
-  const label = new Intl.DateTimeFormat("en-US", {
-    month: "short",
-    day: "numeric",
-    year: "numeric",
-    timeZone: "UTC",
-  }).format(new Date(`${date}T00:00:00Z`));
+  const label = formatTaxDate(date);
   return `Valid through ${label}`;
 }
 

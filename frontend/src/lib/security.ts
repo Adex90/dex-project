@@ -124,7 +124,8 @@ function parseEvent(value: unknown): SecurityEvent | null {
     typeof id !== "number" ||
     !Number.isSafeInteger(id) ||
     !isText(evento, 64) ||
-    !/^[A-Z_]+$/.test(evento) ||
+    // An event code: upper case, digits and underscores ("W8BEN_CERTIFICADO").
+    !/^[A-Z][A-Z0-9_]*$/.test(evento) ||
     !isTimestamp(ocurrido_en) ||
     address === undefined ||
     device === undefined ||

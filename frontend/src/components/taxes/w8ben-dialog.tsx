@@ -8,7 +8,7 @@ import { Alert, Button, Field, Input, cx } from "@/components/ui/primitives";
 import { describeError } from "@/lib/api/client";
 import { formatDate } from "@/components/ui/data";
 import { todayInMexicoCity } from "@/lib/kyc";
-import { certificationRequest, countryName, signatureMatches, validThrough } from "@/lib/taxes";
+import { certificationRequest, countryName, formatTaxDate, signatureMatches } from "@/lib/taxes";
 import type { TaxProfile, W8benCertification, W8benState } from "@/types/taxes";
 
 /*
@@ -253,7 +253,7 @@ export function W8benDialog({
             {matches ? "Matches your legal name" : "Does not match your legal name yet"}
           </p>
           <p className="text-xs text-muted">
-            Signed today, {validThrough(validUntil).toLowerCase()}, unless your details change.
+            Signed today, valid through {formatTaxDate(validUntil)}, unless your details change.
           </p>
           {error ? (
             <Alert tone="error" title="Not certified">
@@ -266,7 +266,7 @@ export function W8benDialog({
       {step === "done" && result?.current ? (
         <div className="space-y-4" data-testid="w8ben-step-done">
           <Alert tone="success" title="W-8BEN certified">
-            Version {result.current.version} is on record, {validThrough(result.current.valid_until).toLowerCase()}.
+            Version {result.current.version} is on record, valid through {formatTaxDate(result.current.valid_until)}.
           </Alert>
           <p className="text-sm text-ink-2">
             U.S.-source dividends are now withheld at{" "}
