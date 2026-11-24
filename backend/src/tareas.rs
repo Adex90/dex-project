@@ -11,7 +11,8 @@
 //!   las órdenes límite y stop que el precio vigente alcanzó; en la misma
 //!   pasada, el programador de planes de ahorro
 //!   ([`mercado::planes::ejecutar_vencidos`]) hace (u omite) cada compra
-//!   vencida.
+//!   vencida, y las alertas de precio ([`mercado::alertas::evaluar`]) que el
+//!   precio vigente alcanzó se disparan.
 
 use std::time::Duration;
 
@@ -112,6 +113,20 @@ pub fn lanzar(estado: AppState) {
                     Ok(_) => {}
                     Err(err) => {
                         tracing::error!(codigo = err.codigo(), error = %err.detalle(), "falló el programador de planes de ahorro")
+                    }
+                }
+                match mercado::alertas::evaluar(&e.pool, &e.config).await {
+                    Ok(r) if r.disparadas + r.errores > 0 => {
+                        tracing::info!(
+                            clientes = r.clientes,
+                            disparadas = r.disparadas,
+                            errores = r.errores,
+                            "alertas de precio"
+                        )
+                    }
+                    Ok(_) => {}
+                    Err(err) => {
+                        tracing::error!(codigo = err.codigo(), error = %err.detalle(), "falló la revisión de alertas de precio")
                     }
                 }
             }

@@ -2,8 +2,9 @@
 //!
 //! Las rutas están en el grupo `api` del límite por IP (limites.rs) y exigen
 //! sesión (el extractor [`Usuario`] valida el JWT y la sesión en la base de
-//! datos). Colocar, listar y cancelar órdenes, y crear y cambiar planes de
-//! ahorro, es solo del cliente.
+//! datos). Colocar, listar y cancelar órdenes, crear y cambiar planes de
+//! ahorro, su historial de órdenes, su lista de seguimiento y sus alertas de
+//! precio son solo del cliente.
 
 use axum::{
     extract::State,
@@ -21,11 +22,14 @@ use crate::{
     error::{AppError, AppResult},
     mercado::{
         self,
+        alertas::{self, Alertas, Direccion, SolicitudAlerta, VistaAlerta},
+        historial_ordenes::{self, HistorialOrdenes},
         pendiente::{self, SolicitudPendiente},
         planes::{self, Cambio, Frecuencia, PlanesAhorro, SolicitudPlan, VistaPlan},
+        seguimiento::{self, EstadoSeguimiento, ListaSeguimiento},
         Catalogo, Cotizacion, Lado, OrdenesPendientes, Recibo, SolicitudOrden, TipoPendiente, VistaPendiente,
     },
-    routes::extraccion::{Json, Path},
+    routes::extraccion::{Cuerpo, Json, Path, Query},
     state::AppState,
 };
 
@@ -40,6 +44,11 @@ pub fn rutas() -> Router<AppState> {
         .route("/market/savings-plans/{id}/pause", post(pausar_plan))
         .route("/market/savings-plans/{id}/resume", post(reanudar_plan))
         .route("/market/savings-plans/{id}/cancel", post(cancelar_plan))
+        .route("/market/orders/history", get(historial))
+        .route("/market/watchlist", get(lista_seguimiento))
+        .route("/market/watchlist/{ticker}/toggle", post(alternar_seguimiento))
+        .route("/market/alerts", get(alertas_de_precio).post(crear_alerta))
+        .route("/market/alerts/{id}/cancel", post(cancelar_alerta))
 }
 
 /// El catálogo (`MarketCatalog`): lo que hoy se cotiza y se opera. Cualquier sesión válida.
@@ -208,4 +217,98 @@ async fn cancelar_plan(State(e): State<AppState>, u: Usuario, Path(id): Path<Uui
 async fn cambiar_plan(e: &AppState, u: &Usuario, id: Uuid, cambio: Cambio) -> AppResult<Json<VistaPlan>> {
     u.exigir_cliente()?;
     Ok(Json(planes::cambiar(&e.pool, u.cliente_id, id, cambio).await?))
+}
+
+/// `?limit=&cursor=` del historial. Campos desconocidos: 400.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConsultaHistorialHttp {
+    #[serde(default)]
+    limit: Option<i64>,
+    #[serde(default)]
+    cursor: Option<String>,
+}
+
+/// Cada orden ejecutada, cancelada o rechazada del cliente, por páginas (`OrderHistory`).
+async fn historial(
+    State(e): State<AppState>,
+    u: Usuario,
+    Query(q): Query<ConsultaHistorialHttp>,
+) -> AppResult<Json<HistorialOrdenes>> {
+    u.exigir_cliente()?;
+    Ok(Json(historial_ordenes::listar(&e.pool, u.cliente_id, q.limit, q.cursor.as_deref()).await?))
+}
+
+/// Los activos que sigue el cliente, con su ficha (`Watchlist`).
+async fn lista_seguimiento(State(e): State<AppState>, u: Usuario) -> AppResult<Json<ListaSeguimiento>> {
+    u.exigir_cliente()?;
+    Ok(Json(seguimiento::listar(&e.pool, &e.config, u.cliente_id).await?))
+}
+
+/// El cuerpo, opcional, de seguir o dejar de seguir: el estado pedido.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SolicitudSeguimientoHttp {
+    watched: bool,
+}
+
+/// Sigue o deja de seguir un activo: con `{"watched": bool}`, ese estado
+/// (repetirlo no cambia nada); sin cuerpo, alterna (`WatchState`).
+async fn alternar_seguimiento(
+    State(e): State<AppState>,
+    u: Usuario,
+    Path(ticker): Path<String>,
+    Cuerpo(cuerpo): Cuerpo,
+) -> AppResult<Json<EstadoSeguimiento>> {
+    u.exigir_cliente()?;
+    let pedido = if cuerpo.iter().all(u8::is_ascii_whitespace) {
+        None
+    } else {
+        let s: SolicitudSeguimientoHttp = serde_json::from_slice(&cuerpo)
+            .map_err(|e| AppError::validacion(format!("el cuerpo no es válido: {e}")))?;
+        Some(s.watched)
+    };
+    Ok(Json(seguimiento::cambiar(&e.pool, &e.config, u.cliente_id, &ticker, pedido).await?))
+}
+
+/// `PriceAlertRequest`. Campos desconocidos: 400.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SolicitudAlertaHttp {
+    ticker: String,
+    /// Como texto ("1700.0000"): nunca un número JSON.
+    #[serde(with = "rust_decimal::serde::str")]
+    target_price: Decimal,
+    direction: Direccion,
+    idempotency_key: String,
+}
+
+/// Las alertas de precio activas del cliente y las disparadas en los últimos días (`PriceAlerts`).
+async fn alertas_de_precio(State(e): State<AppState>, u: Usuario) -> AppResult<Json<Alertas>> {
+    u.exigir_cliente()?;
+    Ok(Json(alertas::listar(&e.pool, u.cliente_id).await?))
+}
+
+/// Una alerta de precio: 201 con la alerta; 200 si repite una clave ya usada para la misma.
+async fn crear_alerta(
+    State(e): State<AppState>,
+    u: Usuario,
+    Json(s): Json<SolicitudAlertaHttp>,
+) -> AppResult<(StatusCode, Json<VistaAlerta>)> {
+    u.exigir_cliente()?;
+    let solicitud = SolicitudAlerta {
+        cliente_id: u.cliente_id,
+        ticker: s.ticker,
+        precio_objetivo: s.target_price,
+        direccion: s.direction,
+        clave_idempotencia: u.clave(&s.idempotency_key)?,
+    };
+    let r = alertas::crear(&e.pool, &e.config, &solicitud).await?;
+    Ok((status_de(r.idempotente), Json(r.alerta)))
+}
+
+/// Cancela una alerta activa del cliente.
+async fn cancelar_alerta(State(e): State<AppState>, u: Usuario, Path(id): Path<Uuid>) -> AppResult<Json<VistaAlerta>> {
+    u.exigir_cliente()?;
+    Ok(Json(alertas::cancelar(&e.pool, u.cliente_id, id).await?))
 }

@@ -221,6 +221,9 @@ fn es_invariante(codigo: &str) -> bool {
             | "PLAN_SIN_EJECUCION"
             | "PLAN_CALENDARIO"
             | "PLAN_TRANSICION"
+            | "AVISO_INCOHERENTE"
+            | "AVISO_TRANSICION"
+            | "AVISO_CERRADO"
     ) || codigo.ends_with("_INMUTABLE")
 }
 
@@ -248,9 +251,10 @@ fn traducir_error_bd(codigo_sql: &str, mensaje: &str, restriccion: &str) -> Opti
         let (codigo, detalle) = resto.split_once(':').unwrap_or((resto, ""));
         let detalle = detalle.trim();
         let detalle = if detalle.is_empty() { mensaje } else { detalle };
-        if codigo == "MERCADO_PRECIO_CAMBIO" {
-            // El precio cambió entre la cotización y la orden: la operación
-            // completa se repite con el precio nuevo (orden de mercado).
+        if codigo == "MERCADO_PRECIO_CAMBIO" || codigo == "AVISO_NO_ALCANZADO" {
+            // El precio cambió entre la cotización y la orden (o entre que el
+            // motor eligió una alerta y la disparó): la operación completa se
+            // repite con el precio nuevo.
             return Some(AppError::Reintentable);
         }
         if codigo == "OPERACION_NO_DISPONIBLE" {
@@ -493,6 +497,31 @@ mod pruebas {
             "SC_PLAN_CALENDARIO: sin fecha siguiente",
             "SC_PLAN_TRANSICION: el plan x no pasa de CANCELADO a ACTIVO",
             "SC_PLAN_INMUTABLE: los términos del plan x no cambian",
+        ] {
+            let e = traducir_error_bd("P0001", mensaje, "").unwrap();
+            assert_eq!(e.codigo(), "INTEGRIDAD", "{mensaje}");
+        }
+    }
+
+    #[test]
+    fn alertas_de_precio_y_seguimiento() {
+        // El oráculo movió el precio desde que el motor eligió la alerta: se repite.
+        let e = traducir_error_bd("P0001", "SC_AVISO_NO_ALCANZADO: AUG1 está en 1690", "").unwrap();
+        assert!(matches!(e, AppError::Reintentable));
+        for (mensaje, codigo) in [
+            ("SC_AVISO_YA_ALCANZADO: AUG1 ya está en 1612.40", "AVISO_YA_ALCANZADO"),
+            ("SC_LIMITE_AVISOS_PRECIO: el cliente ya tiene 50", "LIMITE_AVISOS_PRECIO"),
+            ("SC_LIMITE_SEGUIMIENTO: el cliente ya sigue 50 activos", "LIMITE_SEGUIMIENTO"),
+        ] {
+            let e = traducir_error_bd("23514", mensaje, "").unwrap();
+            assert_eq!((e.status(), e.codigo()), (StatusCode::UNPROCESSABLE_ENTITY, codigo), "{mensaje}");
+        }
+        for mensaje in [
+            "SC_AVISO_INCOHERENTE: una alerta de precio nace activa",
+            "SC_AVISO_TRANSICION: la alerta x sigue activa",
+            "SC_AVISO_CERRADO: la alerta x ya está disparada",
+            "SC_AVISO_INMUTABLE: los términos no cambian",
+            "SC_SEGUIMIENTO_INMUTABLE: el renglón no se edita",
         ] {
             let e = traducir_error_bd("P0001", mensaje, "").unwrap();
             assert_eq!(e.codigo(), "INTEGRIDAD", "{mensaje}");

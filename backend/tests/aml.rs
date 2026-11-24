@@ -1937,6 +1937,17 @@ async fn sin_aviso_al_cliente(pool: PgPool) {
         )
         .await;
     assert_eq!((s, &plan["failure_reason"]), (StatusCode::CREATED, &json!("SALDO_INSUFICIENTE")), "{plan}");
+    // Sigue el oro y le pone una alerta de precio (0024): nada de eso cambia al congelarla.
+    let (s, _) = api.post("/api/v1/market/watchlist/AUG1/toggle", &tok_ana, json!({ "watched": true })).await;
+    assert_eq!(s, StatusCode::OK);
+    let (s, a) = api
+        .post(
+            "/api/v1/market/alerts",
+            &tok_ana,
+            json!({ "ticker": "AUG1", "target_price": "1700", "direction": "above", "idempotency_key": clave_api() }),
+        )
+        .await;
+    assert_eq!(s, StatusCode::CREATED, "{a}");
     // Ana: 10,000 libres y luego la estructuración, todo por el webhook del proveedor.
     for monto in ["10000", "145000", "145000", "145000"] {
         let (s, r) = api.webhook(&cfg, cuerpo_abono(&ana.cuenta_ifpe.clabe, monto)).await;
@@ -2061,6 +2072,10 @@ async fn sin_aviso_al_cliente(pool: PgPool) {
         "/api/v1/auth/step-up",
         // Planes de ahorro (0023), con la compra omitida bajo el congelamiento.
         "/api/v1/market/savings-plans",
+        // Lista de seguimiento, alertas de precio (0024) e historial de órdenes.
+        "/api/v1/market/watchlist",
+        "/api/v1/market/alerts",
+        "/api/v1/market/orders/history",
     ] {
         let (s, cuerpo) = api.llamar_crudo("GET", ruta, Some(&tok_ana), None).await;
         assert_eq!(s, StatusCode::OK, "{ruta}");

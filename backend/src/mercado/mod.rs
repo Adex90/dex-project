@@ -1,5 +1,6 @@
-//! Mercado de valores (migraciones 0013, 0015 y 0023): catálogo,
-//! cotizaciones, órdenes de mercado, órdenes límite y stop y planes de ahorro.
+//! Mercado de valores (migraciones 0013, 0015, 0023 y 0024): catálogo,
+//! cotizaciones, órdenes de mercado, órdenes límite y stop, planes de ahorro,
+//! la lista de seguimiento, las alertas de precio y el historial de órdenes.
 //!
 //! - [`catalogo`]: los activos que hoy se cotizan y se operan
 //!   (`GET /api/v1/market/assets`), el explorador del frontend.
@@ -14,6 +15,11 @@
 //!   `savings_plan`): la misma compra cada semana, cada dos semanas o cada
 //!   mes; su lista, pausa, reanudación y cancelación, y el programador que
 //!   hace cada compra vencida como una orden de mercado.
+//! - [`seguimiento`]: los activos que el cliente sigue, los tenga o no.
+//! - [`alertas`]: avisos cuando un precio llega a un objetivo; el motor los
+//!   dispara en su pasada.
+//! - [`historial_ordenes`]: cada orden ejecutada, cancelada o rechazada del
+//!   cliente, por páginas.
 //!
 //! El mercado es una entidad aparte de la IFPE y la SOFOM: su propio esquema,
 //! su rol (`sc_mercado`) y su ledger encadenado (`mercado.ordenes`). El
@@ -28,12 +34,15 @@
 //! (`503 MERCADO_NO_DISPONIBLE`): nadie compra en producción a un precio de
 //! demostración.
 
+pub mod alertas;
 pub mod calculo;
 pub mod historial;
+pub mod historial_ordenes;
 pub mod modelos;
 mod orden;
 pub mod pendiente;
 pub mod planes;
+pub mod seguimiento;
 
 use axum::http::StatusCode;
 use chrono::Utc;

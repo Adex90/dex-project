@@ -45,6 +45,12 @@
 //! | POST | `/api/v1/market/savings-plans/{id}/pause` | cliente: pausa un plan de ahorro |
 //! | POST | `/api/v1/market/savings-plans/{id}/resume` | cliente: reanuda un plan pausado en su siguiente fecha |
 //! | POST | `/api/v1/market/savings-plans/{id}/cancel` | cliente: cancela un plan de ahorro (definitivo) |
+//! | GET  | `/api/v1/market/orders/history?limit=&cursor=` | cliente: cada orden ejecutada, cancelada o rechazada, de la más reciente a la más antigua, por páginas |
+//! | GET  | `/api/v1/market/watchlist` | cliente: los activos que sigue, con su ficha |
+//! | POST | `/api/v1/market/watchlist/{ticker}/toggle` | cliente: sigue o deja de seguir un activo (`{"watched": bool}`; sin cuerpo, alterna) |
+//! | GET  | `/api/v1/market/alerts` | cliente: sus alertas de precio activas y las disparadas en los últimos 30 días |
+//! | POST | `/api/v1/market/alerts` | cliente: una alerta cuando el precio suba o baje a un objetivo |
+//! | POST | `/api/v1/market/alerts/{id}/cancel` | cliente: cancela una alerta activa |
 //! | GET  | `/api/v1/wealth/linked-accounts` | cliente: sus cuentas vinculadas, a dónde puede retirar (con `MODO_DEMO`, vincula la de demostración) |
 //! | POST | `/api/v1/wealth/withdraw` | cliente con verificación reforzada: retira efectivo disponible a una cuenta vinculada (SPEI a cuenta propia, en proceso hasta liquidarse) |
 //! | GET  | `/api/v1/kyc/expediente` | cliente: estado, intentos, bloqueo y último resultado |
