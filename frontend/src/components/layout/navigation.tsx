@@ -7,6 +7,7 @@ import {
   FileText,
   Landmark,
   LockKeyhole,
+  Receipt,
   Search,
   ShieldCheck,
   TrendingUp,
@@ -21,6 +22,7 @@ import { cx } from "@/components/ui/primitives";
 import { BENEFICIARIES_PATH } from "@/lib/beneficiaries";
 import { DOCUMENTS_PATH } from "@/lib/documents";
 import { SECURITY_PATH } from "@/lib/security";
+import { TAXES_PATH } from "@/lib/taxes";
 
 /*
  * Dashboard navigation: one list of destinations, two presentations.
@@ -38,7 +40,7 @@ import { SECURITY_PATH } from "@/lib/security";
  * and from Discover, and the tab that opened it stays current there (its
  * Back link returns to that tab). Opened by its address, it is the Vault's.
  *
- * Account pages (Documents, Beneficiaries, Security) sit in the sidebar's own
+ * Account pages (Documents, Taxes, Beneficiaries, Security) sit in the sidebar's own
  * "Account" group. On phones the tab bar keeps its five tabs: the Account tab
  * and each account page carry a strip of links to them (`AccountLinks`), and
  * the header's lock opens Security.
@@ -64,6 +66,7 @@ export const DASHBOARD_NAV: readonly NavItem[] = [
   { href: "/dashboard/invest", label: "Invest", icon: TrendingUp },
   { href: "/dashboard/reserve", label: "Reserve", icon: ShieldCheck },
   { href: DOCUMENTS_PATH, label: "Documents", icon: FileText, settings: true },
+  { href: TAXES_PATH, label: "Taxes", icon: Receipt, settings: true },
   { href: BENEFICIARIES_PATH, label: "Beneficiaries", icon: Users, settings: true },
   { href: SECURITY_PATH, label: "Security", icon: LockKeyhole, settings: true },
 ];
@@ -255,12 +258,13 @@ export function AccountLinks({ className }: { className?: string }) {
   const pathname = usePathname();
   return (
     <nav aria-label="Account pages" className={cx("lg:hidden", className)}>
-      <ul className="grid grid-cols-3 border border-border bg-surface">
+      {/* Hairlines between the cells whatever the columns: the gaps show the border color. */}
+      <ul className="grid grid-cols-2 gap-px border border-border bg-border sm:grid-cols-4">
         {ACCOUNT_PAGES.map((item) => {
           const active = isActive(item, pathname);
           const Icon = item.icon;
           return (
-            <li key={item.href} className="min-w-0 border-r border-border last:border-r-0">
+            <li key={item.href} className="min-w-0 bg-surface">
               <Link
                 href={item.href}
                 aria-current={active ? "page" : undefined}

@@ -31,7 +31,7 @@ import type { AccountStatement, FinancialDocument, ReserveSeal, TradeConfirmatio
  * appear in the statement's closing breakdown with the neutral copy.
  */
 
-type Variant = "screen" | "print";
+export type Variant = "screen" | "print";
 
 export function DocumentBody({ doc, variant = "screen" }: { doc: FinancialDocument; variant?: Variant }) {
   return (
@@ -430,7 +430,7 @@ function SealPanel({ seal, variant }: { seal: ReserveSeal; variant: Variant }) {
 /* ------------------------------------------------------------------------ */
 
 /** A gain in green with "+", a loss in red with "−", nothing in plain ink. */
-function PnL({ value }: { value: string }) {
+export function PnL({ value }: { value: string }) {
   const sign = compareAmounts(value, "0");
   return (
     <span className={sign < 0 ? "text-loss" : sign > 0 ? "text-gain" : "text-ink"}>
@@ -439,7 +439,7 @@ function PnL({ value }: { value: string }) {
   );
 }
 
-function Section({ title, children, testId }: { title: string; children: ReactNode; testId?: string }) {
+export function Section({ title, children, testId }: { title: string; children: ReactNode; testId?: string }) {
   return (
     <section className="space-y-2" data-testid={testId}>
       <h4 className="border-b border-border pb-1.5 text-[11px] font-semibold tracking-[0.18em] text-muted uppercase">
@@ -450,11 +450,11 @@ function Section({ title, children, testId }: { title: string; children: ReactNo
   );
 }
 
-function Rows({ children }: { children: ReactNode }) {
+export function Rows({ children }: { children: ReactNode }) {
   return <dl className="divide-y divide-border/60">{children}</dl>;
 }
 
-function Row({
+export function Row({
   label,
   children,
   badge,
@@ -478,7 +478,17 @@ function Row({
   );
 }
 
-function Hash({ value, variant, label, testId }: { value: string; variant: Variant; label: string; testId?: string }) {
+export function Hash({
+  value,
+  variant,
+  label,
+  testId,
+}: {
+  value: string;
+  variant: Variant;
+  label: string;
+  testId?: string;
+}) {
   if (variant === "print") {
     return (
       <span className="font-mono text-[10px] break-all" data-testid={testId}>

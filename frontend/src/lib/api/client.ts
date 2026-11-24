@@ -90,6 +90,42 @@ export async function request<T>(path: string, options: RequestOptions = {}): Pr
 }
 
 /**
+ * A text download (the accounting CSV): the body as text once the API answers
+ * 2xx, otherwise the API's error, like `request`. Never cached.
+ */
+export async function requestText(
+  path: string,
+  options: Pick<RequestOptions, "token" | "signal" | "query"> = {},
+): Promise<{ text: string; contentType: string }> {
+  const { token, signal, query } = options;
+  const url = new URL(`${API_URL}${path}`);
+  for (const [key, value] of Object.entries(query ?? {})) {
+    if (value !== undefined) url.searchParams.set(key, String(value));
+  }
+  const headers: Record<string, string> = { Accept: "text/csv, application/json" };
+  if (token) headers.Authorization = `Bearer ${token}`;
+  let response: Response;
+  try {
+    response = await fetch(url, { headers, signal, cache: "no-store" });
+  } catch (cause) {
+    if (cause instanceof DOMException && cause.name === "AbortError") throw cause;
+    throw new ApiError(0, "RED", `Cannot reach the Synthetic Capital API at ${API_URL}.`);
+  }
+  const text = await response.text();
+  if (!response.ok) {
+    let data: unknown = null;
+    try {
+      data = JSON.parse(text);
+    } catch {
+      data = null;
+    }
+    if (isErrorBody(data)) throw new ApiError(response.status, data.error.codigo, data.error.mensaje);
+    throw new ApiError(response.status, `HTTP_${response.status}`, response.statusText || "Unexpected error");
+  }
+  return { text, contentType: response.headers.get("content-type") ?? "" };
+}
+
+/**
  * English copy for the backend's stable error codes; falls back to the server
  * message. KYC_PROVEEDOR_ERROR and KYC_IDENTIDAD_BLOQUEADA are deliberately
  * absent: their wording depends on the case (e.g. whether the attempt was
@@ -163,6 +199,14 @@ const MESSAGES: Record<string, string> = {
   BENEFICIARIO_INVALIDO: "Check each beneficiary's details. Nothing was saved.",
   DESIGNACION_DESACTUALIZADA:
     "Your beneficiaries were changed from another session. The latest version is shown; review it and save again.",
+  // The W-8BEN (migration 0021): nothing is saved unless every check passes.
+  W8BEN_FIRMA: "Sign with your full legal name, exactly as it appears in your file.",
+  W8BEN_CERTIFICACIONES: "Confirm all three statements to certify.",
+  W8BEN_PERSONA_EUA: "U.S. citizens and residents certify their status on Form W-9 instead.",
+  W8BEN_PERSONA_MORAL: "Business accounts certify on Form W-8BEN-E, which is not available here yet.",
+  W8BEN_RESIDENCIA: "Here you can certify as a resident of Mexico under the U.S.–Mexico tax treaty.",
+  W8BEN_DATOS_INCOMPLETOS: "Your file needs your RFC, date of birth and address before you can certify.",
+  W8BEN_CONCURRENTE: "Your W-8BEN was certified from another session at the same time. Reload and check it.",
   // A client whose account is restricted gets this one neutral message whatever
   // the cause (no tipping off): it must not mention compliance, alerts or freezes.
   OPERACION_NO_DISPONIBLE: GENERIC_UNAVAILABLE_MESSAGE,

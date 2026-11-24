@@ -2,9 +2,10 @@ import { passwordChangeBody } from "@/lib/security";
 import type { LimitOrderRequest, MarketOrderRequest, StopOrderRequest } from "@/types/market";
 import type { DesignationRequest } from "@/types/beneficiaries";
 import type { InactivityMinutes, PasswordChange } from "@/types/security";
+import type { W8benCertification } from "@/types/taxes";
 import type { WithdrawalRequest } from "@/types/wealth";
 
-import { request } from "./client";
+import { request, requestText } from "./client";
 import type {
   AmlAlertsQuery,
   Cliente,
@@ -193,6 +194,21 @@ export const api = {
   /** One document ("co_<order id>" or "ec_<YYYY-MM>"); 404 when it is not the client's. Validate with `parseDocument`. */
   document: (token: string, id: string, signal?: AbortSignal) =>
     request<unknown>(`/api/v1/wealth/documentos/${encodeURIComponent(id)}`, { token, signal }),
+
+  /**
+   * The Tax Center for a fiscal year (the current one by default): the fiscal
+   * profile, the W-8BEN and the year's summary. Validate with `parseTaxCenter`.
+   */
+  taxCenter: (token: string, year?: number, signal?: AbortSignal) =>
+    request<unknown>("/api/v1/wealth/impuestos", { token, signal, query: { year } }),
+
+  /** Certifies or renews the W-8BEN (201); validate the answer with `parseW8benState`. */
+  certifyW8ben: (token: string, body: W8benCertification) =>
+    request<unknown>("/api/v1/wealth/impuestos/w8ben", { method: "POST", token, body }),
+
+  /** The year's accounting export (RFC 4180 CSV); reconcile it with `verifyExport` before saving. */
+  taxExport: (token: string, year: number, signal?: AbortSignal) =>
+    requestText("/api/v1/wealth/impuestos/export.csv", { token, signal, query: { year } }),
 
   movements: (token: string, params: { limit?: number; before?: number } = {}, signal?: AbortSignal) =>
     request<TransaccionIfpe[]>("/api/v1/ifpe/movimientos", {

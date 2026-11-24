@@ -177,6 +177,11 @@ test("log entries in words", () => {
     detail: "Version 3 on record",
     tone: "accent",
   });
+  assert.deepEqual(describeEvent(event("W8BEN_CERTIFICADO", { detail: 2 })), {
+    title: "W-8BEN certified",
+    detail: "Version 2 on record",
+    tone: "accent",
+  });
   assert.equal(describeEvent(event("ALGO_NUEVO")).title, "Security event");
 });
 
@@ -196,6 +201,7 @@ test("no log entry uses words that would tip off a client under review", () => {
     "CONTRASENA_RESTABLECIDA",
     "PREFERENCIAS_ACTUALIZADAS",
     "BENEFICIARIOS_DESIGNADOS",
+    "W8BEN_CERTIFICADO",
     "MFA_SECRETO_GENERADO",
     "MFA_ACTIVADO",
     "MFA_VERIFICADO",
