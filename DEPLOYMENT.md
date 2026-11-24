@@ -110,6 +110,7 @@ internet -> host 80/443 (UFW, fail2ban) -> nginx (edge network)
 | A W-8BEN is only what the verified file says, signed by its holder, and every certification is an immutable, chained version in the client's security log; a year's tax rates never change once published | Same code on both: each certification is a new version in `kyc.formularios_w8ben` (migration `0021`). The database copies Part I from the verified KYC file, requires the three Part III statements and a signature equal to the legal name (normalized with ICU), sets the version, signing time, validity (December 31 of the third year after signing) and hash (SC-W8BEN-v1, chained), refuses unverified clients, businesses, US persons and non-residents, and writes `W8BEN_CERTIFICADO` to the append-only security log in the same transaction (`sc_kyc` may write only that and the 0020 event). Rows are immutable; the backend recomputes the chain on every read. `kyc.parametros_fiscales` holds one immutable row per fiscal year. The tax summary and the CSV are derived on read from the ledgers, as `sc_cliente` under RLS | Same | `tests/impuestos.rs`, `tests/db/0021_centro_fiscal.sql`, smoke e2e (Appendix C) |
 | No request field outside the API contract is accepted | Same code on both: `deny_unknown_fields` on every body and query type (400 `VALIDACION`) | Same | `tests/entrada.rs` (source scan and HTTP) |
 | Money leaves an account, and its beneficiaries change, only from a session that confirmed a credential in the last five minutes | Same code on both: `/wealth/withdraw`, `/ifpe/retiros`, `/ifpe/transferencias`, `/spei/transfer` and saving the beneficiaries answer 403 `STEP_UP_REQUERIDO` without a step-up window on the request's own session, before touching anything (migration `0022`). `POST /auth/step-up` checks the authenticator code (two-step on) or the password, counted in the sign-in lockout before verifying; the try that locks the account closes the session; a code works once. The window (`kyc.sesiones.step_up_valido_hasta`) is set only by the database (now + 5 minutes, never past the session's expiry, only on a live session), and each one opened is written to the append-only security log by a trigger, with the request's IP and device. The database refuses a beneficiary designation whose session has no open window | Same | `tests/step_up.rs`, `tests/db/0022_verificacion_reforzada.sql`, smoke and AML e2e (Appendix C) |
+| A savings plan buys only on its own calendar, through every check of a market order, and its terms never change | Same code on both: each due purchase runs in the trigger engine's pass as a market buy (account lock, KYC, an active vault, an open and offered asset, the cash for the amount, AML on `COMPRA_MERCADO` before any write, the same ledger writer) with the key `plan:<plan>:<period>` (migration `0023`). The database owns the calendar (9:00 a.m. Mexico City, every 7 or 14 days or the same day each month, always a future date next) and records a purchase only while the plan is active and due: made, with the order of that period whose terms are the plan's, or skipped, with the rule's code; an order with a plan key cannot commit without that record. Terms are immutable, cancelled is final, and every change and purchase is an immutable event written by a trigger. A rule that stops a purchase skips it and the plan carries on; nothing is held | Same | `tests/planes.rs`, `tests/db/0023_planes_ahorro.sql`, smoke and AML e2e (Appendix C) |
 | Least-privilege database identities | Service holds only `sc_app` (NOINHERIT, no owner rights); owner credentials only in the migrate task and with DBAs holding the `dba-tunnel` policy | Same, plus the schema owner is **not** a superuser (`deploy/postgres/10-schema-owner.sh`); the `postgres` superuser is break-glass only | `pg_authid` query in Appendix C |
 | Containers non-root, read-only, least capability, resource-limited | uid 65532, read-only rootfs, `drop ALL`, task CPU/memory | uid 65532 / 70 / 101, `read_only`, `cap_drop: ALL`, `no-new-privileges`, CPU/memory/PID limits | `docker inspect` in Appendix C |
 | No secret in code, images, environment or state the operator does not control | Secrets Manager (CMK); RDS manages and rotates the owner password; Terraform state is CMK-encrypted | Docker secrets files (0400, owned by the reading uid); services read them through `NAME_FILE` | No secret value in `docker inspect` or image history (Appendix C) |
@@ -1222,6 +1223,26 @@ following to operations.
   - `/api/v1/auth/step-up` is under `/api/v1/auth/`, so the edge's auth rate
     limit (5 per minute, burst 10, per IP) and the backend's own `auth` group
     apply to it; a client verifies at most every few minutes.
+- **Migration `0023`** (savings plans) adds two new tables
+  (`mercado.planes_ahorro`, `mercado.eventos_plan`) with their triggers, RLS
+  and grants, three calendar functions, a deferred constraint trigger on
+  `mercado.ordenes` that fires only for keys starting with `plan:`, and
+  replaces the comment of `ifpe.cuentas.version_ordenes`. No existing table
+  is rewritten and no row changes.
+
+  Order: migrate, then the backend, then the frontend (or with it).
+  - An old backend on a migrated database keeps working: it never touches
+    the new tables, and no client key can start with `plan:` (they are
+    always `cli:<client>:<key>`).
+  - The new frontend against an old backend: creating a plan is refused (422
+    `TIPO_ORDEN_NO_DISPONIBLE`, shown in English) and the Vault's Savings
+    plans cannot load (404), so it stays hidden.
+  - The scheduler runs in the trigger engine's pass
+    (`MERCADO_DISPARO_INTERVALO_SEG`, default 5 s): with it set to 0, no
+    plan buys. Every backend task runs it; the account and plan locks make
+    each period buy at most once.
+  - Purchases are due at 9:00 a.m. Mexico City time: deploys at that hour
+    only delay them to the next pass (they stay due until processed).
 
 ---
 
@@ -1290,6 +1311,9 @@ to the specific provisions.
 | 34 | The W-8BEN is collected electronically but not yet given to a US withholding agent, and its electronic signature has not been reviewed against the IRS requirements for electronic forms | the form may not be accepted by a US custodian as is | each version is immutable, chained and in the security log with its session, IP and device; Part I comes from the verified file | review the electronic signature process with US tax counsel, and transmit the forms when a US custodian exists (legal, backend) |
 | 35 | Without two-step verification, the step-up check before a withdrawal or a change of beneficiaries is the account password | an attacker with a stolen session **and** a phished password passes the check | with two-step verification on, only the authenticator code passes; every try counts in the sign-in lockout and the try that locks closes the session; every check, passed or failed, is in the security log with its IP and device; the Security page and the check itself invite clients to turn two-step on | passkeys (WebAuthn, the platform's biometrics) as the check, and two-step verification required before a first withdrawal (security, frontend, backend) |
 | 36 | Withdrawals and transfers do not record the session that sent them, so the database cannot re-check their step-up window; the backend is the only guard there (beneficiaries are checked by both) | a backend defect that skipped the check would let a session without a fresh check send money | the check runs before anything else in each of the four routes and `tests/step_up.rs` covers every one; the AML and reserve guards in the database still apply | record the session on each outgoing order and require its window in the database, as for beneficiaries (backend, database) |
+| 37 | Savings plans have no market calendar: a purchase falls on its date, weekends and holidays included, and an asset that is not trading then skips it (`MERCADO_CERRADO`) instead of waiting for the next session | with live prices, a client's purchase on a market holiday is skipped, not deferred | prices are simulated and every asset trades in demo mode; a skipped purchase says why on the Vault, and the plan carries on at its next date | a trading calendar per asset and the purchase deferred to the next session (backend) |
+| 38 | A savings plan's purchases, and its skipped ones, send the client no notice (no email or push) | a client may learn only from the Vault that a purchase was skipped (not enough cash, the market closed) | the Vault shows the last purchase and why one was skipped, in neutral words; each purchase has its trade confirmation in the Document Inbox; every purchase, made or skipped, is an immutable event | notices before and after each purchase once item 1 is resolved (Push Notification Center, roadmap 30) |
+| 39 | Purchases depend on the backend running: if no backend task runs for longer than a plan's period, the dates that passed are not bought and leave no skipped event (the next purchase is the first date still to come) | a long outage loses scheduled purchases silently, apart from the gap in the plan's periods | due purchases run as soon as a task is back (one per plan, at that moment's price); every pass logs what it did and errors are logged per plan; the plan's event log numbers its periods, so a gap is visible | record each missed period as skipped (`SERVICIO_NO_DISPONIBLE`) and alarm on a scheduler that has not run (backend, operations) |
 
 ---
 
@@ -1581,6 +1605,101 @@ before withdrawals, transfers and saving the beneficiaries):
     without horizontal scroll; Cancel leaves the withdrawal unsent; with two-step
     on it takes the code; a wrong code shows 4 tries left; the fifth ends the
     session and the sign-in page says why.
+
+**Savings plans** (migration `0023`, `order_type: "savings_plan"` on
+`/api/v1/market/order`, `/api/v1/market/savings-plans`, the scheduler in the
+trigger engine's pass, the checkout and the Vault's Savings plans):
+
+- **Database:** every SQL suite passes on its own fresh database with all migrations
+  (18 suites), the new `tests/db/0023_planes_ahorro.sql` (62 checks) included. It
+  covers:
+  - the calendar: 9:00 a.m. Mexico City (15:00 UTC) every 7 or 14 days or on the
+    anchor's day of each month, the 31st on the last day of February (the 29th in
+    a leap year) and back on the 31st in March, and the next purchase always the
+    first date still to come;
+  - creation: born active, anchored on the Mexico City day, its first purchase due
+    at once, its `CREADO` event and the vault's version raised; refused when
+    `sc_mercado` sets the anchor or the state, born paused (even by the owner),
+    without verified KYC (RLS), from another client's vault, with another
+    frequency, fractions of a cent or an amount that buys no increment, on a
+    suspended asset, on a vault frozen by an operator or by AML (the constant
+    error), and past 20 open plans (a cancelled one frees a place);
+  - purchases: made with the order of its period (its key, the plan's terms, the
+    position and the chained ledger), then the next date; refused before the date,
+    with the order of another period or other terms, an order with a plan key and
+    no record (at COMMIT), a skip without a code or with free text, a made one with
+    a code; a skip keeps the plan active on its next date; a plan behind several
+    dates records one purchase and moves to the first date still to come;
+  - pause (no date), recording while paused refused, resume (its next date), dates
+    written by the owner ignored, terms immutable (for the owner too), cancel
+    (final: no resume, no purchase), the full event log in order, the vault's
+    version raised by every event;
+  - events never updated or deleted, plans never deleted or truncated;
+    `sc_mercado` inserts only the terms and updates only the state and the
+    purchase record, never the events; the client only reads; no other
+    application role touches either table; RLS shows each client only their own.
+- **Backend:** rustfmt and clippy `-D warnings` clean. 456 tests passed, 0 failed
+  (446 before):
+  - `tests/planes.rs`: a weekly 500 MXN gold plan answers 201 with its first
+    purchase (0.31 AUG1 for 499.84, the key `plan:<id>:0`, its IFPE movement and
+    its AML evaluation) and its next three dates a week apart at 15:00 UTC; the
+    list returns it as created; the same key answers 200 and buys nothing more;
+    the key reused for other terms or for an order (and an order's key for a plan)
+    is 409; a reserve cut and the market chain still verify. The rules: 400 for a
+    missing or unknown frequency, a sell, prices, cents or out of range; 422 for
+    an amount below one increment, a suspended asset and no KYC; 404 for an
+    unknown ticker; 503 without demo mode; 403 for staff; at most 20 plans. The
+    scheduler: nothing before its date; a due purchase without cash is skipped
+    (`SALDO_INSUFICIENTE`, no order, no AML) and the plan keeps its next date;
+    with cash and another price the next one buys (0.3125 AUG1 for 500.00); a
+    suspended asset skips (`MERCADO_CERRADO`). Pause, resume and cancel, each
+    repeated, 409 on a cancelled plan, 404 for another client's, a long pause
+    resuming at the first date still to come. A PLD freeze: a new plan answers
+    the constant error identical to any blocked operation, the due purchase is
+    skipped with it without counting an attempt, nothing in the plans' JSON tips
+    the client off, and pausing and cancelling still work. Concurrent creations
+    with one key make one plan; two concurrent passes buy once; a pause racing a
+    purchase leaves the plan coherent;
+  - `tests/aml.rs`: the plans' list passes the tipping-off guard for a frozen
+    client whose purchase was skipped, and the source scan lists the plan's one
+    AML call; `tests/ordenes_avanzadas.rs`: the plan's validation errors;
+  - unit tests for the purchase key, what skips a purchase, the frequency's
+    contract and the error mapping (`PLAN_CANCELADO` 409, `SC_PLAN_*` invariants
+    500).
+- **Frontend:** typecheck, lint, 341 unit tests (323 before: plans validated whole
+  and rejected when incoherent, dates in Mexico City built from parts, the
+  cadence, the monthly total, the skip reasons, which never use the words of an
+  AML hold, and the store's optimistic pause, resume and cancel with their
+  rollbacks, a plan cancelled elsewhere and a stale load) and `next build`.
+- **End to end** on a fresh stack: smoke 343 checks (326 before), AML 148 (142
+  before).
+  - The smoke run: the checkout offers Savings plan as a live type; a plan larger
+    than the cash warns that its first purchase would be skipped; a weekly 500.00
+    gold plan shows its first purchase now, then every week at 9:00 AM and about
+    $2,166.67 a month; Create Savings Plan answers the receipt with 0.31 AUG1 at
+    $1,612.40 ($499.84 charged) and the next date the API reports; the position
+    arrives over the WebSocket; the Vault lists the plan before the assets; a
+    monthly CETES plan made on another device appears live, newest first, and the
+    month's total becomes $2,266.67; Pause and Resume are instant and say so;
+    Cancel asks once more with Keep focused, then removes the plan for good (a
+    resume from the other device answers 409); with no plans the section leaves
+    the Vault; the two first purchases are all the plans charged, and selling
+    them returns the cash to the cent. 13 deliberate API failures, each
+    announced; no other console error.
+  - The AML run: a plan created before any deposit skips its first purchase and
+    stays active; once the client is frozen, the plans' JSON and the Vault (its
+    skipped purchase in neutral words) carry no tipping-off word; a new plan is
+    refused with the identical constant answer of every other operation; pausing
+    still works. 13 console errors, all deliberate 4xx calls; 0 failed requests.
+    One run recorded two loads aborted by the app itself: creating a plan commits
+    twice (the plan, then its first purchase or skip), so two vault pushes arrived
+    milliseconds apart and each list's reload aborted the one before; both Vault
+    lists (Open orders and Savings plans) now reload once per burst of pushes, and
+    the reruns had none.
+  - On a phone (390 px): the plan form, the receipt (the plan's id included) and
+    the Vault's panel fit the width without horizontal scroll; Pause and Cancel
+    stack under each other at one width, and so do Keep and Yes, cancel; no
+    console error.
 
 **Tax Center: fiscal year, W-8BEN and accounting export** (migration `0021`, the
 routes `/api/v1/wealth/impuestos`, `/impuestos/w8ben` and `/impuestos/export.csv`,

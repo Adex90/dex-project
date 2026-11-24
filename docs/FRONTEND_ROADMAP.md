@@ -120,14 +120,40 @@ what the module waits on. They do not change its scope.
     appearing live, both cancelled, phone layout).
   - Left: trailing stops, time in force (Day/GTC) and a history of closed
     orders (filled, cancelled, rejected).
-- [ ] **4. Savings Plans / DCA** (Automated fractional recurring buys)
-  - Frontend built: Savings plan in the same toggle (buys only), with the
+- [x] **4. Savings Plans / DCA** (Automated fractional recurring buys)
+  - Live: Savings plan in the checkout's type toggle (buys only), with the
     amount per purchase, the frequency (weekly, every 2 weeks, monthly), the
-    quantity at today's price and the monthly equivalent. Contract:
-    `SavingsPlanRequest` (`frequency`).
-  - Not live: the backend answers 422 `TIPO_ORDEN_NO_DISPONIBLE`. Left: the backend schedule (execution day,
-    business days, what happens without cash), the plan's own response
-    (next purchase date), and a screen to pause, edit or cancel plans.
+    quantity at today's price and the monthly equivalent. Create Savings Plan
+    sends it to `POST /api/v1/market/order` (`order_type: "savings_plan"`);
+    the receipt shows the first purchase (made at once, or skipped and why)
+    and the next dates, in Mexico City time. The amount hint warns before
+    anything is sent when today's cash would not cover the first purchase.
+  - Backend (migration 0023, README "Savings plans"): the same KYC, vault,
+    catalog and minimum-unit checks as a market order, at most 20 open plans.
+    The database owns the calendar: the first purchase at once, then at 9:00
+    a.m. Mexico City time every 7 or 14 days or on the same day of each month
+    (the 31st falls on a short month's last day). The trigger engine's pass
+    runs every due purchase as a market order through the same ledger, IFPE
+    movement, 100 % reserve and AML pipeline; a purchase the cash cannot
+    cover (or that a rule stops) is recorded as skipped with its code and the
+    plan carries on. Every change and purchase leaves an immutable event.
+  - Savings plans on the Vault, after Open orders
+    (`components/markets/savings-plans-list.tsx`): what each plan buys and
+    how often, its next purchase, the last one (bought, or skipped in neutral
+    words), what it has invested, and instant Pause and Resume, with Cancel
+    confirmed in place (`store/savings-plans.ts`, optimistic); the list
+    follows the vault's WebSocket and is absent when there are no plans.
+  - Tests: `tests/db/0023_planes_ahorro.sql`, `backend/tests/planes.rs`
+    (creation, receipt, idempotency, rules, the scheduler, skipped purchases,
+    transitions, a PLD freeze without tipping off, races),
+    `lib/savings-plans.test.ts`, `store/savings-plans.test.ts`, smoke e2e
+    (created from the checkout, a plan from another device appearing live,
+    Pause, Resume, Cancel, phone layout) and the AML e2e.
+  - Left: editing a plan's amount or frequency (cancel and create today),
+    choosing the day of the purchases, a market-holiday calendar (a closed
+    market skips that purchase), notifications before and after each
+    purchase, and a plan's full purchase history on screen (it is in the
+    immutable event log and the trade confirmations).
 - [ ] **5. Options & Derivatives Chain** (Calls/Puts, Greeks, Expirations)
   - Gated by module 19. Waits on options market data.
 - [ ] **6. Multi-Currency FX Engine** (Live spread and exchange rates)
@@ -253,7 +279,7 @@ what the module waits on. They do not change its scope.
 - [ ] **15. Round-up & Saveback** (Cashback tracking and spare change investing)
   - Previewed on the card (module 14): a saveback tracker on simulated
     spending. Left: card payments to compute it from, round-ups, and where
-    the money goes (cash, or a savings plan once module 4 is live).
+    the money goes (cash, or a savings plan, module 4).
 - [x] **16. Linked Accounts & Withdrawals** (Whitelisting CLABE and fiat off-ramp)
   - The whitelist (migration 0016, README "Linked accounts and
     withdrawals"): `ifpe.cuentas_vinculadas` holds the external CLABEs a

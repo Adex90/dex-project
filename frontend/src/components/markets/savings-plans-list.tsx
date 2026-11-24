@@ -57,6 +57,8 @@ import type { PlanAction, SavingsPlan } from "@/types/market";
 const NOTICE_MS = 6_000;
 /** How often the dates' "In a moment" and their year are checked against the clock. */
 const CLOCK_MS = 15_000;
+/** Vault moves this close together (one action's commits) reload the list once. */
+const RELOAD_MS = 150;
 
 export function SavingsPlansList({ token, className }: { token: string; className?: string }) {
   const titleId = useId();
@@ -89,8 +91,10 @@ export function SavingsPlansList({ token, className }: { token: string; classNam
   );
 
   // On mount, and whenever the vault moves: a purchase made or skipped, a plan created or changed elsewhere.
+  // A burst of moves (a plan, then its first purchase) reloads once, instead of aborting load after load.
   useEffect(() => {
-    void load();
+    const timer = setTimeout(() => void load(), RELOAD_MS);
+    return () => clearTimeout(timer);
   }, [load, vaultMoved]);
 
   // The next purchase reads "In a moment" once due: the clock moves on its own.
@@ -354,10 +358,11 @@ function PlanRow({
           <div
             role="group"
             aria-label={`Cancel ${what}? This cannot be undone.`}
-            className="ml-auto flex w-max flex-col items-end gap-1.5"
+            className="ml-auto flex w-max flex-col items-stretch gap-1.5 text-right"
           >
             <span className="text-xs font-medium text-danger">Cancel for good?</span>
-            <div className="flex gap-1.5">
+            {/* Stacked on a phone, like Pause and Cancel, so the plan keeps its room. */}
+            <div className="flex flex-col gap-1.5 sm:flex-row">
               <button
                 ref={keepRef}
                 type="button"

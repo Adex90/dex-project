@@ -24,7 +24,10 @@
  * another device saved first, every version in the security log), the
  * Tax Center (the year's summary against the cash ledger, the W-8BEN
  * certified and renewed, the accounting CSV reconciled before it is saved,
- * the Constancia de Retenciones printed)
+ * the Constancia de Retenciones printed), Savings plans (created from the
+ * checkout with its first purchase at once, the receipt's next dates, the
+ * Vault's list live with a plan from another device, Pause, Resume and
+ * Cancel)
  * and the Security page (devices signed in, Revoke and "Sign out all
  * other devices", the inactivity timeout, a password change, the security
  * log; then, for a client of its own on a phone, two-step verification turned
@@ -65,6 +68,8 @@ import { CSV_HEADER, parseCsv } from "../src/lib/taxes.ts";
 import { allocation, formatShare } from "../src/lib/allocation.ts";
 // And the Sovereign Yield preview's, to check the Account tab's live counter against it.
 import { SOVEREIGN_YIELD_PCT, accrued, formatTruncated, monthWindow } from "../src/lib/wealth.ts";
+// And the savings plans' calendar words, to read the dates a plan shows in Mexico City time.
+import { formatPlanDate, formatPlanDay } from "../src/lib/savings-plans.ts";
 
 // createRequire honors NODE_PATH (ESM imports do not), so a global install works.
 const { chromium } = createRequire(import.meta.url)("playwright");
@@ -702,13 +707,14 @@ try {
       check(vaultSockets.length === 2, "the sale empties the asset list live; the whole loop ran on one socket");
 
       // The ledger lists each order's cash leg: the first pass's STSLA buy and
-      // sale, then this pass's two gold buys and the sale.
+      // sale, its two savings plans' first purchases and their sales, then this
+      // pass's two gold buys and the sale.
       await openTab(page, "Account");
-      await page.getByText("Market sale", { exact: true }).nth(1).waitFor();
+      await page.getByText("Market sale", { exact: true }).nth(3).waitFor();
       check(
-        (await page.getByText("Market buy", { exact: true }).count()) === 3 &&
-          (await page.getByText("Market sale", { exact: true }).count()) === 2,
-        "the ledger lists three market buys and two market sales",
+        (await page.getByText("Market buy", { exact: true }).count()) === 5 &&
+          (await page.getByText("Market sale", { exact: true }).count()) === 4,
+        "the ledger lists five market buys (two of them a savings plan's) and four market sales",
       );
       // A limit buy from another device: it waits below the price with its
       // cash held, and cancelling it releases the cash. Both legs reach this
@@ -1897,8 +1903,8 @@ try {
     await page.getByTestId("chart-mode").getByRole("button", { name: "Line" }).click();
     await page.getByTestId("asset-line").waitFor();
     // The order types first. A limit or a stop takes its price on the same
-    // numpad, a savings plan its frequency. Market, limit and stop orders are
-    // live; a savings plan is previewed but never sent.
+    // numpad, a savings plan its frequency. Every type is live; this order
+    // ends as a limit buy (savings plans have their own section, later).
     let ordersSent = 0;
     page.on("request", (r) => {
       if (r.method() === "POST" && r.url().endsWith("/api/v1/market/order")) ordersSent += 1;
@@ -1970,10 +1976,10 @@ try {
     check(
       (await priceField.count()) === 0 &&
         (await buttonText()) === "create savings plan" &&
-        (await confirmButton.isDisabled()) &&
-        /Savings plans are not live yet/.test(await drawer.getByTestId("order-not-live").innerText()) &&
+        (await confirmButton.isEnabled()) &&
+        (await drawer.getByTestId("order-not-live").count()) === 0 &&
         (await summary.innerText()).includes("$2,166.67"),
-      "a savings plan asks how often (1,000.00 every 2 weeks is about $2,166.67 a month), and is not live yet",
+      "a savings plan asks how often (1,000.00 every 2 weeks is about $2,166.67 a month), and can be created",
     );
     await shot(page, "checkout-plan-desktop");
 
@@ -2832,6 +2838,206 @@ try {
     );
     await shot(page, "taxes-phone");
     await page.setViewportSize({ width: 1440, height: 1000 });
+
+    // ---------------------------------------------------------------------
+    // Savings plans (roadmap item 4): the same purchase every week, two weeks
+    // or month, the first at once; listed on the Vault with Pause, Resume and
+    // Cancel, live over the vault's WebSocket
+    // ---------------------------------------------------------------------
+    await page.goto(`${BASE}/dashboard/asset/AUG1`);
+    await page.getByTestId("asset-detail").waitFor();
+    const cashBeforePlan = (await asClient("/api/v1/tablero")).body.boveda.saldo_disponible;
+    await page.getByTestId("asset-buy").click();
+    await chooseType("Savings plan");
+    await drawer.getByTestId("order-frequency").getByText("Weekly", { exact: true }).click();
+    // More than the cash: the first purchase, due now, would be skipped; the drawer says so before anything is sent.
+    await typeKeys(["9", "9", "9", "9", "9", "9", "9"]);
+    const planCashNote = drawer.getByTestId("order-plan-cash");
+    await planCashNote.waitFor();
+    check(
+      flat(await planCashNote.innerText()) ===
+        `The first purchase is due now: with ${formatMoney(cashBeforePlan)} available, it would be skipped.` &&
+        (await confirmButton.isEnabled()),
+      "a plan larger than the cash can still be created, but the drawer warns that its first purchase would be skipped",
+    );
+    for (let i = 0; i < 7; i++) await drawer.getByRole("button", { name: "Delete last digit" }).click();
+    await typeKeys(["5", "0", "0"]);
+    const planSummary = flat(await summary.innerText());
+    check(
+      (await planCashNote.count()) === 0 &&
+        planSummary.includes("Each purchase $500.00") &&
+        planSummary.includes("Frequency Weekly") &&
+        planSummary.includes("First purchase Now") &&
+        planSummary.includes("Then Every week · 9:00 AM") &&
+        planSummary.includes("About a month $2,166.67") &&
+        (await footnote.innerText()).includes("9:00 a.m. Mexico City time"),
+      "a weekly 500.00 plan of gold: the first purchase now, then every week at 9:00 AM, about $2,166.67 a month",
+    );
+    const sentBeforePlan = ordersSent;
+    await confirmButton.click();
+    const planReceipt = drawer.getByTestId("order-receipt");
+    await planReceipt.waitFor();
+    const planCreated = (await asClient("/api/v1/market/savings-plans")).body.plans[0];
+    check(
+      (await planReceipt.getAttribute("data-outcome")) === "plan" &&
+        (await planReceipt.innerText()).includes("Savings plan created") &&
+        (await planReceipt.innerText()).includes("Buys $500.00 of AUG1 every week.") &&
+        flat(await drawer.getByTestId("receipt-first-purchase").innerText()) === "First purchase 0.31 AUG1 at $1,612.40" &&
+        flat(await drawer.getByTestId("receipt-next-purchase").innerText()) ===
+          `Next purchase ${formatPlanDate(planCreated.next_execution_at)}` &&
+        (await planReceipt.innerText()).includes("$499.84") &&
+        ordersSent === sentBeforePlan + 1,
+      `Create Savings Plan: the first purchase at once (0.31 AUG1 for $499.84), the next one ${formatPlanDate(planCreated.next_execution_at)}`,
+    );
+    check(
+      planCreated.status === "active" &&
+        planCreated.frequency === "weekly" &&
+        Date.parse(planCreated.next_execution_at) > Date.now() &&
+        new Date(planCreated.next_execution_at).getUTCHours() === 15 &&
+        Date.parse(planCreated.upcoming[1]) - Date.parse(planCreated.upcoming[0]) === 7 * 86_400_000,
+      "the backend owns the calendar: the next purchase a week from today at 9:00 AM Mexico City (15:00 UTC), then weekly",
+    );
+    await shot(page, "checkout-plan-receipt");
+    await drawer.getByRole("button", { name: "Done" }).click();
+    await drawer.waitFor({ state: "detached" });
+    await page.getByTestId("asset-detail").getByText("0.31 AUG1", { exact: true }).waitFor({ timeout: 5_000 });
+    check(true, "the first purchase reaches the asset's page through the vault's WebSocket: 0.31 AUG1");
+
+    // The Vault: the plan after the open orders and before the assets.
+    await openTab(page, "Vault");
+    const plansPanel = page.getByTestId("savings-plans");
+    const planRows = plansPanel.getByTestId("savings-plan");
+    const goldPlan = planRows.and(page.locator(`[data-plan-id="${planCreated.plan_id}"]`));
+    await goldPlan.waitFor({ timeout: 5_000 });
+    check(
+      (await planRows.count()) === 1 &&
+        (await goldPlan.getAttribute("data-status")) === "active" &&
+        (await goldPlan.getByTestId("savings-plan-cadence").innerText()) === "$500.00 weekly" &&
+        (await goldPlan.getByTestId("savings-plan-next-column").innerText()) ===
+          formatPlanDate(planCreated.next_execution_at) &&
+        (await goldPlan.getByTestId("savings-plan-last").innerText()) ===
+          `Bought 0.31 AUG1 at $1,612.40 on ${formatPlanDay(planCreated.last_purchase.executed_at)}` &&
+        (await goldPlan.getByTestId("savings-plan-invested").innerText()) === "$499.84" &&
+        (await plansPanel.getByTestId("savings-plans-count").innerText()) === "1 active" &&
+        (await plansPanel.getByTestId("savings-plans-monthly").innerText()) === "$2,166.67" &&
+        (await plansPanel.boundingBox()).y < (await page.getByTestId("asset-list").boundingBox()).y,
+      "the Vault lists the plan before the assets: $500.00 weekly, its next date, the purchase made, $499.84 invested",
+    );
+
+    // A plan created on another device appears live, newest first: CETES, 100.00 a month (10 titles for 99.44).
+    const planDevice = await apiLogin(email, password);
+    const cetesPlan = await apiOrder(planDevice, {
+      ticker: "CETES28",
+      side: "buy",
+      amount: "100.00",
+      order_type: "savings_plan",
+      frequency: "monthly",
+    });
+    check(
+      cetesPlan.status === 201 &&
+        cetesPlan.receipt.last_result === "executed" &&
+        cetesPlan.receipt.last_purchase.quantity === "10.00000000" &&
+        cetesPlan.receipt.last_purchase.amount === "99.44000000",
+      `a monthly 100.00 CETES plan from another device buys 10 titles for 99.44 at once (${cetesPlan.status})`,
+    );
+    const cetesRow = planRows.and(page.locator(`[data-plan-id="${cetesPlan.receipt.plan_id}"]`));
+    await cetesRow.waitFor({ timeout: 5_000 });
+    check(
+      (await planRows.count()) === 2 &&
+        (await planRows.first().getAttribute("data-plan-id")) === cetesPlan.receipt.plan_id &&
+        (await cetesRow.getByTestId("savings-plan-cadence").innerText()) === "$100.00 monthly" &&
+        (await plansPanel.getByTestId("savings-plans-count").innerText()) === "2 active" &&
+        (await plansPanel.getByTestId("savings-plans-monthly").innerText()) === "$2,266.67",
+      "it appears live, newest first, and the month's total becomes $2,266.67",
+    );
+    await page.mouse.move(0, 0);
+    await shot(page, "savings-plans-desktop");
+
+    // Pause: instant, no next date; Resume: the next date of its calendar.
+    const plansNotice = plansPanel.getByTestId("savings-plans-notice");
+    await goldPlan.getByTestId("savings-plan-pause").click();
+    await goldPlan.and(page.locator("[data-status=paused]")).waitFor({ timeout: 1_000 });
+    await plansNotice.filter({ hasText: "Savings plan for AUG1 paused: no purchases until you resume it." }).waitFor();
+    check(
+      (await goldPlan.getByTestId("savings-plan-next-column").innerText()) === "Paused" &&
+        (await goldPlan.getByTestId("savings-plan-resume").isVisible()) &&
+        (await plansPanel.getByTestId("savings-plans-count").innerText()) === "1 active · 1 paused" &&
+        (await plansPanel.getByTestId("savings-plans-monthly").innerText()) === "$100.00",
+      "Pause shows at once: Paused, Resume offered, and the month's total counts only the active plan",
+    );
+    await goldPlan.getByTestId("savings-plan-resume").click();
+    await plansNotice
+      .filter({ hasText: `Savings plan for AUG1 resumed. Next purchase: ${formatPlanDate(planCreated.next_execution_at)}.` })
+      .waitFor();
+    check(
+      (await goldPlan.getAttribute("data-status")) === "active" &&
+        (await goldPlan.getByTestId("savings-plan-next-column").innerText()) ===
+          formatPlanDate(planCreated.next_execution_at),
+      "Resume brings back the next date of its calendar (it had not come yet)",
+    );
+
+    // On a phone the rows fit the screen, the actions included.
+    await page.setViewportSize({ width: 390, height: 844 });
+    await plansPanel.scrollIntoViewIfNeeded();
+    check(
+      (await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)) &&
+        (await goldPlan.getByTestId("savings-plan-pause").isVisible()) &&
+        (await goldPlan.getByTestId("savings-plan-cancel").isVisible()) &&
+        (await goldPlan.getByTestId("savings-plan-next").innerText()).startsWith("Next "),
+      "on a phone the savings plans fit the width, Pause and Cancel included, the next date under the plan",
+    );
+    await shot(page, "savings-plans-mobile");
+    await page.setViewportSize({ width: 1440, height: 1000 });
+
+    // Cancel is final: it asks once more, in place. Keep keeps it.
+    await cetesRow.getByTestId("savings-plan-cancel").click();
+    const keep = cetesRow.getByTestId("savings-plan-cancel-keep");
+    await keep.waitFor();
+    check(
+      (await cetesRow.innerText()).includes("Cancel for good?") &&
+        (await page.evaluate(() => document.activeElement?.getAttribute("data-testid"))) === "savings-plan-cancel-keep",
+      "Cancel asks once more in place, the focus on Keep",
+    );
+    await keep.click();
+    await cetesRow.getByTestId("savings-plan-cancel").click();
+    await cetesRow.getByTestId("savings-plan-cancel-confirm").click();
+    await cetesRow.waitFor({ state: "detached", timeout: 2_000 });
+    await plansNotice
+      .filter({ hasText: "Savings plan for CETES28 cancelled. What it bought stays in your vault." })
+      .waitFor();
+    const cancelledCetes = await fetch(`${API}/api/v1/market/savings-plans/${cetesPlan.receipt.plan_id}/resume`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${planDevice}` },
+    });
+    check(
+      (await planRows.count()) === 1 &&
+        cancelledCetes.status === 409 &&
+        (await cancelledCetes.json()).error.codigo === "PLAN_CANCELADO",
+      "Yes, cancel removes it at once, for good: resuming it from another device is refused (409)",
+    );
+    await goldPlan.getByTestId("savings-plan-cancel").click();
+    await goldPlan.getByTestId("savings-plan-cancel-confirm").click();
+    await goldPlan.waitFor({ state: "detached", timeout: 2_000 });
+    await plansPanel.waitFor({ state: "detached", timeout: 10_000 });
+    check(true, "with no plans left, the Savings plans section leaves the Vault once its notice is read");
+    const afterPlans = (await asClient("/api/v1/tablero")).body.boveda.saldo_disponible;
+    check(
+      toUnits(afterPlans) === toUnits(cashBeforePlan) - toUnits("499.84") - toUnits("99.44"),
+      "the two first purchases (499.84 and 99.44) are all the plans charged; cancelling moves no money",
+    );
+    // What the plans bought is the client's like any purchase: sold back at the same prices, the cash is
+    // exactly what it was (and the second pass starts, as before, with nothing in the market).
+    const goldBack = await apiOrder(planDevice, { ticker: "AUG1", side: "sell", amount: "499.84" });
+    const cetesBack = await apiOrder(planDevice, { ticker: "CETES28", side: "sell", amount: "99.44" });
+    const cashAfterSales = (await asClient("/api/v1/tablero")).body.boveda.saldo_disponible;
+    check(
+      goldBack.status === 201 &&
+        goldBack.receipt.quantity === "0.31000000" &&
+        cetesBack.status === 201 &&
+        cetesBack.receipt.quantity === "10.00000000" &&
+        toUnits(cashAfterSales) === toUnits(cashBeforePlan),
+      "the plans' 0.31 AUG1 and 10 CETES28 sell like any position: the cash is back to the cent",
+    );
 
     // ---------------------------------------------------------------------
     // Security (roadmap items 20 and 21): devices, the password, the log

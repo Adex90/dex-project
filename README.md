@@ -940,9 +940,9 @@ price when the price reaches it. The backend is
   `cancelled`, `rejected`), `held_cash` / `held_quantity`, and its
   `execution` once filled. 201 for a new order; 200 when the key repeats the
   same order (as it stands now); 409 `CLAVE_IDEMPOTENCIA_REUTILIZADA` when
-  the key was used for another order, market or pending.
-  `"order_type": "savings_plan"` is 422 `TIPO_ORDEN_NO_DISPONIBLE` until the
-  plans' scheduler exists.
+  the key was used for another order, market or pending, or a savings plan.
+  `"order_type": "savings_plan"` creates a savings plan (see "Savings plans"
+  below).
 - **`GET /api/v1/market/orders/pending`** (client): `{"orders": [...]}`, the
   client's orders still waiting, newest first.
 - **`POST /api/v1/market/orders/{id}/cancel`** (client): the cancelled order,
@@ -1058,6 +1058,136 @@ price when the price reaches it. The backend is
     from the list, the cash back through the WebSocket; the rows on a phone.
     Also a limit buy from another device shows its hold in the Account
     tab's ledger, and cancelling releases it.
+
+## Savings plans (migration `0023`)
+
+A savings plan buys the same amount of an asset every week, every two weeks
+or every month (dollar-cost averaging), with the vault's available cash. Each
+purchase is a market order like any other: the same hash-chained market
+ledger, the same IFPE movement, the same 100 % reserve and the same AML
+evaluation; only the scheduler places it. The backend is
+`backend/src/mercado/planes.rs`; the contract, `SavingsPlan` in
+`frontend/src/types/market.ts`.
+
+- **`POST /api/v1/market/order`** with
+  `{"ticker", "side": "buy", "amount", "idempotency_key", "order_type": "savings_plan", "frequency": "weekly" | "biweekly" | "monthly"}`
+  (no prices; a plan only buys) creates the plan and makes its first purchase
+  at once, in its own transaction, so the answer (201) is the plan with that
+  purchase made, or skipped and why, and its next dates. 200 when the key
+  repeats the same plan (as it stands now); 409 `CLAVE_IDEMPOTENCIA_REUTILIZADA`
+  when the key was used for anything else, and a plan's key cannot be reused
+  by an order either.
+- **Rules at creation**, those of a market buy: verified KYC, an active vault
+  (a preventive AML freeze answers the constant `OPERACION_NO_DISPONIBLE`),
+  an asset that trades and is offered (real price, or simulated with
+  `MODO_DEMO`), an amount in cents that buys at least one increment at
+  today's price (422 `MONTO_INSUFICIENTE`), and at most 20 open plans (active
+  or paused) per client (422 `LIMITE_PLANES`). Nothing is held: each purchase
+  draws on the cash of its day.
+- **The calendar is the database's** (`mercado.momento_plan`). The day of
+  creation in Mexico City is the anchor; the first purchase is immediate and
+  the next ones run at 9:00 a.m. Mexico City time, every 7 or 14 days from
+  the anchor or on the anchor's day of each month (the 31st falls on the last
+  day of shorter months and comes back the next, without drifting). The
+  backend only records what happened to a due purchase; the database then
+  sets the next one, always in the future: a purchase missed while the
+  service was down is not made up.
+- **Execution.** The trigger engine's pass (`MERCADO_DISPARO_INTERVALO_SEG`,
+  default 5 s) also runs every due purchase, oldest first
+  (`mercado::planes::ejecutar_vencidos`): with the account and the plan
+  locked, and only if the plan is still active and due, the market buy's
+  checks (KYC, an active vault, an open and offered asset, the cash for the
+  amount, one increment at the current price), then AML on
+  `COMPRA_MERCADO` before any write, then the order through the market
+  order's own writer with the key `plan:<plan>:<period>`, and the plan
+  records it (`EJECUTADA`, with that order).
+  - A rule that stops it (not enough available cash, a closed or suspended
+    market, KYC, a frozen vault, an AML block) records the purchase as
+    `OMITIDA` with the rule's code (`failure_reason`), in its own
+    transaction, and the plan carries on at its next date. Nothing is held
+    and nothing is retried until then. A frozen vault skips without counting
+    a client attempt: the scheduler is not the client.
+  - A transient error leaves the purchase due for the next pass. Concurrent
+    engines (several replicas) and a pause racing a purchase are serialized
+    by the account and plan locks: a period is bought at most once.
+- **`GET /api/v1/market/savings-plans`** (client): `{"plans": [...]}`, the
+  active and paused plans, newest first, read with the client's role (RLS).
+  Each one: its terms, `status` (`active`, `paused`, `cancelled`),
+  `anchor_date`, `next_execution_at` and the three `upcoming` dates (active
+  only), `last_execution_at`, `last_result` (`executed` or `skipped`),
+  `failure_reason`, `last_purchase` (the latest fill, an `OrderExecution`),
+  and its totals: `purchases`, `skipped`, `invested` (MXN) and `quantity`.
+- **`POST /api/v1/market/savings-plans/{id}/pause`**, **`/resume`** and
+  **`/cancel`** (client) answer the plan as it stands. Paused, it has no date;
+  resumed, its next purchase is the first date of its calendar still to come
+  (those that passed while paused are not made up); cancelled is final, and
+  what it bought stays in the vault. Repeating an action answers the same
+  plan; pausing or resuming a cancelled plan is 409 `PLAN_CANCELADO`;
+  another client's plan does not exist (404). Pausing and cancelling work on
+  a frozen account: they stop purchases and move no money.
+- **What the database guarantees** (`mercado.planes_ahorro`,
+  `mercado.eventos_plan`): a plan is born active, from the client's own MXN
+  vault, on an operable asset, buying at least one increment; its terms
+  (client, vault, asset, amount, frequency, anchor, key) never change
+  (`SC_PLAN_INMUTABLE`); its state only pauses, resumes or cancels, and
+  cancelled is final; its dates are computed, never written; a purchase is
+  recorded only when active and due (`SC_PLAN_NO_ACTIVO`,
+  `SC_PLAN_NO_VENCIDO`), `EJECUTADA` only with the order of its period whose
+  terms are the plan's, `OMITIDA` only with a code (`SC_PLAN_INCOHERENTE`);
+  an order with a plan key cannot exist without that record
+  (`SC_PLAN_SIN_EJECUCION`, at COMMIT). Every creation, pause, resume,
+  cancellation and purchase, made or skipped, leaves its immutable event,
+  written by a trigger; plans and events are never deleted. `sc_mercado`
+  writes only the terms, the state and the purchase records; `sc_cliente`
+  reads only its own (RLS).
+- **The vault:** every change and purchase raises the account's order
+  version, so the vault's `seq` moves and the WebSocket pushes: the Vault's
+  list follows each purchase as it happens. Purchases show in the ledger feed
+  and the trade confirmations like any market buy.
+- **Frontend: creating one.** The checkout's Savings plan type (buys only)
+  takes the amount per purchase and the frequency, and shows the quantity at
+  today's price, "First purchase: Now", the time of the next ones and the
+  monthly equivalent. When today's cash would not cover the first purchase,
+  the amount hint says it would be skipped, before anything is sent. Create
+  Savings Plan answers with the receipt: the first purchase (bought, skipped
+  and why, or in a moment), what it charged, the next purchase and the two
+  after it, in Mexico City time. The asset page validates the answer
+  (`parseSavingsPlan`) and refreshes the Vault's list.
+- **Frontend: Savings plans** (`frontend/src/components/markets/savings-plans-list.tsx`,
+  on the Vault after Open orders, absent when there are none): one row per
+  plan with the ticker (it opens the asset's page), "$500.00 weekly", its
+  next purchase (or Paused) and the two after it, the last purchase (bought,
+  or skipped in neutral words: the reasons a client can act on, else "the
+  purchase was not available at that time"), and what it has invested and
+  bought. The header counts active and paused plans and adds up what the
+  active ones invest in an average month. Pause and Resume are instant and
+  optimistic (`frontend/src/store/savings-plans.ts`): the row changes at
+  once, a failure brings it back and says why. Cancel asks once more in
+  place ("Cancel for good?", Keep focused) before it goes. The list reloads
+  whenever the vault moves; on a phone the details stack under the plan and
+  the rows fit the width.
+- Tests:
+  - `tests/db/0023_planes_ahorro.sql`: the calendar (weekly, biweekly, month
+    ends and leap years, 9:00 a.m. Mexico City), creation rules and refusals,
+    purchases recorded made or skipped, missed dates not made up, pause,
+    resume, cancel, immutability, privileges and RLS, in one transaction.
+  - `backend/tests/planes.rs`: the API and the scheduler (the receipt and its
+    first purchase, idempotency both ways, rules, a skipped purchase without
+    cash that keeps the plan, a later one at another price, a suspended
+    asset, transitions and a long pause, a PLD freeze without tipping off,
+    concurrent creations and passes, a pause racing a purchase); the AML
+    tipping-off and source-scan tests list the plans too.
+  - `frontend/src/lib/savings-plans.test.ts` and
+    `frontend/src/store/savings-plans.test.ts`: validation, dates in Mexico
+    City, the words (no tipping off), and the store (optimistic actions,
+    rollbacks, a plan cancelled elsewhere, a stale load).
+  - `frontend/e2e/smoke.mjs`: a weekly gold plan created in the checkout
+    (the cash warning first, then the receipt with its first purchase and
+    next date), listed on the Vault; a CETES plan from another device appears
+    live; Pause, Resume and Cancel (Keep, then Yes, cancel); the phone
+    layout. `frontend/e2e/aml.mjs`: a frozen client's plan list and screen
+    say nothing, a new plan is refused with the identical constant, pausing
+    still works.
 
 ## Pro chart and portfolio allocation (frontend)
 
@@ -1755,9 +1885,11 @@ the password is hashed, so a parallel burst cannot test more than 5 passwords.
 | GET | `/api/v1/vault/ws` | client: Sovereign Vault real-time channel (WebSocket, subprotocol `sc.vault.v1`) |
 | GET | `/api/v1/market/assets` | any session: the catalog that can be quoted and traded now (`MarketCatalog`) |
 | GET | `/api/v1/market/quote/{ticker}` | any session: the asset and its price history (`MarketQuote`) |
-| POST | `/api/v1/market/order` | client: order by amount (`OrderRequest`): market (`OrderReceipt`, filled at the current price), limit or stop (`PendingOrder`, its cash or units held until it fills) |
+| POST | `/api/v1/market/order` | client: order by amount (`OrderRequest`): market (`OrderReceipt`, filled at the current price), limit or stop (`PendingOrder`, its cash or units held until it fills), or savings plan (`SavingsPlan`, its first purchase at once) |
 | GET | `/api/v1/market/orders/pending` | client: its limit and stop orders still waiting (`PendingOrders`) |
 | POST | `/api/v1/market/orders/{id}/cancel` | client: cancels a pending order and releases what it held |
+| GET | `/api/v1/market/savings-plans` | client: its active and paused savings plans, with their next dates and totals (`SavingsPlans`) |
+| POST | `/api/v1/market/savings-plans/{id}/pause`, `/resume`, `/cancel` | client: pauses, resumes (at the next date still to come) or cancels (final) a savings plan |
 | GET | `/api/v1/wealth/linked-accounts` | client: its linked bank accounts, all in its own name (`MODO_DEMO` links a demo one) |
 | POST | `/api/v1/wealth/withdraw` | client with a step-up window: withdraws available cash to a linked account by SPEI (`WithdrawalReceipt`, processing until settled) |
 | GET | `/api/v1/wealth/documentos`, `/api/v1/wealth/documentos/{id}` | client: its statements and trade confirmations, derived from the ledgers, each with its reserve seal |

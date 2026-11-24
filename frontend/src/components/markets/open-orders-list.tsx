@@ -45,6 +45,8 @@ import type { PendingOrder } from "@/types/market";
 
 /** A confirmation stays this long; an error stays until dismissed or replaced. */
 const NOTICE_MS = 6_000;
+/** Vault moves this close together (one action's commits) reload the list once. */
+const RELOAD_MS = 150;
 
 export function OpenOrdersList({ token, className }: { token: string; className?: string }) {
   const titleId = useId();
@@ -77,8 +79,10 @@ export function OpenOrdersList({ token, className }: { token: string; className?
   );
 
   // On mount, and whenever the vault moves: placed, filled, cancelled or rejected elsewhere.
+  // A burst of moves (an order placed, then filled at once) reloads once, instead of aborting load after load.
   useEffect(() => {
-    void load();
+    const timer = setTimeout(() => void load(), RELOAD_MS);
+    return () => clearTimeout(timer);
   }, [load, vaultMoved]);
 
   // Each asset's quantity increment, so a buy's estimate rounds like its fill (Discover may have loaded it already).

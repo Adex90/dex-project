@@ -488,6 +488,22 @@ try {
   await cp.waitForURL("**/dashboard");
   await cp.getByTestId("kyc-header-badge").and(cp.locator("[data-status=VERIFICADO]")).waitFor();
   check(true, "client completes onboarding (VERIFICADO) and reaches the dashboard");
+  // A savings plan (migration 0023) before any cash: its first purchase is skipped and the plan carries on.
+  // Once the account is under review, neither the plan nor the Vault's Savings plans say anything about it.
+  const plan = await pageFetch(cp, "POST", "/api/v1/market/order", {
+    ticker: "AUG1",
+    side: "buy",
+    amount: "500.00",
+    idempotency_key: crypto.randomUUID(),
+    order_type: "savings_plan",
+    frequency: "monthly",
+  });
+  state.plan = plan.body;
+  check(
+    plan.status === 201 && plan.body?.status === "active" && plan.body?.failure_reason === "SALDO_INSUFICIENTE",
+    `a savings plan created before any deposit answered ${plan.status}: active, its first purchase skipped (${plan.body?.failure_reason})`,
+    plan.body,
+  );
   // Client B: verified through the API; the internal-transfer recipient here and the subject of scenario B.
   state.b = await apiOnboard(cp, runId + 1, `e2e-b-${runId}@example.mx`);
   check(true, `client B ${state.b.nombre} verified through the API (CLABE ${state.b.clabe})`);
@@ -548,6 +564,29 @@ try {
   const hits = [...vaultText.matchAll(TIP_OFF)].map((m) => m[0]);
   check(hits.length === 0, `dashboard text has no tipping-off words (${hits.join(", ") || "none"})`, hits);
   await shot(cp, "client-dashboard-frozen");
+  // The Vault's Savings plans (migration 0023): the plan, active, its skipped purchase in neutral words.
+  await openTab(cp, "Vault");
+  const planRow = cp.getByTestId("savings-plan").and(cp.locator(`[data-plan-id="${state.plan?.plan_id}"]`));
+  await planRow.waitFor({ timeout: 10_000 }).catch(() => undefined);
+  const plans = await pageFetch(cp, "GET", "/api/v1/market/savings-plans");
+  check(
+    plans.status === 200 &&
+      !/aml|pld|congel|alerta|cumplimiento|nivel_riesgo|es_pep|retenido|sospech|uif|preventiv|riesgo/i.test(
+        JSON.stringify(plans.body),
+      ),
+    "the client's savings plans from the API carry no AML wording",
+    plans.body,
+  );
+  check(
+    (await planRow.count()) === 1 &&
+      (await planRow.getAttribute("data-status")) === "active" &&
+      (await planRow.getByTestId("savings-plan-last").innerText()).includes("not enough available cash"),
+    "the Vault lists the plan, active, its skipped purchase in neutral words",
+    (await planRow.count()) === 1 ? await planRow.innerText() : "no row",
+  );
+  const vaultHits = await tipOffWords(cp);
+  check(vaultHits.length === 0, `the Vault, its savings plans included, has no tipping-off words (${vaultHits.join(", ") || "none"})`, vaultHits);
+  await shot(cp, "client-vault-plans-frozen");
   // The Reserve tab on a fresh snapshot (a new client's first proof cuts again,
   // over every account): the held funds are in the leaf, with the neutral copy,
   // and the proof still verifies.
@@ -718,6 +757,15 @@ try {
     }),
     retiro: await pageFetch(cp, "POST", "/api/v1/ifpe/retiros", { clabe_destino: externalClabe, monto: "100.00", clave_idempotencia: crypto.randomUUID() }),
     inversion: { status: invR.status(), body: invBody },
+    // A new savings plan (migration 0023): refused like everything else, before any purchase.
+    plan: await pageFetch(cp, "POST", "/api/v1/market/order", {
+      ticker: "AUG1",
+      side: "buy",
+      amount: "100.00",
+      idempotency_key: crypto.randomUUID(),
+      order_type: "savings_plan",
+      frequency: "weekly",
+    }),
   };
   state.refusals = attempts;
   for (const [k, v] of Object.entries(attempts)) {
@@ -725,6 +773,13 @@ try {
   }
   const shapes = new Set(Object.values(attempts).map((v) => JSON.stringify([v.status, v.body])));
   check(shapes.size === 1, "every refused operation gets the identical status and body", [...shapes]);
+  // Stopping purchases moves no money: pausing the existing plan works as for anyone.
+  const paused = await pageFetch(cp, "POST", `/api/v1/market/savings-plans/${state.plan?.plan_id}/pause`);
+  check(
+    paused.status === 200 && paused.body?.status === "paused",
+    `the client under review can still pause a savings plan (${paused.status} ${paused.body?.status})`,
+    paused.body,
+  );
 
   // =========================================================================
   phase("5-officer1-console");
