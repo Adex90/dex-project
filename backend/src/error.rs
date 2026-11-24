@@ -40,6 +40,19 @@ pub enum AppError {
     /// Token parcial (desafío MFA o de inscripción) vencido, revocado o ajeno.
     #[error("el inicio de sesión venció; vuelve a iniciar sesión")]
     DesafioVencido,
+    /// Acción sensible (sacar dinero de la cuenta, cambiar los beneficiarios)
+    /// sin una verificación reforzada reciente en esta sesión (0022): antes,
+    /// `POST /auth/step-up`.
+    #[error("esta operación pide verificar de nuevo tu identidad: el código de tu app autenticadora o tu contraseña")]
+    StepUpRequerido,
+    /// Credencial rechazada en una verificación que cuenta en el cupo de
+    /// intentos del inicio de sesión; dice cuántos quedan antes del bloqueo.
+    #[error("{mensaje}")]
+    CredencialRechazada { codigo: &'static str, mensaje: String, intentos_restantes: i32 },
+    /// El intento que agotó el cupo desde una sesión abierta: la cuenta quedó
+    /// bloqueada y esa sesión se cerró (verificación reforzada, 0022).
+    #[error("demasiados intentos fallidos: la cuenta quedó bloqueada {minutos} minutos y esta sesión se cerró")]
+    SesionBloqueada { minutos: i64 },
     #[error("{0}")]
     NoEncontrado(String),
     #[error("{0}")]
@@ -109,10 +122,13 @@ impl AppError {
             Self::MfaRequerido => "MFA_REQUERIDO",
             Self::CodigoMfaInvalido => "CODIGO_MFA_INVALIDO",
             Self::DesafioVencido => "DESAFIO_MFA_VENCIDO",
+            Self::StepUpRequerido => "STEP_UP_REQUERIDO",
+            Self::CredencialRechazada { codigo, .. } => codigo,
             Self::NoEncontrado(_) => "NO_ENCONTRADO",
             Self::Validacion(_) => "VALIDACION",
             Self::Negocio { codigo, .. } | Self::Conflicto { codigo, .. } => codigo,
             Self::Bloqueado(_) => "BLOQUEADO",
+            Self::SesionBloqueada { .. } => "SESION_BLOQUEADA",
             Self::OperacionNoDisponible => "OPERACION_NO_DISPONIBLE",
             Self::Peticion { codigo, .. } => codigo,
             Self::Reintentable => "REINTENTAR",
@@ -126,12 +142,14 @@ impl AppError {
             Self::NoAutenticado | Self::CredencialesInvalidas(_) | Self::CodigoMfaInvalido | Self::DesafioVencido => {
                 StatusCode::UNAUTHORIZED
             }
-            Self::Prohibido | Self::MfaRequerido => StatusCode::FORBIDDEN,
+            Self::Prohibido | Self::MfaRequerido | Self::StepUpRequerido => StatusCode::FORBIDDEN,
             Self::NoEncontrado(_) => StatusCode::NOT_FOUND,
             Self::Validacion(_) => StatusCode::BAD_REQUEST,
-            Self::Negocio { .. } | Self::OperacionNoDisponible => StatusCode::UNPROCESSABLE_ENTITY,
+            Self::Negocio { .. } | Self::CredencialRechazada { .. } | Self::OperacionNoDisponible => {
+                StatusCode::UNPROCESSABLE_ENTITY
+            }
             Self::Conflicto { .. } => StatusCode::CONFLICT,
-            Self::Bloqueado(_) => StatusCode::LOCKED,
+            Self::Bloqueado(_) | Self::SesionBloqueada { .. } => StatusCode::LOCKED,
             Self::Peticion { status, .. } => *status,
             Self::Reintentable => StatusCode::SERVICE_UNAVAILABLE,
             Self::Integridad(_) | Self::Interno(_) => StatusCode::INTERNAL_SERVER_ERROR,
@@ -195,6 +213,8 @@ fn es_invariante(codigo: &str) -> bool {
             | "MFA_SIN_SECRETO"
             | "MFA_SOLO_DUENO"
             | "DESIGNACION_INVALIDA"
+            | "STEP_UP_INVALIDO"
+            | "STEP_UP_SESION_NO_VIGENTE"
     ) || codigo.ends_with("_INMUTABLE")
 }
 
@@ -236,6 +256,8 @@ fn traducir_error_bd(codigo_sql: &str, mensaje: &str, restriccion: &str) -> Opti
         }
         match codigo {
             "AML_NO_AUTORIZADO" => return Some(AppError::Prohibido),
+            // La designación de beneficiarios exige la ventana de su sesión (0022).
+            "STEP_UP_REQUERIDO" => return Some(AppError::StepUpRequerido),
             "AML_NO_ENCONTRADO" => return Some(AppError::no_encontrado(detalle)),
             // Otra petición (o el motor de disparo) cerró la orden primero.
             "ORDEN_NO_PENDIENTE" => return Some(AppError::conflicto("ORDEN_NO_PENDIENTE", detalle)),
@@ -385,7 +407,10 @@ impl IntoResponse for AppError {
             }
             otro => otro.to_string(),
         };
-        let cuerpo = json!({ "error": { "codigo": self.codigo(), "mensaje": mensaje } });
+        let mut cuerpo = json!({ "error": { "codigo": self.codigo(), "mensaje": mensaje } });
+        if let AppError::CredencialRechazada { intentos_restantes, .. } = &self {
+            cuerpo["error"]["intentos_restantes"] = json!(intentos_restantes);
+        }
         (status, Json(cuerpo)).into_response()
     }
 }
@@ -495,5 +520,35 @@ mod pruebas {
         assert_eq!((e.status(), e.codigo()), (StatusCode::UNPROCESSABLE_ENTITY, "RETENCION_PROTEGIDA"));
         let e = traducir_error_bd("23514", "SC_CUENTA_CONGELADA: la cuenta IFPE está congelada", "").unwrap();
         assert_eq!(e.codigo(), "CUENTA_CONGELADA");
+    }
+
+    #[test]
+    fn verificacion_reforzada() {
+        // La guardia de la designación (0022): el mismo 403 que el backend.
+        let e =
+            traducir_error_bd("42501", "SC_STEP_UP_REQUERIDO: cambiar los beneficiarios pide verificar", "").unwrap();
+        assert_eq!((e.status(), e.codigo()), (StatusCode::FORBIDDEN, "STEP_UP_REQUERIDO"));
+        assert_eq!(e.to_string(), AppError::StepUpRequerido.to_string(), "mensaje constante, sin el del trigger");
+        // Una ventana fuera de la regla solo la escribe alguien por fuera de la aplicación.
+        for mensaje in ["SC_STEP_UP_INVALIDO: nace sin ventana", "SC_STEP_UP_SESION_NO_VIGENTE: revocada"] {
+            assert_eq!(traducir_error_bd("23514", mensaje, "").unwrap().codigo(), "INTEGRIDAD", "{mensaje}");
+        }
+    }
+
+    #[tokio::test]
+    async fn una_credencial_rechazada_dice_cuantos_intentos_quedan() {
+        let e = AppError::CredencialRechazada {
+            codigo: "CODIGO_MFA_INVALIDO",
+            mensaje: "el código no es válido".into(),
+            intentos_restantes: 3,
+        };
+        let r = e.into_response();
+        assert_eq!(r.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let cuerpo = axum::body::to_bytes(r.into_body(), 1024).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&cuerpo).unwrap();
+        assert_eq!(
+            v,
+            json!({ "error": { "codigo": "CODIGO_MFA_INVALIDO", "mensaje": "el código no es válido", "intentos_restantes": 3 } })
+        );
     }
 }

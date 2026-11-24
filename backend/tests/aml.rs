@@ -143,9 +143,12 @@ async fn token_oficial(api: &Api, pool: &PgPool, nombre: &str) -> (Uuid, String)
     (id, api.token(&email, PASSWORD_INTERNO).await)
 }
 
-/// Token de un cliente creado con `comun::cliente`.
+/// Token de un cliente creado con `comun::cliente`, con la sesión ya
+/// verificada de nuevo (0022): estas pruebas mueven dinero.
 async fn token_cliente(api: &Api, nombre: &str) -> String {
-    api.token(&format!("{}@example.mx", nombre.to_lowercase()), "contraseña-de-prueba-123").await
+    let token = api.token(&format!("{}@example.mx", nombre.to_lowercase()), PASSWORD_CLIENTE).await;
+    verificar_de_nuevo(&api.app, &token).await;
+    token
 }
 
 /// Id de la alerta del cliente con la regla indicada.
@@ -189,6 +192,7 @@ async fn usuario_oficial(pool: &PgPool, nombre: &str) -> Usuario {
         rol: RolUsuario::Cumplimiento,
         mfa: true,
         sesion_id: Uuid::new_v4(),
+        step_up_hasta: None,
     }
 }
 
@@ -1978,6 +1982,35 @@ async fn sin_aviso_al_cliente(pool: PgPool) {
     assert_eq!(bloqueo_ana, bloqueo_beto, "los bloqueos son idénticos byte a byte");
     assert_eq!(String::from_utf8(bloqueo_ana).unwrap(), NO_DISPONIBLE);
 
+    // La verificación reforzada (0022) va antes que PLD y es la de siempre:
+    // sin ventana, la cuenta congelada y una que no lo está oyen lo mismo; y
+    // la congelada verifica de nuevo como cualquiera.
+    let carla = cliente(&pool, &cfg, "Carla").await;
+    let carla_sin_ventana = api.token("carla@example.mx", PASSWORD_CLIENTE).await;
+    let ana_sin_ventana = api.token("ana@example.mx", PASSWORD_CLIENTE).await;
+    let mut sin_ventana = Vec::new();
+    for token in [&ana_sin_ventana, &carla_sin_ventana] {
+        let cuerpo =
+            json!({ "clabe_destino": beto.cuenta_ifpe.clabe, "monto": "5000", "clave_idempotencia": clave_api() });
+        let (s, r) = api.llamar_crudo("POST", "/api/v1/ifpe/transferencias", Some(token), Some(cuerpo)).await;
+        assert_eq!(s, StatusCode::FORBIDDEN);
+        sin_ventana.push(r);
+    }
+    assert_eq!(sin_ventana[0], sin_ventana[1], "la respuesta sin ventana no depende del congelamiento");
+    assert!(String::from_utf8_lossy(&sin_ventana[0]).contains("STEP_UP_REQUERIDO"));
+    let (s, v) = api
+        .llamar_crudo(
+            "POST",
+            "/api/v1/auth/step-up",
+            Some(&ana_sin_ventana),
+            Some(json!({ "password": PASSWORD_CLIENTE })),
+        )
+        .await;
+    assert_eq!(s, StatusCode::OK, "{}", String::from_utf8_lossy(&v));
+    let texto = String::from_utf8(v).unwrap().to_lowercase();
+    assert!(!["aml", "pld", "congel", "retenido"].iter().any(|p| texto.contains(p)), "{texto}");
+    assert!(congelamiento_activo(&pool, carla.cliente.id).await.is_none());
+
     // Ninguna lectura del cliente delata la situación.
     let prohibidas = [
         "aml",
@@ -2010,6 +2043,8 @@ async fn sin_aviso_al_cliente(pool: PgPool) {
         // Centro fiscal (0021): el resumen, el W-8BEN y la exportación contable.
         "/api/v1/wealth/impuestos",
         "/api/v1/wealth/impuestos/export.csv",
+        // Verificación reforzada (0022).
+        "/api/v1/auth/step-up",
     ] {
         let (s, cuerpo) = api.llamar_crudo("GET", ruta, Some(&tok_ana), None).await;
         assert_eq!(s, StatusCode::OK, "{ruta}");
@@ -3299,7 +3334,8 @@ async fn oficial_sujeto_no_ve_su_expediente(pool: PgPool) {
     )
     .await
     .unwrap();
-    let tok_dario = token_cliente(&api, "Dario").await;
+    // Ya es personal (segundo factor obligatorio): su sesión no mueve dinero.
+    let tok_dario = api.token("dario@example.mx", PASSWORD_CLIENTE).await;
     let (_, c1) = token_oficial(&api, &pool, "Uno").await;
     let (s, v) = api
         .post(

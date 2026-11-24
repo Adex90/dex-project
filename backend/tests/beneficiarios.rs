@@ -98,7 +98,7 @@ fn hijo(porcentaje: &str) -> Value {
 async fn designar_por_versiones_con_su_cadena(pool: PgPool) {
     let b = banco(&pool).await;
     let ana = cliente(&pool, &b.estado.config, "Ana").await;
-    let token = token_de(&b.estado, ana.cliente.id, RolUsuario::Cliente, false).await;
+    let token = token_verificado(&b.estado, &b.app, ana.cliente.id).await;
 
     let v = b.leer(&token).await;
     assert_eq!(
@@ -187,7 +187,7 @@ async fn designar_por_versiones_con_su_cadena(pool: PgPool) {
 async fn las_reglas_de_una_designacion(pool: PgPool) {
     let b = banco(&pool).await;
     let ana = cliente(&pool, &b.estado.config, "Ana").await;
-    let token = token_de(&b.estado, ana.cliente.id, RolUsuario::Cliente, false).await;
+    let token = token_verificado(&b.estado, &b.app, ana.cliente.id).await;
     let propia = ana.cliente.curp.clone().expect("Ana tiene CURP");
 
     let casos: Vec<(&str, Value, StatusCode, &str)> = vec![
@@ -286,9 +286,9 @@ async fn solo_un_cliente_verificado_designa_y_cada_quien_ve_lo_suyo(pool: PgPool
     let ana = cliente(&pool, &b.estado.config, "Ana").await;
     let beto = cliente_sin_kyc(&pool, &b.estado.config, "Beto").await;
     let carla = cliente(&pool, &b.estado.config, "Carla").await;
-    let t_ana = token_de(&b.estado, ana.cliente.id, RolUsuario::Cliente, false).await;
-    let t_beto = token_de(&b.estado, beto.cliente.id, RolUsuario::Cliente, false).await;
-    let t_carla = token_de(&b.estado, carla.cliente.id, RolUsuario::Cliente, false).await;
+    let t_ana = token_verificado(&b.estado, &b.app, ana.cliente.id).await;
+    let t_beto = token_verificado(&b.estado, &b.app, beto.cliente.id).await;
+    let t_carla = token_verificado(&b.estado, &b.app, carla.cliente.id).await;
 
     assert_eq!(b.leer(&t_beto).await["puede_designar"], false);
     let (s, v) = b.guardar(&t_beto, 0, json!([hijo("100")])).await;
@@ -307,14 +307,13 @@ async fn solo_un_cliente_verificado_designa_y_cada_quien_ve_lo_suyo(pool: PgPool
     assert_eq!(s, StatusCode::FORBIDDEN);
 }
 
-#[sqlx::test(migrations = "../migrations")]
-async fn la_base_de_datos_repite_la_suma_aunque_el_backend_fallara(pool: PgPool) {
-    let cfg = preparar(&pool).await;
-    let ana = cliente(&pool, &cfg, "Ana").await;
-    // Como si el backend no validara: 60% + 30%, declarado como 100%.
-    let mut tx = db::begin(&pool, Rol::Kyc).await.unwrap();
+/// Una versión escrita por sc_kyc como la escribe el backend, sin pasar por
+/// sus validaciones: `porcentajes` de sus beneficiarios, declarada al 100% y
+/// desde la sesión `sesion`. El error de la sentencia o el del COMMIT.
+async fn designar_por_fuera(pool: &PgPool, cliente: Uuid, sesion: Uuid, porcentajes: &[&str]) -> Result<(), AppError> {
+    let mut tx = db::begin(pool, Rol::Kyc).await.unwrap();
     let id = Uuid::new_v4();
-    for (posicion, porcentaje) in [(1i16, "60"), (2, "30")] {
+    for (posicion, &porcentaje) in (1i16..).zip(porcentajes) {
         sqlx::query(
             "INSERT INTO kyc.beneficiarios (designacion_id, posicion, nombre_completo, parentesco, fecha_nacimiento, porcentaje) \
              VALUES ($1, $2, 'JOSÉ LÓPEZ', 'HIJO', '2005-06-07', $3::numeric)",
@@ -327,26 +326,63 @@ async fn la_base_de_datos_repite_la_suma_aunque_el_backend_fallara(pool: PgPool)
         .unwrap();
     }
     sqlx::query(
-        "INSERT INTO kyc.designaciones_beneficiarios (id, cliente_id, num_beneficiarios, total_porcentaje) \
-         VALUES ($1, $2, 2, 100)",
+        "INSERT INTO kyc.designaciones_beneficiarios (id, cliente_id, num_beneficiarios, total_porcentaje, sesion_id) \
+         VALUES ($1, $2, $3, 100, $4)",
     )
     .bind(id)
-    .bind(ana.cliente.id)
+    .bind(cliente)
+    .bind(porcentajes.len() as i16)
+    .bind(sesion)
     .execute(&mut *tx)
-    .await
-    .unwrap();
-    let e = AppError::from(tx.commit().await.unwrap_err());
+    .await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+#[sqlx::test(migrations = "../migrations")]
+async fn la_base_de_datos_repite_la_suma_aunque_el_backend_fallara(pool: PgPool) {
+    let b = banco(&pool).await;
+    let ana = cliente(&pool, &b.estado.config, "Ana").await;
+    let token = token_verificado(&b.estado, &b.app, ana.cliente.id).await;
+    let sesion = b.estado.jwt.validar(&token).unwrap().sid.unwrap();
+    // Como si el backend no validara: 60% + 30%, declarado como 100%.
+    let e = designar_por_fuera(&pool, ana.cliente.id, sesion, &["60", "30"]).await.unwrap_err();
     assert_eq!((e.codigo(), e.status()), ("BENEFICIARIOS_PORCENTAJE", StatusCode::UNPROCESSABLE_ENTITY), "{e:?}");
     let n: i64 =
         sqlx::query_scalar("SELECT count(*) FROM kyc.designaciones_beneficiarios").fetch_one(&pool).await.unwrap();
     assert_eq!(n, 0, "nada quedó");
 }
 
+/// La base de datos exige la verificación reforzada (0022) aunque el backend
+/// no la pidiera: una versión válida desde una sesión sin ventana, o desde la
+/// ventana de otro cliente, no se guarda; con la suya, sí.
+#[sqlx::test(migrations = "../migrations")]
+async fn la_base_de_datos_repite_la_verificacion_reforzada(pool: PgPool) {
+    let b = banco(&pool).await;
+    let ana = cliente(&pool, &b.estado.config, "Ana").await;
+    let beto = cliente(&pool, &b.estado.config, "Beto").await;
+    let sin_ventana = token_de(&b.estado, ana.cliente.id, RolUsuario::Cliente, false).await;
+    let de_beto = token_verificado(&b.estado, &b.app, beto.cliente.id).await;
+    let sid = |token: &str| b.estado.jwt.validar(token).unwrap().sid.unwrap();
+
+    for (sesion, caso) in [(sid(&sin_ventana), "sin ventana"), (sid(&de_beto), "la ventana de Beto")] {
+        let e = designar_por_fuera(&pool, ana.cliente.id, sesion, &["100"]).await.unwrap_err();
+        assert_eq!((e.codigo(), e.status()), ("STEP_UP_REQUERIDO", StatusCode::FORBIDDEN), "{caso}: {e:?}");
+    }
+    let n: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM kyc.designaciones_beneficiarios").fetch_one(&pool).await.unwrap();
+    assert_eq!(n, 0, "nada quedó");
+
+    verificar_de_nuevo(&b.app, &sin_ventana).await;
+    designar_por_fuera(&pool, ana.cliente.id, sid(&sin_ventana), &["100"]).await.unwrap();
+    assert_eq!(b.leer(&sin_ventana).await["version"], 1);
+}
+
 #[sqlx::test(migrations = "../migrations")]
 async fn una_alteracion_por_fuera_rompe_la_cadena(pool: PgPool) {
     let b = banco(&pool).await;
     let ana = cliente(&pool, &b.estado.config, "Ana").await;
-    let token = token_de(&b.estado, ana.cliente.id, RolUsuario::Cliente, false).await;
+    let token = token_verificado(&b.estado, &b.app, ana.cliente.id).await;
     let (s, _) = b.guardar(&token, 0, json!([hija(), hijo("40")])).await;
     assert_eq!(s, StatusCode::CREATED);
     assert_eq!(b.leer(&token).await["cadena_verificada"], true);

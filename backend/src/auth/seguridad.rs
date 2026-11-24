@@ -23,7 +23,7 @@ use serde::Serialize;
 use sqlx::PgPool;
 
 use super::{
-    mfa, password, registrar_fallo,
+    mfa, password, rechazar_en_sesion,
     sesiones::{self, Evento, Origen, OPCIONES_INACTIVIDAD},
     Usuario, MAX_INTENTOS, MINUTOS_BLOQUEO, SQL_RESERVAR_INTENTO,
 };
@@ -165,23 +165,7 @@ pub async fn cambiar_password(
 /// Un intento rechazado (ya contado): a la bitácora. Si agotó el cupo, la
 /// cuenta queda bloqueada y la sesión que lo intentó se cierra.
 async fn rechazar(estado: &AppState, u: &Usuario, origen: &Origen, agota: bool) -> AppResult<()> {
-    registrar_fallo(&estado.pool, u.cliente_id, "CAMBIO_CONTRASENA_RECHAZADO", agota, origen, Some(u.sesion_id))
-        .await?;
-    if agota {
-        let mut tx = db::begin(&estado.pool, Rol::Auth).await?;
-        sqlx::query(
-            "UPDATE kyc.sesiones SET revocada_en = now(), motivo_revocacion = 'BLOQUEO' \
-             WHERE id = $1 AND cliente_id = $2 AND revocada_en IS NULL",
-        )
-        .bind(u.sesion_id)
-        .bind(u.cliente_id)
-        .execute(&mut *tx)
-        .await?;
-        tx.commit().await?;
-        tracing::warn!(target: "auth", cliente_id = %u.cliente_id, sid = %u.sesion_id,
-            "la sesión agotó los intentos de cambio de contraseña: cerrada");
-    }
-    Ok(())
+    rechazar_en_sesion(&estado.pool, u, "CAMBIO_CONTRASENA_RECHAZADO", agota, origen).await
 }
 
 fn codigo_requerido() -> AppError {

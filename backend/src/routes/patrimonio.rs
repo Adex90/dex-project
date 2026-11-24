@@ -135,6 +135,8 @@ async fn retirar(
     Json(s): Json<SolicitudRetiroHttp>,
 ) -> AppResult<(StatusCode, Json<ReciboRetiro>)> {
     u.exigir_cliente()?;
+    // El dinero sale de la cuenta: verificación reforzada (0022).
+    u.exigir_step_up()?;
     let solicitud = SolicitudRetiro {
         cliente_id: u.cliente_id,
         cuenta_vinculada_id: s.linked_account_id,

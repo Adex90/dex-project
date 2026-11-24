@@ -574,6 +574,8 @@ async fn un_retiro_a_una_cuenta_vinculada_avisa_con_la_version_siguiente(pool: P
 
     let (s, cuentas) = llamar_json(&app, "GET", "/api/v1/wealth/linked-accounts", Some(&token), None).await;
     assert_eq!(s, StatusCode::OK, "{cuentas}");
+    // Verificar de nuevo (0022) tampoco mueve saldo ni avisa.
+    verificar_de_nuevo(&app, &token).await;
     nada_mas(&mut ws, Duration::from_millis(300)).await;
     let cuerpo = json!({ "linked_account_id": cuentas["accounts"][0]["id"], "amount": "250.00",
                          "idempotency_key": "prueba-retiro-ws" });

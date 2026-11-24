@@ -176,6 +176,17 @@ async fn flujo_completo_cliente(pool: PgPool) {
     assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY);
     assert_eq!(e["error"]["codigo"], "MUTUO_NO_VENCIDO");
 
+    // Retirar pide verificar de nuevo la identidad (0022): sin la ventana, 403
+    // antes de mirar el saldo; con la contraseña, la ventana abierta.
+    let retiro =
+        json!({ "monto": "7500.01", "clabe_destino": "646180157000000017", "clave_idempotencia": "retiro-0001" });
+    let (s, e) = api.llamar("POST", "/api/v1/ifpe/retiros", Some(&token), Some(retiro)).await;
+    assert_eq!((s, &e["error"]["codigo"]), (StatusCode::FORBIDDEN, &json!("STEP_UP_REQUERIDO")), "{e}");
+    let (s, v) = api
+        .llamar("POST", "/api/v1/auth/step-up", Some(&token), Some(json!({ "password": "contraseña-segura-123" })))
+        .await;
+    assert_eq!((s, &v["metodo"], &v["segundos"]), (StatusCode::OK, &json!("CONTRASENA"), &json!(300)), "{v}");
+
     // Saldo insuficiente con código estable.
     let (s, e) = api
         .llamar(

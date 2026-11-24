@@ -59,6 +59,9 @@ pub async fn preparar(pool: &PgPool) -> Config {
     cfg
 }
 
+/// La contraseña de los clientes de prueba ([`cliente`], [`cliente_sin_kyc`]).
+pub const PASSWORD_CLIENTE: &str = "contraseña-de-prueba-123";
+
 /// Cliente persona física con cuenta IFPE y KYC VERIFICADO por el camino
 /// real: datos personales, INE y selfie evaluados por el proveedor simulado.
 pub async fn cliente(pool: &PgPool, cfg: &Config, nombre: &str) -> Registro {
@@ -81,7 +84,7 @@ pub async fn cliente_sin_kyc(pool: &PgPool, cfg: &Config, nombre: &str) -> Regis
             apellido_paterno: Some("Prueba".into()),
             apellido_materno: None,
             email: format!("{}@example.mx", nombre.to_lowercase()),
-            password: "contraseña-de-prueba-123".into(),
+            password: PASSWORD_CLIENTE.into(),
             curp: None,
             rfc: None,
             telefono: None,
@@ -928,4 +931,27 @@ pub async fn token_de(
 ) -> String {
     use synthetic_capital::auth::sesiones::{self, Origen};
     sesiones::abrir(estado, cliente_id, rol, mfa, &Origen::desconocido()).await.unwrap().token
+}
+
+/// Verificación reforzada por la API (0022) con la contraseña del cliente de
+/// prueba (sin segundo factor): abre la ventana de la sesión del token para
+/// las acciones sensibles (retiros, transferencias, beneficiarios).
+pub async fn verificar_de_nuevo(app: &axum::Router, token: &str) {
+    let (s, v) = llamar_json(
+        app,
+        "POST",
+        "/api/v1/auth/step-up",
+        Some(token),
+        Some(serde_json::json!({ "password": PASSWORD_CLIENTE })),
+    )
+    .await;
+    assert_eq!(s, axum::http::StatusCode::OK, "verificación reforzada: {v}");
+}
+
+/// [`token_de`] de un cliente sin segundo factor, con la sesión ya verificada
+/// de nuevo por la API ([`verificar_de_nuevo`]).
+pub async fn token_verificado(estado: &synthetic_capital::AppState, app: &axum::Router, cliente_id: Uuid) -> String {
+    let token = token_de(estado, cliente_id, RolUsuario::Cliente, false).await;
+    verificar_de_nuevo(app, &token).await;
+    token
 }

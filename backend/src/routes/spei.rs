@@ -251,6 +251,8 @@ async fn transferir(
             "los pagos SPEI a terceros no están disponibles; tu dinero sale solo a una cuenta vinculada a tu nombre",
         ));
     }
+    // El dinero sale de la cuenta: verificación reforzada (0022).
+    u.exigir_step_up()?;
     let solicitud = SolicitudSpei {
         cliente_id: u.cliente_id,
         clabe_destino: s.clabe_destino,

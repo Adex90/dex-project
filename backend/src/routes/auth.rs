@@ -13,6 +13,7 @@ use crate::{
         self, mfa, restablecimiento,
         seguridad::{self, EventoVista, Preferencias},
         sesiones::{self, ListaSesiones, Origen},
+        step_up::{self, EstadoStepUp, VentanaStepUp},
         IdentidadMfa, ResultadoLogin, Sesion, Usuario,
     },
     error::AppResult,
@@ -41,8 +42,10 @@ pub fn rutas(limites: &Limitadores) -> Router<AppState> {
         .route("/auth/mfa/enable", post(activar_mfa))
         .route("/auth/password/forgot", post(olvido_password))
         .route("/auth/password/reset", post(restablecer_password))
-        .route("/auth/password/change", post(cambiar_password));
-    // Centro de seguridad (sesiones por dispositivo y preferencias, 0019): el límite general.
+        .route("/auth/password/change", post(cambiar_password))
+        .route("/auth/step-up", post(verificar_step_up));
+    // Centro de seguridad (sesiones por dispositivo y preferencias, 0019) y el
+    // estado de la verificación reforzada (0022): el límite general.
     Router::new()
         .merge(limites::aplicar(acceso, &limites.auth))
         .route("/yo", get(yo))
@@ -53,6 +56,7 @@ pub fn rutas(limites: &Limitadores) -> Router<AppState> {
         .route("/auth/sessions/{id}/revoke", post(revocar_sesion))
         .route("/auth/security/events", get(eventos))
         .route("/auth/security/preferences", get(preferencias).post(guardar_preferencias))
+        .route("/auth/step-up", get(estado_step_up))
 }
 
 /// Las proyecciones del propio cliente usan [`ClienteVista`]: sin nivel de
@@ -193,6 +197,32 @@ async fn cambiar_password(
     let n = seguridad::cambiar_password(&e, &u, &c.password_actual, &c.password_nueva, c.codigo.as_deref(), &origen)
         .await?;
     Ok(Json(json!({ "estado": "OK", "sesiones_revocadas": n })))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct VerificacionReforzada {
+    /// El código de la app autenticadora (con el segundo factor activo).
+    codigo: Option<String>,
+    /// La contraseña de la cuenta (sin segundo factor).
+    password: Option<String>,
+}
+
+/// Verificación reforzada (0022): comprueba de nuevo una credencial y abre en
+/// la sesión una ventana de 5 minutos para las acciones sensibles. Los
+/// intentos cuentan en el bloqueo del inicio de sesión.
+async fn verificar_step_up(
+    State(e): State<AppState>,
+    u: Usuario,
+    origen: Origen,
+    Json(v): Json<VerificacionReforzada>,
+) -> AppResult<Json<VentanaStepUp>> {
+    Ok(Json(step_up::verificar(&e, &u, v.codigo.as_deref(), v.password.as_deref(), &origen).await?))
+}
+
+/// Con qué se verifica esta sesión y si ya tiene una ventana abierta.
+async fn estado_step_up(State(e): State<AppState>, u: Usuario) -> AppResult<Json<EstadoStepUp>> {
+    Ok(Json(step_up::estado(&e.pool, &u).await?))
 }
 
 /// Cierra la sesión del token; las demás siguen abiertas.

@@ -11,6 +11,8 @@
 //! | POST | `/api/v1/auth/mfa/enable` | token de inscripción o sesión: primer código; activa el segundo factor |
 //! | POST | `/api/v1/auth/password/forgot` | público: enlace de restablecimiento (siempre 202) |
 //! | POST | `/api/v1/auth/password/reset` | público: token del enlace + contraseña nueva; revoca las sesiones |
+//! | GET  | `/api/v1/auth/step-up` | cualquier sesión: con qué se verifica (código TOTP o contraseña) y si tiene una ventana abierta |
+//! | POST | `/api/v1/auth/step-up` | cualquier sesión: verificación reforzada (0022), abre una ventana de 5 minutos; cuenta en el bloqueo del inicio de sesión |
 //! | GET  | `/api/v1/yo` | cualquier rol (sin nivel de riesgo PLD) |
 //! | GET  | `/api/v1/kyc/expediente` | cliente: estado del onboarding |
 //! | POST | `/api/v1/kyc/perfil` | cliente: datos personales (paso 1) |
@@ -19,8 +21,8 @@
 //! | GET  | `/api/v1/tablero` | cliente |
 //! | GET  | `/api/v1/ifpe/cuenta` | cliente |
 //! | GET  | `/api/v1/ifpe/movimientos` | cliente |
-//! | POST | `/api/v1/ifpe/transferencias` | cliente |
-//! | POST | `/api/v1/ifpe/retiros` | cliente: retiro a cuenta propia, solo a una CLABE vinculada |
+//! | POST | `/api/v1/ifpe/transferencias` | cliente con verificación reforzada |
+//! | POST | `/api/v1/ifpe/retiros` | cliente con verificación reforzada: retiro a cuenta propia, solo a una CLABE vinculada |
 //! | POST | `/api/v1/ifpe/depositos/simulados` | cliente (solo `MODO_DEMO`) |
 //! | GET  | `/api/v1/sofom/tasas` | público |
 //! | GET  | `/api/v1/sofom/posicion` | cliente |
@@ -40,7 +42,7 @@
 //! | GET  | `/api/v1/market/orders/pending` | cliente: sus órdenes límite y stop que esperan |
 //! | POST | `/api/v1/market/orders/{id}/cancel` | cliente: cancela una orden pendiente y devuelve lo comprometido |
 //! | GET  | `/api/v1/wealth/linked-accounts` | cliente: sus cuentas vinculadas, a dónde puede retirar (con `MODO_DEMO`, vincula la de demostración) |
-//! | POST | `/api/v1/wealth/withdraw` | cliente: retira efectivo disponible a una cuenta vinculada (SPEI a cuenta propia, en proceso hasta liquidarse) |
+//! | POST | `/api/v1/wealth/withdraw` | cliente con verificación reforzada: retira efectivo disponible a una cuenta vinculada (SPEI a cuenta propia, en proceso hasta liquidarse) |
 //! | GET  | `/api/v1/kyc/expediente` | cliente: estado, intentos, bloqueo y último resultado |
 //! | POST | `/api/v1/kyc/perfil` | cliente: datos personales y domicilio |
 //! | POST | `/api/v1/kyc/verificar` | cliente: INE + selfie (hasta 12 MB) |
@@ -53,7 +55,7 @@
 //! | POST | `/api/v1/operaciones/creditos/{id}/pagos` | operador |
 //! | POST | `/api/v1/operaciones/capital` | operador |
 //! | POST | `/api/v1/spei/webhook/inbound`, `/api/v1/spei/webhook/estado` | proveedor SPEI (firma HMAC) |
-//! | POST | `/api/v1/spei/transfer` | cliente: SPEI a un tercero, solo con `SPEI_TRANSFERENCIAS_TERCEROS` (apagado por omisión) |
+//! | POST | `/api/v1/spei/transfer` | cliente con verificación reforzada: SPEI a un tercero, solo con `SPEI_TRANSFERENCIAS_TERCEROS` (apagado por omisión) |
 //! | GET  | `/api/v1/spei/transferencias`, `/api/v1/spei/recibidos` | cliente |
 //! | GET  | `/api/v1/spei/conciliacion`, `/api/v1/spei/en-revision` | operador / auditor |
 //! | POST | `/api/v1/operaciones/spei/recibidos/{id}/correccion` | operador: revierte un abono SPEI erróneo |

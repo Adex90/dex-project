@@ -431,7 +431,7 @@ async fn transferencia_saliente_ciclo_completo(pool: PgPool) {
     let ana = cliente(&pool, &b.cfg, "Ana").await;
     depositar(&pool, &b.cfg, ana.cuenta_ifpe.id, "1000").await;
     b.pasarela.fijar_saldo_custodio(reserva_total(&pool).await);
-    let token = token_de(&b.estado, ana.cliente.id, RolUsuario::Cliente, false).await;
+    let token = token_verificado(&b.estado, &b.app, ana.cliente.id).await;
     let cuerpo = json!({
         "clabe_destino": EXTERNA_A,
         "beneficiario_nombre": "Beto Núñez",

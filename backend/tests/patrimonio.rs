@@ -32,9 +32,10 @@ impl Api {
         Self { app: routes::router(estado.clone()), estado }
     }
 
-    /// Token de una sesión real del cliente (su fila en `kyc.sesiones`).
+    /// Token de una sesión real del cliente (su fila en `kyc.sesiones`), ya
+    /// verificada de nuevo (0022): retirar es una acción sensible.
     async fn token(&self, cliente_id: Uuid) -> String {
-        token_de(&self.estado, cliente_id, RolUsuario::Cliente, false).await
+        token_verificado(&self.estado, &self.app, cliente_id).await
     }
 
     async fn cuentas(&self, token: &str) -> Value {

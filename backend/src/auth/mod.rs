@@ -1,6 +1,7 @@
 //! Autenticación: contraseñas Argon2id, JWT HS256, segundo factor TOTP,
 //! restablecimiento de contraseña, sesiones por dispositivo, centro de
-//! seguridad y extractor de usuario.
+//! seguridad, verificación reforzada antes de las acciones sensibles y
+//! extractor de usuario.
 
 pub mod correo;
 pub mod jwt;
@@ -9,6 +10,7 @@ pub mod password;
 pub mod restablecimiento;
 pub mod seguridad;
 pub mod sesiones;
+pub mod step_up;
 
 use axum::{
     extract::{FromRef, FromRequestParts},
@@ -37,6 +39,9 @@ pub struct Usuario {
     pub mfa: bool,
     /// La sesión del token (`kyc.sesiones`, migración 0019).
     pub sesion_id: Uuid,
+    /// Fin de la ventana de verificación reforzada de la sesión ([`step_up`],
+    /// migración 0022), si seguía abierta al validar la petición.
+    pub step_up_hasta: Option<DateTime<Utc>>,
 }
 
 impl Usuario {
@@ -84,6 +89,16 @@ impl Usuario {
         match self.rol {
             RolUsuario::Cliente => Ok(()),
             _ => Err(AppError::Prohibido),
+        }
+    }
+
+    /// Acciones sensibles (sacar dinero de la cuenta, cambiar los
+    /// beneficiarios): la sesión comprobó de nuevo una credencial hace poco
+    /// ([`step_up`]). Sin ella, `403 STEP_UP_REQUERIDO`, antes de tocar nada.
+    pub fn exigir_step_up(&self) -> AppResult<()> {
+        match self.step_up_hasta {
+            Some(_) => Ok(()),
+            None => Err(AppError::StepUpRequerido),
         }
     }
 
@@ -180,6 +195,8 @@ struct FilaSesion {
     sesion_vigente: bool,
     /// Su último uso tiene más de [`sesiones::SEGUNDOS_ENTRE_USOS`].
     tocar: bool,
+    /// Fin de su ventana de verificación reforzada, si sigue abierta.
+    step_up_hasta: Option<DateTime<Utc>>,
 }
 
 /// Lo que valida cada petición, en una sola lectura con sc_kyc. Sin `sid`
@@ -192,7 +209,8 @@ async fn leer_sesion(pool: &PgPool, claims: &jwt::Claims) -> AppResult<Option<Fi
                 coalesce(s.revocada_en IS NULL AND s.expira_en > now() \
                          AND s.ultimo_uso_en > now() - make_interval(mins => coalesce(p.inactividad_minutos, $4)), \
                          false) AS sesion_vigente, \
-                coalesce(s.ultimo_uso_en < now() - make_interval(secs => $5), false) AS tocar \
+                coalesce(s.ultimo_uso_en < now() - make_interval(secs => $5), false) AS tocar, \
+                CASE WHEN s.step_up_valido_hasta > now() THEN s.step_up_valido_hasta END AS step_up_hasta \
          FROM kyc.credenciales cr JOIN kyc.clientes c ON c.id = cr.cliente_id \
          LEFT JOIN kyc.sesiones s ON s.id = $3 AND s.cliente_id = cr.cliente_id \
          LEFT JOIN kyc.preferencias_seguridad p ON p.cliente_id = cr.cliente_id \
@@ -238,7 +256,7 @@ async fn validar_contra_bd(pool: &PgPool, claims: &jwt::Claims, uso: Uso) -> App
     if uso == Uso::Peticion && fila.tocar {
         sesiones::tocar(pool, sesion_id).await;
     }
-    Ok(Usuario { cliente_id: claims.sub, rol: fila.rol, mfa, sesion_id })
+    Ok(Usuario { cliente_id: claims.sub, rol: fila.rol, mfa, sesion_id, step_up_hasta: fila.step_up_hasta })
 }
 
 /// Quien inscribe su segundo factor (`/auth/mfa/setup`, `/auth/mfa/enable`):
@@ -468,7 +486,7 @@ pub async fn iniciar_sesion(
 
 /// Registra un intento fallido ya contado (`evento`) y, si agotó el cupo,
 /// también el bloqueo de la cuenta. `sesion_id`: la sesión desde la que se
-/// intentó (un cambio de contraseña), si la hay.
+/// intentó (un cambio de contraseña, una verificación reforzada), si la hay.
 pub(crate) async fn registrar_fallo(
     pool: &PgPool,
     cliente_id: Uuid,
@@ -489,6 +507,35 @@ pub(crate) async fn registrar_fallo(
     tx.commit().await?;
     if agota {
         tracing::warn!(target: "auth", %cliente_id, "cuenta bloqueada por intentos fallidos");
+    }
+    Ok(())
+}
+
+/// Un intento rechazado (ya contado) desde una sesión abierta (`evento`: un
+/// cambio de contraseña o una verificación reforzada): a la bitácora. Si agotó
+/// el cupo, la cuenta queda bloqueada y la sesión que lo intentó se cierra
+/// (`BLOQUEO`): quien adivina desde una sesión robada no la conserva.
+pub(crate) async fn rechazar_en_sesion(
+    pool: &PgPool,
+    u: &Usuario,
+    evento: &'static str,
+    agota: bool,
+    origen: &Origen,
+) -> AppResult<()> {
+    registrar_fallo(pool, u.cliente_id, evento, agota, origen, Some(u.sesion_id)).await?;
+    if agota {
+        let mut tx = db::begin(pool, Rol::Auth).await?;
+        sqlx::query(
+            "UPDATE kyc.sesiones SET revocada_en = now(), motivo_revocacion = 'BLOQUEO' \
+             WHERE id = $1 AND cliente_id = $2 AND revocada_en IS NULL",
+        )
+        .bind(u.sesion_id)
+        .bind(u.cliente_id)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        tracing::warn!(target: "auth", cliente_id = %u.cliente_id, sid = %u.sesion_id, evento,
+            "la sesión agotó los intentos: cerrada");
     }
     Ok(())
 }

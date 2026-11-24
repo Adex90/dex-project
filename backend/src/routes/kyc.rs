@@ -7,7 +7,7 @@
 //! | POST | `/kyc/verificar` | cliente: INE + selfie (pasos 2 y 3) |
 //! | POST | `/kyc/webhook` | proveedor biométrico (firma HMAC `X-Kyc-Firma`) |
 //! | GET  | `/kyc/beneficiarios` | cliente: designación vigente, historial y cadena comprobada |
-//! | POST | `/kyc/beneficiarios` | cliente verificado: guarda una versión nueva, completa (0020) |
+//! | POST | `/kyc/beneficiarios` | cliente verificado, con verificación reforzada (0022): guarda una versión nueva, completa (0020) |
 
 use axum::{
     extract::{DefaultBodyLimit, State},
@@ -86,6 +86,9 @@ async fn designar_beneficiarios(
     Json(s): Json<SolicitudDesignacion>,
 ) -> AppResult<(StatusCode, Json<VistaBeneficiarios>)> {
     u.exigir_cliente()?;
+    // Verificación reforzada (0022); la base de datos la exige de nuevo a la
+    // sesión que guarda la versión.
+    u.exigir_step_up()?;
     let autor = Autor { sesion_id: Some(u.sesion_id), ip: origen.ip, dispositivo: Some(&origen.dispositivo) };
     let vista = beneficiarios::designar(&e.pool, u.cliente_id, &s, &autor, spei::hoy_cdmx()).await?;
     Ok((StatusCode::CREATED, Json(vista)))

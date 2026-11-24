@@ -72,6 +72,8 @@ async fn transferir(
     Json(s): Json<SolicitudTransferencia>,
 ) -> AppResult<(StatusCode, Json<Movimiento>)> {
     u.exigir_cliente()?;
+    // El dinero sale de la cuenta: verificación reforzada (0022).
+    u.exigir_step_up()?;
     let t = ledger::Transferencia {
         cliente_origen_id: u.cliente_id,
         clabe_destino: s.clabe_destino,
@@ -101,6 +103,7 @@ async fn retirar(
     Json(s): Json<SolicitudRetiro>,
 ) -> AppResult<(StatusCode, Json<ResultadoOrden>)> {
     u.exigir_cliente()?;
+    u.exigir_step_up()?;
     let solicitud = SolicitudSpei {
         cliente_id: u.cliente_id,
         clabe_destino: s.clabe_destino,
