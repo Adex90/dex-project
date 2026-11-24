@@ -395,9 +395,42 @@ what the module waits on. They do not change its scope.
   - Left: approximate location from the IP (needs a GeoIP source and a
     privacy review), notifying the client by email of a new device, and
     showing the user agent's version.
-- [ ] **22. Step-Up Authentication** (Forced biometrics on anomalous withdrawals)
-  - Builds on modules 20 and 16. The anomaly signal comes from the backend's
-    AML engine.
+- [x] **22. Step-Up Authentication** (Forced biometrics on anomalous withdrawals)
+  - "Confirm it's you" (`components/security/step-up-modal.tsx`), right
+    before money leaves the account or the beneficiaries change: the 6-digit
+    code from the authenticator app when two-step verification is on, else
+    the account password. A right answer opens a 5-minute window on that
+    session only; the action that was waiting goes on by itself, with the
+    same idempotency key, so it cannot run twice. Within the window the next
+    sensitive action asks nothing.
+  - Guarded on the server (403 `STEP_UP_REQUERIDO`, before anything is
+    touched and before any AML rule, so a restricted client hears exactly
+    what anyone else hears): withdrawals (`/wealth/withdraw`,
+    `/ifpe/retiros`), transfers to another account (`/ifpe/transferencias`)
+    and to third parties (`/spei/transfer`), and saving the beneficiaries,
+    which the database also refuses without the window of the session that
+    saves it (migration 0022).
+  - Every try counts toward the sign-in lockout (5 wrong tries lock the
+    account 15 minutes). A refused try says how many are left; the one that
+    locks the account also ends the session, and the sign-in page says why.
+    A code works once. The window's end is set by the database, which logs
+    every check passed ("Identity confirmed", with the request's IP and
+    device); failed ones are logged too.
+  - The gate (`components/security/step-up-provider.tsx`, in the dashboard
+    shell) wraps the withdrawal drawer's Confirm and the beneficiaries' Save:
+    the request goes as it is and opens the check only if the server asks.
+  - Endpoints: `GET /api/v1/auth/step-up` (method and open window),
+    `POST /api/v1/auth/step-up` (`{ "codigo" }` or `{ "password" }`).
+  - Tests: `tests/db/0022_verificacion_reforzada.sql`,
+    `backend/tests/step_up.rs` (every guarded route, the lockout, single-use
+    codes, expiry, one window per session), `backend/tests/aml.rs` (no
+    tipping off), `lib/step-up.test.ts`, smoke e2e (a wrong then a right
+    password before a withdrawal, the beneficiaries' first save asking and
+    the next not, another device needing its own check, two-step asking for
+    the code) and the AML e2e.
+  - Left: platform biometrics (WebAuthn passkeys) as the check, risk-based
+    prompts from the AML engine's signals instead of every time, and an
+    email notice when a check locks the account.
 
 ## Phase 5: Compliance & Transparency
 
@@ -457,8 +490,9 @@ what the module waits on. They do not change its scope.
     `lib/beneficiaries.test.ts`, smoke e2e (60 + 30 refused, 60 + 40 saved,
     reloaded, split evenly, a save refused after another device saved, the
     API refusing 99%, every version in the security log) and the AML e2e.
-  - Left: step-up authentication before saving (module 22), notifying the
-    client by email of a change, and designations for business accounts.
+  - Saving asks "Confirm it's you" first (module 22).
+  - Left: notifying the client by email of a change, and designations for
+    business accounts.
 - [x] **26. Tax Center** (W-8BEN, SAT tax withholding certificates, CSV export)
   - The Taxes page, `/dashboard/taxes` (`components/taxes/`), in the
     sidebar's Account group and the phones' strip of account pages. Three

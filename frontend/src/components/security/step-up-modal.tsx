@@ -295,7 +295,7 @@ export function StepUpModal({ token, request, onVerified, onCancel, onSessionEnd
           ) : null}
 
           {method === "password" && !feedback?.locked ? (
-            <p className="text-xs leading-relaxed text-muted">
+            <p className="text-xs leading-relaxed text-balance text-muted">
               Turn on two-step verification in Security to confirm with your authenticator app instead.
             </p>
           ) : null}
@@ -336,7 +336,7 @@ export function StepUpModal({ token, request, onVerified, onCancel, onSessionEnd
               </>
             )}
           </div>
-          <p className="text-[11px] leading-relaxed text-muted">
+          <p className="text-[11px] leading-relaxed text-balance text-muted">
             Five wrong tries lock your account for {LOCK_MINUTES} minutes. Every check is in your security log.
           </p>
         </footer>

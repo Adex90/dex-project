@@ -41,6 +41,11 @@ export const SESSION_LOCKED_MESSAGE = `Too many failed attempts. For your securi
 /** ...and after a lockout from somewhere else: this session stays, the check cannot run. */
 export const ACCOUNT_LOCKED_MESSAGE = `Too many failed attempts. Your account is locked for ${LOCK_MINUTES} minutes; try again later. Nothing was counted.`;
 
+/** The check's own words where the general ones would not fit (there is no "current" password here). */
+const CHECK_MESSAGES: Readonly<Record<string, string>> = {
+  CONTRASENA_ACTUAL_INCORRECTA: "That password is not correct.",
+};
+
 /** Thrown to the action when the person closes the check: the action shows `message` and nothing happened. */
 export class StepUpCancelled extends Error {
   constructor(message: string) {
@@ -165,8 +170,9 @@ export function stepUpFeedback(error: unknown, describe: (error: unknown) => str
       sessionEnded: false,
     };
   }
+  const own = typeof code === "string" && Object.hasOwn(CHECK_MESSAGES, code) ? CHECK_MESSAGES[code] : undefined;
   return {
-    message: describe(error),
+    message: own ?? describe(error),
     remainingAttempts: isSeconds(remainingAttempts, 99) ? remainingAttempts : null,
     locked: false,
     sessionEnded: status === 401,

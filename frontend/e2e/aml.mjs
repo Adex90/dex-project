@@ -667,6 +667,23 @@ try {
   // Transfer, SPEI send and withdrawal through the API with the client's own session.
   const internalClabe = state.b.clabe;
   const externalClabe = clabeWithCheck("01218000123456789");
+  // Money leaving needs a fresh check first (step-up, migration 0022), asked before any AML rule:
+  // without it any client gets the same 403, and the check itself works and says nothing.
+  const unconfirmed = await pageFetch(cp, "POST", "/api/v1/ifpe/transferencias", {
+    clabe_destino: internalClabe,
+    monto: "100.00",
+    clave_idempotencia: crypto.randomUUID(),
+  });
+  const confirmed = await pageFetch(cp, "POST", "/api/v1/auth/step-up", { password: client.password });
+  check(
+    unconfirmed.status === 403 &&
+      unconfirmed.body?.error?.codigo === "STEP_UP_REQUERIDO" &&
+      confirmed.status === 200 &&
+      confirmed.body?.metodo === "CONTRASENA" &&
+      !/aml|pld|congel|alerta|cumplimiento|retenido|sospech|uif|preventiv|riesgo/i.test(JSON.stringify([unconfirmed.body, confirmed.body])),
+    `without a fresh check a transfer answers ${unconfirmed.status} ${unconfirmed.body?.error?.codigo}; the client confirms like anyone (${confirmed.status}), and neither answer says anything`,
+    [unconfirmed.body, confirmed.body],
+  );
   const attempts = {
     transferencia: await pageFetch(cp, "POST", "/api/v1/ifpe/transferencias", { clabe_destino: internalClabe, monto: "100.00", clave_idempotencia: crypto.randomUUID() }),
     spei: await pageFetch(cp, "POST", "/api/v1/spei/transfer", {
@@ -918,8 +935,11 @@ try {
   );
   check(inv2R.status() === 201, `invest after the approval answered ${inv2R.status()}`, await inv2R.json().catch(() => null));
   await cp.getByText(/Contract #\d+ created/).waitFor({ timeout: 10_000 }).catch(() => undefined);
+  // A fresh check again (the first one may have run out), then the transfer goes through.
+  const confirmedAgain = await pageFetch(cp, "POST", "/api/v1/auth/step-up", { password: client.password });
+  check(confirmedAgain.status === 200, `the client confirms it's them again (${confirmedAgain.status})`, confirmedAgain.body);
   const tr2 = await pageFetch(cp, "POST", "/api/v1/ifpe/transferencias", { clabe_destino: internalClabe, monto: "100.00", clave_idempotencia: crypto.randomUUID() });
-  check(tr2.body?.error?.codigo !== "OPERACION_NO_DISPONIBLE", `transfer after the approval answered ${tr2.status} ${tr2.body?.error?.codigo ?? "ok"}`, tr2.body);
+  check(tr2.status === 201 && tr2.body?.error?.codigo === undefined, `transfer after the approval answered ${tr2.status} ${tr2.body?.error?.codigo ?? "ok"}`, tr2.body);
   // The ledger (Account) and the Vault home, after it all.
   await openTab(cp, "Account");
   await cp.getByTestId("vault-available").waitFor();
@@ -1003,6 +1023,8 @@ try {
     // Client B, now frozen: a deposit is held, an SPEI send is refused with the constant error.
     const dep = await apiCall("POST", "/api/v1/ifpe/depositos/simulados", { token: B.token, body: { monto: "5000.00", clave_idempotencia: crypto.randomUUID() } });
     check(dep.status === 201, `frozen client B deposit answered ${dep.status}`);
+    const bConfirmed = await apiCall("POST", "/api/v1/auth/step-up", { token: B.token, body: { password: client.password } });
+    check(bConfirmed.status === 200, `frozen client B confirms it's them before sending (${bConfirmed.status})`, bConfirmed.body);
     const sp = await apiCall("POST", "/api/v1/spei/transfer", {
       token: B.token,
       body: { clabe_destino: clabeWithCheck("01218000123456789"), beneficiario_nombre: "Proveedor Externo SA", monto: "10.00", clave_idempotencia: crypto.randomUUID() },

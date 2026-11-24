@@ -155,6 +155,12 @@ test("feedback: attempts left, the lockout that ends this session, one from else
     locked: true,
     sessionEnded: false,
   });
+  // The check's own words for a wrong password: there is no "current" one here.
+  assert.equal(
+    stepUpFeedback({ status: 422, code: "CONTRASENA_ACTUAL_INCORRECTA", remainingAttempts: 2 }, describe).message,
+    "That password is not correct.",
+  );
+  assert.equal(stepUpFeedback({ status: 422, code: "toString" }, describe).message, "described toString");
   // A 401 here means the session itself is gone.
   assert.equal(stepUpFeedback({ status: 401, code: "NO_AUTENTICADO" }, describe).sessionEnded, true);
   // A count the server did not send, or nonsense, is not shown.

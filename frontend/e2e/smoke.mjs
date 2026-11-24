@@ -805,7 +805,59 @@ try {
         "Confirm withdrawal is the stark action: black on Synthetic Capital Yellow",
       );
       await shot(page, "withdraw-review-desktop", { fullPage: false });
+      // Money leaving needs a fresh check (step-up, roadmap item 22): this session has none, so the
+      // server sends nothing (403) and "Confirm it's you" opens above the drawer, naming the withdrawal.
+      expectFailure("/api/v1/wealth/withdraw");
       await confirmWithdrawal.click();
+      const stepUp = page.getByTestId("step-up-modal");
+      await stepUp.and(page.locator("[data-method=password]")).waitFor();
+      const stepUpPassword = stepUp.getByTestId("step-up-password");
+      await stepUpPassword.waitFor();
+      const waiting = await stepUp.getByTestId("step-up-action").innerText();
+      check(
+        waiting.includes("Withdraw $1,250.50") &&
+          waiting.includes("To BBVA México •••• 1234, by SPEI") &&
+          (await withdrawDrawer.isVisible()) &&
+          (await stepUpPassword.evaluate((el) => el === document.activeElement)) &&
+          !(await stepUp.getByTestId("step-up-submit").isEnabled()),
+        "Confirm withdrawal first asks to confirm it's you: the withdrawal waits behind, named, and the password field has the focus",
+      );
+      check(
+        (await settledStyle(stepUp, "borderTopColor")) === "rgb(234, 179, 8)" &&
+          (await stepUp.evaluate((el) => getComputedStyle(el).borderRadius)) === "0px" &&
+          (await settledStyle(stepUp.getByTestId("step-up-submit"), "backgroundColor")) === "rgb(234, 179, 8)",
+        "the check is square, under a gold rule, with one gold action",
+      );
+      await shot(page, "step-up-withdraw-desktop", { fullPage: false });
+      // Cancel: nothing is sent, the drawer says so, and Confirm asks again (the same withdrawal, the same key).
+      await stepUp.getByTestId("step-up-cancel").click();
+      await stepUp.waitFor({ state: "detached" });
+      await withdrawDrawer.getByRole("alert").filter({ hasText: "Not confirmed: nothing was sent." }).waitFor();
+      check(
+        (await withdrawDrawer.getByTestId("withdraw-step-review").isVisible()) && (await confirmWithdrawal.isEnabled()),
+        "Cancel closes the check: nothing was sent, the drawer says so and keeps the review to confirm again",
+      );
+      expectFailure("/api/v1/wealth/withdraw");
+      await confirmWithdrawal.click();
+      await stepUpPassword.waitFor();
+      // A wrong password: refused and counted toward the sign-in lockout, and the screen says how many tries are left.
+      expectFailure("/api/v1/auth/step-up");
+      await stepUpPassword.fill("not-my-password-1926");
+      await stepUp.getByTestId("step-up-submit").click();
+      await stepUp.getByTestId("step-up-error").waitFor();
+      check(
+        (await stepUp.getByTestId("step-up-error").innerText()).includes("That password is not correct.") &&
+          (await stepUp.getByTestId("step-up-attempts").innerText()) ===
+            "4 attempts left before your account locks for 15 minutes." &&
+          (await stepUpPassword.inputValue()) === "" &&
+          (await stepUpPassword.evaluate((el) => el === document.activeElement)),
+        "a wrong password is refused: 4 tries left before the lockout, the field cleared and focused again",
+      );
+      await shot(page, "step-up-refused-desktop", { fullPage: false });
+      await stepUpPassword.fill(password);
+      await stepUp.getByTestId("step-up-submit").click();
+      await stepUp.waitFor({ state: "detached" });
+      check(true, "the right password closes the check, and the same withdrawal goes on by itself");
       const withdrawReceipt = withdrawDrawer.getByTestId("withdraw-receipt");
       await withdrawReceipt.waitFor();
       const trackingKey = await withdrawDrawer.getByTestId("withdraw-tracking-key").locator("dd").innerText();
@@ -2418,8 +2470,25 @@ try {
       "60% + 40%: 100% allocated, the bar outlined in gold, and Save turns on",
     );
     await shot(page, "beneficiaries-draft");
+    // Saving needs a fresh check (step-up, roadmap item 22): this session has none yet, so the
+    // server saves nothing (403) and "Confirm it's you" names who is being designated.
+    expectFailure("/api/v1/kyc/beneficiarios");
     await saveDesignation.click();
+    const designationCheck = page.getByTestId("step-up-modal");
+    await designationCheck.getByTestId("step-up-password").waitFor();
+    const designationWaiting = await designationCheck.getByTestId("step-up-action").innerText();
+    check(
+      designationWaiting.includes("Save 2 beneficiaries") &&
+        designationWaiting.includes("María López Rojas 60% · José López Rojas 40%") &&
+        (await page.getByText("Saved as version 1").count()) === 0,
+      "Save first asks to confirm it's you, naming the two beneficiaries and their shares; nothing is saved yet",
+    );
+    await shot(page, "step-up-beneficiaries", { fullPage: false });
+    await designationCheck.getByTestId("step-up-password").fill(password);
+    await designationCheck.getByTestId("step-up-submit").click();
+    await designationCheck.waitFor({ state: "detached" });
     await page.getByText("Saved as version 1").waitFor();
+    check(true, "confirmed: the same save goes on, as version 1");
     const firstVersion = (await asClient("/api/v1/kyc/beneficiarios")).body;
     check(
       firstVersion.version === 1 &&
@@ -2472,27 +2541,52 @@ try {
     );
     await saveDesignation.click();
     await page.getByText("Saved as version 2").waitFor();
+    check(
+      (await page.getByTestId("step-up-modal").count()) === 0,
+      "within the five minutes the next save goes straight through: no second check",
+    );
 
     // Another device saves first: this page's save is refused (409); the newer
     // version shows and the edits stay, to be saved again on top of it.
     await thirdHeir.getByRole("button", { name: "Remove beneficiary 3" }).click();
     await page.getByRole("button", { name: "Split evenly" }).click();
     const otherDevice = await apiLogin(email, password, WINDOWS_UA);
-    const savedElsewhere = await fetch(`${API}/api/v1/kyc/beneficiarios`, {
+    const otherDeviceHeaders = {
+      "content-type": "application/json",
+      authorization: `Bearer ${otherDevice}`,
+      "user-agent": WINDOWS_UA,
+    };
+    const saveElsewhere = () =>
+      fetch(`${API}/api/v1/kyc/beneficiarios`, {
+        method: "POST",
+        headers: otherDeviceHeaders,
+        body: JSON.stringify({
+          beneficiarios: [
+            {
+              nombre_completo: "María López Rojas",
+              parentesco: "HIJO",
+              fecha_nacimiento: "2005-06-07",
+              porcentaje: "100",
+            },
+          ],
+          version_base: 2,
+        }),
+      });
+    // A window belongs to the session that opened it: the other device has to confirm too.
+    const unconfirmedElsewhere = await saveElsewhere();
+    const unconfirmedBody = await unconfirmedElsewhere.json();
+    const confirmedElsewhere = await fetch(`${API}/api/v1/auth/step-up`, {
       method: "POST",
-      headers: { "content-type": "application/json", authorization: `Bearer ${otherDevice}`, "user-agent": WINDOWS_UA },
-      body: JSON.stringify({
-        beneficiarios: [
-          {
-            nombre_completo: "María López Rojas",
-            parentesco: "HIJO",
-            fecha_nacimiento: "2005-06-07",
-            porcentaje: "100",
-          },
-        ],
-        version_base: 2,
-      }),
+      headers: otherDeviceHeaders,
+      body: JSON.stringify({ password }),
     });
+    check(
+      unconfirmedElsewhere.status === 403 &&
+        unconfirmedBody.error.codigo === "STEP_UP_REQUERIDO" &&
+        confirmedElsewhere.status === 200,
+      "another device's session cannot save without its own check (403 STEP_UP_REQUERIDO), and confirms with the password",
+    );
+    const savedElsewhere = await saveElsewhere();
     check(savedElsewhere.status === 201, "meanwhile another device saves version 3");
     expectFailure("/api/v1/kyc/beneficiarios");
     await saveDesignation.click();
@@ -2871,9 +2965,10 @@ try {
         "Device signed out",
         "Signed in",
         "Beneficiaries updated",
+        "Identity confirmed",
         "W-8BEN certified",
       ].every((title) => logTitles.includes(title)) && logTitles[0] === "Password changed",
-      "the security log shows the change, the refused try, the timeout, both sign-outs, the sign-ins, the new beneficiaries and the W-8BEN, newest first",
+      "the security log shows the change, the refused try, the timeout, both sign-outs, the sign-ins, the new beneficiaries, the identity check and the W-8BEN, newest first",
     );
     await page.mouse.move(0, 0);
     await shot(page, "security-after-changes");
@@ -2934,6 +3029,34 @@ try {
     await phonePage.getByTestId("timeout-control").getByText("5 min", { exact: true }).click();
     await phonePage.getByTestId("timeout-status").filter({ hasText: "after 5 min" }).waitFor();
     const guardedToken = await pageToken(phonePage);
+    // With two-step verification on, the security check before a sensitive action asks for the
+    // authenticator code, not the password (step-up, roadmap item 22), and a code counts once.
+    const guardedStepUp = async (body) => {
+      const response = await fetch(`${API}/api/v1/auth/step-up`, {
+        method: body ? "POST" : "GET",
+        headers: { authorization: `Bearer ${guardedToken}`, ...(body ? { "content-type": "application/json" } : {}) },
+        body: body ? JSON.stringify(body) : undefined,
+      });
+      return { status: response.status, body: await response.json() };
+    };
+    const twoStepCheck = await guardedStepUp();
+    const passwordOnly = await guardedStepUp({ password });
+    const freshStep = Math.max(Math.floor(Date.now() / 30_000), enrolledStep + 1);
+    const byCode = await guardedStepUp({ codigo: totpCode(authenticatorKey, freshStep) });
+    const codeAgain = await guardedStepUp({ codigo: totpCode(authenticatorKey, freshStep) });
+    check(
+      twoStepCheck.body.metodo === "TOTP" &&
+        twoStepCheck.body.valido_hasta === null &&
+        passwordOnly.status === 422 &&
+        passwordOnly.body.error.codigo === "CODIGO_MFA_REQUERIDO" &&
+        byCode.status === 200 &&
+        byCode.body.metodo === "TOTP" &&
+        byCode.body.segundos === 300 &&
+        codeAgain.status === 422 &&
+        codeAgain.body.error.codigo === "CODIGO_MFA_INVALIDO" &&
+        codeAgain.body.error.intentos_restantes === 4,
+      "two-step on: the check asks for the app's code (the password alone is refused, uncounted), a code works once, a reused one is a counted miss",
+    );
     await phonePage.clock.fastForward("04:00");
     check(
       new URL(phonePage.url()).pathname === "/dashboard/security",

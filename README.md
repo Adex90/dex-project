@@ -1312,8 +1312,9 @@ id (`sid`).
   from another device, "all other devices", password changed or reset,
   two-step verification turned on, timeout changed (sessions already idle
   under the old timeout are closed, so a longer one revives nothing), the
-  tries exhausted while changing the password, or an operator. Rows are
-  never deleted, and only last use moves, forward.
+  tries exhausted while changing the password or confirming a sensitive
+  action (step-up, `0022`), or an operator. Rows are never deleted; only
+  last use moves, forward, and the step-up window, which the database sets.
 - **Password change.** `POST /api/v1/auth/password/change` takes the current
   password and, with two-step verification on, the code. Each try counts in
   the sign-in lockout before anything is verified. The new password follows
@@ -1462,6 +1463,51 @@ fiscal status with the W-8BEN and its gold Certify / Renew flow; realized
 gains and withholding for the selected year; and the export, which the page
 reconciles with a fresh summary before saving it, plus a printable
 Constancia de Retenciones preview (not a CFDI).
+
+## Step-up authentication (migration `0022`)
+
+A valid session is not enough for the actions a stolen token would be used
+for. Money leaving the account (`/wealth/withdraw`, `/ifpe/retiros`, a
+transfer to another account with `/ifpe/transferencias`, a payment to a third
+party with `/spei/transfer`) and saving the beneficiaries also need a
+credential confirmed in the last five minutes, **on that session**:
+
+- **The credential.** The current 6-digit code from the authenticator app
+  when two-step verification is on (the password alone is refused:
+  `CODIGO_MFA_REQUERIDO`), else the account password.
+  `POST /api/v1/auth/step-up` takes `{ "codigo" }` or `{ "password" }`;
+  `GET /api/v1/auth/step-up` says which (`TOTP` or `CONTRASENA`) and whether
+  a window is open.
+- **The lockout.** Every try counts in the sign-in lockout, before anything
+  is verified: 5 wrong ones lock the account 15 minutes. A refused try
+  answers 422 with `intentos_restantes`; the one that locks the account also
+  closes the session it came from (423 `SESION_BLOQUEADA`), and a try while
+  the account is locked answers 423 `BLOQUEADO` without counting. A code
+  works once, as at sign-in.
+- **The window.** `kyc.sesiones.step_up_valido_hasta`, written only by the
+  database: any write becomes `least(now() + 5 minutes, the session's
+  expiry)`, on a live session only; a session is born without one. Each
+  window opened writes `STEP_UP_VERIFICADO` to the client's security log, with
+  the request's IP and device and the window's seconds; each refusal writes
+  `STEP_UP_FALLIDO`.
+- **The guard.** Without a window those routes answer 403
+  `STEP_UP_REQUERIDO` before touching anything and before any AML rule, so a
+  restricted client hears what anyone else hears. The database repeats the
+  rule for the beneficiaries: a designation must come from a live session of
+  that client with an open window, whoever writes it. Withdrawals do not
+  record their session, so there the backend is the guard.
+  `tests/db/0022_verificacion_reforzada.sql` and `backend/tests/step_up.rs`
+  cover it.
+
+**The UI** (`frontend/src/components/security/step-up-modal.tsx` and
+`step-up-provider.tsx`): the withdrawal drawer's Confirm and the
+beneficiaries' Save send the request as it is; when the server asks,
+"Confirm it's you" opens above, names what is waiting (the amount and
+account, or who and each share), takes the code or the password, says how
+many tries are left, and once confirmed sends the same request again with
+the same idempotency key. A session already confirmed in the last five
+minutes is not asked. A lockout signs the person out with a notice on the
+sign-in page.
 
 ## Layout
 
@@ -1693,12 +1739,14 @@ the password is hashed, so a parallel burst cannot test more than 5 passwords.
 | GET | `/api/v1/auth/sessions` | any session: its person's active sessions (device, sign-in IP, times, `actual`) and the inactivity timeout |
 | POST | `/api/v1/auth/sessions/{id}/revoke`, `/api/v1/auth/sessions/revoke-others` | any session: sign out one session of its person (404 if not theirs or already ended), or every other |
 | POST | `/api/v1/auth/password/change` | any session: current password (+ TOTP code if on); counts toward the sign-in lockout; signs out the other sessions |
+| GET | `/api/v1/auth/step-up` | any session: how it confirms a sensitive action (`TOTP` or `CONTRASENA`) and its open window, if any |
+| POST | `/api/v1/auth/step-up` | any session: `{ "codigo" }` (two-step on) or `{ "password" }`; opens a 5-minute window on this session; counts toward the sign-in lockout (422 with `intentos_restantes`, 423 `SESION_BLOQUEADA` when it locks) |
 | GET | `/api/v1/auth/security/events` | any session: its person's security log, newest first (`limite`, 1–100, default 50) |
 | GET, POST | `/api/v1/auth/security/preferences` | any session: inactivity timeout (5, 15, 30, 60) and two-step verification status |
 | GET | `/api/v1/kyc/expediente` | client: onboarding state, attempts, last biometric result, own declarations and the agreements' version in force |
 | POST | `/api/v1/kyc/perfil` | client: step 1, personal data, CURP, RFC and address |
 | POST | `/api/v1/kyc/verificar` | client: the wizard's submission, INE images and data + liveness frames + consent + declarations + accepted agreements (up to 12 MB) |
-| GET, POST | `/api/v1/kyc/beneficiarios` | client: the legal beneficiaries on record, their versions and the chain check; POST saves the whole designation on top of `version_base` (201; 409 if another session saved first) |
+| GET, POST | `/api/v1/kyc/beneficiarios` | client: the legal beneficiaries on record, their versions and the chain check; POST saves the whole designation on top of `version_base` (201; 409 if another session saved first; 403 `STEP_UP_REQUERIDO` without a step-up window) |
 | POST | `/api/v1/kyc/webhook` | biometric provider (HMAC signature `X-Kyc-Firma`) |
 | GET | `/api/v1/operaciones/kyc/pendientes` | operator: files awaiting human review |
 | POST | `/api/v1/operaciones/kyc/{cliente_id}` | operator: verify / reject (with reason) / reopen, risk level (not lowered while the client is under AML review); answers the client projection, without risk fields; an empty dictamen is 400 |
@@ -1711,14 +1759,14 @@ the password is hashed, so a parallel burst cannot test more than 5 passwords.
 | GET | `/api/v1/market/orders/pending` | client: its limit and stop orders still waiting (`PendingOrders`) |
 | POST | `/api/v1/market/orders/{id}/cancel` | client: cancels a pending order and releases what it held |
 | GET | `/api/v1/wealth/linked-accounts` | client: its linked bank accounts, all in its own name (`MODO_DEMO` links a demo one) |
-| POST | `/api/v1/wealth/withdraw` | client: withdraws available cash to a linked account by SPEI (`WithdrawalReceipt`, processing until settled) |
+| POST | `/api/v1/wealth/withdraw` | client with a step-up window: withdraws available cash to a linked account by SPEI (`WithdrawalReceipt`, processing until settled) |
 | GET | `/api/v1/wealth/documentos`, `/api/v1/wealth/documentos/{id}` | client: its statements and trade confirmations, derived from the ledgers, each with its reserve seal |
 | GET | `/api/v1/wealth/impuestos?year=` | client: fiscal profile, W-8BEN state and the fiscal year's summary (realized results, fixed-term interest, ISR withheld and estimated) |
 | POST | `/api/v1/wealth/impuestos/w8ben` | client: certifies or renews the W-8BEN (201); the database copies Part I from the KYC file and logs it |
 | GET | `/api/v1/wealth/impuestos/export.csv?year=` | client: the year's accounting export, RFC 4180 CSV |
 | GET | `/api/v1/ifpe/cuenta`, `/api/v1/ifpe/movimientos` | client |
-| POST | `/api/v1/ifpe/transferencias` | client: internal transfer |
-| POST | `/api/v1/ifpe/retiros` | client: withdrawal to own external CLABE (an outgoing SPEI), which must be a linked account |
+| POST | `/api/v1/ifpe/transferencias` | client with a step-up window: internal transfer |
+| POST | `/api/v1/ifpe/retiros` | client with a step-up window: withdrawal to own external CLABE (an outgoing SPEI), which must be a linked account |
 | POST | `/api/v1/ifpe/depositos/simulados` | client with verified KYC, `MODO_DEMO` only |
 | GET | `/api/v1/sofom/tasas` | public: terms and rates |
 | GET | `/api/v1/sofom/posicion` | client |
@@ -1733,7 +1781,7 @@ the password is hashed, so a parallel burst cannot test more than 5 passwords.
 | POST | `/api/v1/operaciones/creditos`, `.../{id}/pagos`, `.../{id}/castigo` | operator: loans, collections, write-offs (losses absorbed by SOFOM capital) |
 | POST | `/api/v1/operaciones/usuarios/{id}/revocar-sesiones` | operator: invalidate a user's JWTs immediately |
 | POST | `/api/v1/spei/webhook/inbound`, `/api/v1/spei/webhook/estado` | SPEI provider (HMAC signature) |
-| POST | `/api/v1/spei/transfer` | client: send an SPEI to someone else's account; off unless `SPEI_TRANSFERENCIAS_TERCEROS=true` (422 `TRANSFERENCIAS_TERCEROS_NO_DISPONIBLES`) |
+| POST | `/api/v1/spei/transfer` | client with a step-up window: send an SPEI to someone else's account; off unless `SPEI_TRANSFERENCIAS_TERCEROS=true` (422 `TRANSFERENCIAS_TERCEROS_NO_DISPONIBLES`, before asking for the step-up) |
 | GET | `/api/v1/spei/transferencias`, `/api/v1/spei/recibidos` | client |
 | GET | `/api/v1/spei/conciliacion`, `/api/v1/spei/en-revision` | operator / auditor |
 | POST | `/api/v1/operaciones/spei/recibidos/{id}/correccion` | operator: reverse a wrong SPEI credit |
