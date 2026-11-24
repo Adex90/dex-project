@@ -1479,6 +1479,73 @@ available, so Session Manager itself was not exercised. Everything around it was
 - **Backend:** rustfmt and clippy `-D warnings` clean; 314 tests passed, 0 failed.
   hadolint, actionlint and ShellCheck (with the CI settings) are clean.
 
+**Tax Center: fiscal year, W-8BEN and accounting export** (migration `0021`, the
+routes `/api/v1/wealth/impuestos`, `/impuestos/w8ben` and `/impuestos/export.csv`,
+the Taxes page):
+
+- **Database:** every SQL suite passes on its own fresh database with all migrations
+  (16 suites), the new `tests/db/0021_centro_fiscal.sql` (39 checks) included. It
+  covers:
+  - the 2025 and 2026 rates (0.50% and 0.90% a year on capital, 10% on listed
+    shares, 10% and 30% US withholding), immutable for the schema owner too, a
+    treaty rate never above the statutory one, and no writes from `sc_kyc`;
+  - Part I from the file: the legal name normalized with ICU (spaces, NFC,
+    accents in upper case) and the address on one line;
+  - a valid certification: Part I copied, the signature normalized and equal to
+    the legal name, the signing time and the validity (December 31 of the third
+    year after signing) set by the database, the hash recomputable, and its
+    `W8BEN_CERTIFICADO` event written by `sc_kyc`;
+  - refusals: another signature or none, any of the three statements false, a
+    US citizen, an unverified client, a business, a non-resident, no RFC; and
+    `sc_kyc` choosing Part I, the validity or the version;
+  - a renewal chained to the first version, an event per version and none for a
+    refused one; immutability; `sc_kyc` unable to write another event, an event
+    for a missing version or another device, or a second one for a version;
+  - row-level security, no other application role on the two tables, and an
+    extended validity detected by the chain.
+- **Backend:** rustfmt and clippy `-D warnings` clean. 438 tests passed, 0
+  failed (427 before):
+  - `tests/impuestos.rs`: equities sold at a gain and gold at a loss after price
+    moves, a fixed-term contract settled and another open; every figure of the
+    summary against the database (sales, average cost released, gains, losses,
+    interest, the withholding estimate computed independently by day); the
+    profile as the database normalizes it; years validated; the CSV's headers,
+    RFC 4180 quoting, row kinds and order, its totals and the last balance
+    against the account; the W-8BEN refused for a wrong signature, an
+    unconfirmed statement or an extra field, certified with a lower-case
+    signature, renewed, both in the security log, outdated after the address
+    changes, and tampering detected; a US citizen and an unverified client
+    refused by the API and the database; 401 and 403;
+  - the tipping-off guard reading the summary and the CSV; unit tests for the
+    fiscal year's bounds, the days of a term per year, the per-year withholding,
+    the signature, RFC 4180, the four W-8BEN states and who may certify.
+- **Frontend:** typecheck, lint, 311 unit tests (304 before: every answer
+  validated whole, the rates and dates in words, the signature, RFC 4180 parsing,
+  the export reconciled to the unit, the Constancia figures, security-log codes
+  with digits, and no tipping-off word) and `next build`.
+- **End to end** on a fresh stack: smoke 316 checks (301 before) and AML
+  console 139 (137 before).
+  - The smoke run, after the documents and beneficiaries:
+    - the fiscal year's summary against the cash ledger: sales, purchases, zero
+      commissions, the fixed-term contract open, nothing withheld; the tiles and
+      each asset on the page;
+    - fiscal status: the RFC, residence in México, no W-8BEN (US dividends at
+      30%); certified through the page: Part I from the file, the statements all
+      required, a wrong signature refused and the legal name in lower case
+      accepted; version 1 valid through December 31 three years on, US dividends
+      at 10%, the chain verified; renewed through the API as version 2, both in
+      the security log, which the Security page then shows;
+    - the accounting CSV saved only after it reconciles, identical to the API's,
+      with a row per balance-changing movement of the year;
+    - the Constancia preview (fiscal year, ISR withheld, the summary's hash, "not
+      a CFDI"), printed alone on paper and saved as PDF; the phone layout.
+  - The AML run reads a frozen client's Tax Center and both tax endpoints: no
+    tipping-off words; the same 11 deliberate console errors as before, 0 failed
+    requests.
+  - The first run found a real bug, fixed before this record: the security log
+    rejected event codes with digits, so after a W-8BEN certification the
+    Security page could not load.
+
 **Legal beneficiaries and the Document Inbox** (migration `0020`, the routes
 `/api/v1/kyc/beneficiarios` and `/api/v1/wealth/documentos`, the Beneficiaries and
 Documents pages):
