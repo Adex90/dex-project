@@ -4,7 +4,10 @@
  * funds held, while the client sees nothing (no tipping off) -> officer 1
  * proposes a false positive -> officer 2 approves -> the client operates again.
  * Also: manual freeze, escalate, confirm, UIF folio, four-eyes requests, the
- * AUDITOR read-only and CLIENTE / OPERADOR locked out of the console. Staff sign
+ * AUDITOR read-only and CLIENTE / OPERADOR locked out of the console. Under
+ * review, the client's watchlist, price targets and order history read and
+ * work as anyone's (the Vault's Watchlist, the Orders page, an asset's Price
+ * alerts card) and never say why. Staff sign
  * in with two-step verification (TOTP): the first sign-in of each one enrolls
  * an authenticator through the UI or the API, as a person would, and every
  * later sign-in answers the code (RFC 6238, computed here).
@@ -504,6 +507,24 @@ try {
     `a savings plan created before any deposit answered ${plan.status}: active, its first purchase skipped (${plan.body?.failure_reason})`,
     plan.body,
   );
+  // The watchlist and a price target (migration 0024), before the review: under it, both keep working
+  // like anyone's and never say why.
+  const watched = await pageFetch(cp, "POST", "/api/v1/market/watchlist/AUG1/toggle", { watched: true });
+  const target = await pageFetch(cp, "POST", "/api/v1/market/alerts", {
+    ticker: "AUG1",
+    target_price: "1800.00",
+    direction: "above",
+    idempotency_key: crypto.randomUUID(),
+  });
+  state.target = target.body;
+  check(
+    watched.status === 200 &&
+      watched.body?.watched === true &&
+      target.status === 201 &&
+      target.body?.status === "active",
+    `the client follows AUG1 (${watched.status}) and sets a price target at 1,800.00 (${target.status} ${target.body?.status})`,
+    [watched.body, target.body],
+  );
   // Client B: verified through the API; the internal-transfer recipient here and the subject of scenario B.
   state.b = await apiOnboard(cp, runId + 1, `e2e-b-${runId}@example.mx`);
   check(true, `client B ${state.b.nombre} verified through the API (CLABE ${state.b.clabe})`);
@@ -584,9 +605,61 @@ try {
     "the Vault lists the plan, active, its skipped purchase in neutral words",
     (await planRow.count()) === 1 ? await planRow.innerText() : "no row",
   );
+  // The Watchlist (migration 0024): AUG1, not held, with its price target; the reads say nothing either.
+  const watchRow = cp.getByTestId("watchlist-row").and(cp.locator("[data-ticker=AUG1]"));
+  await watchRow.waitFor({ timeout: 10_000 }).catch(() => undefined);
+  const following = {
+    watchlist: await pageFetch(cp, "GET", "/api/v1/market/watchlist"),
+    "price targets": await pageFetch(cp, "GET", "/api/v1/market/alerts"),
+    "order history": await pageFetch(cp, "GET", "/api/v1/market/orders/history"),
+  };
+  for (const [what, read] of Object.entries(following)) {
+    check(
+      read.status === 200 &&
+        !/aml|pld|congel|alerta|cumplimiento|nivel_riesgo|es_pep|retenido|sospech|uif|preventiv|riesgo/i.test(
+          JSON.stringify(read.body),
+        ),
+      `the client's ${what} from the API (${read.status}) carries no AML wording`,
+      read.body,
+    );
+  }
+  check(
+    (await watchRow.count()) === 1 &&
+      (await watchRow.getByTestId("watchlist-row-target").innerText()) === "Rises to $1,800.00",
+    "the Vault's Watchlist lists AUG1 with its price target, as for anyone",
+    (await watchRow.count()) === 1 ? await watchRow.innerText() : "no row",
+  );
   const vaultHits = await tipOffWords(cp);
-  check(vaultHits.length === 0, `the Vault, its savings plans included, has no tipping-off words (${vaultHits.join(", ") || "none"})`, vaultHits);
+  check(
+    vaultHits.length === 0,
+    `the Vault, its savings plans and watchlist included, has no tipping-off words (${vaultHits.join(", ") || "none"})`,
+    vaultHits,
+  );
   await shot(cp, "client-vault-plans-frozen");
+  // The Orders page (its history) and the asset's Price alerts card: nothing there either.
+  await cp.getByTestId("vault-order-history").click();
+  await cp.waitForURL("**/dashboard/orders?tab=history");
+  await cp.getByTestId("order-history").waitFor({ timeout: 10_000 }).catch(() => undefined);
+  const ordersHits = await tipOffWords(cp);
+  check(
+    (await cp.getByTestId("order-history").count()) === 1 && ordersHits.length === 0,
+    `the Orders page's history has no tipping-off words (${ordersHits.join(", ") || "none"})`,
+    ordersHits,
+  );
+  await shot(cp, "client-orders-frozen");
+  await cp.goto(`${BASE}/dashboard/asset/AUG1`);
+  const targetRow = cp.getByTestId("price-alert").and(cp.locator(`[data-alert-id="${state.target?.alert_id}"]`));
+  await targetRow.waitFor({ timeout: 10_000 }).catch(() => undefined);
+  const assetHits = await tipOffWords(cp);
+  check(
+    (await targetRow.count()) === 1 &&
+      (await targetRow.getAttribute("data-status")) === "active" &&
+      (await cp.getByTestId("watch-toggle").getAttribute("aria-pressed")) === "true" &&
+      assetHits.length === 0,
+    `AUG1's page shows the star and the active target, with no tipping-off words (${assetHits.join(", ") || "none"})`,
+    assetHits,
+  );
+  await shot(cp, "client-price-alerts-frozen");
   // The Reserve tab on a fresh snapshot (a new client's first proof cuts again,
   // over every account): the held funds are in the leaf, with the neutral copy,
   // and the proof still verifies.
@@ -779,6 +852,29 @@ try {
     paused.status === 200 && paused.body?.status === "paused",
     `the client under review can still pause a savings plan (${paused.status} ${paused.body?.status})`,
     paused.body,
+  );
+  // Following and price targets move no money: they work as for anyone (refusing them would tip off).
+  const followingChanges = {
+    unfollow: await pageFetch(cp, "POST", "/api/v1/market/watchlist/AUG1/toggle", { watched: false }),
+    "new target": await pageFetch(cp, "POST", "/api/v1/market/alerts", {
+      ticker: "AUG1",
+      target_price: "1500.00",
+      direction: "below",
+      idempotency_key: crypto.randomUUID(),
+    }),
+    "cancel target": await pageFetch(cp, "POST", `/api/v1/market/alerts/${state.target?.alert_id}/cancel`),
+  };
+  check(
+    followingChanges.unfollow.status === 200 &&
+      followingChanges.unfollow.body?.watched === false &&
+      followingChanges["new target"].status === 201 &&
+      followingChanges["cancel target"].status === 200 &&
+      followingChanges["cancel target"].body?.status === "cancelled" &&
+      !/aml|pld|congel|alerta|cumplimiento|retenido|sospech|uif|preventiv|riesgo|OPERACION_NO_DISPONIBLE/i.test(
+        JSON.stringify(Object.values(followingChanges).map((r) => r.body)),
+      ),
+    `under review the client still unfollows (${followingChanges.unfollow.status}), sets (${followingChanges["new target"].status}) and cancels (${followingChanges["cancel target"].status}) price targets, and nothing says why`,
+    Object.fromEntries(Object.entries(followingChanges).map(([k, v]) => [k, [v.status, v.body]])),
   );
 
   // =========================================================================

@@ -11,9 +11,9 @@ import {
   ordersPath,
   ordersTab,
   parseHistoryEntry,
+  placedTime,
   parseOrderHistory,
   rejectReasonText,
-  waited,
 } from "./order-history.ts";
 
 /** The history of backend/tests/seguimiento.rs, newest first. */
@@ -146,10 +146,11 @@ test("each row in words: the kind, the price, the money, when", () => {
   assert.equal(historyPrice(planFill!), "at $9.9439");
   assert.equal(historyAmount(limitFill!), "1249.90000000");
   assert.equal(historyAmount(cancelled!), "100.00000000");
-  assert.equal(waited(limitFill!), true);
-  assert.equal(waited(marketFill!), false);
   // Mexico City time (UTC−6); the year only outside `now`'s.
   const now = Date.parse("2026-11-24T20:00:00Z");
+  assert.equal(placedTime(limitFill!, now), "Nov 24 · 12:04 PM");
+  assert.equal(placedTime(marketFill!, now), null);
+  assert.equal(placedTime({ placed_at: "2026-11-24T18:12:05Z", closed_at: "2026-11-24T18:12:50Z" }, now), null);
   assert.equal(formatOrderTime("2026-11-24T18:12:00Z", now), "Nov 24 · 12:12 PM");
   assert.equal(formatOrderTime("2025-12-30T15:15:00Z", now), "Dec 30, 2025 · 9:15 AM");
 });

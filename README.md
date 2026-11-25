@@ -1189,6 +1189,137 @@ evaluation; only the scheduler places it. The backend is
     say nothing, a new plan is refused with the identical constant, pausing
     still works.
 
+## Watchlist, price alerts and order history (migration `0024`)
+
+The watchlist follows assets the client does not hold yet; a price alert
+waits for an asset's price to reach a target; the order history lists every
+order that is no longer open. The backend is
+`backend/src/mercado/seguimiento.rs`, `alertas.rs` and
+`historial_ordenes.rs`; the contracts, `Watchlist`, `PriceAlert` and
+`OrderHistory` in `frontend/src/types/market.ts`.
+
+- **`GET /api/v1/market/watchlist`** (client): `{"items": [{"ticker", "added_at", "asset"}]}`,
+  newest first, each with its catalog listing (`MarketListing`), read with
+  the client's role (RLS). Without `MODO_DEMO`, simulated assets are left
+  out, as in the catalog.
+- **`POST /api/v1/market/watchlist/{ticker}/toggle`** (client): with
+  `{"watched": true | false}` it sets that state, so repeating it changes
+  nothing and a retry is safe; with no body it flips it. Answers
+  `{"ticker", "watched", "added_at"}` (200). Following needs an asset that
+  exists (404) and is offered (503 `MERCADO_NO_DISPONIBLE`), at most 50 per
+  client (422 `LIMITE_SEGUIMIENTO`).
+- **`POST /api/v1/market/alerts`** (client):
+  `{"ticker", "target_price", "direction": "above" | "below", "idempotency_key"}`
+  answers the alert: 201, or 200 when the key repeats the same one (409
+  `CLAVE_IDEMPOTENCIA_REUTILIZADA` for different terms). The target is a
+  price (positive, at most 8 decimals) on the side the price has not reached:
+  above the current price to wait for a rise, below it for a fall (422
+  `AVISO_YA_ALCANZADO`); at most 50 active per client (422
+  `LIMITE_AVISOS_PRECIO`). The database records the catalog price it was set
+  against (`reference_price`).
+- **`GET /api/v1/market/alerts`** (client): `{"alerts": [...]}`, the active
+  ones and those reached in the last 30 days, newest first. Each one:
+  `alert_id`, `ticker`, `direction`, `target_price`, `status` (`active`,
+  `triggered`, `cancelled`), `reference_price`, `triggered_price`,
+  `created_at`, `triggered_at` and `cancelled_at`.
+- **`POST /api/v1/market/alerts/{id}/cancel`** (client) answers the alert,
+  cancelled. Repeating it answers the same; one already reached is 409
+  `AVISO_DISPARADO`; another client's does not exist (404).
+- **Reaching a target.** The trigger engine's pass
+  (`MERCADO_DISPARO_INTERVALO_SEG`, default 5 s) also marks every active
+  alert whose target the current price has reached, on offered assets only
+  (`mercado::alertas::evaluar`): client by client, each in its own
+  transaction with the account locked first. The database writes the catalog
+  price that reached it (`triggered_price`) and the time; a price that moved
+  back meanwhile makes the transaction retry, and the alert stays active.
+- **No KYC, and no refusal on a frozen account:** following and price alerts
+  move no money, and refusing them would tip off. The client-facing codes say
+  `AVISO`, never `ALERTA`, and no client screen says "alert" in the singular
+  ("Price alerts", "price target", "Notify me").
+- **`GET /api/v1/market/orders/history?limit=&cursor=`** (client):
+  `{"orders": [...], "next_cursor"}`. Every filled order of the market ledger
+  (`mercado.ordenes`: a market order, a limit or stop order's fill, a savings
+  plan's purchase) and every limit or stop order cancelled or rejected
+  (`mercado.ordenes_pendientes`), newest first by when it closed; `limit` 1
+  to 100 (default 50) and an opaque cursor for the next page (null on the
+  last; an invalid one is 400). Each order: `order_id`, `status` (`filled`,
+  `cancelled`, `rejected`), `order_type` (`market`, `limit`, `stop`,
+  `savings_plan`, from the order's real relations, not its key), `side`,
+  `ticker`, `amount` (asked), `limit_price`, `stop_price`, a fill's
+  `quantity`, `price`, `total` and `commission`, a rejection's
+  `reject_reason` (the rule's code), `placed_at`, `closed_at`,
+  `source_order_id` (the limit or stop order it filled) and `plan_id`. Read
+  with the client's role (RLS); it writes nothing.
+- **What the database guarantees** (`mercado.watchlist`,
+  `mercado.alertas_precio`): a follow is the client's own, once per asset,
+  never updated (`SC_SEGUIMIENTO_INMUTABLE`), at most 50
+  (`SC_LIMITE_SEGUIMIENTO`). An alert is born active (`SC_AVISO_INCOHERENTE`)
+  on the side the catalog price has not reached (`SC_AVISO_YA_ALCANZADO`),
+  at most 50 active (`SC_LIMITE_AVISOS_PRECIO`); its terms never change
+  (`SC_AVISO_INMUTABLE`); only an active one moves, to triggered (only when
+  the price meets the target, `SC_AVISO_NO_ALCANZADO`, its price and time
+  written by the database) or to cancelled, and both are final
+  (`SC_AVISO_CERRADO`); alerts are never deleted. `sc_mercado` inserts and
+  deletes follows, inserts alerts and changes only their status;
+  `sc_cliente` reads only its own (RLS). Following, unfollowing, setting,
+  cancelling and reaching a target raise the account's order version: the
+  vault's `seq` moves and the WebSocket pushes, so every device follows.
+- **Frontend: the stars** (`frontend/src/components/markets/watch-toggle.tsx`):
+  on each Discover row (its own column; the row ignores the click) and on
+  the asset's header ("Watch", "Watching"). Outlined zinc, solid gold once
+  followed; optimistic, and a failure restores it and says why beside it.
+  The dashboard loads the watchlist and the price alerts once and reloads
+  them whenever the vault moves (`components/markets/following-sync.tsx`).
+- **Frontend: Price alerts** (`frontend/src/components/markets/price-alerts.tsx`,
+  on the asset's page after the key stats): a target price, the sentence of
+  what it will do ("Notify me when AUG1 rises to $1,700.00", or why a target
+  at the current price cannot be set) and Notify me, which keeps its
+  idempotency key while the target stays the same. Below it, the active
+  targets nearest first with Cancel (optimistic), then those reached, with
+  the price that reached them.
+- **Frontend: Price target reached**
+  (`frontend/src/components/markets/price-target-notices.tsx`): at the top of
+  every dashboard page, the targets reached since this device last dismissed
+  the notice (the first time, the last day), each with its asset's page.
+- **Frontend: the Vault's Watchlist**
+  (`frontend/src/components/markets/watchlist-section.tsx`, after the
+  assets, absent when empty): the assets followed and not held, with their
+  price, 24-hour change and nearest active target; the star unfollows.
+- **Frontend: Orders** (`/dashboard/orders`, linked from the open orders'
+  header and the assets' last line on the Vault; like an asset's page it
+  belongs to the tab that opened it): Open (the open orders, with Cancel) and
+  History (`frontend/src/components/markets/order-history-list.tsx`):
+  status badges (Filled in gold, Cancelled in zinc, Rejected in red), when it
+  closed and, for one that waited, when it was placed, the fill's price and
+  units or the price it waited for, a rejection's reason in plain English
+  (the reasons a client can act on; anything else, one neutral sentence), and
+  Load more, 25 at a time. The tab is in the address (`?tab=history`).
+- Tests:
+  - `tests/db/0024_seguimiento_alertas.sql`: follows (unique, capped,
+    immutable), alerts (born active on the right side, capped, the
+    transitions and their final states, the price written by the database,
+    no deletes), the vault's version, privileges and RLS.
+  - `backend/tests/seguimiento.rs`: the watchlist (set, flip, idempotent
+    retries, cap, unknown and non-offered assets, RLS), alerts (creation,
+    idempotency both ways, the side and range rules, cap, cancel and its
+    409), the engine reaching targets (only those, at the price that reached
+    them, once even with two passes at a time), a PLD freeze that changes
+    nothing and says nothing, and the history (every kind, the order, the
+    cursor pages, limits); the AML tipping-off and source-scan tests list the
+    three routes too.
+  - `frontend/src/lib/{watchlist,price-alerts,order-history}.test.ts` and
+    `frontend/src/store/{watchlist,price-alerts,order-history}.test.ts`:
+    validation, the words (no tipping off), and the stores (optimistic
+    changes and rollbacks, stale loads, pages joined in order).
+  - `frontend/e2e/smoke.mjs`: a star on Discover and on the asset's header,
+    two targets either side of silver's price, one reached when the test
+    moves the price in the database ("Price target reached" on the Vault,
+    dismissed for good on this device; announced once on another), the
+    Vault's Watchlist and its phone layout, the whole order history page by
+    page against the API, and Open. `frontend/e2e/aml.mjs`: under review, the
+    client's watchlist, price targets and history read and work as anyone's,
+    on the API and on screen, and say nothing.
+
 ## Pro chart and portfolio allocation (frontend)
 
 Two analytics views in the Sovereign Gold identity, in native SVG and HTML (no
@@ -1890,6 +2021,11 @@ the password is hashed, so a parallel burst cannot test more than 5 passwords.
 | POST | `/api/v1/market/orders/{id}/cancel` | client: cancels a pending order and releases what it held |
 | GET | `/api/v1/market/savings-plans` | client: its active and paused savings plans, with their next dates and totals (`SavingsPlans`) |
 | POST | `/api/v1/market/savings-plans/{id}/pause`, `/resume`, `/cancel` | client: pauses, resumes (at the next date still to come) or cancels (final) a savings plan |
+| GET | `/api/v1/market/orders/history` | client: its filled, cancelled and rejected orders, newest first, by cursor pages (`limit` 1–100, `cursor`) (`OrderHistory`) |
+| GET | `/api/v1/market/watchlist` | client: the assets it follows, newest first, with their listing (`Watchlist`) |
+| POST | `/api/v1/market/watchlist/{ticker}/toggle` | client: follows or unfollows an asset; `{"watched": bool}` sets the state, no body flips it (`WatchState`) |
+| GET, POST | `/api/v1/market/alerts` | client: its active price alerts and those reached in 30 days; POST sets a target above (rise) or below (fall) the price (201; 200 for the same key) (`PriceAlert`) |
+| POST | `/api/v1/market/alerts/{id}/cancel` | client: cancels an active price alert (409 `AVISO_DISPARADO` once reached) |
 | GET | `/api/v1/wealth/linked-accounts` | client: its linked bank accounts, all in its own name (`MODO_DEMO` links a demo one) |
 | POST | `/api/v1/wealth/withdraw` | client with a step-up window: withdraws available cash to a linked account by SPEI (`WithdrawalReceipt`, processing until settled) |
 | GET | `/api/v1/wealth/documentos`, `/api/v1/wealth/documentos/{id}` | client: its statements and trade confirmations, derived from the ledgers, each with its reserve seal |

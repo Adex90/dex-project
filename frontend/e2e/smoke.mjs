@@ -8,6 +8,8 @@
  * Requires the `playwright` package (resolved from NODE_PATH or a global
  * install) and a Chromium build (PLAYWRIGHT_BROWSERS_PATH). Chromium runs with
  * a fake camera (an animated test pattern), so the liveness frames differ.
+ * And `psql` on the stack's database (e2e/aml-stack.sh's PG* variables and DB),
+ * to move a price as the oracle will.
  *
  * First pass: landing -> sign-up -> KYC-locked dashboard -> the four-step
  * verification at /dashboard/verify (identity, INE photos and details,
@@ -27,7 +29,11 @@
  * the Constancia de Retenciones printed), Savings plans (created from the
  * checkout with its first purchase at once, the receipt's next dates, the
  * Vault's list live with a plan from another device, Pause, Resume and
- * Cancel)
+ * Cancel), the watchlist and price alerts (a star on Discover and on the
+ * asset's header, two targets either side of the price, one reached when the
+ * test moves silver's price in the database: "Price target reached" on the
+ * Vault, dismissed for good on this device; the Vault's Watchlist), the
+ * Orders page (the whole history, 25 at a time, as the API lists it; Open)
  * and the Security page (devices signed in, Revoke and "Sign out all
  * other devices", the inactivity timeout, a password change, the security
  * log; then, for a client of its own on a phone, two-step verification turned
@@ -41,7 +47,8 @@
  * Second pass: signing in again lands directly on the Vault, which is live
  * over its WebSocket: a deposit made outside the browser reaches the screen
  * with REST blocked, a server restart (1001) reconnects, and a session the
- * server ends (4001) returns to sign-in. The Vault's allocation shows the
+ * server ends (4001) returns to sign-in. A target reached in the first pass
+ * is announced once on this new device. The Vault's allocation shows the
  * shares its own figures give, exactly, and follows the deposit and the gold
  * buy live. In between, trading with REST for
  * the vault blocked: a gold buy on another device appears in the asset list,
@@ -52,6 +59,7 @@
  * The theme is dark only ("Sovereign Gold"); the passes still differ in the
  * browser's preferred color scheme, which must not change it.
  */
+import { execFileSync } from "node:child_process";
 import { createRequire } from "node:module";
 import { createHmac } from "node:crypto";
 import { mkdirSync, readFileSync } from "node:fs";
@@ -70,6 +78,8 @@ import { allocation, formatShare } from "../src/lib/allocation.ts";
 import { SOVEREIGN_YIELD_PCT, accrued, formatTruncated, monthWindow } from "../src/lib/wealth.ts";
 // And the savings plans' calendar words, to read the dates a plan shows in Mexico City time.
 import { formatPlanDate, formatPlanDay } from "../src/lib/savings-plans.ts";
+// And the order history's plain-English reasons, to read a rejected order's row.
+import { rejectReasonText } from "../src/lib/order-history.ts";
 
 // createRequire honors NODE_PATH (ESM imports do not), so a global install works.
 const { chromium } = createRequire(import.meta.url)("playwright");
@@ -216,6 +226,22 @@ async function apiOrder(token, order) {
 
 /** Collapses the whitespace `innerText` puts between a component's pieces. */
 const flat = (text) => text.replace(/\s+/g, " ").trim();
+
+/**
+ * A statement on the stack's database (e2e/aml-stack.sh: the same PG* variables
+ * and database name). The demo's simulated prices stand still, so the test
+ * moves a price itself, as the price oracle will, to see a price target reached.
+ */
+function sql(statement) {
+  const env = {
+    ...process.env,
+    PGHOST: process.env.PGHOST ?? "localhost",
+    PGUSER: process.env.PGUSER ?? "synthetic",
+    PGPASSWORD: process.env.PGPASSWORD ?? "synthetic",
+  };
+  const db = process.env.DB ?? "sc_e2e_aml";
+  return execFileSync("psql", ["-d", db, "-v", "ON_ERROR_STOP=1", "-qAtc", statement], { env, encoding: "utf8" });
+}
 
 /**
  * The vault's allocation from its own figures (GET /api/v1/vault), through
@@ -397,6 +423,15 @@ try {
       );
       await page.getByTestId("kyc-header-badge").and(page.locator("[data-status=VERIFICADO]")).waitFor();
       check((await page.getByTestId("kyc-banner").count()) === 0, "second pass: no KYC banner for the verified client");
+      // The price target the first pass reached is news on this device: announced once, then dismissed.
+      const reachedElsewhere = page.getByTestId("price-target-notices");
+      await reachedElsewhere.waitFor({ timeout: 5_000 });
+      check(
+        flat(await reachedElsewhere.innerText()).includes("AGT1 rose to $560.35, past your $560.00 target."),
+        "a new device announces the price target reached in the first pass",
+      );
+      await reachedElsewhere.getByTestId("price-target-dismiss").click();
+      await reachedElsewhere.waitFor({ state: "detached" });
       // The allocation: cash and the fixed-term contract, nothing in the market yet, in the
       // exact shares the vault's own figures give (they add up to 100.00 %).
       let split = await expectedAllocation(await apiLogin(email, password));
@@ -3038,6 +3073,332 @@ try {
         toUnits(cashAfterSales) === toUnits(cashBeforePlan),
       "the plans' 0.31 AUG1 and 10 CETES28 sell like any position: the cash is back to the cent",
     );
+
+    // ---------------------------------------------------------------------
+    // Watchlist, price alerts and the order history: the stars on Discover
+    // and an asset's page, price targets the market worker reaches (the
+    // notice on any page), the Vault's Watchlist and the Orders page
+    // ---------------------------------------------------------------------
+    const TIP_OFF =
+      /\b(compliance hold|compliance review|frozen|freeze|restrict\w*|AML|PLD|suspicious|alert|congel\w*|preventiv\w*|UIF|investigat\w*|risk)\b/i;
+    /** Polls `probe` until it returns something truthy (or `timeout` ms pass); returns its last value. */
+    const eventually = async (probe, timeout = 5_000) => {
+      const end = Date.now() + timeout;
+      let value = await probe();
+      while (!value && Date.now() < end) {
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        value = await probe();
+      }
+      return value;
+    };
+    const watchedTickers = async () =>
+      (await asClient("/api/v1/market/watchlist")).body.items.map((item) => item.ticker).join(",");
+    check((await watchedTickers()) === "", "the watchlist starts empty");
+
+    // Discover: the star on a row follows the asset without opening it.
+    await openTab(page, "Discover");
+    const silverRow = page.getByTestId("market-row").and(page.locator("[data-ticker=AGT1]"));
+    const silverStar = silverRow.getByTestId("watch-toggle");
+    await silverStar.and(page.locator(":enabled")).waitFor();
+    check(
+      (await silverStar.getAttribute("aria-pressed")) === "false" &&
+        (await silverStar.getAttribute("aria-label")) === "Add AGT1 to your watchlist",
+      "each Discover row ends with an outlined star: Add AGT1 to your watchlist",
+    );
+    await silverStar.click();
+    await silverStar.and(page.locator("[aria-pressed=true]")).waitFor({ timeout: 1_000 });
+    await page.mouse.move(0, 0);
+    check(
+      new URL(page.url()).pathname === "/dashboard/discover" &&
+        (await silverStar.getAttribute("aria-label")) === "Remove AGT1 from your watchlist" &&
+        (await settledStyle(silverStar, "color")) === "rgb(234, 179, 8)" &&
+        (await eventually(async () => (await watchedTickers()) === "AGT1")),
+      "pressed, the star turns solid gold at once and stays on Discover; the server follows AGT1",
+    );
+    await silverRow.scrollIntoViewIfNeeded();
+    await shot(page, "discover-watch-star", { fullPage: false });
+
+    // AGT1's page: its header says so; the Price alerts card sets targets on either side of the price.
+    await silverRow.getByTestId("market-row-link").click();
+    await page.waitForURL("**/dashboard/asset/AGT1");
+    const headerStar = page.getByTestId("asset-detail").getByTestId("watch-toggle");
+    await headerStar.and(page.locator("[aria-pressed=true]")).waitFor();
+    check(
+      flat(await headerStar.innerText()).toLowerCase() === "watching",
+      "the asset's header star reads Watching for an asset followed from Discover",
+    );
+    const alertsCard = page.getByTestId("price-alerts");
+    const targetField = alertsCard.getByTestId("price-alert-target");
+    const targetHint = alertsCard.getByTestId("price-alert-hint");
+    const notifyMe = alertsCard.getByTestId("price-alert-submit");
+    const targetRows = alertsCard.getByTestId("price-alert");
+    check(
+      (await alertsCard.getByTestId("price-alerts-count").innerText()) === "NONE SET" &&
+        (await targetRows.count()) === 0 &&
+        !(await notifyMe.isEnabled()),
+      "the Price alerts card starts with none set, Notify me disabled",
+    );
+    await targetField.fill("548.20");
+    check(
+      (await targetHint.innerText()) === "AGT1 is at $548.20 now: choose a price above or below it." &&
+        (await targetField.getAttribute("aria-invalid")) === "true" &&
+        !(await notifyMe.isEnabled()),
+      "a target at the current price cannot be set, and the card says why",
+    );
+    await targetField.fill("560");
+    check(
+      (await targetHint.innerText()) === "Notify me when AGT1 rises to $560.00" && (await notifyMe.isEnabled()),
+      "above the price, it waits for a rise: Notify me when AGT1 rises to $560.00",
+    );
+    await notifyMe.click();
+    await alertsCard.getByTestId("price-alert-made").waitFor();
+    await targetField.fill("540");
+    check(
+      (await targetHint.innerText()) === "Notify me when AGT1 falls to $540.00",
+      "below it, for a fall: Notify me when AGT1 falls to $540.00",
+    );
+    await notifyMe.press("Enter");
+    await eventually(async () => (await targetRows.count()) === 2);
+    const targetsSet = (await asClient("/api/v1/market/alerts")).body.alerts;
+    check(
+      targetsSet.length === 2 &&
+        targetsSet.every((a) => a.ticker === "AGT1" && a.status === "active" && a.reference_price === "548.20000000") &&
+        JSON.stringify(targetsSet.map((a) => [a.direction, a.target_price]).sort()) ===
+          JSON.stringify([
+            ["above", "560.00000000"],
+            ["below", "540.00000000"],
+          ]) &&
+        (await targetField.inputValue()) === "",
+      "two targets set, once each: rises to 560.00 and falls to 540.00, both against 548.20",
+    );
+    check(
+      JSON.stringify(await targetRows.evaluateAll((rows) => rows.map((r) => r.querySelector("p")?.textContent))) ===
+        JSON.stringify(["Falls to $540.00", "Rises to $560.00"]) &&
+        (await alertsCard.getByTestId("price-alerts-count").innerText()) === "2 ACTIVE" &&
+        (await targetRows.first().innerText()).includes("Set at $548.20"),
+      "the card lists them nearest first (540.00 is 8.20 away, 560.00 is 11.80), each with the price it was set at",
+    );
+    check(!TIP_OFF.test(await alertsCard.innerText()), "the card never says the singular word an AML hold would use");
+    await alertsCard.scrollIntoViewIfNeeded();
+    await shot(page, "asset-price-alerts");
+
+    // The market worker reaches the 560.00 target when silver trades above it (the price moves in the
+    // database, as the price oracle will move it); the notice shows wherever the client is.
+    await openTab(page, "Vault");
+    sql("UPDATE mercado.activos SET precio = 560.35 WHERE ticker = 'AGT1'");
+    const reachedNotice = page.getByTestId("price-target-notices");
+    try {
+      await reachedNotice.waitFor({ timeout: 15_000 });
+    } finally {
+      sql("UPDATE mercado.activos SET precio = 548.20 WHERE ticker = 'AGT1'");
+    }
+    const reachedTargets = (await asClient("/api/v1/market/alerts")).body.alerts;
+    const reachedOne = reachedTargets.find((a) => a.status === "triggered");
+    check(
+      flat(await reachedNotice.innerText()).startsWith(
+        "PRICE TARGET REACHED AGT1 rose to $560.35, past your $560.00 target.",
+      ) &&
+        reachedOne?.target_price === "560.00000000" &&
+        reachedOne.triggered_price === "560.35000000" &&
+        reachedTargets.filter((a) => a.status === "active").length === 1 &&
+        !TIP_OFF.test(await reachedNotice.innerText()),
+      "silver at 560.35: the worker marks the target reached at that price, and the Vault says Price target reached",
+    );
+    await shot(page, "price-target-reached", { fullPage: false });
+    await reachedNotice.getByRole("link", { name: "View AGT1" }).click();
+    await page.waitForURL("**/dashboard/asset/AGT1");
+    const reachedRow = targetRows.and(page.locator("[data-status=triggered]"));
+    await reachedRow.waitFor();
+    check(
+      (await reachedRow.innerText()).includes("AGT1 rose to $560.35, past your $560.00 target.") &&
+        (await reachedRow.getByTestId("price-alert-cancel").count()) === 0 &&
+        (await alertsCard.getByTestId("price-alerts-count").innerText()) === "1 ACTIVE · 1 REACHED",
+      "View AGT1 opens the asset: the target shows Reached with the price that reached it, nothing to cancel",
+    );
+    await reachedNotice.getByTestId("price-target-dismiss").click();
+    await reachedNotice.waitFor({ state: "detached" });
+    await page.goto(`${BASE}/dashboard`);
+    await page.getByTestId("vault-total").waitFor();
+    await page.waitForTimeout(500);
+    check((await reachedNotice.count()) === 0, "dismissed, the notice stays gone on this device after a reload");
+    const lateCancel = await asClient(`/api/v1/market/alerts/${reachedOne.alert_id}/cancel`, { method: "POST" });
+    check(
+      lateCancel.status === 409 && lateCancel.body.error.codigo === "AVISO_DISPARADO",
+      "a reached target cannot be cancelled (409 AVISO_DISPARADO)",
+    );
+
+    // The Vault's Watchlist: followed and not held, with its nearest target; its star unfollows.
+    const watchlist = page.getByTestId("vault-watchlist");
+    const silverWatch = watchlist.getByTestId("watchlist-row").and(page.locator("[data-ticker=AGT1]"));
+    await silverWatch.waitFor();
+    check(
+      (await watchlist.getByTestId("vault-watchlist-count").innerText()) === "1 asset you're watching" &&
+        (await silverWatch.innerText()).includes("Tokenized silver, 1 oz") &&
+        (await silverWatch.innerText()).includes("$548.20") &&
+        (await silverWatch.getByTestId("watchlist-row-target").innerText()) === "Falls to $540.00" &&
+        (await watchlist.boundingBox()).y > (await page.getByTestId("asset-list").boundingBox()).y &&
+        !TIP_OFF.test(await watchlist.innerText()),
+      "the Vault's Watchlist, after the assets: AGT1 at $548.20, its active target Falls to $540.00",
+    );
+    await watchlist.scrollIntoViewIfNeeded();
+    await shot(page, "vault-watchlist", { fullPage: false });
+    await page.setViewportSize({ width: 390, height: 844 });
+    await watchlist.scrollIntoViewIfNeeded();
+    check(
+      (await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)) &&
+        (await silverWatch.getByTestId("watch-toggle").isVisible()),
+      "on a phone the Watchlist fits the width, its star included",
+    );
+    await shot(page, "vault-watchlist-mobile", { fullPage: false });
+    await page.setViewportSize({ width: 1440, height: 1000 });
+
+    // The last target cancelled from the asset's card: the row goes at once.
+    await page.goto(`${BASE}/dashboard/asset/AGT1`);
+    const fallTarget = targetRows.and(page.locator("[data-status=active]"));
+    await fallTarget.waitFor();
+    await fallTarget.getByTestId("price-alert-cancel").click();
+    await fallTarget.waitFor({ state: "detached", timeout: 1_000 });
+    check(
+      (await alertsCard.getByTestId("price-alerts-count").innerText()) === "1 REACHED" &&
+        (await eventually(async () =>
+          (await asClient("/api/v1/market/alerts")).body.alerts.every((a) => a.status === "triggered"),
+        )),
+      "Cancel takes the active target off at once; the server keeps only the reached one",
+    );
+    // Unfollowed from the header, the Vault has no Watchlist left.
+    await headerStar.click();
+    await headerStar.and(page.locator("[aria-pressed=false]")).waitFor({ timeout: 1_000 });
+    check(
+      flat(await headerStar.innerText()).toLowerCase() === "watch" &&
+        (await eventually(async () => (await watchedTickers()) === "")),
+      "the header star unfollows AGT1: Watch again, and the server agrees",
+    );
+    await openTab(page, "Vault");
+    await page.getByTestId("asset-list").waitFor();
+    await page.waitForTimeout(300);
+    check((await watchlist.count()) === 0, "with nothing followed, the Watchlist is not on the Vault");
+
+    // Orders: from the Vault's assets, the history, page by page, exactly as the API has it.
+    const historyAll = [];
+    for (let cursor = null, first = true; first || cursor !== null; first = false) {
+      const path = `/api/v1/market/orders/history?limit=100${cursor ? `&cursor=${cursor}` : ""}`;
+      const page100 = (await asClient(path)).body;
+      historyAll.push(...page100.orders);
+      cursor = page100.next_cursor;
+    }
+    const pendingNow = (await asClient("/api/v1/market/orders/pending")).body.orders;
+    // Pages of 3 here (the page's request rewritten on its way out), so this client's few orders take several.
+    const HISTORY_PAGE = 3;
+    const historyRoute = "**/api/v1/market/orders/history?*";
+    await page.route(historyRoute, (route) => {
+      const url = route.request().url();
+      return route.continue({ url: url.replace(/limit=\d+/, `limit=${HISTORY_PAGE}`) });
+    });
+    await page.getByTestId("vault-order-history").click();
+    await page.waitForURL("**/dashboard/orders?tab=history");
+    const ordersTabs = page.getByTestId("orders-tabs");
+    const historyRows = page.getByTestId("history-row");
+    await historyRows.first().waitFor();
+    const vaultTab = mainNav(page).getByRole("link", { name: "Vault", exact: true });
+    check(
+      (await ordersTabs.getByRole("radio", { name: "History" }).isChecked()) &&
+        (await vaultTab.getAttribute("aria-current")) === "page" &&
+        (await page.getByTestId("orders-back").innerText()).toLowerCase() === "back to vault",
+      "Order history opens the Orders page on History; the Vault stays the current tab, and Back returns to it",
+    );
+    const more = page.getByTestId("order-history-more");
+    const firstPage = await historyRows.count();
+    let loadMoreClicks = 0;
+    while ((await more.count()) > 0) {
+      const shown = await historyRows.count();
+      await more.click();
+      loadMoreClicks += 1;
+      await eventually(async () => (await historyRows.count()) > shown);
+    }
+    const shownIds = await historyRows.evaluateAll((rows) => rows.map((r) => r.getAttribute("data-order-id")));
+    const apiIds = historyAll.map((o) => o.order_id);
+    check(
+      historyAll.length > HISTORY_PAGE &&
+        firstPage === HISTORY_PAGE &&
+        loadMoreClicks === Math.ceil(historyAll.length / HISTORY_PAGE) - 1 &&
+        isDeepStrictEqual(shownIds, apiIds) &&
+        (await page.getByTestId("order-history-shown").innerText()) ===
+          `${historyAll.length} orders: that's all of them`,
+      `the history shows all ${historyAll.length} orders, newest first, a page at a time (Load more ${loadMoreClicks}×), as the API lists them`,
+    );
+    await page.unroute(historyRoute);
+    const kinds = new Set(historyAll.map((o) => `${o.status}:${o.order_type}`));
+    check(
+      ["filled:market", "filled:savings_plan", "cancelled:limit"].every((kind) => kinds.has(kind)),
+      `it holds every kind this client placed: ${[...kinds].sort().join(", ")}`,
+    );
+    const newest = historyRows.first();
+    check(
+      (await newest.getByTestId("history-kind").innerText()) === "Market sale" &&
+        (await newest.getAttribute("data-ticker")) === "CETES28" &&
+        (await newest.getByTestId("history-status").last().innerText()) === "FILLED" &&
+        (await newest.getByTestId("history-amount").innerText()) === "$99.44" &&
+        (await newest.innerText()).includes("10 CETES28"),
+      "the newest is the CETES28 sale that closed the plans: Market sale, Filled, $99.44 for 10 CETES28",
+    );
+    const planBuy = historyRows.and(page.locator("[data-order-type=savings_plan]")).first();
+    check(
+      (await planBuy.getByTestId("history-kind").innerText()) === "Savings plan purchase" &&
+        (await planBuy.innerText()).includes("at $"),
+      "a savings plan's purchase is labelled as such, with its price",
+    );
+    const cancelledRow = historyRows.and(page.locator("[data-status=cancelled]")).first();
+    check(
+      (await cancelledRow.getByTestId("history-status").last().innerText()) === "CANCELLED" &&
+        (await cancelledRow.innerText()).includes("Not filled") &&
+        /\b(Limit|Stop) \$/.test(await cancelledRow.innerText()),
+      "a cancelled limit or stop order shows its price and Not filled",
+    );
+    for (const rejected of historyAll.filter((o) => o.status === "rejected")) {
+      const row = historyRows.and(page.locator(`[data-order-id="${rejected.order_id}"]`));
+      check(
+        (await row.getByTestId("history-reason").innerText()) === rejectReasonText(rejected.reject_reason),
+        `a rejected ${rejected.order_type} order says why in plain English (${rejected.reject_reason})`,
+      );
+    }
+    check(!TIP_OFF.test(await page.getByTestId("order-history").innerText()), "the history never tips anything off");
+    await page.mouse.move(0, 0);
+    await shot(page, "orders-history-desktop");
+    await page.setViewportSize({ width: 390, height: 844 });
+    check(
+      (await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)) &&
+        (await newest.getByTestId("history-status").first().isVisible()),
+      "on a phone the history fits the width, each status badge beside its order",
+    );
+    await shot(page, "orders-history-mobile", { fullPage: false });
+    await page.setViewportSize({ width: 1440, height: 1000 });
+
+    // Open: the same list as the Vault's, here even when there are none; the address follows the tab.
+    await ordersTabs.getByText("Open", { exact: true }).click();
+    await page.waitForURL((url) => url.pathname === "/dashboard/orders" && url.search === "");
+    if (pendingNow.length === 0) {
+      await page.getByTestId("open-orders-empty").waitFor();
+      check(
+        (await page.getByTestId("open-orders-count").innerText()) === "No open orders",
+        "Open, with nothing waiting: the card says so and points to Discover",
+      );
+    } else {
+      await page.getByTestId("open-order").first().waitFor();
+      check(
+        (await page.getByTestId("open-order").count()) === pendingNow.length,
+        `Open lists the ${pendingNow.length} order(s) still waiting for their price`,
+      );
+    }
+    await page.reload();
+    const openContent = page.getByTestId(pendingNow.length === 0 ? "open-orders-empty" : "open-order");
+    await openContent.first().waitFor();
+    check(
+      await ordersTabs.getByRole("radio", { name: "Open" }).isChecked(),
+      "a reload keeps the tab the address names (Open)",
+    );
+    await shot(page, "orders-open");
+    await page.getByTestId("orders-back").click();
+    await page.waitForURL("**/dashboard");
 
     // ---------------------------------------------------------------------
     // Security (roadmap items 20 and 21): devices, the password, the log

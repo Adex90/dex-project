@@ -42,8 +42,8 @@ export interface WatchlistFields {
 
 export interface WatchlistActions {
   load: (fetchWatchlist: WatchlistFetcher) => Promise<void>;
-  /** Follows or unfollows `ticker`; `asset` lets a new one show in the list before the next load. */
-  set: (ticker: string, watched: boolean, setWatched: WatchSetter, asset?: MarketListing) => Promise<void>;
+  /** Follows or unfollows `ticker`; its listing (`asset`) puts a new one in the list before the next load. */
+  set: (ticker: string, watched: boolean, setWatched: WatchSetter, asset: MarketListing) => Promise<void>;
   dismissNotice: () => void;
   reset: () => void;
 }
@@ -100,12 +100,7 @@ export const useWatchlistStore = create<WatchlistState>()((set, get) => ({
       // A 2xx means it stands as asked; an answer that cannot be read still is one.
       const addedAt = answer?.ticker === ticker && answer.watched ? answer.added_at : new Date().toISOString();
       const others = get().items.filter((item) => item.ticker !== ticker);
-      const items =
-        watched && asset
-          ? [{ ticker, added_at: addedAt ?? new Date().toISOString(), asset }, ...others]
-          : watched
-            ? get().items
-            : others;
+      const items = watched ? [{ ticker, added_at: addedAt ?? new Date().toISOString(), asset }, ...others] : others;
       settle({ items });
     } catch (error) {
       settle({ notice: { ticker, watched, error } });

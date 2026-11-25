@@ -19,8 +19,8 @@ import {
   historyAmount,
   historyKind,
   historyPrice,
+  placedTime,
   rejectReasonText,
-  waited,
 } from "@/lib/order-history";
 import { formatShares } from "@/lib/vault";
 import { useOrderHistoryStore } from "@/store/order-history";
@@ -35,7 +35,7 @@ import type { HistoryStatus, OrderHistoryEntry } from "@/types/market";
  *
  * - Each row: the ticker (it opens the asset), the kind of order, a status
  *   badge (Filled in gold, Cancelled in zinc, Rejected in red), when it
- *   closed (and, for one that waited for its price, when it was placed), the
+ *   closed (and when it was placed, for one that waited for its price), the
  *   price (a fill's, or what it waited for) and the money (a fill's total
  *   with its units; otherwise the amount asked for). A rejected order says
  *   why in plain English.
@@ -161,7 +161,7 @@ export function OrderHistoryList({ token, className }: { token: string; classNam
         <footer className="flex flex-wrap items-center justify-between gap-3 border-t border-border px-5 py-3 sm:px-6">
           {error !== null ? (
             <p role="alert" className="text-xs text-danger">
-              Could not load more. {describeError(error)}
+              Some orders could not be loaded. {describeError(error)}
             </p>
           ) : (
             <p className="text-xs text-muted" data-testid="order-history-shown">
@@ -216,6 +216,7 @@ function HistoryRow({ entry }: { entry: OrderHistoryEntry }) {
         : null;
   const price = historyPrice(entry);
   const units = filled && hasQuantity(entry) && entry.quantity !== null ? formatShares(entry.quantity, 8) : null;
+  const placed = placedTime(entry);
 
   return (
     <tr
@@ -244,7 +245,7 @@ function HistoryRow({ entry }: { entry: OrderHistoryEntry }) {
             </span>
             <span className="block text-xs text-muted tabular-nums" data-testid="history-time">
               {formatOrderTime(entry.closed_at)}
-              {waited(entry) ? ` · placed ${formatOrderTime(entry.placed_at)}` : null}
+              {placed !== null ? ` · placed ${placed}` : null}
             </span>
             {/* The price has its own column from md up. */}
             {price !== "" ? (

@@ -68,7 +68,8 @@ test("the star turns at once; the server's answer settles it", async () => {
       ["AUG1", "2026-11-24T18:03:00Z"],
     ],
   );
-  await store().set("AUG1", false, async () => ({ ticker: "AUG1", watched: false, added_at: null }));
+  const unfollowed = async () => ({ ticker: "AUG1", watched: false, added_at: null });
+  await store().set("AUG1", false, unfollowed, listing("AUG1"));
   assert.deepEqual(
     store().items.map((i) => i.ticker),
     ["AGT1"],
@@ -79,15 +80,16 @@ test("the star turns at once; the server's answer settles it", async () => {
 test("a failure restores the star and says so; a stale load cannot undo a change", async () => {
   await store().load(async () => ({ items: [item("AUG1")] }));
   const offline = new Error("offline");
-  await store().set("AUG1", false, async () => {
+  const failing = async () => {
     throw offline;
-  });
+  };
+  await store().set("AUG1", false, failing, listing("AUG1"));
   assert.equal(isWatched(store(), "AUG1"), true);
   assert.deepEqual(store().notice, { ticker: "AUG1", watched: false, error: offline });
 
   const slow = deferred<unknown>();
   const loading = store().load(() => slow.promise);
-  await store().set("AUG1", false, async () => ({ ticker: "AUG1", watched: false, added_at: null }));
+  await store().set("AUG1", false, async () => ({ ticker: "AUG1", watched: false, added_at: null }), listing("AUG1"));
   slow.resolve({ items: [item("AUG1")] });
   await loading;
   assert.equal(isWatched(store(), "AUG1"), false);

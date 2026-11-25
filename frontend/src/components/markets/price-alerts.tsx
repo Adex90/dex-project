@@ -103,6 +103,7 @@ export function PriceAlertsCard({ ticker, price, token, className }: PriceAlerts
     if (request === null) return;
     setBusy(true);
     setError(null);
+    setMade(null);
     try {
       const alert = await usePriceAlertsStore
         .getState()
@@ -165,8 +166,9 @@ export function PriceAlertsCard({ ticker, price, token, className }: PriceAlerts
           </label>
           <span className="text-xs text-muted tabular-nums">Now {formatPrice(price)}</span>
         </div>
-        <div className="mt-2 grid gap-3 sm:grid-cols-[minmax(0,1fr)_auto] sm:items-end">
-          <div className="flex items-baseline gap-1.5 border-b-2 border-border pb-1 transition-colors focus-within:border-synthetic-yellow">
+        {/* minmax(0, 1fr) and w-0 on the field: a text input's intrinsic width must never widen a phone. */}
+        <div className="mt-2 grid grid-cols-[minmax(0,1fr)] gap-3 sm:grid-cols-[minmax(0,1fr)_auto] sm:items-end">
+          <div className="flex min-w-0 items-baseline gap-1.5 border-b-2 border-border pb-1 transition-colors focus-within:border-synthetic-yellow">
             <span aria-hidden className="text-xl font-semibold text-synthetic-yellow">
               $
             </span>
@@ -181,7 +183,7 @@ export function PriceAlertsCard({ ticker, price, token, className }: PriceAlerts
               aria-describedby={hintId}
               aria-invalid={atPrice || undefined}
               readOnly={busy}
-              className="min-w-0 flex-1 bg-transparent p-0 font-mono text-2xl font-semibold tracking-tight text-ink tabular-nums caret-synthetic-yellow outline-none placeholder:text-muted/50"
+              className="w-0 min-w-0 flex-1 bg-transparent p-0 font-mono text-2xl font-semibold tracking-tight text-ink tabular-nums caret-synthetic-yellow outline-none placeholder:text-muted/50"
               data-testid="price-alert-target"
             />
             <span className="text-xs font-semibold tracking-[0.16em] text-muted">MXN</span>
@@ -271,7 +273,7 @@ export function PriceAlertsCard({ ticker, price, token, className }: PriceAlerts
 function describeTargetError(error: unknown): string {
   if (error instanceof ApiError) {
     if (error.code === "VALIDACION") return INVALID_TARGET;
-    if (error.status === 404) return NOT_LISTED;
+    if (error.code === "NO_ENCONTRADO") return NOT_LISTED;
     if (error.code === "MERCADO_NO_DISPONIBLE") return MARKET_CLOSED;
   }
   return describeError(error);

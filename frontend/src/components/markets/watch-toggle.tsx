@@ -34,7 +34,7 @@ const NOTICE_MS = 6_000;
 export interface WatchToggleProps {
   ticker: string;
   /** The asset's listing, so a newly followed asset shows in the Vault's Watchlist before the next load. */
-  asset?: MarketListing;
+  asset: MarketListing;
   variant?: "icon" | "labelled";
   className?: string;
 }

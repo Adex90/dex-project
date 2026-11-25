@@ -184,6 +184,7 @@ const MESSAGES: Record<string, string> = {
   TIPO_NO_SOPORTADO: "The request was not sent as JSON.",
   CUERPO_DEMASIADO_GRANDE: "The request is too large.",
   RUTA_INEXISTENTE: "That page of the API does not exist.",
+  NO_ENCONTRADO: "That was not found: it may no longer exist.",
   METODO_NO_PERMITIDO: "That operation is not supported here.",
   PRUEBA_PENDIENTE: "Your account will be included in the next reserve snapshot. Please try again in a minute.",
   CORTE_EN_CURSO: "A reserve snapshot is being generated right now. Please try again in a moment.",

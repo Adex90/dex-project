@@ -118,8 +118,19 @@ what the module waits on. They do not change its scope.
     (`store/orders.ts`); the list follows the vault's WebSocket. Unit tests
     and smoke e2e (placed in the checkout, a stop-loss from another device
     appearing live, both cancelled, phone layout).
-  - Left: trailing stops, time in force (Day/GTC) and a history of closed
-    orders (filled, cancelled, rejected).
+  - Order history (`GET /api/v1/market/orders/history`, README "Watchlist,
+    price alerts and order history"): every filled order (market, a limit or stop's fill, a savings
+    plan's purchase) and every limit or stop order cancelled or rejected,
+    newest first, by cursor pages, read under the client's RLS. The Orders
+    page (`app/dashboard/orders/page.tsx`, linked from the Vault's open
+    orders and assets) has Open and History
+    (`components/markets/order-history-list.tsx`): status badges, the fill's
+    price and units or the price it waited for, when it was placed and
+    closed, a rejection's reason in plain English (`lib/order-history.ts`),
+    and Load more; it follows the vault's WebSocket. Unit tests,
+    `backend/tests/seguimiento.rs`, smoke e2e (every page against the API,
+    phone layout) and the AML e2e.
+  - Left: trailing stops and time in force (Day/GTC).
 - [x] **4. Savings Plans / DCA** (Automated fractional recurring buys)
   - Live: Savings plan in the checkout's type toggle (buys only), with the
     amount per purchase, the frequency (weekly, every 2 weeks, monthly), the
@@ -182,6 +193,13 @@ what the module waits on. They do not change its scope.
     the screener's asset class (module 9). Both step aside while a search is
     typed, and everything comes from the catalog (`lib/screener.ts`, unit
     tested): no new endpoint.
+  - Watchlist (migration 0024, README "Watchlist, price alerts and order
+    history"): a gold star on each Discover row and on the asset's header follows or unfollows
+    it (`components/markets/watch-toggle.tsx`; the request asks for the
+    state, so a retry cannot flip it), and the Vault lists the assets followed
+    and not held, each with its nearest price target
+    (`components/markets/watchlist-section.tsx`, absent when empty). At most
+    50 per client.
   - Left: predictive search once the catalog outgrows a single page (a `q`
     parameter on the endpoint), and curated collections beyond asset classes
     (themes chosen by hand, which need a catalog field or an endpoint).
@@ -604,8 +622,18 @@ what the module waits on. They do not change its scope.
 ## Phase 6: Engagement
 
 - [ ] **30. Push Notification Center** (Price alerts, volatility warnings)
+  - Live, in the app only: price alerts (migration 0024, README "Watchlist,
+    price alerts and order history"). An asset's page has a Price alerts card
+    (`components/markets/price-alerts.tsx`): a target above the price waits
+    for a rise, below it for a fall, at most 50 active. The market worker
+    checks them every 5 seconds and records the price that reached each one;
+    the vault's WebSocket brings it, and "Price target reached" shows at the
+    top of any dashboard page until dismissed on that device
+    (`components/markets/price-target-notices.tsx`). No client screen says
+    "alert" in the singular (the AML word the tipping-off scans forbid).
   - Web Push needs a service worker. iOS delivers it only to an app installed
-    on the home screen.
+    on the home screen. Left: push delivery, volatility warnings and a
+    notification center (the notices' history).
 - [ ] **31. Market Data Paywalls** (In-app subscriptions for Nasdaq/CME real-time data)
   - Waits on redistribution agreements with the exchanges.
 - [ ] **32. Referral Engine** ("Invite & Earn" gamification and unboxing)

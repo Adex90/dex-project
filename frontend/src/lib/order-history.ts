@@ -192,9 +192,14 @@ export function historyAmount(entry: OrderHistoryEntry): string {
   return entry.total ?? entry.amount;
 }
 
-/** Whether a fill ran at a different moment than it was placed (a limit, a stop): the row says when it was placed too. */
-export function waited(entry: Pick<OrderHistoryEntry, "placed_at" | "closed_at">): boolean {
-  return Date.parse(entry.closed_at) - Date.parse(entry.placed_at) >= 1_000;
+/**
+ * When it was placed, for a row that shows when it closed: an order that
+ * waited (a limit or a stop filled or cancelled later) says both; null when
+ * they read the same to the minute.
+ */
+export function placedTime(entry: Pick<OrderHistoryEntry, "placed_at" | "closed_at">, now = Date.now()): string | null {
+  const placed = formatOrderTime(entry.placed_at, now);
+  return placed === formatOrderTime(entry.closed_at, now) ? null : placed;
 }
 
 const DATE_PARTS = new Intl.DateTimeFormat("en-US", {

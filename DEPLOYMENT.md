@@ -111,6 +111,7 @@ internet -> host 80/443 (UFW, fail2ban) -> nginx (edge network)
 | No request field outside the API contract is accepted | Same code on both: `deny_unknown_fields` on every body and query type (400 `VALIDACION`) | Same | `tests/entrada.rs` (source scan and HTTP) |
 | Money leaves an account, and its beneficiaries change, only from a session that confirmed a credential in the last five minutes | Same code on both: `/wealth/withdraw`, `/ifpe/retiros`, `/ifpe/transferencias`, `/spei/transfer` and saving the beneficiaries answer 403 `STEP_UP_REQUERIDO` without a step-up window on the request's own session, before touching anything (migration `0022`). `POST /auth/step-up` checks the authenticator code (two-step on) or the password, counted in the sign-in lockout before verifying; the try that locks the account closes the session; a code works once. The window (`kyc.sesiones.step_up_valido_hasta`) is set only by the database (now + 5 minutes, never past the session's expiry, only on a live session), and each one opened is written to the append-only security log by a trigger, with the request's IP and device. The database refuses a beneficiary designation whose session has no open window | Same | `tests/step_up.rs`, `tests/db/0022_verificacion_reforzada.sql`, smoke and AML e2e (Appendix C) |
 | A savings plan buys only on its own calendar, through every check of a market order, and its terms never change | Same code on both: each due purchase runs in the trigger engine's pass as a market buy (account lock, KYC, an active vault, an open and offered asset, the cash for the amount, AML on `COMPRA_MERCADO` before any write, the same ledger writer) with the key `plan:<plan>:<period>` (migration `0023`). The database owns the calendar (9:00 a.m. Mexico City, every 7 or 14 days or the same day each month, always a future date next) and records a purchase only while the plan is active and due: made, with the order of that period whose terms are the plan's, or skipped, with the rule's code; an order with a plan key cannot commit without that record. Terms are immutable, cancelled is final, and every change and purchase is an immutable event written by a trigger. A rule that stops a purchase skips it and the plan carries on; nothing is held | Same | `tests/planes.rs`, `tests/db/0023_planes_ahorro.sql`, smoke and AML e2e (Appendix C) |
+| Price alerts, the watchlist and the order history move no money and tip no one off | Same code on both: a client's follows and price alerts are written with the account locked first (migration `0024`): at most 50 of each, a follow never updated, an alert born active on the side the catalog price has not reached, its terms immutable, triggered only when the catalog price meets the target (the database writes that price and the time) or cancelled, both final, never deleted. The trigger engine's pass marks the alerts reached, client by client. None needs KYC or refuses a frozen account (a refusal would tell); their client codes say `AVISO`, and the reads (`/market/watchlist`, `/market/alerts`, `/market/orders/history`) are made under the client's RLS and carry no compliance field | Same | `tests/seguimiento.rs`, `tests/aml.rs`, `tests/db/0024_seguimiento_alertas.sql`, smoke and AML e2e (Appendix C) |
 | Least-privilege database identities | Service holds only `sc_app` (NOINHERIT, no owner rights); owner credentials only in the migrate task and with DBAs holding the `dba-tunnel` policy | Same, plus the schema owner is **not** a superuser (`deploy/postgres/10-schema-owner.sh`); the `postgres` superuser is break-glass only | `pg_authid` query in Appendix C |
 | Containers non-root, read-only, least capability, resource-limited | uid 65532, read-only rootfs, `drop ALL`, task CPU/memory | uid 65532 / 70 / 101, `read_only`, `cap_drop: ALL`, `no-new-privileges`, CPU/memory/PID limits | `docker inspect` in Appendix C |
 | No secret in code, images, environment or state the operator does not control | Secrets Manager (CMK); RDS manages and rotates the owner password; Terraform state is CMK-encrypted | Docker secrets files (0400, owned by the reading uid); services read them through `NAME_FILE` | No secret value in `docker inspect` or image history (Appendix C) |
@@ -1243,6 +1244,26 @@ following to operations.
     each period buy at most once.
   - Purchases are due at 9:00 a.m. Mexico City time: deploys at that hour
     only delay them to the next pass (they stay due until processed).
+- **Migration `0024`** (watchlist and price alerts) adds two new tables
+  (`mercado.watchlist`, `mercado.alertas_precio`) with their triggers,
+  indexes, RLS and grants, and three functions (the two caps and the vault
+  notice). No existing table is rewritten and no row changes; the order
+  history reads tables that already exist.
+
+  Order: migrate, then the backend, then the frontend (or with it).
+  - An old backend on a migrated database keeps working: it never touches
+    the new tables.
+  - The new frontend against an old backend: a star or a new price target
+    fails with a message (404), the Price alerts card says its targets could
+    not be loaded, and the Orders page's history cannot load. Deploy the
+    backend first.
+  - Alerts are checked in the trigger engine's pass
+    (`MERCADO_DISPARO_INTERVALO_SEG`, default 5 s): with it set to 0, no
+    target is ever reached. Every backend task runs it; the account lock
+    makes each alert trigger once.
+  - Nothing new to configure. The dashboard reloads the watchlist and the
+    price alerts whenever a client's vault moves: two more small reads per
+    move.
 
 ---
 
@@ -1314,6 +1335,9 @@ to the specific provisions.
 | 37 | Savings plans have no market calendar: a purchase falls on its date, weekends and holidays included, and an asset that is not trading then skips it (`MERCADO_CERRADO`) instead of waiting for the next session | with live prices, a client's purchase on a market holiday is skipped, not deferred | prices are simulated and every asset trades in demo mode; a skipped purchase says why on the Vault, and the plan carries on at its next date | a trading calendar per asset and the purchase deferred to the next session (backend) |
 | 38 | A savings plan's purchases, and its skipped ones, send the client no notice (no email or push) | a client may learn only from the Vault that a purchase was skipped (not enough cash, the market closed) | the Vault shows the last purchase and why one was skipped, in neutral words; each purchase has its trade confirmation in the Document Inbox; every purchase, made or skipped, is an immutable event | notices before and after each purchase once item 1 is resolved (Push Notification Center, roadmap 30) |
 | 39 | Purchases depend on the backend running: if no backend task runs for longer than a plan's period, the dates that passed are not bought and leave no skipped event (the next purchase is the first date still to come) | a long outage loses scheduled purchases silently, apart from the gap in the plan's periods | due purchases run as soon as a task is back (one per plan, at that moment's price); every pass logs what it did and errors are logged per plan; the plan's event log numbers its periods, so a gap is visible | record each missed period as skipped (`SERVICIO_NO_DISPONIBLE`) and alarm on a scheduler that has not run (backend, operations) |
+| 40 | Price alerts reach the client only in the app: no push or email, and the "Price target reached" notice is remembered per device (browser storage) | a client learns that a target was reached only when they open the dashboard; on a new device the last day's are announced again | the asset's Price alerts card lists the targets reached in the last 30 days with their price and time; every alert keeps its reference price, the price that reached it and when | Web Push and email notices (Push Notification Center, roadmap 30, and item 1) (frontend, backend) |
+| 41 | Discover shows the prices read when it opened, and the Vault's Watchlist those read when the dashboard loaded or the vault last moved: neither follows every price change | a watched asset's price can be minutes old on screen | the asset's page reads a fresh quote; orders and price targets are always checked against the catalog price on the server | stream catalog prices over the vault's WebSocket (backend, frontend) |
+| 42 | The order history is read and sorted from the client's whole history for each page (the cursor seeks in the result), and the alerts' pass scans the active alerts every 5 s | read cost grows with an account's history, and the pass with the number of active alerts | 50 active alerts per client; an index on active alerts by asset; at most 500 clients per pass; pages of at most 100 orders | an index on each table's closing time per client, and checking only the assets whose price moved (backend, database) |
 
 ---
 
@@ -1700,6 +1724,93 @@ trigger engine's pass, the checkout and the Vault's Savings plans):
     the Vault's panel fit the width without horizontal scroll; Pause and Cancel
     stack under each other at one width, and so do Keep and Yes, cancel; no
     console error.
+
+**Watchlist, price alerts and order history** (migration `0024`,
+`/api/v1/market/watchlist`, `/api/v1/market/alerts`,
+`/api/v1/market/orders/history`, the alerts' check in the trigger engine's
+pass, the stars, the Price alerts card, the reached-target notice, the
+Vault's Watchlist and the Orders page):
+
+- **Database:** every SQL suite passes on its own fresh database with all migrations
+  (19 suites), the new `tests/db/0024_seguimiento_alertas.sql` (48 checks) included. It
+  covers:
+  - the watchlist: a follow dated by the database, once per asset, only for
+    catalog assets, without KYC, never edited (the schema owner included),
+    deleted to unfollow, at most 50 (one removed frees a place), and every
+    change raising the vault's version;
+  - creation: born active with the catalog price as its reference and the
+    database's time, one per idempotency key, without KYC; refused for a
+    target the price has already reached on either side, another direction,
+    and past 50 active (a cancelled one frees a place);
+  - triggering: refused before the price meets the target (the backend then
+    retries at the new price); `sc_mercado` cannot write the price, the
+    database records the catalog price and the time, and the vault's version
+    rises; a triggered alert cannot be cancelled, and an active one changes
+    only by triggering or cancelling (the schema owner included);
+  - cancelling: final, with its time and no price (what a caller writes is
+    ignored); the terms and the reference never change, for the owner too;
+  - alerts never deleted or truncated; `sc_mercado` inserts the terms and
+    changes only the state, follows and unfollows; the client only reads; no
+    other application role touches either table; RLS (RESTRICTIVE for the
+    client) on both.
+- **Backend:** rustfmt and clippy `-D warnings` clean. 465 tests passed, 0 failed
+  (456 before):
+  - `tests/seguimiento.rs`: the watchlist (no body flips it, `{"watched"}`
+    sets it and a repeat changes nothing, newest first with the catalog's
+    listing, each change raising the vault's version once; unknown tickers
+    and malformed bodies refused; staff 403; each client sees only its own;
+    without demo mode a simulated asset is neither listed nor followed, but
+    can be unfollowed; at most 50). Alerts: 201 with the reference price, the
+    same key 200, other terms 409; the side and range rules (422
+    `AVISO_YA_ALCANZADO` either way, 400 for the shape), 503 without demo
+    mode, staff 403; cancel 404 for another client's or an unknown one, 400
+    for a malformed id, idempotent, cancelled ones not listed; at most 50
+    active. The engine: nothing before the price moves; gold at 1,701.20
+    triggers both clients' targets above (each vault notified), at that
+    price; a triggered one is 409 to cancel and never triggers again; at
+    1,490 the target below; without demo mode a simulated price triggers
+    nothing; two passes at once trigger once. A PLD freeze: following,
+    setting and the engine work as for anyone, and no route's answer
+    carries a compliance word. The history: every kind (market, a limit's
+    fill with its source order, a savings plan purchase, cancelled and
+    rejected orders with their codes), newest first, cursor pages, limits.
+  - `tests/aml.rs` adds the three routes to the tipping-off scan.
+- **Frontend:** lint and typecheck clean; 366 unit tests passed (25
+  new: validation of the three payloads, the words with no tipping off, the
+  stores' optimistic changes, rollbacks, stale loads and pages); `next build`
+  succeeded.
+- **End to end** (`aml-stack.sh`, fresh database):
+  - `smoke.mjs`: 377 checks passed (343 before), with only its 13
+    deliberate refusals in the console. New: a star on a Discover row turns
+    solid gold without opening the asset and the server follows it; the
+    asset's header says Watching; a target at the current price
+    cannot be set and the card says why; two targets either side of
+    silver's 548.20 (560.00 above, 540.00 below), listed nearest first; the
+    test moves silver to 560.35 in the database and within seconds the
+    Vault shows "Price target reached: AGT1 rose to $560.35, past your
+    $560.00 target." (the price restored after); View AGT1 shows it reached
+    with nothing to cancel; dismissed, it stays gone after a reload, and a
+    new browser in the second pass announces it once; the Vault's Watchlist
+    after the assets (AGT1, $548.20, Falls to $540.00), on a phone too;
+    Cancel and unfollowing from the header leave no Watchlist; Order history
+    opens the Orders page on History, with the Vault still the current tab:
+    every order, pages of 3 with Load more, exactly as the API lists them,
+    the newest a CETES28 market sale, savings plan purchases and cancelled
+    orders labelled, the phone layout without horizontal scroll; Open with
+    no orders, kept by a reload. The first full run stopped at the second
+    pass's phone check of AUG1's page: the Price alerts card's target field
+    kept a text input's intrinsic width and pushed the card past a 390 px
+    screen. The field now shrinks (`w-0` in a `minmax(0, 1fr)` column), and
+    the rerun passed.
+  - A separate phone pass (390 px, a new device) found the reached-target
+    notice, the Price alerts card (Notify me across the card, Cancel on its
+    row) and the history within the width, with no console error.
+  - `aml.mjs`: 156 of 156 checks passed, with only the deliberate 4xx calls in the console. New: a client who follows AUG1 and set a
+    target before the review sees, while frozen, the Watchlist with its
+    target, the Orders page and AUG1's Price alerts card with no
+    tipping-off words, and the three reads carry no AML wording; under
+    review the client still unfollows, sets and cancels targets, and
+    nothing says why.
 
 **Tax Center: fiscal year, W-8BEN and accounting export** (migration `0021`, the
 routes `/api/v1/wealth/impuestos`, `/impuestos/w8ben` and `/impuestos/export.csv`,
