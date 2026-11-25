@@ -274,22 +274,40 @@ struct Limite {
     limite: Option<i64>,
 }
 
+/// Las órdenes SPEI del cliente, sin el motivo ni el último error del
+/// proveedor: son texto interno, que el operador escribe a mano en un
+/// reembolso y que podría nombrar la prevención de lavado de dinero (aviso
+/// indebido). El rastreador (`/wealth/spei/transfers`) dice cada paso con
+/// palabras neutrales.
 async fn transferencias(
     State(e): State<AppState>,
     u: Usuario,
     Query(q): Query<Limite>,
 ) -> AppResult<Json<Vec<SpeiOutbound>>> {
     u.exigir_cliente()?;
-    Ok(Json(outbound::de_cliente(&e.pool, u.cliente_id, q.limite.unwrap_or(50)).await?))
+    let mut ordenes = outbound::de_cliente(&e.pool, u.cliente_id, q.limite.unwrap_or(50)).await?;
+    for o in &mut ordenes {
+        o.motivo = None;
+        o.ultimo_error = None;
+    }
+    Ok(Json(ordenes))
 }
 
+/// Los SPEI recibidos del cliente, sin la causa ni el motivo de una
+/// devolución al emisor: pueden nombrar la Lista de Personas Bloqueadas
+/// (aviso indebido, como en el rastreador).
 async fn recibidos(
     State(e): State<AppState>,
     u: Usuario,
     Query(q): Query<Limite>,
 ) -> AppResult<Json<Vec<SpeiInbound>>> {
     u.exigir_cliente()?;
-    Ok(Json(inbound::de_cliente(&e.pool, u.cliente_id, q.limite.unwrap_or(50)).await?))
+    let mut recibidos = inbound::de_cliente(&e.pool, u.cliente_id, q.limite.unwrap_or(50)).await?;
+    for r in &mut recibidos {
+        r.motivo = None;
+        r.causa_devolucion = None;
+    }
+    Ok(Json(recibidos))
 }
 
 async fn conciliacion(State(e): State<AppState>, u: Usuario) -> AppResult<Json<Vec<Conciliacion>>> {

@@ -270,6 +270,17 @@ async fn el_rastreador_spei(pool: PgPool) {
     for palabra in ["bloquead", "lista de personas", "motivo", "cuenta inexistente", "raw_payload"] {
         assert!(!texto.contains(palabra), "el rastreador dice «{palabra}»: {texto}");
     }
+    // Las rutas anteriores del cliente tampoco dicen por qué (el depósito devuelto, la orden devuelta).
+    for ruta in ["/api/v1/spei/recibidos", "/api/v1/spei/transferencias"] {
+        let texto = b.leer(&token, ruta).await.to_string().to_lowercase();
+        assert!(
+            texto.contains("devuelto1") || texto.contains(&r.orden.clave_rastreo.to_lowercase()),
+            "{ruta}: {texto}"
+        );
+        for palabra in ["bloquead", "lista de personas", "cuenta inexistente", "rechazada"] {
+            assert!(!texto.contains(palabra), "{ruta} dice «{palabra}»: {texto}");
+        }
+    }
 
     // Un depósito de demostración: simulado, sin fecha de operación ni ordenante.
     depositar_por(&pool, &cfg, ana.cuenta_ifpe.id, "100.00", Origen::Demo).await;
