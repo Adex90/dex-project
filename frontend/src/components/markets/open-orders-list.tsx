@@ -3,7 +3,7 @@
 import { useCallback, useEffect, useId, useMemo, useRef } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
-import { Check, Clock, Info, Lock, X } from "lucide-react";
+import { ArrowRight, Check, Clock, Info, Lock, Search, X } from "lucide-react";
 
 import { AssetTableSkeleton, TABLE_CARD, TickerChip } from "@/components/markets/asset-table";
 import { cx } from "@/components/ui/primitives";
@@ -40,7 +40,9 @@ import type { PendingOrder } from "@/types/market";
  * - With no open orders it renders nothing, unless it has something to say
  *   (a cancellation just confirmed). While it loads it shows a placeholder
  *   only if the vault says something is held, so the Vault never jumps for
- *   clients without orders.
+ *   clients without orders. On the Orders page (`standalone`) it always
+ *   shows: a placeholder while it loads, and a card saying there are none.
+ * - On the Vault its header links to the order history (`historyHref`).
  */
 
 /** A confirmation stays this long; an error stays until dismissed or replaced. */
@@ -48,7 +50,16 @@ const NOTICE_MS = 6_000;
 /** Vault moves this close together (one action's commits) reload the list once. */
 const RELOAD_MS = 150;
 
-export function OpenOrdersList({ token, className }: { token: string; className?: string }) {
+export interface OpenOrdersListProps {
+  token: string;
+  /** The order history's address, for a link in the header (the Vault). */
+  historyHref?: string;
+  /** The Orders page: never absent; a placeholder while it loads and a card when there are none. */
+  standalone?: boolean;
+  className?: string;
+}
+
+export function OpenOrdersList({ token, historyHref, standalone = false, className }: OpenOrdersListProps) {
   const titleId = useId();
   const router = useRouter();
   const all = useOrdersStore((s) => s.orders);
@@ -114,10 +125,10 @@ export function OpenOrdersList({ token, className }: { token: string; className?
   const holds = !isZero(heldCash) || holdings.some((holding) => !isZero(holding.held_shares));
 
   if (orders.length === 0 && notice === null) {
-    if ((status === "idle" || status === "loading") && holds) {
+    if ((status === "idle" || status === "loading") && (holds || standalone)) {
       return <AssetTableSkeleton label="Loading your open orders…" className={className} rows={1} />;
     }
-    if (status === "error" && holds) {
+    if (status === "error" && (holds || standalone)) {
       return (
         <section className={cx(TABLE_CARD, "px-5 py-4 sm:px-6", className)} data-testid="open-orders-error">
           <p role="alert" className="text-sm text-danger">
@@ -129,7 +140,7 @@ export function OpenOrdersList({ token, className }: { token: string; className?
         </section>
       );
     }
-    return null;
+    if (!standalone) return null;
   }
 
   return (
@@ -158,21 +169,46 @@ export function OpenOrdersList({ token, className }: { token: string; className?
             </p>
           </div>
         </div>
-        {!isZero(heldCash) ? (
-          <div className="text-right">
-            <p className="text-[11px] font-medium tracking-[0.18em] text-muted uppercase">Cash held</p>
-            <p
-              className="inline-flex items-center gap-1.5 text-lg font-medium tracking-tight text-ink tabular-nums"
-              data-testid="open-orders-held"
+        <div className="flex items-center gap-5">
+          {!isZero(heldCash) ? (
+            <div className="text-right">
+              <p className="text-[11px] font-medium tracking-[0.18em] text-muted uppercase">Cash held</p>
+              <p
+                className="inline-flex items-center gap-1.5 text-lg font-medium tracking-tight text-ink tabular-nums"
+                data-testid="open-orders-held"
+              >
+                <Lock className="size-4 text-synthetic-yellow" aria-hidden />
+                {formatMoney(heldCash)}
+              </p>
+            </div>
+          ) : null}
+          {historyHref ? (
+            <Link
+              href={historyHref}
+              className="inline-flex items-center gap-1.5 text-[11px] font-semibold tracking-[0.18em] text-muted uppercase transition-colors hover:text-synthetic-yellow focus-visible:ring-2 focus-visible:ring-synthetic-yellow focus-visible:ring-offset-2 focus-visible:ring-offset-surface focus-visible:outline-none"
+              data-testid="open-orders-history"
             >
-              <Lock className="size-4 text-synthetic-yellow" aria-hidden />
-              {formatMoney(heldCash)}
-            </p>
-          </div>
-        ) : null}
+              History
+              <ArrowRight className="size-3.5" aria-hidden />
+            </Link>
+          ) : null}
+        </div>
       </header>
 
       {notice ? <Notice notice={notice} /> : null}
+
+      {orders.length === 0 && standalone ? (
+        <div className="flex flex-col items-start gap-3 px-5 py-6 sm:px-6" data-testid="open-orders-empty">
+          <p className="text-sm text-ink-2">
+            Limit and stop orders wait here, with the cash or units they hold, until their price is reached. Place one
+            from any asset&apos;s page.
+          </p>
+          <Link href="/dashboard/discover" className={QUIET_BUTTON}>
+            <Search className="size-3.5" aria-hidden />
+            Discover assets
+          </Link>
+        </div>
+      ) : null}
 
       {orders.length > 0 ? (
         <table className="w-full border-collapse text-sm">

@@ -1,6 +1,6 @@
 import { passwordChangeBody } from "@/lib/security";
 import { stepUpBody } from "@/lib/step-up";
-import type { OrderRequest, PlanAction } from "@/types/market";
+import type { OrderRequest, PlanAction, PriceAlertRequest } from "@/types/market";
 import type { DesignationRequest } from "@/types/beneficiaries";
 import type { InactivityMinutes, PasswordChange } from "@/types/security";
 import type { StepUpCredential } from "@/types/step-up";
@@ -59,6 +59,8 @@ import type {
 } from "./types";
 
 const AML = "/api/v1/aml";
+/** Orders per page of the order history (the backend allows 1 to 100). */
+export const ORDER_HISTORY_PAGE = 25;
 
 /** One function per backend route used by the client app (see backend/src/routes). */
 export const api = {
@@ -200,6 +202,57 @@ export const api = {
       method: "POST",
       token,
     }),
+
+  /**
+   * One page of the client's order history, newest first: every filled order
+   * (market, limit, stop and savings plan purchases) and every limit or stop
+   * order cancelled or rejected. `cursor` is the previous page's
+   * `next_cursor`. Untyped on purpose: `parseOrderHistory` validates it.
+   */
+  orderHistory: (token: string, cursor: string | null, signal?: AbortSignal) => {
+    const query = new URLSearchParams({ limit: String(ORDER_HISTORY_PAGE) });
+    if (cursor !== null) query.set("cursor", cursor);
+    return request<unknown>(`/api/v1/market/orders/history?${query}`, { token, signal });
+  },
+
+  /**
+   * The assets the client follows, newest first, each with its catalog
+   * listing. Untyped on purpose: `parseWatchlist` validates the list.
+   */
+  watchlist: (token: string, signal?: AbortSignal) => request<unknown>("/api/v1/market/watchlist", { token, signal }),
+
+  /**
+   * Follows or unfollows an asset. The body asks for the state, so repeating
+   * it changes nothing (a retry is safe). Untyped on purpose:
+   * `parseWatchState` validates the answer.
+   */
+  setWatched: (token: string, ticker: string, watched: boolean) =>
+    request<unknown>(`/api/v1/market/watchlist/${encodeURIComponent(ticker)}/toggle`, {
+      method: "POST",
+      token,
+      body: { watched },
+    }),
+
+  /**
+   * The client's price alerts: the active ones and those reached in the last
+   * 30 days. Untyped on purpose: `parsePriceAlerts` validates the list.
+   */
+  priceAlerts: (token: string, signal?: AbortSignal) => request<unknown>("/api/v1/market/alerts", { token, signal }),
+
+  /**
+   * Sets a price target. 201 for a new one, 200 when the idempotency key
+   * repeats the same one; a target the price is already at is 422
+   * `AVISO_YA_ALCANZADO`. Untyped on purpose: `parsePriceAlert` validates it.
+   */
+  createPriceAlert: (token: string, body: PriceAlertRequest) =>
+    request<unknown>("/api/v1/market/alerts", { method: "POST", token, body }),
+
+  /**
+   * Cancels an active price alert. Repeating it answers the same one; one
+   * already reached is 409 `AVISO_DISPARADO`.
+   */
+  cancelPriceAlert: (token: string, alertId: string) =>
+    request<unknown>(`/api/v1/market/alerts/${encodeURIComponent(alertId)}/cancel`, { method: "POST", token }),
 
   /**
    * The client's bank accounts linked for withdrawals, all in their own name.

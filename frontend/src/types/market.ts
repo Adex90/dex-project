@@ -295,3 +295,106 @@ export type PlanAction = "pause" | "resume" | "cancel";
 
 /** What `POST /api/v1/market/order` answers, by the order's type. */
 export type PlacedOrder = OrderReceipt | PendingOrder | SavingsPlan;
+
+/* ------------------------------------------------------------------------ */
+/* Watchlist, price alerts and order history (migration 0024)               */
+/* ------------------------------------------------------------------------ */
+
+/** An asset the client follows, held or not, with its catalog listing. */
+export interface WatchlistItem {
+  ticker: string;
+  /** When it was added, ISO 8601. */
+  added_at: string;
+  asset: MarketListing;
+}
+
+/** `GET /api/v1/market/watchlist`: newest first. */
+export interface Watchlist {
+  items: WatchlistItem[];
+}
+
+/** `POST /api/v1/market/watchlist/{ticker}/toggle`: how it stands now. */
+export interface WatchState {
+  ticker: string;
+  watched: boolean;
+  /** Since when; null when not watched. */
+  added_at: string | null;
+}
+
+/** Which way the price must move to reach the target. */
+export type AlertDirection = "above" | "below";
+
+/** An active alert waits; a triggered one reached its target once; cancelled is final. */
+export type AlertStatus = "active" | "triggered" | "cancelled";
+
+/**
+ * A price alert: notify the client when the price reaches `target_price`,
+ * rising (`above`) or falling (`below`). The backend checks every few seconds
+ * and records the price that reached it.
+ */
+export interface PriceAlert {
+  alert_id: string;
+  ticker: string;
+  direction: AlertDirection;
+  target_price: DecimalString;
+  status: AlertStatus;
+  /** The price when it was set. */
+  reference_price: DecimalString;
+  /** The price that reached the target; null unless triggered. */
+  triggered_price: DecimalString | null;
+  created_at: string;
+  triggered_at: string | null;
+  cancelled_at: string | null;
+}
+
+/** `GET /api/v1/market/alerts`: the active ones and those triggered in the last 30 days, newest first. */
+export interface PriceAlerts {
+  alerts: PriceAlert[];
+}
+
+/** `POST /api/v1/market/alerts`. */
+export interface PriceAlertRequest {
+  ticker: string;
+  /** MXN per unit, up to 4 decimals, as a string. */
+  target_price: DecimalString;
+  direction: AlertDirection;
+  /** 8 to 64 characters [A-Za-z0-9-_.]; reused on a retry. */
+  idempotency_key: string;
+}
+
+/** How an order ended: filled, cancelled by the client, or rejected by a rule when it triggered. */
+export type HistoryStatus = "filled" | "cancelled" | "rejected";
+
+/** One order of `GET /api/v1/market/orders/history`. */
+export interface OrderHistoryEntry {
+  /** The fill's id in the market ledger, or the limit or stop order's own. */
+  order_id: string;
+  status: HistoryStatus;
+  order_type: OrderType;
+  side: OrderSide;
+  ticker: string;
+  /** MXN asked for. */
+  amount: DecimalString;
+  limit_price: DecimalString | null;
+  stop_price: DecimalString | null;
+  /** Filled: units, execution price, cash charged or credited, commission; null otherwise. */
+  quantity: DecimalString | null;
+  price: DecimalString | null;
+  total: DecimalString | null;
+  commission: DecimalString | null;
+  /** Rejected: the rule's code ("SALDO_INSUFICIENTE"); null otherwise. */
+  reject_reason: string | null;
+  placed_at: string;
+  closed_at: string;
+  /** A fill of a limit or stop order: that order's id. */
+  source_order_id: string | null;
+  /** A savings plan's purchase: the plan's id. */
+  plan_id: string | null;
+}
+
+/** `GET /api/v1/market/orders/history`: newest first, a page at a time. */
+export interface OrderHistory {
+  orders: OrderHistoryEntry[];
+  /** For the next page (`?cursor=`); null on the last one. */
+  next_cursor: string | null;
+}

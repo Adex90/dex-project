@@ -21,6 +21,7 @@ import { Brand } from "@/components/brand";
 import { cx } from "@/components/ui/primitives";
 import { BENEFICIARIES_PATH } from "@/lib/beneficiaries";
 import { DOCUMENTS_PATH } from "@/lib/documents";
+import { ORDERS_PATH } from "@/lib/order-history";
 import { SECURITY_PATH } from "@/lib/security";
 import { TAXES_PATH } from "@/lib/taxes";
 
@@ -39,6 +40,7 @@ import { TAXES_PATH } from "@/lib/taxes";
  * An asset's page is not a tab of its own: it opens from the Vault's holdings
  * and from Discover, and the tab that opened it stays current there (its
  * Back link returns to that tab). Opened by its address, it is the Vault's.
+ * The Orders page (open orders and the history) works the same way.
  *
  * Account pages (Documents, Taxes, Beneficiaries, Security) sit in the sidebar's own
  * "Account" group. On phones the tab bar keeps its five tabs: the Account tab
@@ -75,7 +77,7 @@ export const DASHBOARD_NAV: readonly NavItem[] = [
 export const ACCOUNT_PAGES: readonly NavItem[] = DASHBOARD_NAV.filter((item) => item.settings);
 
 /** Pages that open from more than one tab: they belong to the tab that opened them. */
-const DETAIL_PATHS: readonly string[] = ["/dashboard/asset"];
+const DETAIL_PATHS: readonly string[] = ["/dashboard/asset", ORDERS_PATH];
 
 /** Under `path`: the page itself or one of its sub-pages. */
 function isUnder(pathname: string, path: string): boolean {
@@ -88,7 +90,7 @@ export function isActive(item: Pick<NavItem, "href" | "exact">, pathname: string
   return !item.exact && isUnder(pathname, item.href);
 }
 
-/** Whether `pathname` is a detail page (an asset's), which belongs to the tab that opened it. */
+/** Whether `pathname` is a detail page (an asset's, the orders), which belongs to the tab that opened it. */
 export function isDetailPage(pathname: string): boolean {
   return DETAIL_PATHS.some((path) => isUnder(pathname, path));
 }

@@ -9,6 +9,8 @@ import { useDashboard } from "@/components/layout/dashboard-shell";
 import { tabFor, useNavOrigin } from "@/components/layout/navigation";
 import { AssetDetail, AssetDetailSkeleton } from "@/components/markets/asset-detail";
 import { MarketNotice, NoticeLink } from "@/components/markets/market-notice";
+import { PriceAlertsCard } from "@/components/markets/price-alerts";
+import { WatchError, WatchToggle } from "@/components/markets/watch-toggle";
 import { Alert, Button } from "@/components/ui/primitives";
 import { ApiError, describeError } from "@/lib/api/client";
 import { api } from "@/lib/api/endpoints";
@@ -52,6 +54,9 @@ import type { MarketQuote, OrderRequest, PlacedOrder } from "@/types/market";
  * - A limit or stop order refreshes the open orders the Vault lists, and a
  *   savings plan its savings plans, so the new one is there when the client
  *   goes back.
+ * - The header's star follows the asset (the Vault's Watchlist shows it while
+ *   it is not held), and the Price alerts card sets and cancels price
+ *   targets; both read the stores the dashboard keeps current.
  */
 
 type QuoteResult =
@@ -188,6 +193,7 @@ export default function AssetPage() {
             Demo · simulated prices
           </p>
         ) : null}
+        {isTicker(ticker) ? <WatchError ticker={ticker} className="w-full" /> : null}
       </div>
 
       {quote.status === "missing" ? (
@@ -234,7 +240,16 @@ export default function AssetPage() {
           sellable={sellableFor(holdings, quote.quote.asset.ticker)}
           priceSource={quote.quote.price_source}
           onPlaceOrder={placeOrder}
-        />
+          headerAction={
+            <WatchToggle
+              ticker={quote.quote.asset.ticker}
+              asset={{ ...quote.quote.asset, price_source: quote.quote.price_source }}
+              variant="labelled"
+            />
+          }
+        >
+          <PriceAlertsCard ticker={quote.quote.asset.ticker} price={quote.quote.asset.price} token={token} />
+        </AssetDetail>
       )}
     </div>
   );

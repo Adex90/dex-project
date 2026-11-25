@@ -12,6 +12,7 @@ import {
   TickerChip,
   useRowNavigation,
 } from "@/components/markets/asset-table";
+import { WatchError, WatchToggle } from "@/components/markets/watch-toggle";
 import { cx } from "@/components/ui/primitives";
 import { formatAmount, formatMoney } from "@/lib/decimal";
 import { assetPath } from "@/lib/market-data";
@@ -27,6 +28,8 @@ import type { MarketListing } from "@/types/market";
  *   pays one), the price with its 24-hour change. From md up the 24-hour
  *   volume has its own column, and from lg up the market cap.
  * - Market figures are compact ("$84.3M"), with the exact amount on hover.
+ * - The last column is the watchlist star (components/markets/watch-toggle.tsx):
+ *   pressing it follows or unfollows the asset without opening it.
  */
 
 export interface MarketListProps {
@@ -73,8 +76,11 @@ export function MarketList({ assets, title, summary, icon: Icon, className }: Ma
             <th scope="col" className="hidden px-3 py-2.5 text-right font-medium md:table-cell">
               24h volume
             </th>
-            <th scope="col" className="px-5 py-2.5 text-right font-medium sm:px-6">
+            <th scope="col" className="py-2.5 pr-1 pl-3 text-right font-medium">
               Price
+            </th>
+            <th scope="col" className="py-2.5 pr-3 pl-0 font-medium sm:pr-4">
+              <span className="sr-only">Watchlist</span>
             </th>
           </tr>
         </thead>
@@ -107,6 +113,7 @@ function MarketRow({ asset }: { asset: MarketListing }) {
               {asset.asset_class}
               {asset.yield_pct === null ? null : ` · ${formatAmount(asset.yield_pct, 2)}% a year`}
             </span>
+            <WatchError ticker={asset.ticker} className="mt-0.5 whitespace-normal" />
           </span>
         </div>
       </th>
@@ -116,9 +123,12 @@ function MarketRow({ asset }: { asset: MarketListing }) {
       <td className="hidden px-3 py-3.5 text-right text-ink-2 tabular-nums md:table-cell">
         <Figure value={asset.volume_24h} />
       </td>
-      <td className="px-5 py-3.5 text-right sm:px-6">
+      <td className="py-3.5 pr-1 pl-3 text-right">
         <span className="block font-medium text-ink tabular-nums">{formatMoney(asset.price)}</span>
         <DailyChange pct={asset.change_24h_pct} suffix="in 24 hours" className="mt-0.5" />
+      </td>
+      <td className="w-px py-2 pr-3 pl-0 sm:pr-4">
+        <WatchToggle ticker={asset.ticker} asset={asset} />
       </td>
     </tr>
   );

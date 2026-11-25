@@ -1,6 +1,6 @@
 "use client";
 
-import { useId } from "react";
+import { useId, type ReactNode } from "react";
 import Link from "next/link";
 import { Coins, Search } from "lucide-react";
 
@@ -30,6 +30,7 @@ import type { Holding } from "@/types/vault";
  * - Phones get two columns (asset with its shares, value with its daily
  *   change); wider screens get shares and price as their own columns.
  * - With nothing held, it points to Discover, where a first buy starts.
+ * - `footer` closes the card (the Vault's link to the order history).
  *
  * Presentational apart from `useId` and the router. Feed it `holdings` from
  * `useVaultStore`; amounts are decimal strings, formatted exactly.
@@ -37,10 +38,12 @@ import type { Holding } from "@/types/vault";
 
 export interface AssetListProps {
   holdings: readonly Holding[];
+  /** At the bottom of the card, under the holdings. */
+  footer?: ReactNode;
   className?: string;
 }
 
-export function AssetList({ holdings, className }: AssetListProps) {
+export function AssetList({ holdings, footer, className }: AssetListProps) {
   const titleId = useId();
   const total = holdings.length > 0 ? addUnits(...holdings.map((h) => h.total_value)) : null;
 
@@ -103,6 +106,7 @@ export function AssetList({ holdings, className }: AssetListProps) {
           </tbody>
         </table>
       )}
+      {footer}
     </section>
   );
 }

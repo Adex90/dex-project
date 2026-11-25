@@ -124,6 +124,13 @@ export function parseMarketQuote(value: unknown): MarketQuote | null {
   return { asset, history, as_of, price_source };
 }
 
+/** An asset as the catalog lists it (and the watchlist): its fields and where its price comes from. */
+export function parseMarketListing(value: unknown): MarketListing | null {
+  const asset = parseMarketAsset(value);
+  const source = isRecord(value) ? value.price_source : undefined;
+  return asset && isOneOf(SOURCES, source) ? { ...asset, price_source: source } : null;
+}
+
 /** `GET /api/v1/market/assets`; null if any listing is malformed or a ticker repeats. */
 export function parseMarketCatalog(value: unknown): MarketCatalog | null {
   if (!isRecord(value)) return null;
@@ -132,11 +139,10 @@ export function parseMarketCatalog(value: unknown): MarketCatalog | null {
   const listings: MarketListing[] = [];
   const tickers = new Set<string>();
   for (const raw of assets) {
-    const asset = parseMarketAsset(raw);
-    const source = isRecord(raw) ? raw.price_source : undefined;
-    if (!asset || !isOneOf(SOURCES, source) || tickers.has(asset.ticker)) return null;
-    tickers.add(asset.ticker);
-    listings.push({ ...asset, price_source: source });
+    const listing = parseMarketListing(raw);
+    if (!listing || tickers.has(listing.ticker)) return null;
+    tickers.add(listing.ticker);
+    listings.push(listing);
   }
   return { assets: listings, as_of };
 }

@@ -38,14 +38,14 @@ export const ROW_HEADER = cx(
 );
 
 /**
- * A row's click handler: follows `href` from anywhere on the row, except the
- * link itself (whose click is its own, modifier keys included) and the end
- * of a text selection.
+ * A row's click handler: follows `href` from anywhere on the row, except a
+ * link or a button in it (whose click is its own: the name with its modifier
+ * keys, the watchlist star) and the end of a text selection.
  */
 export function useRowNavigation(href: string) {
   const router = useRouter();
   return (event: MouseEvent<HTMLTableRowElement>) => {
-    if (event.target instanceof Element && event.target.closest("a")) return;
+    if (event.target instanceof Element && event.target.closest("a, button")) return;
     if (window.getSelection()?.isCollapsed === false) return;
     router.push(href);
   };

@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useId, useMemo, useRef, useState } from "react";
+import { useEffect, useId, useMemo, useRef, useState, type ReactNode } from "react";
 import { ArrowDownRight, ArrowUpRight, Minus, type LucideIcon } from "lucide-react";
 
 import { ChartModeToggle, ProCandlestickChart, type ChartMode } from "@/components/charts/pro-candlestick-chart";
@@ -31,6 +31,8 @@ import type { DecimalString } from "@/types/vault";
  * - A sticky action bar: Sell (charcoal) and Buy (solid gold), massive, held
  *   above the phone's tab bar and at the bottom of the terminal on desktop.
  *   Either opens the checkout drawer.
+ * - What the page adds: an action at the header's end (the watchlist star)
+ *   and sections after the position (the Price alerts card).
  *
  * Presentational: the page owns the data (the quote, its history, the cash
  * and the position) and the order call (`onPlaceOrder`). Amounts are exact
@@ -76,6 +78,10 @@ export interface AssetDetailProps {
   priceSource?: PriceSource;
   /** Places an order: resolves with the receipt, or rejects with the error to show. */
   onPlaceOrder: (order: OrderRequest) => Promise<PlacedOrder>;
+  /** At the end of the header's first line (the watchlist star). */
+  headerAction?: ReactNode;
+  /** After the key stats and the position, before the action bar (the Price alerts card). */
+  children?: ReactNode;
   className?: string;
 }
 
@@ -89,6 +95,8 @@ export function AssetDetail({
   live = false,
   priceSource = "oracle",
   onPlaceOrder,
+  headerAction,
+  children,
   className,
 }: AssetDetailProps) {
   const titleId = useId();
@@ -134,6 +142,7 @@ export function AssetDetail({
                 Live
               </span>
             ) : null}
+            {headerAction ? <div className="ml-auto">{headerAction}</div> : null}
           </div>
           <h2 id={titleId} className="mt-3 text-2xl font-semibold tracking-tight text-ink sm:text-3xl">
             {asset.name}
@@ -238,6 +247,8 @@ export function AssetDetail({
           </p>
         </section>
       ) : null}
+
+      {children}
 
       {/*
         The action bar sticks to the bottom of the screen while the page scrolls:

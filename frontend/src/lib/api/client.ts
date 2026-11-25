@@ -205,6 +205,11 @@ const MESSAGES: Record<string, string> = {
   // Savings plans (migration 0023).
   LIMITE_PLANES: "You have the maximum of 20 savings plans. Cancel one to create another.",
   PLAN_CANCELADO: "This savings plan was already cancelled: it cannot be paused or resumed.",
+  // Watchlist and price targets (migration 0024). Never the singular "alert": a client screen must not show it.
+  LIMITE_SEGUIMIENTO: "You already watch 50 assets. Remove one from your watchlist to add another.",
+  AVISO_YA_ALCANZADO: "The price is already there. Choose a target above or below the current price.",
+  LIMITE_AVISOS_PRECIO: "You have the maximum of 50 active price targets. Cancel one to set another.",
+  AVISO_DISPARADO: "That price target was already reached: there is nothing to cancel.",
   // Withdrawals (migration 0016): only to a bank account linked in the client's own name.
   CUENTA_NO_VINCULADA: "Withdrawals go only to a bank account linked in your name. Nothing was sent.",
   TRANSFERENCIAS_TERCEROS_NO_DISPONIBLES:

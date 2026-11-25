@@ -6,6 +6,8 @@ import { usePathname, useRouter } from "next/navigation";
 import { DashboardHeader } from "@/components/dashboard/dashboard-header";
 import { KycBanner, isKycLocked } from "@/components/dashboard/kyc-status";
 import { AccountLinks, Navigation, activeItem, resetNavOrigin, useNavOrigin } from "@/components/layout/navigation";
+import { FollowingSync } from "@/components/markets/following-sync";
+import { PriceTargetNotices } from "@/components/markets/price-target-notices";
 import { StepUpProvider } from "@/components/security/step-up-provider";
 import { Alert, Button } from "@/components/ui/primitives";
 import { ONBOARDING_PATH } from "@/hooks/use-client-home";
@@ -23,10 +25,13 @@ import { useAuthStore } from "@/store/auth";
 import { useCardStore } from "@/store/card";
 import { useDashboardStore } from "@/store/dashboard";
 import { useMarketStore } from "@/store/market";
+import { useOrderHistoryStore } from "@/store/order-history";
 import { useOrdersStore } from "@/store/orders";
+import { usePriceAlertsStore } from "@/store/price-alerts";
 import { useSavingsPlansStore } from "@/store/savings-plans";
 import { useSecurityStore } from "@/store/security";
 import { displayedRealtime, useVaultStore } from "@/store/vault";
+import { useWatchlistStore } from "@/store/watchlist";
 
 /*
  * The dashboard's frame, shared by every tab (Vault, Discover, Account,
@@ -49,6 +54,10 @@ import { displayedRealtime, useVaultStore } from "@/store/vault";
  * a withdrawal or a change of beneficiaries that the server refuses without a
  * fresh check opens "Confirm it's you" and goes on once confirmed. A lockout
  * there ends the session, and the sign-in page says why.
+ *
+ * The watchlist and the price alerts load here too, and reload when the
+ * vault moves (components/markets/following-sync.tsx), so a target reached
+ * shows "Price target reached" at the top of any page.
  */
 
 const ACCOUNT_TAB_PATH = "/dashboard/account";
@@ -125,13 +134,16 @@ export function DashboardShell({ children }: { children: ReactNode }) {
   const origin = useNavOrigin();
 
   // Sign-out unmounts the dashboard: the next person in this tab starts from
-  // an empty search and the card's defaults, and an asset page opened by
-  // address belongs to the Vault.
+  // an empty search, the card's defaults and no one's watchlist, price alerts
+  // or order history, and an asset page opened by address belongs to the Vault.
   useEffect(
     () => () => {
       useMarketStore.getState().reset();
       useOrdersStore.getState().reset();
       useSavingsPlansStore.getState().reset();
+      useWatchlistStore.getState().reset();
+      usePriceAlertsStore.getState().reset();
+      useOrderHistoryStore.getState().reset();
       useCardStore.getState().reset();
       useSecurityStore.getState().reset();
       resetNavOrigin();
@@ -168,6 +180,7 @@ export function DashboardShell({ children }: { children: ReactNode }) {
     <DashboardContext value={context}>
       <StepUpProvider token={context.token} onSessionEnded={endStepUpSession}>
         <Navigation />
+        <FollowingSync token={context.token} />
         <div className="lg:pl-60">
           <DashboardHeader
             title={verifying ? "Verify identity" : (section?.label ?? "Dashboard")}
@@ -193,6 +206,7 @@ export function DashboardShell({ children }: { children: ReactNode }) {
               <Alert tone="warning">Showing the last data received. {describeError(error)}</Alert>
             ) : null}
             {client && kycLocked && !verifying ? <KycBanner client={client} token={context.token} /> : null}
+            {client ? <PriceTargetNotices key={client.id} clientId={client.id} /> : null}
             {accountLinks ? <AccountLinks /> : null}
             {children}
           </main>

@@ -2,11 +2,12 @@
 
 import { useMemo } from "react";
 import Link from "next/link";
-import { Lock } from "lucide-react";
+import { ArrowRight, History, Lock } from "lucide-react";
 
 import { useDashboard } from "@/components/layout/dashboard-shell";
 import { OpenOrdersList } from "@/components/markets/open-orders-list";
 import { SavingsPlansList } from "@/components/markets/savings-plans-list";
+import { WatchlistSection } from "@/components/markets/watchlist-section";
 import { Alert, Button } from "@/components/ui/primitives";
 import { ONBOARDING_PATH } from "@/hooks/use-client-home";
 import { AssetList, AssetListSkeleton } from "@/components/vault/asset-list";
@@ -16,6 +17,7 @@ import { SovereignBalance, SovereignBalanceSkeleton } from "@/components/vault/s
 import { SpeiDepositCard, SpeiDepositCardSkeleton } from "@/components/vault/spei-deposit-card";
 import { describeError } from "@/lib/api/client";
 import { addUnits } from "@/lib/decimal";
+import { ordersPath } from "@/lib/order-history";
 import { cashBalanceHistory } from "@/lib/portfolio";
 import { useDashboardStore } from "@/store/dashboard";
 import { useVaultStore } from "@/store/vault";
@@ -31,12 +33,16 @@ import { useVaultStore } from "@/store/vault";
  * (components/markets/open-orders-list.tsx), and the savings plans after
  * them, with their next purchases and Pause, Resume and Cancel
  * (components/markets/savings-plans-list.tsx); each section is absent when
- * there is nothing in it.
+ * there is nothing in it. The assets close with a link to the Orders page's
+ * history (as the open orders' header does), and the Watchlist follows them:
+ * the assets the client follows and does not hold
+ * (components/markets/watchlist-section.tsx), absent when there are none.
  *
  * Layout: one column on phones (balance, allocation, trend, deposit, open
- * orders, savings plans, assets); from xl, the balance (two thirds) beside
- * the deposit card, both the same height, then the allocation, the trend, the
- * open orders, the savings plans and the assets across the full width.
+ * orders, savings plans, assets, watchlist); from xl, the balance (two
+ * thirds) beside the deposit card, both the same height, then the allocation,
+ * the trend, the open orders, the savings plans, the assets and the
+ * watchlist across the full width.
  */
 export default function VaultPage() {
   const { token, client, kycLocked, refresh } = useDashboard();
@@ -113,14 +119,33 @@ export default function VaultPage() {
         </div>
 
         {/* Each its own grid item, or nothing: no empty row (and no extra gap) without orders or plans. */}
-        <OpenOrdersList token={token} className="min-w-0 xl:col-span-3" />
+        <OpenOrdersList token={token} historyHref={ordersPath("history")} className="min-w-0 xl:col-span-3" />
         <SavingsPlansList token={token} className="min-w-0 xl:col-span-3" />
 
         <div className="min-w-0 xl:col-span-3">
-          {loaded ? <AssetList holdings={holdings} /> : <AssetListSkeleton />}
+          {loaded ? <AssetList holdings={holdings} footer={<OrderHistoryLink />} /> : <AssetListSkeleton />}
         </div>
+
+        <WatchlistSection className="min-w-0 xl:col-span-3" />
       </div>
     </div>
+  );
+}
+
+/** The assets' last line: every order placed, on the Orders page. */
+function OrderHistoryLink() {
+  return (
+    <Link
+      href={ordersPath("history")}
+      className="flex items-center justify-between gap-3 border-t border-border px-5 py-3 text-[11px] font-semibold tracking-[0.18em] text-muted uppercase transition-colors hover:bg-surface-2 hover:text-synthetic-yellow focus-visible:ring-2 focus-visible:ring-synthetic-yellow focus-visible:ring-inset focus-visible:outline-none sm:px-6"
+      data-testid="vault-order-history"
+    >
+      <span className="inline-flex items-center gap-2">
+        <History className="size-4" aria-hidden />
+        Order history
+      </span>
+      <ArrowRight className="size-4" aria-hidden />
+    </Link>
   );
 }
 
