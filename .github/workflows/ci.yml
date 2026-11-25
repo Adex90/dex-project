@@ -264,6 +264,8 @@ jobs:
             expect: "tests/db/0025_aclaraciones_spei.sql: todas las pruebas pasaron (ROLLBACK)"
           - suite: 0026_avisos_spei
             expect: "tests/db/0026_avisos_spei.sql: todas las pruebas pasaron (ROLLBACK)"
+          - suite: 0027_llaves_acceso_recuperacion
+            expect: "tests/db/0027_llaves_acceso_recuperacion.sql: todas las pruebas pasaron (ROLLBACK)"
     services:
       postgres:
         image: postgres:16
