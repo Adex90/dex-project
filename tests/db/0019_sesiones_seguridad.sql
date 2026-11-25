@@ -344,11 +344,17 @@ SELECT pg_temp.debe_fallar('ni las revoca', ARRAY[
   'SET LOCAL ROLE sc_kyc',
   $q$UPDATE kyc.sesiones SET revocada_en = now(), motivo_revocacion = 'OPERADOR'$q$
 ], 'permission denied');
+-- 0025: sc_ifpe y sc_spei escriben en la bitácora los eventos de las
+-- aclaraciones SPEI y ningún otro (sus políticas, en 0025_aclaraciones_spei.sql);
+-- no la leen ni la cambian.
 SELECT pg_temp.exigir('los demás roles de la aplicación no tocan sesiones, preferencias ni bitácora', (
   SELECT bool_and(NOT has_any_column_privilege(r, t, 'SELECT, INSERT, UPDATE, REFERENCES'))
     FROM unnest(ARRAY['sc_ifpe', 'sc_sofom', 'sc_puente', 'sc_spei', 'sc_mercado', 'sc_aml', 'sc_auditor',
                       'sc_auditor_pld', 'sc_kyc_verificador']) AS r,
-         unnest(ARRAY['kyc.sesiones', 'kyc.preferencias_seguridad', 'kyc.eventos_autenticacion']) AS t));
+         unnest(ARRAY['kyc.sesiones', 'kyc.preferencias_seguridad', 'kyc.eventos_autenticacion']) AS t
+   WHERE NOT (r IN ('sc_ifpe', 'sc_spei') AND t = 'kyc.eventos_autenticacion'))
+  AND NOT has_any_column_privilege('sc_ifpe', 'kyc.eventos_autenticacion', 'SELECT, UPDATE, REFERENCES')
+  AND NOT has_any_column_privilege('sc_spei', 'kyc.eventos_autenticacion', 'SELECT, UPDATE, REFERENCES'));
 
 -- -----------------------------------------------------------------------------
 -- 6. El cliente lee lo suyo y nada más (RLS, como en 0011)

@@ -260,6 +260,8 @@ jobs:
             expect: "tests/db/0023_planes_ahorro.sql: todas las pruebas pasaron (ROLLBACK)"
           - suite: 0024_seguimiento_alertas
             expect: "tests/db/0024_seguimiento_alertas.sql: todas las pruebas pasaron (ROLLBACK)"
+          - suite: 0025_aclaraciones_spei
+            expect: "tests/db/0025_aclaraciones_spei.sql: todas las pruebas pasaron (ROLLBACK)"
     services:
       postgres:
         image: postgres:16
