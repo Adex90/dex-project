@@ -224,6 +224,7 @@ fn es_invariante(codigo: &str) -> bool {
             | "AVISO_INCOHERENTE"
             | "AVISO_TRANSICION"
             | "AVISO_CERRADO"
+            | "ACLARACION_INCOHERENTE"
     ) || codigo.ends_with("_INMUTABLE")
 }
 
@@ -273,6 +274,13 @@ fn traducir_error_bd(codigo_sql: &str, mensaje: &str, restriccion: &str) -> Opti
             "ORDEN_NO_PENDIENTE" => return Some(AppError::conflicto("ORDEN_NO_PENDIENTE", detalle)),
             // Otra sesión canceló el plan de ahorro primero (0023).
             "PLAN_CANCELADO" => return Some(AppError::conflicto("PLAN_CANCELADO", detalle)),
+            // Aclaraciones SPEI (0025): otra activa del mismo movimiento, o
+            // otro operador la movió o la cerró primero.
+            "ACLARACION_ACTIVA" | "ACLARACION_CERRADA" | "ACLARACION_TRANSICION" => {
+                return Some(AppError::conflicto(codigo, detalle))
+            }
+            // El movimiento no es del cliente: para él no existe.
+            "ACLARACION_AJENA" => return Some(AppError::no_encontrado("el SPEI no existe")),
             c if es_conflicto_aml(c) => return Some(AppError::conflicto(c, detalle)),
             _ => {}
         }
@@ -308,6 +316,9 @@ fn traducir_error_bd(codigo_sql: &str, mensaje: &str, restriccion: &str) -> Opti
                 "W8BEN_CONCURRENTE",
                 "otra sesión certificó tu W-8BEN al mismo tiempo; vuelve a cargarlo",
             )
+        } else if restriccion.starts_with("ux_aclaraciones_activa") {
+            // Dos aclaraciones del mismo movimiento a la vez: gana una (0025).
+            AppError::conflicto("ACLARACION_ACTIVA", "ese SPEI ya tiene una aclaración activa")
         } else if restriccion.starts_with("ux_beneficiarios") {
             AppError::negocio("BENEFICIARIO_DUPLICADO", "un beneficiario aparece dos veces")
         } else if restriccion.starts_with("ux_perfiles") {
@@ -522,6 +533,38 @@ mod pruebas {
             "SC_AVISO_CERRADO: la alerta x ya está disparada",
             "SC_AVISO_INMUTABLE: los términos no cambian",
             "SC_SEGUIMIENTO_INMUTABLE: el renglón no se edita",
+        ] {
+            let e = traducir_error_bd("P0001", mensaje, "").unwrap();
+            assert_eq!(e.codigo(), "INTEGRIDAD", "{mensaje}");
+        }
+    }
+
+    #[test]
+    fn aclaraciones_spei() {
+        for (mensaje, codigo) in [
+            ("SC_ACLARACION_ACTIVA: el SPEI X ya tiene una aclaración activa", "ACLARACION_ACTIVA"),
+            ("SC_ACLARACION_CERRADA: la aclaración 3 ya se cerró", "ACLARACION_CERRADA"),
+            ("SC_ACLARACION_TRANSICION: la aclaración 3 no pasa de EN_REVISION a ABIERTA", "ACLARACION_TRANSICION"),
+        ] {
+            let e = traducir_error_bd("P0001", mensaje, "").unwrap();
+            assert_eq!((e.status(), e.codigo()), (StatusCode::CONFLICT, codigo), "{mensaje}");
+        }
+        for (mensaje, codigo) in [
+            ("SC_LIMITE_ACLARACIONES: a lo más 10", "LIMITE_ACLARACIONES"),
+            ("SC_ACLARACION_VENCIDA: dentro de los 90 días", "ACLARACION_VENCIDA"),
+            ("SC_ACLARACION_NOTA: la nota la lee el cliente", "ACLARACION_NOTA"),
+        ] {
+            let e = traducir_error_bd("P0001", mensaje, "").unwrap();
+            assert_eq!((e.status(), e.codigo()), (StatusCode::UNPROCESSABLE_ENTITY, codigo), "{mensaje}");
+        }
+        let ajena =
+            traducir_error_bd("P0001", "SC_ACLARACION_AJENA: el movimiento SPEI no es del cliente", "").unwrap();
+        assert_eq!(ajena.status(), StatusCode::NOT_FOUND);
+        let carrera = traducir_error_bd("23505", "duplicate key", "ux_aclaraciones_activa_inbound").unwrap();
+        assert_eq!((carrera.status(), carrera.codigo()), (StatusCode::CONFLICT, "ACLARACION_ACTIVA"));
+        for mensaje in [
+            "SC_ACLARACION_INCOHERENTE: una aclaración nace ABIERTA",
+            "SC_ACLARACION_INMUTABLE: los términos no cambian",
         ] {
             let e = traducir_error_bd("P0001", mensaje, "").unwrap();
             assert_eq!(e.codigo(), "INTEGRIDAD", "{mensaje}");

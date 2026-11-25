@@ -1,7 +1,8 @@
-//! Patrimonio: las cuentas vinculadas del cliente y los retiros a ellas
+//! Patrimonio: las cuentas vinculadas del cliente y los retiros a ellas, el
+//! buzón, el Centro Fiscal, y el rastreador SPEI con sus aclaraciones
 //! (`crate::patrimonio`). Solo el cliente; rutas del grupo `api` del límite
 //! por IP (limites.rs), con los nombres en inglés del frontend
-//! (`frontend/src/types/wealth.ts`).
+//! (`frontend/src/types/wealth.ts`, `frontend/src/types/transfers.ts`).
 
 use axum::{
     extract::State,
@@ -22,9 +23,11 @@ use crate::{
     kyc::beneficiarios::Autor,
     patrimonio::{
         self,
+        aclaraciones::{self, Aclaraciones, Motivo, SolicitudAclaracion, VistaAclaracion},
         documentos::{self, Documento, Documentos},
         impuestos::{self, CentroFiscal, EstadoW8ben, SolicitudW8ben},
         modelos::{CuentasVinculadas, ReciboRetiro},
+        transferencias::{self, Direccion, Transferencia, Transferencias},
         SolicitudRetiro,
     },
     routes::extraccion::{Json, Path, Query},
@@ -40,6 +43,87 @@ pub fn rutas() -> Router<AppState> {
         .route("/wealth/impuestos", get(ver_impuestos))
         .route("/wealth/impuestos/w8ben", post(certificar_w8ben))
         .route("/wealth/impuestos/export.csv", get(exportar_impuestos))
+        .route("/wealth/spei/transfers", get(transferencias_spei))
+        .route("/wealth/spei/transfers/{id}", get(transferencia_spei))
+        .route("/wealth/spei/disputes", get(aclaraciones_spei).post(abrir_aclaracion))
+}
+
+/// `?limit=&cursor=` del rastreador SPEI.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConsultaTransferencias {
+    limit: Option<i64>,
+    cursor: Option<String>,
+}
+
+/// Con la pasarela simulada (`MODO_DEMO`), los SPEI salientes no pasan por
+/// Banxico: no tienen CEP.
+fn pasarela_simulada(e: &AppState) -> bool {
+    e.pasarela.nombre() == "simulada"
+}
+
+/// Los SPEI del cliente (`SpeiTransfers`), del más reciente al más antiguo.
+async fn transferencias_spei(
+    State(e): State<AppState>,
+    u: Usuario,
+    Query(q): Query<ConsultaTransferencias>,
+) -> AppResult<Json<Transferencias>> {
+    u.exigir_cliente()?;
+    let simulada = pasarela_simulada(&e);
+    Ok(Json(transferencias::listar(&e.pool, u.cliente_id, simulada, q.limit, q.cursor.as_deref()).await?))
+}
+
+/// Un SPEI del cliente (`SpeiTransfer`), por su id o por el de un movimiento
+/// del ledger que hizo. 404 si no es suyo.
+async fn transferencia_spei(
+    State(e): State<AppState>,
+    u: Usuario,
+    Path(id): Path<Uuid>,
+) -> AppResult<Json<Transferencia>> {
+    u.exigir_cliente()?;
+    Ok(Json(transferencias::obtener(&e.pool, u.cliente_id, pasarela_simulada(&e), id).await?))
+}
+
+/// Las aclaraciones SPEI del cliente (`SpeiClarifications`).
+async fn aclaraciones_spei(State(e): State<AppState>, u: Usuario) -> AppResult<Json<Aclaraciones>> {
+    u.exigir_cliente()?;
+    Ok(Json(aclaraciones::listar(&e.pool, u.cliente_id).await?))
+}
+
+/// `SpeiClarificationRequest`. Campos desconocidos: 400.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SolicitudAclaracionHttp {
+    transfer_id: Uuid,
+    direction: Direccion,
+    reason: Motivo,
+    #[serde(default)]
+    description: Option<String>,
+    idempotency_key: String,
+}
+
+/// Abre una aclaración sobre un SPEI del cliente: 201 con ella; 200 si repite
+/// la clave de la misma.
+async fn abrir_aclaracion(
+    State(e): State<AppState>,
+    u: Usuario,
+    origen: Origen,
+    Json(s): Json<SolicitudAclaracionHttp>,
+) -> AppResult<(StatusCode, Json<VistaAclaracion>)> {
+    u.exigir_cliente()?;
+    let solicitud = SolicitudAclaracion {
+        cliente_id: u.cliente_id,
+        transferencia_id: s.transfer_id,
+        direccion: s.direction,
+        motivo: s.reason,
+        descripcion: s.description,
+        clave_idempotencia: u.clave(&s.idempotency_key)?,
+        sesion_id: Some(u.sesion_id),
+        ip: origen.ip,
+        dispositivo: Some(origen.dispositivo.clone()),
+    };
+    let r = aclaraciones::abrir(&e.pool, &solicitud).await?;
+    Ok((status_de(r.idempotente), Json(r.aclaracion)))
 }
 
 /// `?year=`: el ejercicio (el actual si no viene).

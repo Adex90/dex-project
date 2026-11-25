@@ -2076,6 +2076,9 @@ async fn sin_aviso_al_cliente(pool: PgPool) {
         "/api/v1/market/watchlist",
         "/api/v1/market/alerts",
         "/api/v1/market/orders/history",
+        // Rastreador SPEI y aclaraciones (0025).
+        "/api/v1/wealth/spei/transfers",
+        "/api/v1/wealth/spei/disputes",
     ] {
         let (s, cuerpo) = api.llamar_crudo("GET", ruta, Some(&tok_ana), None).await;
         assert_eq!(s, StatusCode::OK, "{ruta}");

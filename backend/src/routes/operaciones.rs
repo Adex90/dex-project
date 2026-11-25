@@ -21,6 +21,7 @@ use crate::{
         kyc::ClienteVista,
         sofom::{Credito, TransaccionSofom},
     },
+    patrimonio::aclaraciones::{self, AclaracionOperador, EstadoAclaracion},
     routes::extraccion::{Json, Path, Query},
     sofom::credito::{self, ResultadoCastigo, ResultadoCredito, ResultadoPago},
     spei::{
@@ -40,6 +41,8 @@ pub fn rutas() -> Router<AppState> {
         .route("/operaciones/spei/recibidos/{id}/anulacion", post(anular_spei))
         .route("/operaciones/spei/enviados/{id}/reembolso", post(reembolsar_spei_enviado))
         .route("/operaciones/spei/en-revision/{id}/descarte", post(descartar_spei_retenido))
+        .route("/operaciones/spei/aclaraciones", get(aclaraciones_activas))
+        .route("/operaciones/spei/aclaraciones/{id}", post(cambiar_aclaracion))
         .route("/operaciones/depositos", post(deposito))
         .route("/operaciones/retenciones", post(retencion))
         .route("/operaciones/kyc/pendientes", get(kyc_pendientes))
@@ -403,6 +406,50 @@ async fn anular_spei(
     };
     let r = inbound::anular(&e.pool, &solicitud).await?;
     Ok((status_de(r.idempotente), Json(r)))
+}
+
+/// Las aclaraciones SPEI activas de los clientes (0025), la más antigua primero.
+async fn aclaraciones_activas(State(e): State<AppState>, u: Usuario) -> AppResult<Json<Vec<AclaracionOperador>>> {
+    u.exigir_operador()?;
+    Ok(Json(aclaraciones::cola(&e.pool).await?))
+}
+
+/// A dónde pasa una aclaración: en revisión, resuelta o rechazada.
+#[derive(Deserialize)]
+enum EstadoAclaracionHttp {
+    #[serde(rename = "EN_REVISION")]
+    EnRevision,
+    #[serde(rename = "RESUELTA")]
+    Resuelta,
+    #[serde(rename = "RECHAZADA")]
+    Rechazada,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CambioAclaracionHttp {
+    estado: EstadoAclaracionHttp,
+    /// Para el cliente: obligatoria al cerrarla (10 a 500 caracteres) y sin
+    /// nombrar la prevención de lavado de dinero (la base de datos lo exige).
+    #[serde(default)]
+    nota: Option<String>,
+}
+
+/// Pasa una aclaración SPEI a EN_REVISION, RESUELTA o RECHAZADA. Cerrada no
+/// cambia más (409); el cliente ve el paso en su bitácora.
+async fn cambiar_aclaracion(
+    State(e): State<AppState>,
+    u: Usuario,
+    Path(id): Path<Uuid>,
+    Json(s): Json<CambioAclaracionHttp>,
+) -> AppResult<Json<AclaracionOperador>> {
+    u.exigir_operador()?;
+    let estado = match s.estado {
+        EstadoAclaracionHttp::EnRevision => EstadoAclaracion::EnRevision,
+        EstadoAclaracionHttp::Resuelta => EstadoAclaracion::Resuelta,
+        EstadoAclaracionHttp::Rechazada => EstadoAclaracion::Rechazada,
+    };
+    Ok(Json(aclaraciones::cambiar_estado(&e.pool, id, estado, s.nota.as_deref()).await?))
 }
 
 /// Descarta como duplicado una notificación retenida (`/spei/en-revision`)

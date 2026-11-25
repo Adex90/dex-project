@@ -53,6 +53,10 @@
 //! | POST | `/api/v1/market/alerts/{id}/cancel` | cliente: cancela una alerta activa |
 //! | GET  | `/api/v1/wealth/linked-accounts` | cliente: sus cuentas vinculadas, a dónde puede retirar (con `MODO_DEMO`, vincula la de demostración) |
 //! | POST | `/api/v1/wealth/withdraw` | cliente con verificación reforzada: retira efectivo disponible a una cuenta vinculada (SPEI a cuenta propia, en proceso hasta liquidarse) |
+//! | GET  | `/api/v1/wealth/spei/transfers?limit=&cursor=` | cliente: sus SPEI entrantes y salientes con su liquidación y los datos de su CEP, por páginas |
+//! | GET  | `/api/v1/wealth/spei/transfers/{id}` | cliente: un SPEI suyo, por su id o por el de un movimiento del ledger que hizo |
+//! | GET  | `/api/v1/wealth/spei/disputes` | cliente: sus aclaraciones SPEI, con su historia |
+//! | POST | `/api/v1/wealth/spei/disputes` | cliente con KYC verificado: abre una aclaración sobre un SPEI suyo (una activa por SPEI) |
 //! | GET  | `/api/v1/kyc/expediente` | cliente: estado, intentos, bloqueo y último resultado |
 //! | POST | `/api/v1/kyc/perfil` | cliente: datos personales y domicilio |
 //! | POST | `/api/v1/kyc/verificar` | cliente: INE + selfie (hasta 12 MB) |
@@ -72,6 +76,8 @@
 //! | POST | `/api/v1/operaciones/spei/recibidos/{id}/anulacion` | operador: anula una captura manual errónea |
 //! | POST | `/api/v1/operaciones/spei/enviados/{id}/reembolso` | operador: reembolsa una orden en revisión que el proveedor no tiene |
 //! | POST | `/api/v1/operaciones/spei/en-revision/{id}/descarte` | operador: descarta como duplicado una notificación retenida |
+//! | GET  | `/api/v1/operaciones/spei/aclaraciones` | operador: las aclaraciones SPEI activas, la más antigua primero |
+//! | POST | `/api/v1/operaciones/spei/aclaraciones/{id}` | operador: pasa una aclaración a EN_REVISION, RESUELTA o RECHAZADA (con nota para el cliente) |
 //!
 //! El personal interno (operador, auditor, cumplimiento) solo opera con una
 //! sesión que verificó el segundo factor (`MFA_REQUERIDO` si no).

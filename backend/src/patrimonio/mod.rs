@@ -17,10 +17,16 @@
 //!   con una CLABE válida que termina en 1234. Fuera de `MODO_DEMO` no se
 //!   vincula ninguna: falta el flujo que verifica con el banco que la cuenta
 //!   es del cliente (docs/FRONTEND_ROADMAP.md, módulo 16).
+//! - **Rastreador SPEI y aclaraciones** (roadmap 17, migración 0025): cada
+//!   SPEI del cliente con su liquidación y los datos de su CEP
+//!   ([`transferencias`]), y las aclaraciones que abre sobre ellos
+//!   ([`aclaraciones`]).
 
+pub mod aclaraciones;
 pub mod documentos;
 pub mod impuestos;
 pub mod modelos;
+pub mod transferencias;
 pub mod vinculadas;
 
 use rust_decimal::Decimal;
