@@ -225,12 +225,17 @@ async fn el_rastreador_spei(pool: PgPool) {
     assert!(!b.leer(&token, "/api/v1/wealth/spei/transfers").await.to_string().contains(CLABE_BBVA));
 
     // El liquidador la acepta, la liquida y el banco receptor la devuelve: cada etapa, y el reembolso.
+    // Cada paso avisa a la bóveda (migración 0026), aunque no mueva el saldo: la pantalla vuelve a leer.
+    let cuenta = ana.cuenta_ifpe.id;
+    let v0 = version_ordenes(&pool, cuenta).await;
     b.evento(&pool, r.orden.id, outbound::Evento::Aceptada { id_proveedor: Some("987".into()), fecha_operacion: None })
         .await;
+    assert_eq!(version_ordenes(&pool, cuenta).await, v0 + 1, "ENVIADA avisa a la bóveda");
     let w = por_id(&b.transferencias(&token).await, &json!(r.orden.id)).clone();
     assert_eq!((&w["status"], &w["stage"]), (&json!("pending"), &json!("sent")));
     assert!(w["sent_at"].is_string() && w["cep"].is_null(), "{w}");
     b.evento(&pool, r.orden.id, outbound::Evento::Liquidada { fecha_operacion: Some(Utc::now().date_naive()) }).await;
+    assert_eq!(version_ordenes(&pool, cuenta).await, v0 + 2, "LIQUIDADA (con su fecha de operación) avisa una vez");
     let w = por_id(&b.transferencias(&token).await, &json!(r.orden.id)).clone();
     assert_eq!((&w["status"], &w["stage"], &w["simulated"]), (&json!("settled"), &json!("settled"), &json!(true)));
     assert_eq!(
@@ -243,6 +248,7 @@ async fn el_rastreador_spei(pool: PgPool) {
         (&json!("Synthetic Capital"), &json!("BBVA México"))
     );
     b.evento(&pool, r.orden.id, outbound::Evento::Devuelta { causa: 1, motivo: "cuenta inexistente".into() }).await;
+    assert_eq!(version_ordenes(&pool, cuenta).await, v0 + 3, "DEVUELTA avisa (y su reembolso, con el saldo)");
     let w = por_id(&b.transferencias(&token).await, &json!(r.orden.id)).clone();
     assert_eq!(
         (&w["status"], &w["stage"], &w["return_reason"]),
@@ -252,6 +258,7 @@ async fn el_rastreador_spei(pool: PgPool) {
 
     // Un depósito devuelto al emisor: sin CEP ni movimiento, y sin la causa ni el motivo (aviso indebido).
     let regreso = devuelto(&pool, &ana, "DEVUELTO1", 0).await;
+    assert_eq!(version_ordenes(&pool, cuenta).await, v0 + 4, "un depósito devuelto avisa: el saldo no cambió");
     let todo = b.leer(&token, "/api/v1/wealth/spei/transfers").await;
     let v = por_id(todo["transfers"].as_array().unwrap(), &json!(regreso));
     assert_eq!(

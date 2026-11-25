@@ -24,6 +24,9 @@
 //!   monto. Un SPEI simulado (`MODO_DEMO`: los depósitos de demostración y la
 //!   pasarela simulada) no tiene CEP en Banxico, y se dice (`available`).
 //! - La última aclaración de cada movimiento (migración 0025), si la hay.
+//! - Cada paso de un SPEI avisa a la bóveda del cliente, aunque no mueva el
+//!   saldo (migración 0026: una orden enviada, liquidada o con su fecha de
+//!   operación, un depósito devuelto): la pantalla vuelve a leer al momento.
 //! - Con el rol del cliente y RLS: solo lo suyo. Por páginas, del más reciente
 //!   al más antiguo, con un cursor opaco como el del historial de órdenes; o
 //!   uno, por su id o por el de un movimiento del ledger que hizo.
@@ -210,7 +213,7 @@ pub struct ResumenAclaracion {
     pub estado: EstadoAclaracion,
 }
 
-/// Un SPEI del cliente (`SpeiTransfer`).
+/// Un SPEI del cliente (`TrackedTransfer`).
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Transferencia {
     /// La orden de envío o el registro del SPEI recibido.
