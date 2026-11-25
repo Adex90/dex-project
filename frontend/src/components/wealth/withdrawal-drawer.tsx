@@ -1,13 +1,27 @@
 "use client";
 
 import { useEffect, useId, useRef, useState, type ChangeEvent, type FormEvent, type RefObject } from "react";
-import { ArrowLeft, BadgeCheck, Check, Clock, Delete, Landmark, Loader2, ShieldCheck, Undo2, X } from "lucide-react";
+import Link from "next/link";
+import {
+  ArrowLeft,
+  ArrowRight,
+  BadgeCheck,
+  Check,
+  Clock,
+  Delete,
+  Landmark,
+  Loader2,
+  ShieldCheck,
+  Undo2,
+  X,
+} from "lucide-react";
 
 import { cx } from "@/components/ui/primitives";
 import { ApiError, describeError } from "@/lib/api/client";
 import { newIdempotencyKey } from "@/lib/api/endpoints";
 import { formatAmount, formatMoney, toUnits } from "@/lib/decimal";
 import { NUMPAD_KEYS, formatAmountInput, pressKey, sanitizeAmount, type NumpadKey } from "@/lib/market";
+import { transfersPath } from "@/lib/transfers";
 import {
   STATUS_LABELS,
   accountLabel,
@@ -691,6 +705,14 @@ function Receipt({
           ? "Your bank can find it with the tracking key. If it is returned, the money comes back to your vault."
           : "The tracking key identifies the transfer at both banks."}
       </p>
+      <Link
+        href={transfersPath({ transfer: withdrawal.id })}
+        className="mt-3 inline-flex min-h-10 items-center gap-1.5 text-[11px] font-semibold tracking-[0.16em] text-synthetic-yellow uppercase hover:underline focus-visible:ring-2 focus-visible:ring-synthetic-yellow focus-visible:outline-none"
+        data-testid="withdraw-track"
+      >
+        Track this transfer
+        <ArrowRight className="size-3.5" aria-hidden />
+      </Link>
       <button
         ref={doneRef}
         type="button"

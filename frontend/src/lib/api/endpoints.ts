@@ -5,6 +5,7 @@ import type { DesignationRequest } from "@/types/beneficiaries";
 import type { InactivityMinutes, PasswordChange } from "@/types/security";
 import type { StepUpCredential } from "@/types/step-up";
 import type { W8benCertification } from "@/types/taxes";
+import type { SpeiClarificationRequest } from "@/types/transfers";
 import type { WithdrawalRequest } from "@/types/wealth";
 
 import { request, requestText } from "./client";
@@ -273,6 +274,40 @@ export const api = {
     request<unknown>("/api/v1/wealth/withdraw", { method: "POST", token, body }),
 
   /**
+   * The client's SPEI transfers, in and out, newest first, a page at a time
+   * (`cursor` from the previous page; null for the first). Untyped on
+   * purpose: `parseSpeiTransfers` validates each page.
+   */
+  speiTransfers: (token: string, cursor: string | null, signal?: AbortSignal) =>
+    request<unknown>("/api/v1/wealth/spei/transfers", {
+      token,
+      signal,
+      query: { limit: SPEI_TRANSFERS_PAGE, cursor: cursor ?? undefined },
+    }),
+
+  /**
+   * One SPEI transfer, by its id or by the id of a ledger movement it made
+   * (an order's charge or refund, a deposit's credit); 404 when it is not the
+   * client's. Validate with `parseTrackedTransfer`.
+   */
+  speiTransfer: (token: string, id: string, signal?: AbortSignal) =>
+    request<unknown>(`/api/v1/wealth/spei/transfers/${encodeURIComponent(id)}`, { token, signal }),
+
+  /** The client's SPEI clarifications, newest first, with their history. Validate with `parseSpeiClarifications`. */
+  speiClarifications: (token: string, signal?: AbortSignal) =>
+    request<unknown>("/api/v1/wealth/spei/disputes", { token, signal }),
+
+  /**
+   * Opens a clarification on one of the client's SPEI transfers: 201 for a
+   * new one, 200 when the idempotency key repeats it. 409
+   * `ACLARACION_ACTIVA` when the transfer already has one open, 422
+   * `ACLARACION_VENCIDA` past 90 days and `LIMITE_ACLARACIONES` with 10 open.
+   * Untyped on purpose: `parseClarification` validates the answer.
+   */
+  openSpeiClarification: (token: string, body: SpeiClarificationRequest) =>
+    request<unknown>("/api/v1/wealth/spei/disputes", { method: "POST", token, body }),
+
+  /**
    * The Document Inbox: monthly account statements and a trade confirmation
    * for every executed order, derived from the hash-chained ledgers, newest
    * first. Untyped on purpose: `parseDocumentList` validates the answer.
@@ -509,6 +544,9 @@ export const api = {
   amlVerifyAuditLog: (token: string, signal?: AbortSignal) =>
     request<VerificacionBitacoraAml>(`${AML}/bitacora/verificacion`, { token, signal }),
 };
+
+/** SPEI transfers per page on the Transfers page (the backend allows up to 100). */
+export const SPEI_TRANSFERS_PAGE = 25;
 
 /** A fresh idempotency key: one per logical operation, reused on retries. */
 export function newIdempotencyKey(): string {

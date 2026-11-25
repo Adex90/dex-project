@@ -73,7 +73,7 @@ async fn transferencias_spei(
     Ok(Json(transferencias::listar(&e.pool, u.cliente_id, simulada, q.limit, q.cursor.as_deref()).await?))
 }
 
-/// Un SPEI del cliente (`SpeiTransfer`), por su id o por el de un movimiento
+/// Un SPEI del cliente (`TrackedTransfer`), por su id o por el de un movimiento
 /// del ledger que hizo. 404 si no es suyo.
 async fn transferencia_spei(
     State(e): State<AppState>,

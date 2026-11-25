@@ -254,6 +254,16 @@ export function describeEvent(event: SecurityEvent): EventDescription {
       return { title: "Beneficiaries updated", detail: n > 0 ? `Version ${n} on record` : null, tone: "accent" };
     case "W8BEN_CERTIFICADO":
       return { title: "W-8BEN certified", detail: n > 0 ? `Version ${n} on record` : null, tone: "accent" };
+    // SPEI clarifications (migration 0025): `detail` is the case number. The client opens
+    // one (from their session); our team moves it to review and closes it (no session).
+    case "ACLARACION_SPEI_ABIERTA":
+      return { title: "SPEI clarification opened", detail: n > 0 ? `Case #${n}` : null, tone: "accent" };
+    case "ACLARACION_SPEI_EN_REVISION":
+      return { title: "SPEI clarification in review", detail: n > 0 ? `Case #${n}` : null, tone: "neutral" };
+    case "ACLARACION_SPEI_RESUELTA":
+      return { title: "SPEI clarification resolved", detail: n > 0 ? `Case #${n}` : null, tone: "neutral" };
+    case "ACLARACION_SPEI_RECHAZADA":
+      return { title: "SPEI clarification declined", detail: n > 0 ? `Case #${n}` : null, tone: "neutral" };
     // Step-up (migration 0022): `detail` is the window's length in seconds.
     case "STEP_UP_VERIFICADO":
       return {

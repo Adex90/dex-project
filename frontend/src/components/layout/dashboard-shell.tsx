@@ -26,6 +26,7 @@ import { useCardStore } from "@/store/card";
 import { useDashboardStore } from "@/store/dashboard";
 import { useMarketStore } from "@/store/market";
 import { useOrderHistoryStore } from "@/store/order-history";
+import { useTransfersStore } from "@/store/transfers";
 import { useOrdersStore } from "@/store/orders";
 import { usePriceAlertsStore } from "@/store/price-alerts";
 import { useSavingsPlansStore } from "@/store/savings-plans";
@@ -134,8 +135,9 @@ export function DashboardShell({ children }: { children: ReactNode }) {
   const origin = useNavOrigin();
 
   // Sign-out unmounts the dashboard: the next person in this tab starts from
-  // an empty search, the card's defaults and no one's watchlist, price alerts
-  // or order history, and an asset page opened by address belongs to the Vault.
+  // an empty search, the card's defaults and no one's watchlist, price alerts,
+  // order history, transfers or clarifications, and an asset page opened by
+  // address belongs to the Vault.
   useEffect(
     () => () => {
       useMarketStore.getState().reset();
@@ -144,6 +146,7 @@ export function DashboardShell({ children }: { children: ReactNode }) {
       useWatchlistStore.getState().reset();
       usePriceAlertsStore.getState().reset();
       useOrderHistoryStore.getState().reset();
+      useTransfersStore.getState().reset();
       useCardStore.getState().reset();
       useSecurityStore.getState().reset();
       resetNavOrigin();

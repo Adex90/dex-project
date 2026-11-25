@@ -3,6 +3,7 @@
 import {
   FileSignature,
   History,
+  MessageSquareText,
   KeyRound,
   LogIn,
   LogOut,
@@ -21,8 +22,9 @@ import type { SecurityEvent } from "@/types/security";
  * Recent security activity (roadmap item 20): sign-ins and failed attempts,
  * sign-outs and revoked devices, password and two-step changes, the
  * inactivity timeout, every new version of the legal beneficiaries, every
- * W-8BEN certification, and every "Confirm it's you" before a withdrawal or a
- * change of beneficiaries, passed or failed. The server keeps it in an
+ * W-8BEN certification, every "Confirm it's you" before a withdrawal or a
+ * change of beneficiaries, passed or failed, and every step of a SPEI
+ * clarification (opened, in review, resolved or declined). The server keeps it in an
  * append-only log: the database refuses to edit or delete an entry. This
  * shows the latest 50.
  */
@@ -41,6 +43,10 @@ const ICONS: Record<string, LucideIcon> = {
   PREFERENCIAS_ACTUALIZADAS: Timer,
   BENEFICIARIOS_DESIGNADOS: Users,
   W8BEN_CERTIFICADO: FileSignature,
+  ACLARACION_SPEI_ABIERTA: MessageSquareText,
+  ACLARACION_SPEI_EN_REVISION: MessageSquareText,
+  ACLARACION_SPEI_RESUELTA: MessageSquareText,
+  ACLARACION_SPEI_RECHAZADA: MessageSquareText,
   STEP_UP_VERIFICADO: ShieldCheck,
   STEP_UP_FALLIDO: ShieldAlert,
   MFA_CODIGO_RECHAZADO: ShieldAlert,

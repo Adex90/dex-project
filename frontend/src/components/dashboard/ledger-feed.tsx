@@ -1,6 +1,7 @@
 "use client";
 
 import { Fragment, useState } from "react";
+import Link from "next/link";
 import {
   ArrowDownLeft,
   ArrowLeftRight,
@@ -8,6 +9,7 @@ import {
   Banknote,
   ChevronRight,
   Coins,
+  FileSearch,
   Link2,
   Hourglass,
   Lock,
@@ -20,6 +22,7 @@ import { HashText, Money, formatDateTime } from "@/components/ui/data";
 import { Badge, Button, Card, CardHeader, Skeleton, cx, type Tone } from "@/components/ui/primitives";
 import type { TipoTxIfpe, TransaccionIfpe } from "@/lib/api/types";
 import { CLIENT_HOLD_LABELS } from "@/lib/aml";
+import { isSpeiMovement, transfersPath } from "@/lib/transfers";
 
 type Direction = "in" | "out" | "internal";
 
@@ -61,7 +64,15 @@ function describe(tx: TransaccionIfpe, accountId: string | null): Kind {
   );
 }
 
-/** Your entries in the bank's append-only, SHA-256-chained IFPE ledger. */
+const TRACK_LINK =
+  "inline-flex h-6 items-center gap-1 border border-synthetic-yellow/40 px-1.5 text-[10px] font-semibold tracking-[0.14em] text-synthetic-yellow uppercase transition-colors hover:bg-synthetic-yellow hover:text-black focus-visible:ring-2 focus-visible:ring-synthetic-yellow focus-visible:outline-none";
+
+/**
+ * Your entries in the bank's append-only, SHA-256-chained IFPE ledger. A SPEI
+ * movement (a deposit, a withdrawal, the refund of one that came back) links
+ * to its transfer on the Transfers page: its settlement steps, tracking key
+ * and Banxico CEP.
+ */
 export function LedgerFeed({
   movements,
   accountId,
@@ -144,9 +155,23 @@ export function LedgerFeed({
                       <td className="py-2 pr-3 font-mono text-xs text-muted">#{tx.secuencia}</td>
                       <td className="py-2 pr-3 whitespace-nowrap text-ink-2">{formatDateTime(tx.creado_en)}</td>
                       <td className="py-2 pr-3">
-                        <Badge tone={kind.tone} icon={<Icon className="size-3" aria-hidden />}>
-                          {kind.label}
-                        </Badge>
+                        <span className="inline-flex items-center gap-2">
+                          <Badge tone={kind.tone} icon={<Icon className="size-3" aria-hidden />}>
+                            {kind.label}
+                          </Badge>
+                          {isSpeiMovement(tx) ? (
+                            <Link
+                              href={transfersPath({ transfer: tx.id })}
+                              onClick={(e) => e.stopPropagation()}
+                              className={TRACK_LINK}
+                              aria-label={`Track the SPEI transfer of movement ${tx.secuencia}`}
+                              data-testid="ledger-track"
+                            >
+                              <FileSearch className="size-3" aria-hidden />
+                              Track
+                            </Link>
+                          ) : null}
+                        </span>
                       </td>
                       <td className="max-w-[260px] truncate py-2 pr-3 text-ink-2" title={tx.concepto ?? undefined}>
                         {tx.concepto ?? <span className="text-muted">—</span>}
@@ -194,11 +219,25 @@ export function LedgerFeed({
 }
 
 function MovementDetails({ tx }: { tx: TransaccionIfpe }) {
-  const rows: [string, React.ReactNode][] = [
+  const rows: [string, React.ReactNode][] = [];
+  if (isSpeiMovement(tx)) {
+    rows.push([
+      "SPEI transfer",
+      <Link
+        key="t"
+        href={transfersPath({ transfer: tx.id })}
+        className="font-semibold text-synthetic-yellow underline-offset-2 hover:underline focus-visible:ring-2 focus-visible:ring-synthetic-yellow focus-visible:outline-none"
+        data-testid="ledger-track-details"
+      >
+        Inspect: settlement steps, tracking key and Banxico CEP
+      </Link>,
+    ]);
+  }
+  rows.push(
     ["Movement ID", <span key="id" className="font-mono">{tx.id}</span>],
     ["tx_hash", <HashText key="h" value={tx.tx_hash} head={32} tail={32} label="transaction hash" />],
     ["Previous hash (chain link)", <HashText key="p" value={tx.hash_anterior} head={32} tail={32} label="previous hash" />],
-  ];
+  );
   if (tx.referencia_externa) rows.push(["External reference", <span key="r" className="font-mono">{tx.referencia_externa}</span>]);
   if (tx.ref_movimiento_espejo)
     rows.push(["Mirror entry (SOFOM ledger)", <span key="m" className="font-mono">{tx.ref_movimiento_espejo}</span>]);

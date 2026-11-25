@@ -200,6 +200,18 @@ test("log entries in words", () => {
     detail: "Wrong code or password",
     tone: "warning",
   });
+  // SPEI clarifications (migration 0025): the case number, opened by the client, moved by our team.
+  assert.deepEqual(describeEvent(event("ACLARACION_SPEI_ABIERTA", { detail: 7 })), {
+    title: "SPEI clarification opened",
+    detail: "Case #7",
+    tone: "accent",
+  });
+  assert.deepEqual(
+    ["ACLARACION_SPEI_EN_REVISION", "ACLARACION_SPEI_RESUELTA", "ACLARACION_SPEI_RECHAZADA"].map(
+      (kind) => describeEvent(event(kind, { detail: 7 })).title,
+    ),
+    ["SPEI clarification in review", "SPEI clarification resolved", "SPEI clarification declined"],
+  );
   assert.equal(describeEvent(event("ALGO_NUEVO")).title, "Security event");
 });
 
@@ -227,6 +239,10 @@ test("no log entry uses words that would tip off a client under review", () => {
     "MFA_VERIFICADO",
     "MFA_CODIGO_RECHAZADO",
     "MFA_DESACTIVADO",
+    "ACLARACION_SPEI_ABIERTA",
+    "ACLARACION_SPEI_EN_REVISION",
+    "ACLARACION_SPEI_RESUELTA",
+    "ACLARACION_SPEI_RECHAZADA",
   ];
   for (const kind of kinds) {
     const { title, detail } = describeEvent(event(kind, { detail: 2 }));

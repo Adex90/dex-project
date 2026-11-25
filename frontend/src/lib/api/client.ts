@@ -215,6 +215,10 @@ const MESSAGES: Record<string, string> = {
   CUENTA_NO_VINCULADA: "Withdrawals go only to a bank account linked in your name. Nothing was sent.",
   TRANSFERENCIAS_TERCEROS_NO_DISPONIBLES:
     "Payments to other people's accounts are not available. Withdrawals go to a bank account in your name.",
+  // SPEI clarifications (migration 0025): one open per transfer, within 90 days, 10 open at most.
+  ACLARACION_ACTIVA: "This transfer already has an open clarification. Follow it in Clarifications.",
+  ACLARACION_VENCIDA: "Clarifications can be opened within 90 days of the transfer.",
+  LIMITE_ACLARACIONES: "You have 10 open clarifications. Once one is closed you can open another.",
   // Legal beneficiaries (migration 0020): a save is all or nothing.
   BENEFICIARIOS_PORCENTAJE: "The percentages must add up to exactly 100%. Nothing was saved.",
   BENEFICIARIOS_MAXIMO: "Name at most 5 beneficiaries. Nothing was saved.",

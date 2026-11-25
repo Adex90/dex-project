@@ -4,6 +4,7 @@ import { useEffect } from "react";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import {
+  ArrowLeftRight,
   FileText,
   Landmark,
   LockKeyhole,
@@ -24,6 +25,7 @@ import { DOCUMENTS_PATH } from "@/lib/documents";
 import { ORDERS_PATH } from "@/lib/order-history";
 import { SECURITY_PATH } from "@/lib/security";
 import { TAXES_PATH } from "@/lib/taxes";
+import { TRANSFERS_PATH } from "@/lib/transfers";
 
 /*
  * Dashboard navigation: one list of destinations, two presentations.
@@ -42,7 +44,7 @@ import { TAXES_PATH } from "@/lib/taxes";
  * Back link returns to that tab). Opened by its address, it is the Vault's.
  * The Orders page (open orders and the history) works the same way.
  *
- * Account pages (Documents, Taxes, Beneficiaries, Security) sit in the sidebar's own
+ * Account pages (Transfers, Documents, Taxes, Beneficiaries, Security) sit in the sidebar's own
  * "Account" group. On phones the tab bar keeps its five tabs: the Account tab
  * and each account page carry a strip of links to them (`AccountLinks`), and
  * the header's lock opens Security.
@@ -67,6 +69,7 @@ export const DASHBOARD_NAV: readonly NavItem[] = [
   { href: "/dashboard/account", label: "Account", icon: Landmark },
   { href: "/dashboard/invest", label: "Invest", icon: TrendingUp },
   { href: "/dashboard/reserve", label: "Reserve", icon: ShieldCheck },
+  { href: TRANSFERS_PATH, label: "Transfers", icon: ArrowLeftRight, settings: true },
   { href: DOCUMENTS_PATH, label: "Documents", icon: FileText, settings: true },
   { href: TAXES_PATH, label: "Taxes", icon: Receipt, settings: true },
   { href: BENEFICIARIES_PATH, label: "Beneficiaries", icon: Users, settings: true },
@@ -261,12 +264,13 @@ export function AccountLinks({ className }: { className?: string }) {
   return (
     <nav aria-label="Account pages" className={cx("lg:hidden", className)}>
       {/* Hairlines between the cells whatever the columns: the gaps show the border color. */}
-      <ul className="grid grid-cols-2 gap-px border border-border bg-border sm:grid-cols-4">
+      <ul className="grid grid-cols-2 gap-px border border-border bg-border sm:grid-cols-5">
         {ACCOUNT_PAGES.map((item) => {
           const active = isActive(item, pathname);
           const Icon = item.icon;
           return (
-            <li key={item.href} className="min-w-0 bg-surface">
+            // Two columns on phones: an odd last page takes the whole row, never leaving a hole.
+            <li key={item.href} className="min-w-0 bg-surface max-sm:last:odd:col-span-2">
               <Link
                 href={item.href}
                 aria-current={active ? "page" : undefined}
