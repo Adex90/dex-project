@@ -1484,6 +1484,127 @@ client's own name: the AML whitelist.
   `MODO_DEMO` no account is linked yet, so withdrawals need that flow
   first (`docs/FRONTEND_ROADMAP.md`, module 16).
 
+## SPEI tracker and clarifications (migrations `0025` and `0026`)
+
+Where each SPEI transfer of the client is, what Banxico's CEP (Comprobante
+Electrónico de Pago) lookup asks for, and the clarification (aclaración) a
+client opens when a transfer is delayed, doesn't arrive or comes back.
+Roadmap item 17.
+
+- **`GET /api/v1/wealth/spei/transfers?limit=&cursor=`** (client, with its
+  role and RLS): its SPEI transfers in and out, newest first, 50 a page
+  (`limit` 1 to 100) with an opaque `next_cursor`. `GET .../transfers/{id}`
+  reads one by its id or by the id of a ledger movement it made (an
+  order's charge or its refund, a deposit's credit); another client's is
+  404. Each one:
+  `{"transfer_id", "direction": "incoming" | "outgoing", "kind": "deposit" | "withdrawal" | "payment", "status": "pending" | "settled" | "returned", "stage": "initiated" | "sent" | "settled" | "returned" | "rejected", "amount", "tracking_key", "operation_date", "concept", "numeric_reference", "counterparty": {"name", "bank": {"code", "name"}, "account_last4"}, "initiated_at", "sent_at", "settled_at", "returned_at", "return_reason", "transaction_id", "refund_transaction_id", "simulated", "cep", "clarification"}`.
+  - Incoming: the deposits credited to the client's account, and those it
+    could not receive (returned to the sender, never credited). A returned
+    deposit carries no cause and no reason: they could name the blocked
+    persons list (no tipping off). The return of one of our orders is not
+    listed apart: it is that order's outcome.
+  - Outgoing: withdrawals to a linked account and payments to someone else.
+    PENDIENTE is `initiated`; ENVIADA is `sent` (STP has it, on Banxico's
+    SPEI network); then LIQUIDADA, DEVUELTA (the receiving bank returned it)
+    or RECHAZADA (it never settled). In the last two the money is back in
+    the vault. The return cause is a short code (Banxico's causes 1, 2, 3
+    and 14, else `other`); the provider's reason and errors never leave the
+    API.
+  - The counterparty: name, bank (the short catalog of linked accounts) and
+    the last four digits of its account. Another person's full CLABE never
+    leaves the API.
+  - `cep`, once it settled: the operation date, the tracking key, the sender
+    and the receiver bank, the beneficiary account (the client's own CLABE
+    in full when they are the beneficiary, else its last four digits), the
+    amount and Banxico's page. A simulated transfer (demo deposits, the
+    simulated gateway) has no CEP at Banxico, and says so (`available:
+    false`).
+- **`ifpe.aclaraciones_spei`** (migration `0025`): each clarification, with
+  its case number per client (set by the database), the movement (one order
+  of `ifpe.spei_outbound` or one record of `ifpe.spei_inbound`), its
+  tracking key (copied from the movement), the reason, the client's
+  description, who opened it (the session of `0019`, the IP and the
+  device), the status and the resolution note.
+  - Opening one, the database requires: born ABIERTA without a note; KYC
+    VERIFICADO; the movement is the client's (an order of theirs, a deposit
+    credited or returned to their account); at most 90 calendar days since
+    the transfer (Ley para la Transparencia y Ordenamiento de los Servicios
+    Financieros, art. 23); no other active clarification of the movement (a
+    partial unique index guarantees it); at most 10 active per client.
+  - The terms never change. ABIERTA -> EN_REVISION -> RESUELTA | RECHAZADA
+    (an ABIERTA one may close directly). Closing needs a note of 10 to 500
+    characters, refused if it names AML, the UIF, a freeze, an alert, a
+    suspicion or a risk: the client reads it. Nothing is deleted.
+  - Every step goes into the client's security log (`ACLARACION_SPEI_*`;
+    the opening with its session, IP and device, the institution's steps
+    without them) and bumps the client's vault version.
+  - RLS: the client reads its own; `sc_ifpe` opens; `sc_spei` reviews and
+    closes; `sc_auditor` reads.
+- **`GET /api/v1/wealth/spei/disputes`** (client): its clarifications,
+  newest first (the latest 200), each with its history from the security
+  log. **`POST /api/v1/wealth/spei/disputes`**:
+  `{"transfer_id", "direction", "reason": "delayed" | "not_received" | "returned" | "wrong_amount" | "not_recognized" | "other", "description"?, "idempotency_key"}`
+  ("other" needs a description of at least 10 characters; 500 at most).
+  - 201 with the clarification; 200 when the key repeats the same terms,
+    409 `CLAVE_IDEMPOTENCIA_REUTILIZADA` with other terms.
+  - 409 `ACLARACION_ACTIVA`; 422 `ACLARACION_VENCIDA` (past 90 days),
+    `LIMITE_ACLARACIONES` (10 open) or `KYC_NO_VERIFICADO`; 404 for a
+    transfer that is not the client's.
+  - A frozen client opens clarifications like anyone: they move no money,
+    and refusing would tell.
+- **The SPEI operator** (`sc_spei`, with MFA):
+  `GET /api/v1/operaciones/spei/aclaraciones` lists the active ones, oldest
+  first. `POST /api/v1/operaciones/spei/aclaraciones/{id}`
+  `{"estado": "EN_REVISION" | "RESUELTA" | "RECHAZADA", "nota"?}` moves one
+  (the note is required to close); 409 `ACLARACION_CERRADA` or
+  `ACLARACION_TRANSICION`.
+- **Live** (migration `0026`): a change of state of an order, a new
+  operation date and a deposit returned to the sender bump the vault
+  version of the client's account (`version_ordenes`) although no money
+  moves, so the WebSocket pushes a snapshot and the page reads again. The
+  settlement locks the order and then the account, as the refund of a
+  returned order already did; a deadlock against a clarification being
+  opened on the same order aborts one of the two, which
+  `db::con_reintentos` retries whole.
+- **The older client routes** `GET /api/v1/spei/recibidos` and
+  `/api/v1/spei/transferencias` keep their shape but no longer carry a
+  returned deposit's cause and reason, or an order's internal reason
+  (`motivo`, `ultimo_error`): a deposit refused for a client on the blocked
+  persons list was returned with a reason that said so.
+- **The UI**: `/dashboard/transfers` (`frontend/src/components/transfers/`),
+  first in the sidebar's Account group and in the phones' strip of account
+  pages.
+  - Transfers: the list, 25 a page with Load more. Each row: what it was,
+    the counterparty, the amount, the status (Processing, Settled, Returned
+    or Not completed), its clarification and its tracking key.
+  - The inspector, a drawer on the right (a sheet along the bottom on
+    phones): the timeline (Initiated -> Sent to Banxico via STP -> Settled,
+    then Returned or Not completed; a deposit is received from Banxico via
+    STP and credited, or returned to the sender), the clave de rastreo with
+    one-tap copy, the details, the CEP inspector (Copy details, and Verify
+    on Banxico at `https://www.banxico.org.mx/cep/`, the only site the link
+    may open) and "Report a delay" / "Open a clarification".
+  - Clarifications: each case with its number, reason, status (Open, In
+    review, Resolved, Declined), history and the note from the team.
+  - Links in: Track on the Account ledger's SPEI rows and in a movement's
+    details, and "Track this transfer" on the withdrawal receipt
+    (`?transfer=` takes a transfer's id or a ledger movement's). The
+    Security log names each step ("SPEI clarification opened", "... in
+    review", "... resolved", "... declined").
+  - `frontend/src/lib/transfers.ts` validates every answer whole, coherence
+    included, and holds the words; `frontend/src/store/transfers.ts` keeps
+    the pages, the inspected transfer and the clarifications.
+- Tests: `tests/db/0025_aclaraciones_spei.sql`,
+  `tests/db/0026_avisos_spei.sql`, `backend/tests/aclaraciones.rs`,
+  `frontend/src/lib/transfers.test.ts`, `frontend/src/store/transfers.test.ts`,
+  `frontend/e2e/smoke.mjs` (a real deposit's CEP, a withdrawal settling
+  live, a clarification from opened to resolved, a phone) and
+  `frontend/e2e/aml.mjs` (a frozen client).
+- Left: checking the CEP automatically (Banxico publishes no API: the
+  backend would fetch the CEP and compare it), the clarifications queue in
+  the staff console (the API exists), a clarification for a deposit that
+  never reached us (no record to attach it to), and email notices.
+
 ## Proof of Reserve: positions and the Solvency Explorer (migration `0018`)
 
 A Proof of Reserve cut (`backend/src/reserva.rs`) commits to every client's
@@ -2032,6 +2153,8 @@ the password is hashed, so a parallel burst cannot test more than 5 passwords.
 | GET | `/api/v1/wealth/impuestos?year=` | client: fiscal profile, W-8BEN state and the fiscal year's summary (realized results, fixed-term interest, ISR withheld and estimated) |
 | POST | `/api/v1/wealth/impuestos/w8ben` | client: certifies or renews the W-8BEN (201); the database copies Part I from the KYC file and logs it |
 | GET | `/api/v1/wealth/impuestos/export.csv?year=` | client: the year's accounting export, RFC 4180 CSV |
+| GET | `/api/v1/wealth/spei/transfers?limit=&cursor=`, `/api/v1/wealth/spei/transfers/{id}` | client: its SPEI transfers in and out, with their settlement steps, the counterparty masked and the CEP data (`{id}` may be a ledger movement's) |
+| GET, POST | `/api/v1/wealth/spei/disputes` | client: its SPEI clarifications; opens one (one active per transfer, within 90 days, 10 open at most) |
 | GET | `/api/v1/ifpe/cuenta`, `/api/v1/ifpe/movimientos` | client |
 | POST | `/api/v1/ifpe/transferencias` | client with a step-up window: internal transfer |
 | POST | `/api/v1/ifpe/retiros` | client with a step-up window: withdrawal to own external CLABE (an outgoing SPEI), which must be a linked account |
@@ -2050,12 +2173,14 @@ the password is hashed, so a parallel burst cannot test more than 5 passwords.
 | POST | `/api/v1/operaciones/usuarios/{id}/revocar-sesiones` | operator: invalidate a user's JWTs immediately |
 | POST | `/api/v1/spei/webhook/inbound`, `/api/v1/spei/webhook/estado` | SPEI provider (HMAC signature) |
 | POST | `/api/v1/spei/transfer` | client with a step-up window: send an SPEI to someone else's account; off unless `SPEI_TRANSFERENCIAS_TERCEROS=true` (422 `TRANSFERENCIAS_TERCEROS_NO_DISPONIBLES`, before asking for the step-up) |
-| GET | `/api/v1/spei/transferencias`, `/api/v1/spei/recibidos` | client |
+| GET | `/api/v1/spei/transferencias`, `/api/v1/spei/recibidos` | client: its SPEI orders and received SPEI, without internal reasons or a returned deposit's cause (the Transfers page reads `/wealth/spei/transfers`) |
 | GET | `/api/v1/spei/conciliacion`, `/api/v1/spei/en-revision` | operator / auditor |
 | POST | `/api/v1/operaciones/spei/recibidos/{id}/correccion` | operator: reverse a wrong SPEI credit |
 | POST | `/api/v1/operaciones/spei/recibidos/{id}/anulacion` | operator: void a wrong manual SPEI entry and free its identity |
 | POST | `/api/v1/operaciones/spei/enviados/{id}/reembolso` | operator: refund an order in manual review that the provider never received |
 | POST | `/api/v1/operaciones/spei/en-revision/{id}/descarte` | operator: discard a held SPEI notification as a duplicate (no money moves) |
+| GET | `/api/v1/operaciones/spei/aclaraciones` | operator: the active SPEI clarifications, oldest first |
+| POST | `/api/v1/operaciones/spei/aclaraciones/{id}` | operator: a clarification to EN_REVISION, RESUELTA or RECHAZADA (closing needs a neutral note the client reads) |
 | POST | `/api/v1/operaciones/...` | operator: holds (shown to the client as neutral `ret:`/`lib:` entries), KYC, capital |
 | GET/POST | `/api/v1/aml/...` | compliance officer (auditor read-only): AML/PLD console, see above |
 

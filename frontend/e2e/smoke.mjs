@@ -9,7 +9,8 @@
  * install) and a Chromium build (PLAYWRIGHT_BROWSERS_PATH). Chromium runs with
  * a fake camera (an animated test pattern), so the liveness frames differ.
  * And `psql` on the stack's database (e2e/aml-stack.sh's PG* variables and DB),
- * to move a price as the oracle will.
+ * to move a price as the oracle will, and the stack's SPEI_WEBHOOK_SECRETO (its
+ * environment or $AML_E2E_DIR/stack.env) to sign the SPEI provider's notices.
  *
  * First pass: landing -> sign-up -> KYC-locked dashboard -> the four-step
  * verification at /dashboard/verify (identity, INE photos and details,
@@ -55,7 +56,14 @@
  * its row opens the asset's page, a buy whose answer is lost is retried with
  * the same idempotency key and fills once, refusals show their reason; then,
  * on a phone-sized screen (bottom tab bar instead of the sidebar, Discover
- * included), "Max" sells the whole position.
+ * included), "Max" sells the whole position. After the withdrawal, the SPEI
+ * tracker: a deposit from BBVA through the provider's signed webhook, the
+ * ledger's Track link to the withdrawal in the inspector (its steps, its
+ * tracking key copied, no CEP yet), Report a delay opening case #1 (a second
+ * one refused), the deposit's CEP inspector and its copied details, the
+ * withdrawal settling live, the case reviewed and resolved by the SPEI
+ * operator with the note on the Clarifications tab, each step in the Security
+ * log, and the page on a phone.
  * The theme is dark only ("Sovereign Gold"); the passes still differ in the
  * browser's preferred color scheme, which must not change it.
  */
@@ -69,7 +77,7 @@ import { isDeepStrictEqual } from "node:util";
 // KYC library builds an identity that passes every frontend and backend check.
 import { curpCheckDigit, sampleIdentity, SAMPLE_IDENTITY_SPACE, todayInMexicoCity } from "../src/lib/kyc.ts";
 // And exact decimals, to read the documents' figures as the screens do.
-import { formatMoney, isZero, toUnits } from "../src/lib/decimal.ts";
+import { formatAmount, formatMoney, isZero, toUnits } from "../src/lib/decimal.ts";
 // And the Tax Center's RFC 4180 parser, to read the accounting export it saves.
 import { CSV_HEADER, parseCsv } from "../src/lib/taxes.ts";
 // And the allocation's exact math, to know what the Vault must show for the figures the API gives.
@@ -222,6 +230,30 @@ async function apiOrder(token, order) {
     body: JSON.stringify({ ...order, idempotency_key: crypto.randomUUID() }),
   });
   return { status: response.status, receipt: await response.json() };
+}
+
+/**
+ * A notification of the SPEI provider (STP) to the stack's webhooks, signed as the provider signs
+ * it (backend/src/spei/firma.rs: HMAC-SHA256 of "<t>.<body>" with SPEI_WEBHOOK_SECRETO, from the
+ * environment or the stack.env e2e/aml-stack.sh writes into $AML_E2E_DIR).
+ */
+async function speiWebhook(kind, payload) {
+  const dir = process.env.AML_E2E_DIR ?? `${process.env.TMPDIR ?? "/tmp"}/sc-aml-e2e`;
+  const secret =
+    process.env.SPEI_WEBHOOK_SECRETO ??
+    readFileSync(`${dir}/stack.env`, "utf8")
+      .split("\n")
+      .find((line) => line.startsWith("SPEI_WEBHOOK_SECRETO="))
+      ?.slice("SPEI_WEBHOOK_SECRETO=".length);
+  if (!secret) throw new Error(`no SPEI_WEBHOOK_SECRETO in the environment or in ${dir}/stack.env`);
+  const body = JSON.stringify(payload);
+  const t = Math.floor(Date.now() / 1000);
+  const signature = createHmac("sha256", secret).update(`${t}.${body}`).digest("hex");
+  return fetch(`${API}/api/v1/spei/webhook/${kind}`, {
+    method: "POST",
+    headers: { "content-type": "application/json", "x-spei-firma": `t=${t},v1=${signature}` },
+    body,
+  });
 }
 
 /** Collapses the whitespace `innerText` puts between a component's pieces. */
@@ -920,6 +952,296 @@ try {
       );
       await page.getByRole("cell", { name: "Withdrawal" }).first().waitFor();
       check(true, "the ledger lists the withdrawal");
+
+      // The SPEI tracker (roadmap item 17, migrations 0025 and 0026): every transfer in and out, its
+      // settlement steps, its tracking key, its Banxico CEP, and the clarification a client opens on one.
+      // Only links inside the app from here on: the vault keeps its one socket.
+      const TRACKER_TIP_OFF =
+        /\b(compliance hold|compliance review|frozen|freeze|restrict\w*|AML|PLD|suspicious|alert|congel\w*|preventiv\w*|UIF|investigat\w*|risk)\b/i;
+      await context.grantPermissions(["clipboard-read", "clipboard-write"], { origin: BASE });
+      const ownClabe = sql(
+        `SELECT c.clabe FROM ifpe.cuentas c JOIN kyc.clientes k ON k.id = c.cliente_id WHERE k.email = '${email}'`,
+      ).trim();
+      const withdrawalId = sql(`SELECT id FROM ifpe.spei_outbound WHERE clave_rastreo = '${trackingKey}'`).trim();
+      // A SPEI from BBVA through the provider's signed webhook: a real one, with a CEP at Banxico.
+      const operationDay = todayInMexicoCity();
+      const depositKey = `BBVA${runId}`;
+      const availableBefore = (await page.getByTestId("vault-available").innerText()).replace(/[^0-9.]/g, "");
+      const credited = await speiWebhook("inbound", {
+        fechaOperacion: operationDay.replaceAll("-", ""),
+        institucionOrdenante: "40012",
+        claveRastreo: depositKey,
+        monto: 2500,
+        nombreOrdenante: "JUAN PEREZ LOPEZ",
+        cuentaOrdenante: "012180009876543210",
+        cuentaBeneficiario: ownClabe,
+        conceptoPago: "Ahorro noviembre",
+        referenciaNumerica: 1125,
+        tipoPago: 1,
+      });
+      check(
+        credited.status === 200 && (await credited.json()).mensaje === "confirmar",
+        "a SPEI from BBVA, signed by the provider, is credited to the client's CLABE",
+      );
+      await page
+        .getByTestId("vault-available")
+        .filter({ hasText: formatAmount(toUnits(availableBefore) + toUnits("2500")) })
+        .waitFor();
+      // In the Account ledger, every SPEI movement links to its transfer.
+      const withdrawalRow = page.getByRole("row").filter({ hasText: "Withdrawal" }).first();
+      const trackWithdrawal = withdrawalRow.getByTestId("ledger-track");
+      await trackWithdrawal.waitFor();
+      check(
+        (await page.getByTestId("ledger-track").count()) >= 2 &&
+          (await trackWithdrawal.getAttribute("href")).startsWith("/dashboard/transfers?transfer="),
+        "in the Account ledger the SPEI movements (the new deposit, the withdrawal) carry a Track link",
+      );
+      await trackWithdrawal.click();
+      await page.waitForURL(/\/dashboard\/transfers\?transfer=[0-9a-f-]{36}$/);
+      const inspector = page.getByTestId("transfer-inspector");
+      await inspector.and(page.locator("[data-status=ready]")).waitFor();
+      const steps = () =>
+        inspector
+          .getByTestId("timeline-step")
+          .evaluateAll((all) => all.map((s) => `${s.dataset.step}:${s.dataset.state}`).join(" "));
+      check(
+        (await inspector.getAttribute("data-transfer-id")) === withdrawalId &&
+          (await inspector.getByTestId("inspector-title").innerText()) === "Withdrawal to BBVA México •••• 1234" &&
+          (await inspector.getByTestId("inspector-tracking-key").innerText()) === trackingKey &&
+          (await inspector.getByTestId("transfer-status").getAttribute("data-status")) === "pending" &&
+          (await steps()) === "initiated:done sent:current settled:upcoming" &&
+          (await inspector.getByTestId("cep-notice").innerText()) ===
+            "Banxico issues the CEP once the transfer settles." &&
+          (await mainNav(page).getByRole("link", { name: "Transfers", exact: true }).getAttribute("aria-current")) ===
+            "page",
+        "Track opens the withdrawal in the inspector: Processing, its tracking key, waiting to be sent to Banxico via STP, no CEP yet",
+      );
+      await inspector.getByTestId("copy-tracking-key").click();
+      await inspector.getByTestId("copy-tracking-key").and(page.locator("[data-copied=true]")).waitFor();
+      check(
+        (await page.evaluate(() => navigator.clipboard.readText())) === trackingKey,
+        "one tap copies the clave de rastreo",
+      );
+      await shot(page, "transfer-inspector-desktop", { fullPage: false });
+
+      // Report a delay: the reasons that fit a withdrawal on its way; "Something else" asks what happened.
+      await inspector.getByTestId("clarification-start").click();
+      const clarificationForm = inspector.getByTestId("clarification-form");
+      await clarificationForm.waitFor();
+      check(
+        (await clarificationForm
+          .getByTestId("clarification-reason")
+          .evaluateAll((all) => all.map((r) => r.dataset.reason).join(" "))) === "delayed other" &&
+          (await clarificationForm.locator("input[value=delayed]").isChecked()),
+        "Report a delay opens the clarification form: taking too long (chosen) or something else",
+      );
+      await clarificationForm.getByTestId("clarification-reason").and(page.locator("[data-reason=other]")).click();
+      await clarificationForm.getByTestId("clarification-submit").click();
+      await clarificationForm.getByText("Tell us what happened, in at least 10 characters.").waitFor();
+      check(true, "Something else needs ten characters of description before anything is sent");
+      await clarificationForm.getByTestId("clarification-reason").and(page.locator("[data-reason=delayed]")).click();
+      await clarificationForm.getByTestId("clarification-description").fill("My bank still doesn't show it.");
+      await shot(page, "transfer-clarification-form-desktop", { fullPage: false });
+      await clarificationForm.getByTestId("clarification-submit").click();
+      const openedNotice = inspector.getByTestId("clarification-opened");
+      await openedNotice.waitFor();
+      const caseNumber = Number(/#(\d+)/.exec(await openedNotice.innerText())?.[1]);
+      check(
+        caseNumber === 1 && flat(await openedNotice.innerText()).startsWith("Clarification #1 opened"),
+        "the clarification opens as case #1",
+      );
+      const again = await fetch(`${API}/api/v1/wealth/spei/disputes`, {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: `Bearer ${otherDevice}` },
+        body: JSON.stringify({
+          transfer_id: withdrawalId,
+          direction: "outgoing",
+          reason: "other",
+          description: "Asking again from another device.",
+          idempotency_key: crypto.randomUUID(),
+        }),
+      });
+      check(
+        again.status === 409 && (await again.json()).error.codigo === "ACLARACION_ACTIVA",
+        "a second clarification on the same transfer is refused while the first is open (409)",
+      );
+      await page.keyboard.press("Escape");
+      await inspector.waitFor({ state: "detached" });
+      const withdrawalListed = page
+        .getByTestId("transfer-row")
+        .and(page.locator(`[data-transfer-id="${withdrawalId}"]`));
+      check(
+        new URL(page.url()).pathname === "/dashboard/transfers" &&
+          new URL(page.url()).search === "" &&
+          flat(await withdrawalListed.getByTestId("transfer-clarification").innerText()).includes("#1") &&
+          (await page.getByTestId("transfers-tabs").innerText()).toUpperCase().includes("CLARIFICATIONS · 1"),
+        "Escape closes the inspector; the withdrawal's row shows clarification #1, and the tab counts one open",
+      );
+
+      // The deposit from BBVA: settled, and its CEP is ready to look up at Banxico.
+      const depositListed = page.getByTestId("transfer-row").filter({ hasText: "JUAN PEREZ LOPEZ" });
+      check(
+        (await page.getByTestId("transfer-row").first().getAttribute("data-transfer-id")) ===
+          (await depositListed.getAttribute("data-transfer-id")) &&
+          (await depositListed.getAttribute("data-status")) === "settled",
+        "the list starts with the newest transfer: the deposit, settled",
+      );
+      await shot(page, "transfers-desktop");
+      await depositListed.click();
+      await inspector.and(page.locator("[data-status=ready]")).waitFor();
+      const cep = inspector.getByTestId("cep-inspector");
+      const cepLink = cep.getByTestId("cep-link");
+      const cepFields = flat(await cep.getByTestId("cep-fields").innerText());
+      check(
+        (await inspector.getByTestId("inspector-title").innerText()) === "Deposit from JUAN PEREZ LOPEZ" &&
+          (await steps()) === "initiated:done sent:done settled:done" &&
+          (await cep.getAttribute("data-available")) === "true" &&
+          (await cepLink.getAttribute("href")) === "https://www.banxico.org.mx/cep/" &&
+          (await cepLink.getAttribute("target")) === "_blank" &&
+          (await cepLink.getAttribute("rel")) === "noopener noreferrer" &&
+          [depositKey, "BBVA México (012)", `Synthetic Capital (${ownClabe.slice(0, 3)})`, ownClabe, "$2,500.00"].every(
+            (part) => cepFields.includes(part),
+          ),
+        "the deposit's CEP inspector lists what Banxico asks for, and Verify on Banxico opens Banxico's own page",
+      );
+      await cep.getByTestId("copy-cep").click();
+      await cep.getByTestId("copy-cep").and(page.locator("[data-copied=true]")).waitFor();
+      const cepCopied = await page.evaluate(() => navigator.clipboard.readText());
+      const cepExpected = [
+        `Operation date: ${operationDay}`,
+        `Tracking key: ${depositKey}`,
+        "Sender: BBVA México (012)",
+        `Receiver: Synthetic Capital (${ownClabe.slice(0, 3)})`,
+        `Beneficiary account: ${ownClabe}`,
+        "Amount: 2500.00 MXN",
+      ].join("\n");
+      check(
+        cepCopied === cepExpected,
+        `Copy details puts the CEP's fields on the clipboard, the amount to the cent${cepCopied === cepExpected ? "" : ` (got ${JSON.stringify(cepCopied)})`}`,
+      );
+      await cep.scrollIntoViewIfNeeded();
+      await shot(page, "transfer-cep-desktop", { fullPage: false });
+      check(!TRACKER_TIP_OFF.test(await inspector.innerText()), "the inspector never tips anything off");
+      await page.keyboard.press("Escape");
+      await inspector.waitFor({ state: "detached" });
+
+      // STP settles the withdrawal: no money moves, yet the vault announces it (0026) and the row turns Settled.
+      const settled = await speiWebhook("estado", {
+        claveRastreo: trackingKey,
+        estado: "LIQUIDADA",
+        fechaOperacion: operationDay.replaceAll("-", ""),
+      });
+      check(settled.status === 200, "the provider reports the withdrawal settled (signed webhook)");
+      await withdrawalListed.and(page.locator("[data-status=settled]")).waitFor();
+      await withdrawalListed.click();
+      await inspector.and(page.locator("[data-status=ready]")).waitFor();
+      check(
+        (await steps()) === "initiated:done sent:done settled:done" &&
+          (await cep.getAttribute("data-available")) === "false" &&
+          (await cep.getByTestId("cep-notice").innerText()).startsWith(
+            "A simulated transfer: Banxico has no CEP for it.",
+          ) &&
+          (await cep.getByTestId("cep-link").count()) === 0 &&
+          flat(await inspector.getByTestId("clarification-active").innerText()).includes("Clarification #1") &&
+          (await inspector.getByTestId("clarification-start").count()) === 0,
+        "live: the withdrawal settled (no CEP for the demo's simulated gateway), and case #1 stays open on it",
+      );
+      await page.keyboard.press("Escape");
+      await inspector.waitFor({ state: "detached" });
+
+      // Our team reviews and resolves it (the SPEI operator's role): the client sees each step and the note.
+      const clarificationId = sql(
+        `SELECT a.id FROM ifpe.aclaraciones_spei a JOIN kyc.clientes k ON k.id = a.cliente_id WHERE k.email = '${email}' AND a.numero = 1`,
+      ).trim();
+      const resolution = "The receiving bank confirmed the credit to your account. No further action is needed.";
+      sql(`SET ROLE sc_spei; UPDATE ifpe.aclaraciones_spei SET estado = 'EN_REVISION' WHERE id = '${clarificationId}'`);
+      await withdrawalListed.getByTestId("clarification-status").and(page.locator("[data-status=in_review]")).waitFor();
+      sql(
+        `SET ROLE sc_spei; UPDATE ifpe.aclaraciones_spei SET estado = 'RESUELTA', nota_resolucion = '${resolution}' WHERE id = '${clarificationId}'`,
+      );
+      await withdrawalListed.getByTestId("clarification-status").and(page.locator("[data-status=resolved]")).waitFor();
+      check(true, "the row follows the clarification live: in review, then resolved");
+      await page.getByTestId("transfers-tabs").getByText("Clarifications", { exact: true }).click();
+      await page.waitForURL("**/dashboard/transfers?tab=clarifications");
+      const caseCard = page.getByTestId("clarification").and(page.locator("[data-number='1']"));
+      await caseCard.waitFor();
+      check(
+        (await caseCard.getAttribute("data-status")) === "resolved" &&
+          (await caseCard.getByTestId("clarification-note").innerText()).includes(resolution) &&
+          flat(await caseCard.getByTestId("clarification-history").innerText()).match(
+            /^Opened .+ In review .+ Resolved /,
+          ) !== null &&
+          (await caseCard.getByTestId("clarification-reason-label").innerText()) === "It's taking too long" &&
+          flat(await page.getByTestId("clarifications-count").innerText()) === "None open right now",
+        "Clarifications: case #1 resolved, with the team's note and its history (opened, in review, resolved)",
+      );
+      check(
+        !TRACKER_TIP_OFF.test(await page.getByTestId("transfers-page").innerText()),
+        "the clarifications never tip anything off",
+      );
+      await shot(page, "transfers-clarifications-desktop");
+      // "View transfer" opens the case's transfer in the inspector.
+      await caseCard.getByTestId("clarification-open-transfer").click();
+      await inspector.and(page.locator("[data-status=ready]")).waitFor();
+      check(
+        (await inspector.getAttribute("data-transfer-id")) === withdrawalId &&
+          (await inspector.getByTestId("clarification-closed").innerText()).includes("Clarification #1"),
+        "View transfer opens the withdrawal, which says its clarification was resolved",
+      );
+      await page.keyboard.press("Escape");
+      await inspector.waitFor({ state: "detached" });
+
+      // Every step is in the client's security log, the institution's ones without a device or an IP.
+      await mainNav(page).getByRole("link", { name: "Security", exact: true }).click();
+      await page.waitForURL("**/dashboard/security");
+      const caseEvents = page.getByTestId("security-event").filter({ hasText: "Case #1" });
+      await caseEvents.nth(2).waitFor();
+      check(
+        JSON.stringify(await caseEvents.getByTestId("security-event-title").allInnerTexts()) ===
+          JSON.stringify(["SPEI clarification resolved", "SPEI clarification in review", "SPEI clarification opened"]),
+        "the security log lists the clarification's steps, newest first",
+      );
+
+      // On a phone: Transfers gold in the account pages' strip (the fifth across the row), the list fits,
+      // and the inspector is a sheet along the bottom.
+      await mainNav(page).getByRole("link", { name: "Transfers", exact: true }).click();
+      await page.waitForURL("**/dashboard/transfers");
+      await page.getByTestId("transfer-row").first().waitFor();
+      await page.setViewportSize({ width: 390, height: 844 });
+      const strip = page.getByRole("navigation", { name: "Account pages" });
+      const transfersLink = strip.getByRole("link", { name: "Transfers" });
+      await transfersLink.waitFor();
+      const stripBox = await strip.boundingBox();
+      const lastBox = await strip.getByRole("link", { name: "Security" }).boundingBox();
+      check(
+        JSON.stringify(await strip.getByRole("link").allInnerTexts()) ===
+          JSON.stringify(["Transfers", "Documents", "Taxes", "Beneficiaries", "Security"]) &&
+          (await settledStyle(transfersLink, "backgroundColor")) === "rgb(234, 179, 8)" &&
+          stripBox !== null &&
+          lastBox !== null &&
+          Math.abs(lastBox.width - (stripBox.width - 2)) <= 2 &&
+          (await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)),
+        "on a phone the account pages' strip has Transfers gold and Security across the last row; the list fits",
+      );
+      await shot(page, "transfers-phone");
+      await withdrawalListed.click();
+      await inspector.and(page.locator("[data-status=ready]")).waitFor();
+      // Measured once it slid in (a 200 ms transition from 24 px lower).
+      await inspector.evaluate((el) => Promise.all(el.getAnimations().map((a) => a.finished.catch(() => undefined))));
+      const sheetBox = await inspector.boundingBox();
+      check(
+        sheetBox !== null &&
+          Math.round(sheetBox.width) === 390 &&
+          Math.abs(sheetBox.y + sheetBox.height - 844) <= 1 &&
+          (await inspector.evaluate((el) => el.scrollWidth <= el.clientWidth)),
+        "on a phone the inspector is a sheet along the bottom, as wide as the screen",
+      );
+      await shot(page, "transfer-inspector-phone", { fullPage: false });
+      await page.keyboard.press("Escape");
+      await inspector.waitFor({ state: "detached" });
+      await page.setViewportSize({ width: 1440, height: 1000 });
+      await openTab(page, "Account");
+      check(vaultSockets.length === 2, "the whole tracker ran on the vault's one socket");
 
       // On a phone the drawer is a bottom sheet with a large numpad, as wide as the screen.
       await page.setViewportSize({ width: 390, height: 844 });
@@ -2220,8 +2542,8 @@ try {
     await openTab(page, "Documents");
     check(
       JSON.stringify(await mainNav(page).locator("ul").nth(1).getByRole("link").allInnerTexts()) ===
-        JSON.stringify(["Documents", "Taxes", "Beneficiaries", "Security"]),
-      "the sidebar's Account group lists Documents, Taxes, Beneficiaries and Security",
+        JSON.stringify(["Transfers", "Documents", "Taxes", "Beneficiaries", "Security"]),
+      "the sidebar's Account group lists Transfers, Documents, Taxes, Beneficiaries and Security",
     );
     const docRows = page.getByTestId("document-row");
     await docRows.nth(inbox.documents.length - 1).waitFor();
@@ -2420,7 +2742,7 @@ try {
     await documentsLink.waitFor();
     check(
       JSON.stringify(await accountPages.getByRole("link").allInnerTexts()) ===
-        JSON.stringify(["Documents", "Taxes", "Beneficiaries", "Security"]) &&
+        JSON.stringify(["Transfers", "Documents", "Taxes", "Beneficiaries", "Security"]) &&
         (await documentsLink.getAttribute("aria-current")) === "page" &&
         (await settledStyle(documentsLink, "backgroundColor")) === "rgb(234, 179, 8)" &&
         (await mainNav(page).getByRole("link").count()) === 5,
@@ -2861,7 +3183,7 @@ try {
     await page.keyboard.press("Escape");
     await constancia.waitFor({ state: "detached" });
 
-    // On a phone: the account pages as a 2×2 strip, Taxes gold; the page fits.
+    // On a phone: the account pages as a strip two wide (the fifth across the row), Taxes gold; the page fits.
     await page.setViewportSize({ width: 390, height: 844 });
     const taxesLink = page.getByRole("navigation", { name: "Account pages" }).getByRole("link", { name: "Taxes" });
     await taxesLink.waitFor();

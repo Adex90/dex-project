@@ -337,11 +337,62 @@ what the module waits on. They do not change its scope.
     to the CLABE plus the holder's name on Banxico's CEP for it, matched
     against the KYC name. Until that exists no account is linked outside
     demo mode, so production cannot withdraw yet. Also left: unlinking from
-    the app, a limit on accounts per client, and the withdrawal's later
-    states (settled, returned) in the app beyond the ledger.
-- [ ] **17. SPEI Dispute Tracker** (Banxico CEP integration for delayed transfers)
-  - Orders already carry their tracking key (`clave_rastreo`). The lookup of
-    Banxico's CEP (electronic payment receipt) goes through the backend.
+    the app and a limit on accounts per client. A withdrawal's later states
+    (sent, settled, returned) are on the Transfers page (module 17).
+- [x] **17. SPEI Dispute Tracker** (Banxico CEP integration for delayed transfers)
+  - The Transfers page, `/dashboard/transfers` (`components/transfers/`),
+    first in the sidebar's Account group and in the phones' strip of
+    account pages (README "SPEI tracker and clarifications"). Every SPEI
+    transfer of the client, in and out, newest first, 25 a page
+    (`GET /api/v1/wealth/spei/transfers`): what it was (deposit,
+    withdrawal, payment), the counterparty (name, bank and last four
+    digits: another person's full CLABE never leaves the API), the amount,
+    the status (Processing, Settled, Returned; Not completed for an order
+    that never went out), its clarification and its tracking key.
+  - The inspector, a drawer on the right (a sheet along the bottom on
+    phones): the settlement timeline, Initiated -> Sent to Banxico via STP
+    -> Settled, then Returned (the receiving bank's cause in plain words)
+    or Not completed. A deposit was sent by the other bank, received from
+    Banxico via STP and credited, or returned to the sender, with no cause:
+    a cause could name the blocked persons list (no tipping off). The clave
+    de rastreo with one-tap copy. The Banxico CEP inspector: the fields
+    Banxico's lookup asks for (operation date, tracking key, sender,
+    receiver, beneficiary account, amount), Copy details, and Verify on
+    Banxico (`https://www.banxico.org.mx/cep/`, the only site the link may
+    open). Before settlement, or for a simulated transfer (demo mode), it
+    says why there is no CEP.
+  - Clarifications (migration 0025): "Report a delay" on a transfer on its
+    way, "Open a clarification" otherwise, with the reasons that fit (it's
+    taking too long; settled but didn't arrive; it came back; wrong amount;
+    I don't recognize it; something else, described in 10 characters or
+    more). The database keeps one active clarification per transfer, 10
+    active per client, 90 calendar days from the transfer, KYC verified;
+    it sets the case number, never deletes and never changes the terms.
+    The SPEI operator moves a case to review and closes it with a note the
+    client reads, which the database refuses if it names AML. The
+    Clarifications tab shows each case's status (Open, In review,
+    Resolved, Declined), its history from the immutable security log and
+    the note; the Security log names each step.
+  - Live (migration 0026): every SPEI step bumps the vault's version, also
+    the ones that move no money (an order sent, settled or given its
+    operation date; a deposit returned to the sender), so the page reads
+    again as it happens.
+  - Links in: Track on the Account ledger's SPEI rows and in a movement's
+    details, and "Track this transfer" on the withdrawal receipt
+    (`?transfer=` takes a transfer's id or a ledger movement's).
+  - A frozen client sees the same and opens clarifications like anyone:
+    they move no money, and refusing would tell.
+  - Tests: `tests/db/0025_aclaraciones_spei.sql`,
+    `tests/db/0026_avisos_spei.sql`, `backend/tests/aclaraciones.rs`,
+    `lib/transfers.test.ts`, `store/transfers.test.ts`, smoke e2e (a real
+    deposit's CEP, a withdrawal settling live, a clarification from opened
+    to resolved, the Security log, a phone) and AML e2e (a frozen client's
+    tracker and clarification).
+  - Left: checking the CEP automatically (Banxico publishes no API: the
+    backend would fetch the CEP and compare it), the clarifications queue
+    in the staff console (the API exists), a clarification for a deposit
+    that never reached us (no record to attach it to), and email notices
+    when a case changes.
 
 ## Phase 4: Identity, Security & KYC
 

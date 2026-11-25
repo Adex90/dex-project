@@ -7,7 +7,8 @@
  * AUDITOR read-only and CLIENTE / OPERADOR locked out of the console. Under
  * review, the client's watchlist, price targets and order history read and
  * work as anyone's (the Vault's Watchlist, the Orders page, an asset's Price
- * alerts card) and never say why. Staff sign
+ * alerts card) and never say why, and so do the SPEI tracker and its
+ * clarifications (one opens on a deposit as for anyone). Staff sign
  * in with two-step verification (TOTP): the first sign-in of each one enrolls
  * an authenticator through the UI or the API, as a person would, and every
  * later sign-in answers the code (RFC 6238, computed here).
@@ -647,6 +648,72 @@ try {
     ordersHits,
   );
   await shot(cp, "client-orders-frozen");
+  // The SPEI tracker (roadmap item 17): the client's transfers and clarifications read as anyone's,
+  // the Transfers page and the inspector say nothing, and a clarification still opens (it moves no
+  // money; refusing it would tell).
+  const trackerReads = {
+    transfers: await pageFetch(cp, "GET", "/api/v1/wealth/spei/transfers"),
+    clarifications: await pageFetch(cp, "GET", "/api/v1/wealth/spei/disputes"),
+  };
+  for (const [what, read] of Object.entries(trackerReads)) {
+    check(
+      read.status === 200 &&
+        !/aml|pld|congel|alerta|cumplimiento|nivel_riesgo|es_pep|retenido|sospech|uif|preventiv|riesgo/i.test(
+          JSON.stringify(read.body),
+        ),
+      `the client's SPEI ${what} from the API (${read.status}) carry no AML wording`,
+      read.body,
+    );
+  }
+  check(
+    (trackerReads.transfers.body?.transfers ?? []).some((t) => t.kind === "deposit" && t.status === "settled"),
+    "the deposits made while frozen are in the tracker, settled, like anyone's",
+    trackerReads.transfers.body,
+  );
+  await openTab(cp, "Transfers");
+  const depositRow = cp
+    .getByTestId("transfer-row")
+    .and(cp.locator("[data-direction=incoming][data-status=settled]"))
+    .first();
+  await depositRow.waitFor({ timeout: 10_000 });
+  const transfersHits = await tipOffWords(cp);
+  check(
+    transfersHits.length === 0,
+    `the Transfers page has no tipping-off words (${transfersHits.join(", ") || "none"})`,
+    transfersHits,
+  );
+  await shot(cp, "client-transfers-frozen");
+  await depositRow.click();
+  const inspector = cp.getByTestId("transfer-inspector");
+  await inspector.and(cp.locator("[data-status=ready]")).waitFor({ timeout: 10_000 });
+  await inspector.getByTestId("clarification-start").click();
+  await inspector.getByTestId("clarification-reason").and(cp.locator("[data-reason=not_recognized]")).click();
+  const clarified = await withResponse(
+    cp,
+    (x) => x.url().endsWith("/api/v1/wealth/spei/disputes") && x.request().method() === "POST",
+    () => inspector.getByTestId("clarification-submit").click(),
+  );
+  await inspector.getByTestId("clarification-opened").waitFor({ timeout: 10_000 });
+  const inspectorHits = [...(await inspector.innerText()).matchAll(TIP_OFF)].map((m) => m[0]);
+  check(
+    clarified.status() === 201 && inspectorHits.length === 0,
+    `a clarification opens on a deposit as for anyone (${clarified.status()}); the inspector has no tipping-off words (${inspectorHits.join(", ") || "none"})`,
+    inspectorHits,
+  );
+  await shot(cp, "client-clarification-frozen");
+  await cp.keyboard.press("Escape");
+  await inspector.waitFor({ state: "detached" });
+  await cp
+    .getByTestId("transfers-tabs")
+    .getByText(/^Clarifications/)
+    .click();
+  await cp.getByTestId("clarification").first().waitFor({ timeout: 10_000 });
+  const clarificationsHits = await tipOffWords(cp);
+  check(
+    clarificationsHits.length === 0,
+    `the client's clarifications have no tipping-off words (${clarificationsHits.join(", ") || "none"})`,
+    clarificationsHits,
+  );
   await cp.goto(`${BASE}/dashboard/asset/AUG1`);
   const targetRow = cp.getByTestId("price-alert").and(cp.locator(`[data-alert-id="${state.target?.alert_id}"]`));
   await targetRow.waitFor({ timeout: 10_000 }).catch(() => undefined);

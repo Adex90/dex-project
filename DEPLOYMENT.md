@@ -112,6 +112,7 @@ internet -> host 80/443 (UFW, fail2ban) -> nginx (edge network)
 | Money leaves an account, and its beneficiaries change, only from a session that confirmed a credential in the last five minutes | Same code on both: `/wealth/withdraw`, `/ifpe/retiros`, `/ifpe/transferencias`, `/spei/transfer` and saving the beneficiaries answer 403 `STEP_UP_REQUERIDO` without a step-up window on the request's own session, before touching anything (migration `0022`). `POST /auth/step-up` checks the authenticator code (two-step on) or the password, counted in the sign-in lockout before verifying; the try that locks the account closes the session; a code works once. The window (`kyc.sesiones.step_up_valido_hasta`) is set only by the database (now + 5 minutes, never past the session's expiry, only on a live session), and each one opened is written to the append-only security log by a trigger, with the request's IP and device. The database refuses a beneficiary designation whose session has no open window | Same | `tests/step_up.rs`, `tests/db/0022_verificacion_reforzada.sql`, smoke and AML e2e (Appendix C) |
 | A savings plan buys only on its own calendar, through every check of a market order, and its terms never change | Same code on both: each due purchase runs in the trigger engine's pass as a market buy (account lock, KYC, an active vault, an open and offered asset, the cash for the amount, AML on `COMPRA_MERCADO` before any write, the same ledger writer) with the key `plan:<plan>:<period>` (migration `0023`). The database owns the calendar (9:00 a.m. Mexico City, every 7 or 14 days or the same day each month, always a future date next) and records a purchase only while the plan is active and due: made, with the order of that period whose terms are the plan's, or skipped, with the rule's code; an order with a plan key cannot commit without that record. Terms are immutable, cancelled is final, and every change and purchase is an immutable event written by a trigger. A rule that stops a purchase skips it and the plan carries on; nothing is held | Same | `tests/planes.rs`, `tests/db/0023_planes_ahorro.sql`, smoke and AML e2e (Appendix C) |
 | Price alerts, the watchlist and the order history move no money and tip no one off | Same code on both: a client's follows and price alerts are written with the account locked first (migration `0024`): at most 50 of each, a follow never updated, an alert born active on the side the catalog price has not reached, its terms immutable, triggered only when the catalog price meets the target (the database writes that price and the time) or cancelled, both final, never deleted. The trigger engine's pass marks the alerts reached, client by client. None needs KYC or refuses a frozen account (a refusal would tell); their client codes say `AVISO`, and the reads (`/market/watchlist`, `/market/alerts`, `/market/orders/history`) are made under the client's RLS and carry no compliance field | Same | `tests/seguimiento.rs`, `tests/aml.rs`, `tests/db/0024_seguimiento_alertas.sql`, smoke and AML e2e (Appendix C) |
+| SPEI clarifications are the client's own, one active per transfer, never edited or deleted, and nothing about them or about a returned SPEI tips anyone off | Same code on both: the database opens a clarification only for a verified client's own SPEI (an order of theirs, a deposit credited or returned to their account) within 90 days, one active per movement (a partial unique index) and 10 per client, with the case number and tracking key it sets (migration `0025`); the terms never change, the states only advance, closing needs a note it refuses if it names AML; each step is in the client's security log. The client's SPEI reads (`/wealth/spei/transfers`, `/spei/recibidos`, `/spei/transferencias`) never carry a returned deposit's cause or an internal reason; a frozen client opens clarifications like anyone | Same | `tests/aclaraciones.rs`, `tests/aml.rs`, `tests/db/0025_aclaraciones_spei.sql`, `tests/db/0026_avisos_spei.sql`, smoke and AML e2e (Appendix C) |
 | Least-privilege database identities | Service holds only `sc_app` (NOINHERIT, no owner rights); owner credentials only in the migrate task and with DBAs holding the `dba-tunnel` policy | Same, plus the schema owner is **not** a superuser (`deploy/postgres/10-schema-owner.sh`); the `postgres` superuser is break-glass only | `pg_authid` query in Appendix C |
 | Containers non-root, read-only, least capability, resource-limited | uid 65532, read-only rootfs, `drop ALL`, task CPU/memory | uid 65532 / 70 / 101, `read_only`, `cap_drop: ALL`, `no-new-privileges`, CPU/memory/PID limits | `docker inspect` in Appendix C |
 | No secret in code, images, environment or state the operator does not control | Secrets Manager (CMK); RDS manages and rotates the owner password; Terraform state is CMK-encrypted | Docker secrets files (0400, owned by the reading uid); services read them through `NAME_FILE` | No secret value in `docker inspect` or image history (Appendix C) |
@@ -1264,6 +1265,35 @@ following to operations.
   - Nothing new to configure. The dashboard reloads the watchlist and the
     price alerts whenever a client's vault moves: two more small reads per
     move.
+- **Migrations `0025` and `0026`** (SPEI clarifications, and the vault's
+  notice of every SPEI step) add one table (`ifpe.aclaraciones_spei`) with
+  its triggers, indexes, RLS and grants; extend the security log's event
+  catalog (four `ACLARACION_SPEI_*` events, one per case and step, with
+  column grants and RESTRICTIVE insert policies for `sc_ifpe` and
+  `sc_spei`); and add AFTER triggers on `ifpe.spei_outbound` (a change of
+  state or of operation date) and `ifpe.spei_inbound` (a deposit returned
+  to the sender) that bump the client's `version_ordenes`. No existing
+  table is rewritten and no row changes.
+
+  Order: migrate, then the backend, then the frontend (or with it).
+  - An old backend on a migrated database keeps working: it never touches
+    the new table, and the new triggers only raise a version it already
+    reads (the dashboard reloads a little more often).
+  - The new frontend against an old backend: the Transfers page cannot load
+    (404) and says so, and the ledger's Track links lead there. Deploy the
+    backend first.
+  - A settlement now takes the account's lock after the order's, as the
+    refund of a returned order already did. A deadlock against a
+    clarification opened on the same order at that moment aborts one of
+    the two, which is retried whole.
+  - Nothing new to configure. The SPEI operator works the clarifications
+    through `/api/v1/operaciones/spei/aclaraciones` (no console screen yet,
+    item 45 of §12).
+  - `GET /api/v1/spei/recibidos` and `/spei/transferencias` (client) no
+    longer return an order's internal reason (`motivo`, `ultimo_error`) or
+    a returned deposit's cause and reason: they could name the blocked
+    persons list. An integration that read them from those routes uses the
+    operator's routes.
 
 ---
 
@@ -1338,6 +1368,10 @@ to the specific provisions.
 | 40 | Price alerts reach the client only in the app: no push or email, and the "Price target reached" notice is remembered per device (browser storage) | a client learns that a target was reached only when they open the dashboard; on a new device the last day's are announced again | the asset's Price alerts card lists the targets reached in the last 30 days with their price and time; every alert keeps its reference price, the price that reached it and when | Web Push and email notices (Push Notification Center, roadmap 30, and item 1) (frontend, backend) |
 | 41 | Discover shows the prices read when it opened, and the Vault's Watchlist those read when the dashboard loaded or the vault last moved: neither follows every price change | a watched asset's price can be minutes old on screen | the asset's page reads a fresh quote; orders and price targets are always checked against the catalog price on the server | stream catalog prices over the vault's WebSocket (backend, frontend) |
 | 42 | The order history is read and sorted from the client's whole history for each page (the cursor seeks in the result), and the alerts' pass scans the active alerts every 5 s | read cost grows with an account's history, and the pass with the number of active alerts | 50 active alerts per client; an index on active alerts by asset; at most 500 clients per pass; pages of at most 100 orders | an index on each table's closing time per client, and checking only the assets whose price moved (backend, database) |
+| 43 | The backend does not fetch or check the CEP: the Transfers page gives the details Banxico's lookup asks for and opens Banxico's page, where the client checks it | a client sees the CEP only on Banxico's site, and nothing confirms automatically that Banxico holds one | the details come from the order and the provider's notices (tracking key, operation date, banks, amount); the link can only open `https://www.banxico.org.mx/cep/` (the frontend's parser refuses any other); a simulated transfer says it has no CEP | fetch each settled transfer's CEP from Banxico and keep it with the order (backend) |
+| 44 | A clarification's resolution note is free text by the SPEI operator, and the client reads it: the database refuses AML words, but a paraphrase could still tip a client off | an operator could disclose an AML matter in other words | the note is required to close, 10 to 500 characters, refused by the database if it names AML, the UIF, a freeze, an alert, a suspicion or a risk; each note is kept with its case | resolution templates approved by compliance, and a second approval for notes on clients under review (compliance, backend) |
+| 45 | Clarifications have no staff console screen and no deadline tracking: operators work them through the API | an answer could come late (the LTOSF, art. 23, also bounds the time to answer) | the queue lists the active ones, oldest first; the client sees each step and the note; every step is in the immutable security log | a queue in the staff console with each case's due date and reminders (frontend, operations) |
+| 46 | A deposit that never reached the client's account has no record to open a clarification on: the Transfers page lists only SPEI that reached it | the client must contact support about a deposit that never arrived | the sending bank traces it with its tracking key; held notifications are in the operator's review queue (`/spei/en-revision`) | a clarification for a missing deposit, with the sender's tracking key and date (backend, frontend) |
 
 ---
 
@@ -1811,6 +1845,88 @@ Vault's Watchlist and the Orders page):
     tipping-off words, and the three reads carry no AML wording; under
     review the client still unfollows, sets and cancels targets, and
     nothing says why.
+
+**SPEI tracker and clarifications** (migrations `0025` and `0026`,
+`/api/v1/wealth/spei/transfers`, `/api/v1/wealth/spei/disputes`, the SPEI
+operator's `/api/v1/operaciones/spei/aclaraciones`, the Transfers page):
+
+- **Database:** every SQL suite passes on its own fresh database with all migrations
+  (21 suites), the new `tests/db/0025_aclaraciones_spei.sql` (70 checks) and
+  `tests/db/0026_avisos_spei.sql` (23 checks) included. They cover:
+  - opening: born ABIERTA without a note, for a verified client's own order
+    or a deposit credited or returned to their account (not the return of an
+    order, not another client's), with the next case number, the movement's
+    tracking key, and the session's IP and device; refused past 90 days (89
+    accepted), for a second active one on the same movement (the partial
+    unique index too), past 10 active, without KYC, from another client's
+    session, and with "other" and no description;
+  - the states: ABIERTA -> EN_REVISION -> RESUELTA | RECHAZADA, an ABIERTA one
+    closing directly, closed ones final; the terms immutable for the schema
+    owner too; the note required to close, 10 to 500 characters, refused when
+    it names AML, the UIF, a freeze, an alert, a suspicion or a risk; never
+    deleted or truncated;
+  - the security log: one event per case and step, written by `sc_ifpe` (with
+    the session, IP and device) or `sc_spei` (without them), and nothing else;
+    each step raises the client's vault version;
+  - privileges and RLS: `sc_ifpe` inserts the terms only, `sc_spei` changes
+    only the state and the note, the client and the auditor read; RESTRICTIVE
+    RLS for the client;
+  - 0026: each change of state or operation date of an order, made by
+    `sc_spei` (which cannot update accounts), raises its account's vault
+    version once and no other's; a reschedule that changes nothing and the
+    order's internal columns stay silent; a deposit returned to the sender
+    raises it, one returned without an account raises none, and a credited
+    one does not take this path.
+- **Backend:** rustfmt and clippy `-D warnings` clean. 478 tests passed, 0 failed
+  (465 before):
+  - `tests/aclaraciones.rs`: the tracker (a deposit from BBVA with its CEP
+    and its masked counterparty; a withdrawal through every stage, the vault
+    version raised by each, its return cause as a short code; a deposit
+    returned to the sender with no cause or reason, in the tracker and in the
+    older client routes `/spei/recibidos` and `/spei/transferencias`; a demo
+    deposit marked simulated; one transfer by its id or any of its ledger
+    movements; cursor pages); the clarifications (opening, idempotency, the
+    rules, another client's transfer as 404, the history); the operator's
+    queue and transitions with the note's rules; the limits (10 active, 90
+    days); and a frozen client, who opens one like anyone.
+  - `tests/aml.rs` adds the two routes to the tipping-off scan.
+  - Found on the way: `GET /api/v1/spei/recibidos` (a client route since the SPEI integration)
+    returned a returned deposit's reason, which for a client on the blocked
+    persons list named the list. The two older client routes no longer carry
+    internal reasons or a returned deposit's cause.
+- **Frontend:** lint and typecheck clean; 396 unit tests passed (30 new: the
+  strict validation of the three payloads, coherence included; the timeline
+  of every stage; the words, with no tipping off; the CEP's link and copied
+  details; the clarification rules and request; the store's pages, refreshes,
+  inspector and the clarification just opened); `next build` succeeded.
+- **End to end** (`aml-stack.sh`, fresh database):
+  - `smoke.mjs`: 401 checks passed (377 before), with only its 13
+    deliberate refusals in the console. New, in the second pass: a SPEI from
+    BBVA signed as the provider signs it is credited, live; the Account
+    ledger's Track link opens the withdrawal in the inspector (Processing,
+    its tracking key copied in one tap, waiting to be sent to Banxico via
+    STP, no CEP yet); Report a delay opens case #1 (Something else first
+    asks for 10 characters), and a second one from another device is refused
+    with 409; the deposit's CEP inspector lists what Banxico asks for,
+    copies it with the amount to the cent, and links only to Banxico's page;
+    the provider settles the withdrawal and the row turns Settled live
+    (migration `0026`), with no CEP for the demo's simulated gateway; the
+    operator's review and resolution reach the row live, and Clarifications
+    shows case #1 resolved with the team's note and its history; the
+    Security log lists the three steps; on a phone, Transfers is gold in the
+    account pages' strip, the list fits, and the inspector is a sheet along
+    the bottom; all on the vault's one WebSocket. Earlier runs stopped twice. One stopped at the phone check of the inspector,
+    measured during its 200 ms slide-in (the check now waits for it). One stopped
+    in the first pass at Go to your vault after the 503 notice, a step this change
+    does not touch, which passed in both runs that followed (and in every earlier
+    recorded run). The phone screenshot also showed the list's titles cut short
+    beside the amounts: on phones the amount now goes under the title, and the
+    final run, on a fresh stack, passed whole.
+  - `aml.mjs`: 162 of 162 checks passed (156 before), with only the deliberate
+    4xx calls in the console. New: the frozen client's transfers and
+    clarifications carry no AML wording, the Transfers page, the inspector
+    and the clarifications show no tipping-off words, and a clarification on
+    a deposit still opens (201).
 
 **Tax Center: fiscal year, W-8BEN and accounting export** (migration `0021`, the
 routes `/api/v1/wealth/impuestos`, `/impuestos/w8ben` and `/impuestos/export.csv`,
