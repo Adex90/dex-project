@@ -168,12 +168,9 @@ function TransferRow({
     >
       <DirectionMark transfer={transfer} />
       <span className="min-w-0 flex-1">
-        <span className="flex min-w-0 items-baseline justify-between gap-3">
-          {/* Two lines on a phone (the amount takes its share of the row), one from sm up. */}
-          <span
-            className="line-clamp-2 min-w-0 font-medium break-words text-ink sm:line-clamp-1"
-            data-testid="transfer-title"
-          >
+        {/* On a phone the title has the whole width (the amount goes under it); from sm up, side by side. */}
+        <span className="flex min-w-0 flex-col gap-0.5 sm:flex-row sm:items-baseline sm:justify-between sm:gap-3">
+          <span className="min-w-0 font-medium break-words text-ink sm:truncate" data-testid="transfer-title">
             {transferTitle(transfer)}
           </span>
           <Money
